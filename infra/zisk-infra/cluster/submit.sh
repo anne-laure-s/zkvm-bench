@@ -4,18 +4,29 @@
 # runs/<tag>-<ts>/: proof.bin · report.json (timings + proof_bytes) · prove.log ·
 # env.txt (+ coordinator/worker logs).
 #
-#   ./submit.sh <elf> <input.bin> <hints> [prove-compressed|prove-plonk]
-# NOTE: pass the RAW input (.bin) AND the hints — the prover needs both.
+#   ./submit.sh <elf> <input.bin> [hints] [prove-compressed|prove-plonk]
+# HINTS is OPTIONAL: reth needs them (auto-found as the sibling <stem>.hints, or pass a path / HINTS=env);
+# a hint-less guest (e.g. Monad) proves without any. A 3rd arg naming a mode (prove-*) is taken as the mode.
 set -uo pipefail
 cd "$(dirname "$0")"
 
-ELF="${1:?usage: ./submit.sh <elf> <input.bin> <hints> [mode]}"
-INPUT="${2:?usage: ./submit.sh <elf> <input.bin> <hints> [mode]}"
-HINTS="${3:?usage: ./submit.sh <elf> <input.bin> <hints> [mode]}"
-MODE="${4:-prove-compressed}"
+ELF="${1:?usage: ./submit.sh <elf> <input.bin> [hints] [mode]}"
+INPUT="${2:?usage: ./submit.sh <elf> <input.bin> [hints] [mode]}"
+# HINTS optional. Resolve: HINTS= env · explicit path in arg 3 · sibling <stem>.hints · none.
+# Arg 3 naming a mode (prove-*) is taken as MODE (so a hint-less guest can do `… input prove-compressed`).
+MODE="prove-compressed"
+HINTS="${HINTS:-}"
+case "${3:-}" in
+  "")      : ;;
+  prove-*) MODE="$3" ;;
+  *)       HINTS="$3"; [[ -n "${4:-}" ]] && MODE="$4" ;;
+esac
 abspath() { case "$1" in /*) echo "$1";; *) echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")";; esac; }
-ELF="$(abspath "$ELF")"; INPUT="$(abspath "$INPUT")"; HINTS="$(abspath "$HINTS")"
-[[ -f "$ELF" && -f "$INPUT" && -e "$HINTS" ]] || { echo "ERROR: elf/input/hints not found" >&2; exit 1; }
+ELF="$(abspath "$ELF")"; INPUT="$(abspath "$INPUT")"
+[[ -z "$HINTS" && -e "${INPUT%.bin}.hints" ]] && HINTS="${INPUT%.bin}.hints"   # auto-detect sibling
+[[ -n "$HINTS" ]] && HINTS="$(abspath "$HINTS")"
+[[ -f "$ELF" && -f "$INPUT" ]] || { echo "ERROR: elf/input not found" >&2; exit 1; }
+[[ -z "$HINTS" || -e "$HINTS" ]] || { echo "ERROR: hints not found: $HINTS" >&2; exit 1; }
 
 # Locate the runner: explicit $RUNNER, ~/zisk-runner, or the sibling in this repo.
 if   [[ -n "${RUNNER:-}" && -x "${RUNNER:-}" ]]; then :
@@ -33,16 +44,16 @@ run="runs/${tag}-$(date -u +%Y%m%d-%H%M%SZ)"
 mkdir -p "$run"
 
 { echo "tag=$tag mode=$MODE date=$(date -u)"
-  echo "elf=$ELF input=$INPUT hints=$HINTS"
+  echo "elf=$ELF input=$INPUT hints=${HINTS:-<none>}"
   echo "backend=$ZISK_PROVE_BACKEND coordinator=$ZISK_COORDINATOR_URL"
   echo "zisk=$(cargo-zisk --version 2>/dev/null || echo '?')"
   echo "--- gpus ---"; nvidia-smi -L 2>/dev/null || echo "(no nvidia-smi)"; } > "$run/env.txt"
 
 echo "== prove $tag ($MODE) via ZisK coordinator -> $run =="
-RUST_LOG="${RUST_LOG:-info}" \
-  "$RUNNER" --elf "$ELF" --input "$INPUT" --hints "$HINTS" --mode "$MODE" --skip-verify \
-    --output "$run/proof.bin" \
-    --report "$run/report.json" 2>&1 | tee "$run/prove.log"
+runner_args=(--elf "$ELF" --input "$INPUT" --mode "$MODE" --skip-verify
+             --output "$run/proof.bin" --report "$run/report.json")
+[[ -n "$HINTS" ]] && runner_args+=(--hints "$HINTS")
+RUST_LOG="${RUST_LOG:-info}" "$RUNNER" "${runner_args[@]}" 2>&1 | tee "$run/prove.log"
 rc=${PIPESTATUS[0]}
 # --skip-verify so a flaky verify can't discard a good proof; verify the saved
 # proof afterwards:  cargo-zisk verify -p <run>/proof.bin

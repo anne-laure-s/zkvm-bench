@@ -41,6 +41,11 @@ proving-key folder and a backend (default `--asm`; `--emulator` only for hint-le
                                                     #   MPI path instead: USE_MPI=1 ZISK_SRC=~/zisk ./start.sh  (segfaults on vast.ai — see top)
 cargo-zisk remote setup -e ~/zisk-reth.elf --hints --coordinator http://127.0.0.1:7000   # once/ELF
 ./submit.sh ~/zisk-reth.elf ~/1-24628607.bin ~/1-24628607.hints   # remote prove -> runs/<tag>-<ts>/
+# hint-less guest (e.g. Monad): compiled without a hints stream, so just drop hints — the DEFAULT asm
+#   backend handles it (asm is a superset; --hints is optional on it). `remote setup -e <elf>` WITHOUT
+#   --hints, then submit with NO hints arg:
+#   ./submit.sh ~/elfs/monad-zkvm-guest-zisk.elf ~/witnesses-monad/1-<blk>.bin   (submit.sh: hints optional)
+#   (WORKER_BACKEND=emulator also works as a fallback — same Rust emulator, but slower trace-gen.)
 ./stop.sh
 ```
 Confirm in `logs/worker.log` that the single worker registers and `nvidia-smi` shows **all** GPUs busy
