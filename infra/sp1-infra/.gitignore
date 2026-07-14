@@ -1,0 +1,21 @@
+# Rust build
+target/
+target-native/
+target-prof/
+
+# Guest artifacts live in ../../guests/ — any stray .bin here is transient
+*.bin
+
+# All run outputs / proofs / fetched records — unified here (regenerated)
+/results/
+
+# cluster-native: extracted v2.4.3 images + on-box process state (box checkout only)
+cluster-native/rootfs-*/
+cluster-native/_dl_*/
+cluster-native/run/
+cluster-native/logs/
+cluster-native/runs/
+
+# Python / OS
+__pycache__/
+.DS_Store

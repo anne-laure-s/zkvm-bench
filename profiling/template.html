@@ -1,0 +1,267 @@
+<!-- hotspots template. Placeholders __DATA__ / __CFG__ are filled by hotspots.py.
+     Edit freely: re-run `hotspots.py render` to apply design changes without re-profiling. -->
+<style>
+:root{
+  --ink:#0a0c12; --panel:#11141e; --panel2:#161b28; --line:#242b3c;
+  --fg:#e7eaf2; --muted:#8b93a7; --dim:#59627a; --gold:#e8b04b;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+*{box-sizing:border-box}
+.wrap{max-width:1180px;margin:0 auto;padding:34px 26px 60px;color:var(--fg);font-family:var(--sans);
+  background:var(--ink);background-image:radial-gradient(900px 380px at 82% -8%,rgba(91,141,239,.10),transparent 60%);}
+.eyebrow{font-size:11px;letter-spacing:.20em;text-transform:uppercase;color:var(--gold);font-family:var(--mono);font-weight:600;margin:0 0 10px}
+h1{font-size:clamp(26px,4vw,40px);line-height:1.04;margin:0 0 8px;font-weight:680;letter-spacing:-.02em;text-wrap:balance}
+.sub{color:var(--muted);font-size:14px;margin:0;max-width:66ch}
+.sub code{font-family:var(--mono);color:#c3ccdf;font-size:12.5px}
+.tabs{display:flex;gap:7px;margin:24px 0 22px;flex-wrap:wrap}
+.tab{appearance:none;cursor:pointer;text-align:left;background:var(--panel);border:1px solid var(--line);
+  border-radius:10px;padding:9px 13px;color:var(--fg);font-family:var(--sans);transition:border-color .15s,background .15s}
+.tab:hover{border-color:#3a445c}
+.tab[aria-selected=true]{border-color:var(--gold);background:var(--panel2);box-shadow:0 0 0 1px rgba(232,176,75,.25)}
+.tab .bn{font-family:var(--mono);font-size:13px;font-weight:600;letter-spacing:-.01em}
+.tab .bd{font-size:10.5px;color:var(--muted);margin-top:2px;font-family:var(--mono)}
+.tab[aria-selected=true] .bd{color:#c8b483}
+.tab:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:13px;overflow:hidden;margin-bottom:22px}
+.card{background:var(--panel);padding:14px 16px}
+.card .k{font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--dim);font-family:var(--mono)}
+.card .v{font-family:var(--mono);font-size:22px;font-weight:600;margin-top:6px;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.card .u{font-size:11px;color:var(--muted);margin-left:3px;font-weight:400}
+.card.wide{grid-column:1/-1}
+.card.wide .v{font-size:12.5px;word-break:break-all;font-weight:500;color:#aeb7cc;line-height:1.5}
+.card.ok .k{color:#4bbf8a}.card.ok .v{color:#bfe6d3}
+.grid2{display:grid;grid-template-columns:1.15fr 1fr;gap:18px;margin-bottom:24px}
+@media(max-width:820px){.grid2{grid-template-columns:1fr}}
+.pane{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:17px 18px}
+.pane h2{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 14px;
+  font-family:var(--mono);font-weight:600;display:flex;justify-content:space-between}
+.pane h2 .tot{color:var(--dim);letter-spacing:0;text-transform:none}
+.stack{display:flex;height:30px;border-radius:7px;overflow:hidden;border:1px solid var(--line)}
+.stack>span{transition:filter .15s}.stack>span:hover{filter:brightness(1.18)}
+.legend{display:flex;flex-wrap:wrap;gap:5px 16px;margin-top:13px}
+.legend .li{display:flex;align-items:center;gap:7px;font-size:12px}
+.legend .sw{width:10px;height:10px;border-radius:3px;flex:none}
+.legend .ln{color:#cdd4e4}.legend .lp{font-family:var(--mono);color:var(--muted);font-variant-numeric:tabular-nums}
+.ops{display:flex;flex-direction:column;gap:9px}
+.op{display:grid;grid-template-columns:112px 1fr 52px;align-items:center;gap:10px}
+.op .on{font-family:var(--mono);font-size:12.5px;color:#cdd4e4;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.op .track{height:9px;background:#1c2231;border-radius:5px;overflow:hidden}
+.op .fill{height:100%;border-radius:5px}
+.op .op-p{font-family:var(--mono);font-size:12px;color:var(--muted);text-align:right;font-variant-numeric:tabular-nums}
+.flamepane{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:17px 18px 20px}
+.flamehead{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:4px}
+.flamehead h2{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0;font-family:var(--mono);font-weight:600}
+.flamehead .hint{font-size:11.5px;color:var(--dim)}
+.icicle{margin-top:14px;position:relative}
+.band{display:flex;width:100%;overflow:hidden;border-radius:6px}
+.band.mods{height:32px;margin-bottom:3px}.band.funcs{height:104px}
+.cell{position:relative;height:100%;border-right:1px solid rgba(10,12,18,.6);overflow:hidden;cursor:default;transition:opacity .12s}
+.band.mods .cell{display:flex;align-items:center;padding:0 8px;font-family:var(--mono);font-size:11px;font-weight:600;color:rgba(10,12,18,.85)}
+.band.funcs .cell{border-top:2px solid rgba(10,12,18,.35)}
+.band.funcs .cell .fl{position:absolute;inset:6px 6px auto 7px;font-family:var(--mono);font-size:10.5px;
+  color:rgba(9,11,17,.92);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+.band.funcs .cell.rest{background-image:repeating-linear-gradient(45deg,rgba(9,11,17,.30) 0 4px,rgba(9,11,17,0) 4px 8px)}
+.band.funcs .cell.rest .fl{color:rgba(9,11,17,.72);font-weight:500}
+.icicle.dim .cell:not(.hot){opacity:.32}
+.axis{display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--dim);margin-top:7px;font-variant-numeric:tabular-nums}
+.modlegend{display:flex;flex-wrap:wrap;gap:6px 15px;margin-top:15px;padding-top:14px;border-top:1px solid var(--line)}
+.modlegend .li{display:flex;align-items:center;gap:7px;font-size:12px;font-family:var(--mono)}
+.modlegend .sw{width:11px;height:11px;border-radius:3px;flex:none}.modlegend .lp{color:var(--muted);font-variant-numeric:tabular-nums}
+#tip{position:fixed;z-index:50;pointer-events:none;opacity:0;transition:opacity .1s;background:#05060a;
+  border:1px solid var(--gold);border-radius:9px;padding:10px 12px;max-width:450px;box-shadow:0 12px 34px rgba(0,0,0,.55)}
+#tip .tn{font-family:var(--mono);font-size:11.5px;color:#eef1f8;word-break:break-all;line-height:1.45}
+#tip .tm{font-family:var(--mono);font-size:11px;margin-top:6px;color:var(--muted);display:flex;gap:12px;font-variant-numeric:tabular-nums}
+#tip .tm b{color:var(--gold);font-weight:600}
+.insight{margin-top:20px;background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--gold);
+  border-radius:0 11px 11px 0;padding:15px 18px}
+.insight h3{margin:0 0 7px;font-size:12px;letter-spacing:.13em;text-transform:uppercase;color:var(--gold);font-family:var(--mono);font-weight:600}
+.insight p{margin:0;font-size:13.5px;line-height:1.6;color:#cdd4e4}
+.insight code{font-family:var(--mono);font-size:12px;background:#0c0f17;padding:1px 6px;border-radius:5px;color:#dbe2f0;border:1px solid var(--line)}
+.insight b{color:#fff;font-weight:600}
+.note{margin-top:16px;font-size:12px;color:var(--dim);line-height:1.6;font-family:var(--mono)}
+.fgbar{position:relative;width:100%;margin-top:13px;min-height:18px}
+.fn{position:absolute;height:17px;border-radius:2px;border:1px solid rgba(10,12,18,.5);overflow:hidden;cursor:pointer;
+  font-family:var(--mono);font-size:10px;line-height:15px;color:rgba(9,11,17,.92);padding:0 4px;white-space:nowrap;transition:opacity .1s}
+.fgbar.dim .fn:not(.hot){opacity:.32}
+.fgcrumb{font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-top:2px;display:flex;flex-wrap:wrap;gap:0 6px;align-items:center}
+.fgcrumb b{color:var(--gold)}.fgcrumb .lnk{cursor:pointer}.fgcrumb .lnk:hover{color:var(--fg);text-decoration:underline}
+.fgcrumb .rst{color:var(--gold);cursor:pointer;margin-left:6px}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+  <p class="eyebrow" id="eyebrow"></p>
+  <h1 id="title"></h1>
+  <p class="sub" id="subtitle"></p>
+  <div class="tabs" id="tabs" role="tablist"></div>
+  <div class="cards" id="cards"></div>
+  <div class="grid2">
+    <div class="pane">
+      <h2>Cost by category <span class="tot" id="catTot"></span></h2>
+      <div class="stack" id="cat"></div><div class="legend" id="catLeg"></div>
+    </div>
+    <div class="pane">
+      <h2>Top opcodes <span class="tot">by proving cost</span></h2>
+      <div class="ops" id="ops"></div>
+    </div>
+  </div>
+  <div class="flamepane">
+    <div class="flamehead">
+      <h2>Hotspot icicle — module → function</h2>
+      <span class="hint">width = share of executed instructions · hover for detail · hatched = per-module tail</span>
+    </div>
+    <div class="icicle" id="icicle">
+      <div class="band mods" id="mods"></div><div class="band funcs" id="funcs"></div>
+      <div class="axis"><span>0%</span><span>50%</span><span>100% of instructions</span></div>
+    </div>
+    <div class="modlegend" id="modLeg"></div>
+  </div>
+  <div class="flamepane" id="flameSection" style="display:none">
+    <div class="flamehead">
+      <h2>Call-tree flamegraph</h2>
+      <span class="hint">bottom = entry · width = share of samples · click a frame to zoom · hover for detail</span>
+    </div>
+    <div class="fgcrumb" id="fgcrumb"></div>
+    <div class="fgbar" id="flame"></div>
+  </div>
+  <div class="insight" id="insight"></div>
+  <p class="note" id="note"></p>
+</div>
+<div id="tip"><div class="tn"></div><div class="tm"></div></div>
+
+<script>
+const DATA=__DATA__, CFG=__CFG__;
+const ORDER=Object.keys(DATA).sort((a,b)=>(DATA[a].meta.steps||0)-(DATA[b].meta.steps||0));
+document.getElementById('eyebrow').textContent=CFG.eyebrow||'ZisK · guest execution profile';
+document.getElementById('title').textContent=CFG.title||'Where the proving cost goes';
+document.getElementById('subtitle').innerHTML=CFG.subtitle||'';
+
+// module color families (reth Rust + Monad C++), with deterministic fallback
+const MODCOL={
+  revm_interpreter:"#5b8def",revm_handler:"#4f7bd6",revm_context:"#6f97e8",revm_context_interface:"#3f66bd",revm_database:"#8ab0f2",
+  zeth_mpt:"#2dd4bf",tries:"#37c98a",alloy_trie:"#15b39a",alloy_rlp:"#57e0b0",
+  ziskos:"#e8b04b",tiny_keccak:"#f0883e",
+  monad:"#5b8def",boost:"#2dd4bf",compiler_builtins:"#f0883e",ankerl:"#37c98a",builtins:"#c78bd9",
+  std:"#9d7cd8",ruint:"#b48ead",bincode:"#b48ead",intx:"#e08fb0",evmc:"#57c8e0",
+  core:"#7c869c",alloc:"#7c869c",mem:"#565f75",bytes:"#6b7488",
+  guest_reth:"#9d7cd8",stateless:"#8a6fd0",reth_ethereum_consensus:"#7d63c4",reth_evm:"#b39ae0"
+};
+const FALLBACK=["#5b8def","#2dd4bf","#e8b04b","#9d7cd8","#f0883e","#37c98a","#b48ead","#57c8e0"];
+function modColor(m){ if(MODCOL[m])return MODCOL[m]; let h=0; for(const c of m)h=(h*31+c.charCodeAt(0))>>>0; return FALLBACK[h%FALLBACK.length]; }
+const OTHER="#242b3c";
+const fmt=n=>n.toLocaleString('en-US');
+const fmtM=n=>n>=1e9?(n/1e9).toFixed(2)+'B':n>=1e6?(n/1e6).toFixed(1)+'M':fmt(n);
+const enc=s=>String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const stripGen=s=>s.replace(/<[^>]*>/g,'');
+function lastSeg(s){s=stripGen(s);let p=s.split('::').filter(Boolean);return p[p.length-1]||s;}
+function shortName(raw){
+  let s=raw;
+  let mm=s.match(/^<([^<>]+?) as [^>]*>::(.+)$/); if(mm) return lastSeg(mm[1])+'::'+mm[2].split('(')[0];
+  if(s[0]==='<'){let m2=s.match(/^<(.+)>::(.+)$/); if(m2) return lastSeg(m2[1])+'::'+m2[2].split('(')[0];}
+  s=stripGen(s).split('(')[0]; let p=s.replace(/^</,'').split('::').filter(Boolean); return p.slice(-2).join('::');
+}
+const $=id=>document.getElementById(id);
+const tip=$('tip'),tipN=tip.querySelector('.tn'),tipM=tip.querySelector('.tm');
+const UNIT=CFG.unit||'steps', UNITCAP=UNIT.charAt(0).toUpperCase()+UNIT.slice(1);
+const CARDS=[['cost','Proving cost',v=>fmtM(v),''],['steps',UNITCAP,v=>fmtM(v),''],
+  ['emu',CFG.execLabel||'Exec (ziskemu)',v=>v.toFixed(2),'s'],['txs','Transactions',v=>fmt(v),''],['gas','Gas used',v=>(v/1e6).toFixed(2),'M']];
+
+function render(tag){
+  const b=DATA[tag],t=b.total_count,m=b.meta;
+  $('tabs').querySelectorAll('.tab').forEach(el=>el.setAttribute('aria-selected',el.dataset.tag===tag));
+  let cards=CARDS.filter(([k])=>m[k]!=null).map(([k,lab,f,u])=>`<div class="card"><div class="k">${lab}</div><div class="v">${f(m[k])}<span class="u">${u}</span></div></div>`).join('');
+  if(m.hash!=null){cards+=`<div class="card wide"><div class="k">Block hash</div><div class="v">${enc(m.hash)}</div></div>`;}
+  if(m.root!=null){const ok=m.root_ok!==false;cards+=`<div class="card wide ${ok?'ok':''}"><div class="k">Post-state root${ok?' · verified ✓':''}</div><div class="v">${enc(m.root)}</div></div>`;}
+  $('cards').innerHTML=cards;
+  const catColor={Base:"#3b4258",Main:"#5b8def",Opcodes:"#2dd4bf",Precompiles:"#e8b04b",Memory:"#9d7cd8"};
+  $('catTot').textContent=fmtM(m.cost)+' cost units';
+  $('cat').innerHTML=b.categories.map(c=>`<span style="flex:0 0 ${c.pct}%;background:${catColor[c.name]||'#555'}" title="${c.name} ${c.pct}%"></span>`).join('');
+  $('catLeg').innerHTML=b.categories.map(c=>`<span class="li"><span class="sw" style="background:${catColor[c.name]||'#555'}"></span><span class="ln">${c.name}</span> <span class="lp">${c.pct}%</span></span>`).join('');
+  const omax=Math.max(...b.opcodes.map(o=>o.pct),0.01);
+  $('ops').innerHTML=b.opcodes.slice(0,8).map(o=>`<div class="op"><div class="on">${o.name}</div><div class="track"><div class="fill" style="width:${o.pct/omax*100}%;background:${o.name==='keccak'?'var(--gold)':'#4f7bd6'}"></div></div><div class="op-p">${o.pct}%</div></div>`).join('');
+  // full per-module totals (backend emits `modules`; fall back to shown functions)
+  let modTot=b.modules; if(!modTot){modTot={};b.functions.forEach(f=>modTot[f.module]=(modTot[f.module]||0)+f.count);}
+  const byMod={};b.functions.forEach(f=>{(byMod[f.module]=byMod[f.module]||[]).push(f);});
+  let modsAll=Object.entries(modTot).map(([mm,tot])=>({m:mm,tot})).sort((a,c)=>c.tot-a.tot);
+  const CAP=14, keep=new Set(modsAll.slice(0,CAP).map(x=>x.m)); Object.keys(byMod).forEach(mm=>keep.add(mm));
+  let shownMods=modsAll.filter(x=>keep.has(x.m)), otherTot=modsAll.filter(x=>!keep.has(x.m)).reduce((s,x)=>s+x.tot,0);
+  let mh='',fh='';
+  shownMods.forEach(md=>{const w=md.tot/t*100,col=modColor(md.m);
+    mh+=`<div class="cell" style="flex:0 0 ${w}%;background-color:${col}">${w>5?md.m:''}</div>`;
+    const fns=(byMod[md.m]||[]).sort((a,c)=>c.count-a.count); let ssum=0;
+    fns.forEach(f=>{const fw=f.count/t*100;ssum+=f.count;
+      fh+=`<div class="cell" data-f="1" style="flex:0 0 ${fw}%;background-color:${col}" data-name="${enc(f.name)}" data-mod="${md.m}" data-c="${f.count}" data-p="${fw.toFixed(2)}">`+(fw>4?`<span class="fl">${enc(shortName(f.name))}</span>`:'')+`</div>`;});
+    const rem=md.tot-ssum;
+    if(rem>0){const rw=rem/t*100, lab=fns.length?md.m+' · rest':md.m;
+      fh+=`<div class="cell rest" data-f="1" style="flex:0 0 ${rw}%;background-color:${col}" data-name="${md.m} — ${fns.length?'remaining':'all'} functions (aggregated tail)" data-mod="${md.m}" data-c="${rem}" data-p="${rw.toFixed(2)}">`+(rw>6?`<span class="fl">${lab}</span>`:'')+`</div>`;}});
+  if(otherTot>0){const w=otherTot/t*100;
+    mh+=`<div class="cell" style="flex:0 0 ${w}%;background-color:${OTHER};color:#8b93a7">${w>5?'other':''}</div>`;
+    fh+=`<div class="cell rest" data-f="1" style="flex:0 0 ${w}%;background-color:${OTHER}" data-name="other modules (each below the top ${CAP})" data-mod="other" data-c="${otherTot}" data-p="${w.toFixed(2)}"></div>`;}
+  $('mods').innerHTML=mh;$('funcs').innerHTML=fh;
+  $('modLeg').innerHTML=modsAll.slice(0,10).map(md=>`<span class="li"><span class="sw" style="background:${modColor(md.m)}"></span>${md.m} <span class="lp">${(md.tot/t*100).toFixed(1)}%</span></span>`).join('')+(otherTot>0?`<span class="li"><span class="sw" style="background:${OTHER}"></span>other <span class="lp">${(otherTot/t*100).toFixed(1)}%</span></span>`:'');
+  const kec=b.opcodes.find(o=>o.name==='keccak'),prec=b.categories.find(c=>c.name==='Precompiles');
+  $('insight').innerHTML=`<h3>Read of this block</h3><p>Hottest function: <code>${enc(shortName(b.functions[0].name))}</code> at <b>${(b.functions[0].count/t*100).toFixed(1)}%</b> of executed instructions (module <b>${b.functions[0].module}</b>). By proving cost, the top opcode is <b>${kec?'keccak at '+kec.pct+'%':(b.opcodes[0]?b.opcodes[0].name+' at '+b.opcodes[0].pct+'%':'—')}</b>${prec?`, and precompiles total <b>${prec.pct}%</b>`:''} — hashing &amp; trie work are the usual levers for a leaner guest.</p>`;
+  $('note').textContent=CFG.note||'Flat profile: instructions attributed to the enclosing symbol. No call hierarchy (ziskemu reports STACK MISMATCH on frame-pointer-less builds) — this is a hotspot icicle, not a call tree.';
+  renderFlame(tag);
+}
+
+// ── call-tree flamegraph (rendered only when a backend emits `tree`) ──
+const ROWH=18; let FG_FOCUS=null, FG_ROOT=null;
+function fgPath(root,target){ if(root===target)return[root];
+  for(const c of root.children){const p=fgPath(c,target);if(p)return[root,...p];} return null; }
+function renderFlame(tag){
+  const tree=DATA[tag].tree, sec=$('flameSection');
+  if(!tree){sec.style.display='none';return;}
+  sec.style.display=''; FG_ROOT=tree;
+  if(!FG_FOCUS||!fgPath(tree,FG_FOCUS)) FG_FOCUS=tree;   // reset focus when switching tabs
+  drawFlame();
+}
+function drawFlame(){
+  const host=$('flame'),focus=FG_FOCUS,grand=FG_ROOT.value,ftot=focus.value;
+  const rows=[]; let maxd=0; const nodes=[];
+  (function lay(n,d,x0){(rows[d]=rows[d]||[]).push([n,x0]);maxd=Math.max(maxd,d);
+    let cx=x0;for(const c of n.children){lay(c,d+1,cx);cx+=c.value;}})(focus,0,0);
+  host.style.height=((maxd+1)*ROWH)+'px';
+  let html='';
+  for(let d=0;d<rows.length;d++)for(const [n,x0] of rows[d]){
+    const w=n.value/ftot*100; if(w<0.15)continue;
+    const id=nodes.length; nodes.push(n);
+    html+=`<div class="fn" data-id="${id}" data-name="${enc(n.name)}" data-mod="${n.module}" data-c="${n.value}" data-p="${(n.value/grand*100).toFixed(2)}" style="left:${x0/ftot*100}%;width:${w}%;bottom:${d*ROWH}px;background:${modColor(n.module)}">`+(w>3.5?enc(shortName(n.name)):'')+`</div>`;
+  }
+  host.innerHTML=html; host._nodes=nodes;
+  const path=fgPath(FG_ROOT,focus)||[focus];
+  $('fgcrumb')._path=path;
+  $('fgcrumb').innerHTML=path.map((n,i)=>i===path.length-1?`<b>${enc(shortName(n.name))}</b>`
+    :`<span class="lnk" data-di="${i}">${enc(shortName(n.name))}</span>`).join(' › ')
+    +(focus!==FG_ROOT?` <span class="rst" data-di="0">⟲ reset</span>`:'');
+}
+(function(){const host=$('flame');
+  host.addEventListener('click',e=>{const c=e.target.closest('.fn');if(!c)return;
+    const n=host._nodes[+c.dataset.id]; if(n&&n.children&&n.children.length){FG_FOCUS=n;drawFlame();}});
+  host.addEventListener('mousemove',e=>{const c=e.target.closest('.fn');
+    if(!c){tip.style.opacity=0;host.classList.remove('dim');host.querySelectorAll('.fn.hot').forEach(x=>x.classList.remove('hot'));return;}
+    host.classList.add('dim');host.querySelectorAll('.fn.hot').forEach(x=>x.classList.remove('hot'));c.classList.add('hot');
+    tipN.textContent=c.dataset.name;
+    tipM.innerHTML=`<span>mod <b>${c.dataset.mod}</b></span><span><b>${Number(c.dataset.c).toLocaleString('en-US')}</b> samples</span><span><b>${c.dataset.p}%</b></span>`;
+    tip.style.opacity=1;let x=e.clientX+14,y=e.clientY+16;if(x+460>innerWidth)x=e.clientX-460;if(y+90>innerHeight)y=e.clientY-90;
+    tip.style.left=x+'px';tip.style.top=y+'px';});
+  host.addEventListener('mouseleave',()=>{tip.style.opacity=0;host.classList.remove('dim');});
+  $('fgcrumb').addEventListener('click',e=>{const s=e.target.closest('[data-di]');if(!s)return;
+    FG_FOCUS=$('fgcrumb')._path[+s.dataset.di];drawFlame();});
+})();
+const ic=$('icicle');
+ic.addEventListener('mousemove',e=>{const c=e.target.closest('.cell[data-f]');
+  if(!c){tip.style.opacity=0;ic.classList.remove('dim');document.querySelectorAll('.funcs .cell.hot').forEach(x=>x.classList.remove('hot'));return;}
+  ic.classList.add('dim');document.querySelectorAll('.funcs .cell.hot').forEach(x=>x.classList.remove('hot'));c.classList.add('hot');
+  tipN.textContent=c.dataset.name;
+  tipM.innerHTML=`<span>mod <b>${c.dataset.mod}</b></span><span><b>${Number(c.dataset.c).toLocaleString('en-US')}</b> instr</span><span><b>${c.dataset.p}%</b></span>`;
+  tip.style.opacity=1;let x=e.clientX+14,y=e.clientY+16;if(x+460>innerWidth)x=e.clientX-460;if(y+90>innerHeight)y=e.clientY-90;
+  tip.style.left=x+'px';tip.style.top=y+'px';});
+ic.addEventListener('mouseleave',()=>{tip.style.opacity=0;ic.classList.remove('dim');});
+$('tabs').innerHTML=ORDER.map(tag=>`<button class="tab" role="tab" data-tag="${enc(tag)}" aria-selected="false"><div class="bn">${enc(CFG.labels&&CFG.labels[tag]||tag)}</div><div class="bd">${DATA[tag].meta.steps?(DATA[tag].meta.steps/1e6).toFixed(0)+'M '+UNIT:''}</div></button>`).join('');
+$('tabs').addEventListener('click',e=>{const b=e.target.closest('.tab');if(b)render(b.dataset.tag);});
+$('tabs').addEventListener('keydown',e=>{if(e.key==='ArrowRight'||e.key==='ArrowLeft'){const i=ORDER.indexOf(document.querySelector('.tab[aria-selected=true]').dataset.tag);render(ORDER[(i+(e.key==='ArrowRight'?1:ORDER.length-1))%ORDER.length]);}});
+render(ORDER[0]);
+</script>

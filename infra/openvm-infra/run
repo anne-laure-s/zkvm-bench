@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+#
+# run — dispatcher for the OpenVM proving pipeline.
+#
+# Same producer/consumer split as the SP1 / ZisK infra, with one OpenVM twist:
+#   * OpenVM bakes the guest ELF INTO the prover binary (`include_bytes!`) and mints
+#     its OWN block witness from an archive RPC by block number. So there is no
+#     separate ELF/witness to ship — the cross-zkVM interface is just the BLOCK NUMBER
+#     (same as SP1/ZisK at the block level; the bytes are never shared).
+#   * PRODUCERS (guest-aware) build the binary / pre-warm the RPC cache. They run on
+#     whatever machine has the toolchain (the heavy CUDA build is on the box; see
+#     cluster/00-install-once.sh). On the Mac they give you the CPU cycle count.
+#   * CONSUMERS (generic) execute / prove / verify. `prove` is the multi-GPU run on
+#     the box (see docs/openvm-multigpu.md); `execute` is the cheap local cycle count.
+#
+# OpenVM specifics vs SP1/ZisK:
+#   * The runner is a SHELL wrapper (./openvm-runner) around openvm-reth-benchmark,
+#     NOT a compiled binary. It emits the SAME report.json schema as sp1-runner.
+#   * Multi-GPU is one process PER GPU (path ①, CUDA_VISIBLE_DEVICES-pinned) via cluster/submit.sh on
+#     the box, orchestrated here by `prove`; not a coordinator/worker cluster. NUM_GPUS = how many GPUs.
+#
+# Producers (guests/<name>/guest.sh provides build_elf / build_bin / gen_input / decode_pv):
+#   ./run build-elf GUEST=<name> [OPENVM_ETH_DIR=../../vendor/openvm-eth]
+#       -> cross-compiles the guest to ../../guests/<name>/<name>.elf (RISC-V; needs cargo-openvm; no GPU).
+#          OpenVM embeds this into the binary, so this is for parity/visibility + a .commit pin.
+#   ./run build-bin GUEST=<name> [OPENVM_ETH_DIR=../../vendor/openvm-eth] [CUDA=1]
+#       -> builds openvm-reth-benchmark (CPU build by default; CUDA=1 for the box)
+#   ./run gen-input GUEST=<name> BLOCK=<n> [CHAIN_ID=1] [RPC_URL=…] [NO_REPORT=1]
+#       -> warms the RPC cache + (default) writes the OpenVM cycle-count report
+#   ./run decode-pv GUEST=<name> PV=<path>
+#
+# Consumers (block- or path-based, no GUEST needed beyond defaults):
+#   ./run execute BLOCK=<n> [CHAIN_ID=1] [RPC_URL=…]          (local emulation -> cycles)
+#   ./run prove   BLOCK=<n> REMOTE=user@host [PORT=p] [NUM_GPUS=8] [REMOTE_INFRA=…] [RSYNC_CACHE=1]
+#   ./run verify  PROOF=<path>                                (cryptographic verify)
+#
+# Examples:
+#   ./run build-bin GUEST=openvm-reth OPENVM_ETH_DIR=../../vendor/openvm-eth
+#   ./run execute   BLOCK=20000000 RPC_URL=$RPC_1
+#   ./run prove     BLOCK=20000000 REMOTE=root@ssh.vast.ai PORT=12345 NUM_GPUS=8
+#   ./run verify    PROOF=results/openvm-reth/1-20000000/prove-stark-…/proof.json
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+  sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; /^set -euo/d'
+  exit "${1:-0}"
+}
+
+cmd="${1:-}"
+[[ -z "$cmd" || "$cmd" == "-h" || "$cmd" == "--help" || "$cmd" == "help" ]] && usage 0
+shift
+
+# Parse KEY=VALUE tokens into the environment.
+for kv in "$@"; do
+  case "$kv" in
+    *=*) export "${kv%%=*}=${kv#*=}" ;;
+    *) echo "ERROR: bad argument '$kv' (expected KEY=VALUE)" >&2; exit 1 ;;
+  esac
+done
+
+# Guest artifacts (ELF + inputs) live in the top-level guests/<name>/ folder;
+# run records stay in the infra dir. Overridable via env.
+GUEST="${GUEST:-openvm-reth}"
+CHAIN_ID="${CHAIN_ID:-1}"
+GUESTS_DIR="${GUESTS_DIR:-$ROOT/../../guests}"
+IN_DIR="${IN_DIR:-$GUESTS_DIR/$GUEST/inputs}"   # this guest's inputs (rpc-cache, reports)
+OUT_DIR="${OUT_DIR:-$ROOT/results}"
+RUNNER="${RUNNER:-$ROOT/openvm-runner}"
+
+# shellcheck source=/dev/null
+source "$ROOT/scripts/core.sh"
+
+# load_guest — source guests/<GUEST>/guest.sh (producers / decode only).
+load_guest() {
+  : "${GUEST:?set GUEST=<name> (see guests/)}"
+  local f="$ROOT/guests/$GUEST/guest.sh"
+  if [[ ! -f "$f" ]]; then
+    echo "ERROR: unknown guest '$GUEST' — $f not found." >&2
+    echo "Available guests:" >&2
+    ls -1 "$ROOT/guests" 2>/dev/null | sed 's/^/  - /' >&2 || true
+    exit 1
+  fi
+  # shellcheck source=/dev/null
+  source "$f"
+  declare -F guest_decode_pv >/dev/null || \
+    guest_decode_pv() { echo "(no guest_decode_pv; hex dump of $1)"; xxd -l 256 "$1" || true; }
+}
+
+abspath() { case "$1" in /*) echo "$1";; *) echo "$PWD/$1";; esac; }
+
+# tag for a block: <chain>-<block> (mirrors RSP/ZisK cache layout for comparison).
+block_tag() { : "${BLOCK:?set BLOCK=<block number>}"; echo "${CHAIN_ID}-${BLOCK}"; }
+
+case "$cmd" in
+  build-elf)
+    load_guest
+    ELF="$GUESTS_DIR/$GUEST/$GUEST.elf"
+    mkdir -p "$(dirname "$ELF")"
+    guest_build_elf
+    echo "ELF: $ELF"
+    ;;
+  build-bin)
+    load_guest
+    guest_build_bin
+    ;;
+  gen-input)
+    load_guest
+    : "${BLOCK:?set BLOCK=<block number>}"
+    guest_gen_input
+    ;;
+  execute)
+    : "${BLOCK:?set BLOCK=<block number>}"
+    execute_local
+    ;;
+  prove)
+    : "${BLOCK:?set BLOCK=<block number>}"
+    prove_remote
+    ;;
+  verify)
+    PROOF="$(abspath "${PROOF:?set PROOF=path to the proof file}")"
+    verify_local
+    ;;
+  decode-pv)
+    load_guest
+    : "${PV:?set PV=path to a public-values file}"
+    [[ -f "$PV" ]] || { echo "ERROR: PV not found: $PV" >&2; exit 1; }
+    guest_decode_pv "$(abspath "$PV")"
+    ;;
+  *)
+    echo "ERROR: unknown command '$cmd'" >&2
+    usage 1
+    ;;
+esac

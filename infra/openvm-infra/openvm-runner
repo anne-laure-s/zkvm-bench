@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+#
+# openvm-runner — shell wrapper around openvm-reth-benchmark, the parity twin of
+# sp1-runner / zisk-runner.
+#
+# A single entrypoint for both local execution (Mac/CPU, cycle count) and remote
+# proving (box/GPU). It emits the SAME report.json schema as sp1-runner so the
+# downstream cross-zkVM comparison tooling works unchanged.
+#
+#   openvm-runner --mode execute       --block N [--chain C] [--rpc URL] [--report R] [--public-values PV]
+#   openvm-runner --mode prove-stark   --block N [--chain C] [--rpc URL] --output O [--report R] [--num-gpus K]
+#   openvm-runner --mode verify        --proof  O [--report R]
+#
+# Modes:
+#   execute       metered execution -> OpenVM cycle count (≈ SP1 cycles / ZisK steps)   [no GPU]
+#   prove-stark   recursive STARK proof with aggregation (≈ SP1 prove-compressed)       [DEFAULT prove]
+#   prove-evm     STARK + on-chain halo2/KZG wrap (≈ SP1 groth16) — supported, unused by default
+#   verify        verify an existing proof (see notes — OpenVM verify path is version-dependent)
+#
+# Multi-GPU (env / flags):
+#   NUM_GPUS=K   number of GPUs ONE process should fan its segment proofs across.
+#   MULTI_GPU=0  force the stock single-GPU path (no patched --num-gpus flag emitted).
+#   The multi-GPU fan-out requires the vendored patch (docs/openvm-multigpu.md). On a
+#   stock binary, --num-gpus is unknown: keep MULTI_GPU=0 (or NUM_GPUS=1).
+#
+# ⚠️ openvm-reth-benchmark flags/outputs drift with the pinned openvm rev. Every external
+# invocation is overridable via env (see CONFIG) and output parsing is best-effort. Confirm
+# with `openvm-reth-benchmark --help` on your build and adjust the regexes / flags / env knobs.
+set -uo pipefail
+
+# ── CONFIG (override via env) ────────────────────────────────────────────────
+OPENVM_BIN="${OPENVM_BIN:-openvm-reth-benchmark}"      # the (patched) prover binary
+OPENVM_CACHE_DIR="${OPENVM_CACHE_DIR:-./rpc-cache}"    # witness cache (re-fetch avoided)
+OPENVM_APP_PK="${OPENVM_APP_PK:-}"                     # optional pre-generated app proving key dir
+OPENVM_AGG_PK="${OPENVM_AGG_PK:-}"                     # optional pre-generated agg proving key dir
+OPENVM_EXEC_EXTRA_FLAGS="${OPENVM_EXEC_EXTRA_FLAGS:-}"
+# Segment / blowup tuning — defaults mirror Axiom's own server (server/prove_block.sh).
+OPENVM_PROVE_EXTRA_FLAGS="${OPENVM_PROVE_EXTRA_FLAGS:---app-log-blowup 1 --leaf-log-blowup 1 --internal-log-blowup 2 --root-log-blowup 3 --max-segment-length 4194304 --segment-max-cells 1200000000}"
+OPENVM_VERIFY_EXTRA_FLAGS="${OPENVM_VERIFY_EXTRA_FLAGS:-}"
+NUM_GPUS="${NUM_GPUS:-1}"
+MULTI_GPU="${MULTI_GPU:-1}"
+# Skip the host+VM re-execution comparison during prove (it CPU-re-executes the block and
+# would inflate the timed region). Default on for benchmarking, like Axiom's own server.
+# Set 0 to keep the block-hash correctness check in-band.
+OPENVM_SKIP_COMPARISON="${OPENVM_SKIP_COMPARISON:-1}"
+
+# ── arg parsing (same shape as sp1-runner / zisk-runner) ──────────────────────
+MODE="execute" BLOCK="" CHAIN="1" RPC="" PROOF="" OUTPUT="" PV="" REPORT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode)           MODE="$2"; shift 2 ;;
+    --block)          BLOCK="$2"; shift 2 ;;
+    --chain)          CHAIN="$2"; shift 2 ;;
+    --rpc)            RPC="$2"; shift 2 ;;
+    --proof)          PROOF="$2"; shift 2 ;;
+    --output)         OUTPUT="$2"; shift 2 ;;
+    --public-values)  PV="$2"; shift 2 ;;
+    --report)         REPORT="$2"; shift 2 ;;
+    --num-gpus)       NUM_GPUS="$2"; shift 2 ;;
+    -h|--help)        sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
+    *) echo "ERROR: unknown arg '$1'" >&2; exit 2 ;;
+  esac
+done
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+now() {
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then echo "${EPOCHREALTIME/,/.}"; return; fi
+  local t; t="$(date +%s.%N 2>/dev/null)"
+  case "$t" in *N|"") date +%s ;; *) echo "$t" ;; esac
+}
+elapsed() { awk -v a="$1" -v b="$2" 'BEGIN{ d=b-a; if (d<0) d=0; printf "%.3f", d }'; }
+ensure_parent() { local d; d="$(dirname "$1")"; [[ -n "$d" ]] && mkdir -p "$d"; }
+jnum() { [[ -n "$1" ]] && printf '%s' "$1" || printf 'null'; }
+jbool() { [[ "$1" == 1 ]] && printf 'true' || printf 'false'; }
+write_report() {
+  [[ -z "$REPORT" ]] && return 0
+  ensure_parent "$REPORT"
+  printf '%s\n' "$1" > "$REPORT"
+  echo "Report        : $REPORT"
+}
+# parse_cycles <metrics.json> <stdout-log> — best-effort OpenVM cycle count.
+# OpenVM reports the metered instruction/cell count via the OUTPUT_PATH metrics json
+# and/or a "total cycles"/"instret"/"insns" line on stdout. Try json keys first.
+parse_cycles() {
+  local mj="$1" log="$2" c=""
+  if [[ -f "$mj" ]] && command -v python3 >/dev/null 2>&1; then
+    c="$(python3 - "$mj" <<'PY' 2>/dev/null || true
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit()
+def walk(x):
+    if isinstance(x,dict):
+        for k,v in x.items():
+            if any(t in k.lower() for t in ("total_cycle","cycles","instret","total_insn","num_insn","instructions_executed")) and isinstance(v,(int,float)):
+                return int(v)
+            r=walk(v)
+            if r is not None: return r
+    elif isinstance(x,list):
+        for v in x:
+            r=walk(v)
+            if r is not None: return r
+    return None
+r=walk(d)
+print(r if r is not None else "")
+PY
+)"
+  fi
+  if [[ -z "$c" ]]; then
+    # Strip ANSI colour codes first (else the "1" in \e[1;32m gets picked up), then grab the
+    # number right after instructions_executed / total_cycles / cycles, and take the MAX
+    # (the block total is the largest of any per-span counters).
+    c="$(sed -E $'s/\x1b\\[[0-9;]*m//g' "$log" 2>/dev/null \
+        | grep -oiE '(instructions_executed|total_cycles|cycles|instret)[ =:]*[0-9][0-9,]*' \
+        | grep -oE '[0-9][0-9,]*' | tr -d ',' | sort -n | tail -n1)"
+  fi
+  printf '%s' "$c"
+}
+
+echo "== openvm-runner =="
+echo "Mode     : $MODE"
+
+case "$MODE" in
+  # ──────── EXECUTE (metered, cycle count, no GPU) ────────
+  execute)
+    [[ -n "$BLOCK" ]] || { echo "ERROR: execute needs --block" >&2; exit 2; }
+    echo "Block    : $BLOCK (chain $CHAIN)"
+    # Explicit trailing-X template (no `-t`): identical on GNU coreutils and BSD/macOS,
+    # and $mj is the file actually created — so the `rm -f "$mj"` below really cleans it up.
+    # (`mktemp -t <prefix>` was BSD-only and `$(mktemp …).json` leaked the un-suffixed temp.)
+    mj="$(mktemp "${TMPDIR:-/tmp}/openvm-metrics.XXXXXX")"
+    log="$(mktemp "${TMPDIR:-/tmp}/openvm-exec.XXXXXX")"
+    t0="$(now)"
+    # shellcheck disable=SC2086
+    OUTPUT_PATH="$mj" RUST_LOG="${RUST_LOG:-info}" RUSTFLAGS="${RUSTFLAGS:--Ctarget-cpu=native}" \
+      "$OPENVM_BIN" --mode execute --block-number "$BLOCK" --chain-id "$CHAIN" \
+        ${RPC:+--rpc-url "$RPC"} --cache-dir "$OPENVM_CACHE_DIR" $OPENVM_EXEC_EXTRA_FLAGS 2>&1 | tee "$log"
+    rc=${PIPESTATUS[0]}
+    t1="$(now)"; dt="$(elapsed "$t0" "$t1")"
+    [[ "$rc" == 0 ]] || { echo "ERROR: execute exited $rc" >&2; rm -f "$mj" "$log"; exit "$rc"; }
+    cycles="$(parse_cycles "$mj" "$log")"
+    pv_bytes=""; [[ -n "$PV" && -f "$PV" ]] && pv_bytes="$(wc -c < "$PV" | tr -d ' ')"
+    rm -f "$mj" "$log"
+    echo "Cycles        : ${cycles:-<unparsed>}"
+    echo "Time          : ${dt}s"
+    write_report "$(cat <<JSON
+{
+  "mode": "execute",
+  "zkvm": "OpenVM",
+  "block": $BLOCK,
+  "cycles": $(jnum "$cycles"),
+  "elapsed_secs": $(jnum "$dt"),
+  "public_values_bytes": $(jnum "$pv_bytes")
+}
+JSON
+)"
+    ;;
+
+  # ──────── PROVE ────────
+  prove-stark|prove-evm)
+    [[ -n "$BLOCK"  ]] || { echo "ERROR: prove needs --block"  >&2; exit 2; }
+    [[ -n "$OUTPUT" ]] || { echo "ERROR: prove needs --output (dir for proof+metrics)" >&2; exit 2; }
+    ensure_parent "$OUTPUT/x"
+    mkdir -p "$OUTPUT"
+    echo "Block    : $BLOCK (chain $CHAIN)"
+    echo "Out dir  : $OUTPUT"
+    echo "GPUs     : NUM_GPUS=$NUM_GPUS MULTI_GPU=$MULTI_GPU"
+
+    # Build the command. --num-gpus is OUR patched flag; only pass it when multi-GPU is
+    # requested AND enabled, so a stock binary still runs (single GPU) without choking.
+    set -- "$OPENVM_BIN" --mode "$MODE" --block-number "$BLOCK" --chain-id "$CHAIN" \
+      ${RPC:+--rpc-url "$RPC"} --cache-dir "$OPENVM_CACHE_DIR" --output-dir "$OUTPUT"
+    # Pre-generated proving keys (see cluster/01-keygen.sh) keep keygen OUT of the timed
+    # region. Both-or-neither (the binary bails otherwise). Warn loudly if unset.
+    if [[ -n "$OPENVM_APP_PK" && -n "$OPENVM_AGG_PK" ]]; then
+      set -- "$@" --app-pk-path "$OPENVM_APP_PK" --agg-pk-path "$OPENVM_AGG_PK"
+    else
+      echo "WARN: no OPENVM_APP_PK/OPENVM_AGG_PK -> keygen runs IN-BAND and inflates prove_secs." >&2
+      echo "      Generate keys once with cluster/01-keygen.sh for a clean, comparable number." >&2
+    fi
+    [[ "$OPENVM_SKIP_COMPARISON" == 1 ]] && set -- "$@" --skip-comparison
+    if [[ "$MULTI_GPU" == 1 && "$NUM_GPUS" -gt 1 ]] 2>/dev/null; then
+      # ⚠️ In-process multi-GPU ("path ②": one process across N GPUs via --num-gpus) is
+      # KNOWN-BROKEN — it crashes at runtime in VPMM (cudaErrorInvalidResourceHandle) and was
+      # abandoned. The working multi-GPU path is per-GPU segment sharding (cluster/submit.sh,
+      # "path ①"; see docs/openvm-multigpu.md). Refuse by default so a direct runner call fails
+      # fast with a clear message instead of a confusing VPMM crash; OPENVM_ALLOW_INPROC_MG=1
+      # forces it for deliberate testing.
+      if [[ "${OPENVM_ALLOW_INPROC_MG:-0}" != 1 ]]; then
+        echo "ERROR: in-process multi-GPU (--num-gpus $NUM_GPUS) is the abandoned path ② and crashes in" >&2
+        echo "       VPMM at runtime. Use cluster/submit.sh (path ① segment sharding) for multi-GPU," >&2
+        echo "       or set OPENVM_ALLOW_INPROC_MG=1 to force path ② anyway (expected to fail)." >&2
+        exit 2
+      fi
+      echo "WARN: forcing in-process multi-GPU path ② (OPENVM_ALLOW_INPROC_MG=1) — expected to crash in VPMM." >&2
+      set -- "$@" --num-gpus "$NUM_GPUS"
+    fi
+    # shellcheck disable=SC2206
+    [[ -n "$OPENVM_PROVE_EXTRA_FLAGS" ]] && set -- "$@" $OPENVM_PROVE_EXTRA_FLAGS
+
+    echo "Cmd      : $*"
+    mj="$OUTPUT/metrics.json"
+    t0="$(now)"
+    OUTPUT_PATH="$mj" RUST_LOG="${RUST_LOG:-info}" RUSTFLAGS="${RUSTFLAGS:--Ctarget-cpu=native}" "$@"
+    rc=$?
+    t1="$(now)"
+    [[ "$rc" == 0 ]] || { echo "ERROR: prove exited $rc" >&2; exit "$rc"; }
+    prove_dt="$(elapsed "$t0" "$t1")"
+    echo "Prove         : ${prove_dt}s"
+
+    # Locate the proof file the binary wrote (name varies; override with OPENVM_PROOF_GLOB).
+    proof_path=""; proof_bytes=""
+    for g in ${OPENVM_PROOF_GLOB:-} "$OUTPUT"/proof.json "$OUTPUT"/*.proof "$OUTPUT"/proof.bin "$OUTPUT"/*proof*; do
+      [[ -f "$g" ]] && { proof_path="$g"; break; }
+    done
+    if [[ -n "$proof_path" ]]; then
+      proof_bytes="$(wc -c < "$proof_path" | tr -d ' ')"
+      echo "Proof saved   : $proof_path ($proof_bytes bytes)"
+    else
+      echo "WARN: no proof file found under $OUTPUT (set OPENVM_PROOF_GLOB)" >&2
+    fi
+    cycles="$(parse_cycles "$mj" /dev/null)"
+
+    write_report "$(cat <<JSON
+{
+  "mode": "$MODE",
+  "zkvm": "OpenVM",
+  "block": $BLOCK,
+  "num_gpus": $NUM_GPUS,
+  "multi_gpu": $(jbool $([[ "$MULTI_GPU" == 1 && "$NUM_GPUS" -gt 1 ]] 2>/dev/null && echo 1 || echo 0)),
+  "cycles": $(jnum "$cycles"),
+  "prove_secs": $(jnum "$prove_dt"),
+  "total_secs": $(jnum "$prove_dt"),
+  "proof_bytes": $(jnum "$proof_bytes"),
+  "keygen_excluded": $(jbool $([[ -n "$OPENVM_APP_PK" && -n "$OPENVM_AGG_PK" ]] && echo 1 || echo 0)),
+  "comparison_skipped": $(jbool "$OPENVM_SKIP_COMPARISON"),
+  "verified": null,
+  "backend": "single-process-multi-gpu"
+}
+JSON
+)"
+    ;;
+
+  # ──────── VERIFY ────────
+  # NOTE: openvm-reth-benchmark has no standalone `verify` mode (modes are execute /
+  # prove-app / prove-stark / prove-evm). prove-stark already verifies segments internally
+  # while proving. A cryptographic re-verify of a saved VmStarkProof needs the SDK verifier
+  # (openvm-org/v2-verify-stark, or a small verify bin). Until that is wired, this reports
+  # the proof's presence/size and defers to the prove-time self-verification.
+  verify)
+    [[ -n "$PROOF" ]] || { echo "ERROR: verify needs --proof" >&2; exit 2; }
+    [[ -f "$PROOF" ]] || { echo "ERROR: proof not found: $PROOF" >&2; exit 2; }
+    pb="$(wc -c < "$PROOF" | tr -d ' ')"
+    echo "Proof    : $PROOF ($pb bytes)"
+    if [[ -n "${OPENVM_VERIFY_BIN:-}" ]]; then
+      t0="$(now)"
+      "$OPENVM_VERIFY_BIN" --proof "$PROOF" $OPENVM_VERIFY_EXTRA_FLAGS
+      rc=$?; t1="$(now)"
+      [[ "$rc" == 0 ]] || { echo "ERROR: verify failed ($rc)" >&2; exit "$rc"; }
+      vdt="$(elapsed "$t0" "$t1")"
+      echo "Verify OK     : ${vdt}s"
+      write_report "{ \"mode\": \"verify\", \"zkvm\": \"OpenVM\", \"verify_secs\": $(jnum "$vdt"), \"verified\": true }"
+    else
+      echo "Note: no OPENVM_VERIFY_BIN set — prove-stark self-verifies segments at prove time."
+      echo "      For an independent re-verify, wire a verify bin (see docs/openvm-multigpu.md)."
+      write_report "{ \"mode\": \"verify\", \"zkvm\": \"OpenVM\", \"verify_secs\": null, \"verified\": null, \"note\": \"self-verified at prove time\" }"
+    fi
+    ;;
+
+  *)
+    echo "ERROR: unknown mode '$MODE' (execute|prove-stark|prove-evm|verify)" >&2
+    exit 2 ;;
+esac

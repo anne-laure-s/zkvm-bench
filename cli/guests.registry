@@ -1,0 +1,17 @@
+# guests.registry — the guests known to this benchmark. Single source of truth for the
+# root tools (gen-witness · gen-elf · execute), parsed via reg.sh. One row per guest,
+# `|`-separated (surrounding spaces ignored). Add a guest = add a row.
+#
+#   name | infra_dir | run_guest | eth_var | vendor_dir | elf | witness | exec | description
+#
+# elf     : build (from vendor_dir) · presupplied (shipped in-repo)
+# witness : rpc (standard archive RPC) · rpc-debug (needs a debug_executionWitness node) ·
+#           presupplied (shipped in-repo) · toy (not a block witness)
+# exec    : input (./run execute ELF INPUT) · block (./run execute BLOCK) · batch (guests/monad/ev.sh)
+#
+rsp        | infra/sp1-infra    | rsp         | RSP_DIR        | vendor/rsp             | build       | rpc         | input | SP1 · reth (RSP)
+openvm     | infra/openvm-infra | openvm-reth | OPENVM_ETH_DIR | vendor/openvm-eth      | build       | rpc         | block | OpenVM · reth
+zisk       | infra/zisk-infra   | zisk-reth   | ZISK_ETH_DIR   | vendor/zisk-eth-client | build       | rpc-debug   | input | ZisK · reth
+monad-sp1  | guests/monad       | -           | -              | -                      | presupplied | presupplied | batch | Monad guest on SP1
+monad-zisk | guests/monad       | -           | -              | -                      | presupplied | presupplied | batch | Monad guest on ZisK
+fibonacci  | infra/sp1-infra    | fibonacci   | -              | -                      | build       | toy         | input | SP1 example guest

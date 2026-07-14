@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "lib",
+    "tools",
+]
+# Do not include program here: it has its dedicated workspace,
+# because cargo prove build uses a dedicated toolchain.
+
+resolver = "2"

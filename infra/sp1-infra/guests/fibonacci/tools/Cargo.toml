@@ -1,0 +1,18 @@
+[package]
+name = "fib-tools"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "make-input"
+path = "src/bin/make-input.rs"
+
+[[bin]]
+name = "read-output"
+path = "src/bin/read-output.rs"
+
+[dependencies]
+fib-lib = { path = "../lib" }
+bincode = "1.3"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"

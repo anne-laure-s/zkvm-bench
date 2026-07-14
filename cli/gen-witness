@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+#
+# gen-witness — generate a block witness for a guest, by delegating to that guest's stack.
+#
+# Thin root dispatcher over `infra/<stack>-infra/run gen-input`, driven by guests.registry
+# (via reg.sh). The stacks stay self-contained; this only routes the call.
+#
+#   ./gen-witness --guest <name> --block <n> [--rpc <url>] [--eth-dir <checkout>]
+#   ./gen-witness --list
+#
+# `zisk` needs a debug node and `monad-*` witnesses are pre-supplied → clear error.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"                 # repo root (cli/ lives one level down)
+source "$HERE/reg.sh"
+
+die()   { echo "gen-witness: $*" >&2; exit 2; }
+usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; /^set -euo/d'; exit "${1:-0}"; }
+abs()   { case "$1" in /*) echo "$1";; *) echo "$ROOT/$1";; esac; }
+
+GUEST="" BLOCK="" RPC="" ETH_DIR=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --guest)   GUEST="${2:?}"; shift 2 ;;
+    --block)   BLOCK="${2:?}"; shift 2 ;;
+    --rpc)     RPC="${2:?}";   shift 2 ;;
+    --eth-dir) ETH_DIR="${2:?}"; shift 2 ;;
+    --list)    echo "guests (guests.registry):"; reg_list; exit 0 ;;
+    -h|--help) usage 0 ;;
+    *) die "unknown argument '$1' (see --help)" ;;
+  esac
+done
+[[ -n "$GUEST" ]] || { echo "gen-witness: --guest is required" >&2; reg_list >&2; exit 1; }
+reg_lookup "$GUEST" || die "unknown guest '$GUEST' (run --list to see them)."
+
+case "$REG_WIT" in
+  rpc)
+    [[ -n "$BLOCK" ]] || die "$GUEST ($REG_DESC): --block <n> required"
+    dir="$(abs "${ETH_DIR:-$REG_VENDOR}")"
+    [[ -d "$dir" ]] || die "$GUEST ($REG_DESC): checkout not found: $dir (clone it there, or pass --eth-dir)"
+    echo "== gen-witness: $GUEST ($REG_DESC) · block $BLOCK =="
+    ( cd "$ROOT/$REG_INFRA" && ./run gen-input GUEST="$REG_RUNG" "$REG_ETHVAR=$dir" BLOCK="$BLOCK" ${RPC:+RPC_URL="$RPC"} )
+    ;;
+  rpc-debug)
+    die "$GUEST ($REG_DESC): witness generation from a standard RPC is NOT possible — it needs a reth node
+  exposing debug_executionWitness. With such a node, run the stack directly:
+      ( cd $REG_INFRA && ./run gen-input GUEST=$REG_RUNG $REG_ETHVAR=$(abs "$REG_VENDOR") BLOCK=${BLOCK:-<n>} RPC_URL=<debug-node> )
+  Otherwise use an offline sample from guests/$REG_RUNG/inputs/ (see its README to regenerate)."
+    ;;
+  presupplied)
+    die "$GUEST ($REG_DESC): witnesses are pre-supplied, not generated — see $REG_INFRA/witnesses/<block>.witness."
+    ;;
+  toy)
+    die "$GUEST ($REG_DESC): toy guest, not a block witness:  ( cd $REG_INFRA && ./run gen-input GUEST=$REG_RUNG N=<n> )"
+    ;;
+  *) die "$GUEST: unrecognized witness mode '$REG_WIT' in guests.registry" ;;
+esac

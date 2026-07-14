@@ -1,0 +1,22 @@
+# Rust build
+target/
+
+# Guest artifacts live in ../../guests/ — witnesses are transient here
+*.bin
+*.hints
+
+# All run outputs / proofs / fetched records — unified here (regenerated)
+/results/
+
+# cluster: on-box process state (box checkout only)
+cluster/run/
+cluster/logs/
+cluster/runs/
+
+# Prebuilt patched CUDA worker (76 MB) is COMMITTED on purpose — it's load-bearing:
+# the stock ziskup worker crashes in count_and_plan.cu on multi-GPU, so all-GPU proving
+# (MPI *and* NO_MPI single-process) needs this drop-in. Rebuild recipe: docs/zisk-bringup-report.md.
+
+# Python / OS
+__pycache__/
+.DS_Store

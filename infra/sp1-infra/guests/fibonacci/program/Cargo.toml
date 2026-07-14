@@ -1,0 +1,15 @@
+[package]
+name = "fib-program"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "fib-program"
+path = "src/main.rs"
+
+[dependencies]
+sp1-zkvm = "6.2.4"
+fib-lib = { path = "../lib" }
+
+[workspace]
+# Important: isolate the program from any other workspace (separated Cargo.lock)

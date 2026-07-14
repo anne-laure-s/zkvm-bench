@@ -1,0 +1,19 @@
+# Rust build + the patch's vendored clones (openvm / stark-backend)
+target/
+.vendor/
+
+# RPC witness cache (large; re-fetchable from an archive RPC by block number)
+inputs/**/rpc-cache/
+rpc-cache/
+
+# All run outputs / proofs / fetched records — unified here (regenerated)
+/results/
+
+# on-box process state / generated config (box checkout only)
+cluster/runs/
+cluster/box-env.sh
+gpu_memory_usage.csv
+
+# Python / OS
+__pycache__/
+.DS_Store

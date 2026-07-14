@@ -1,0 +1,45 @@
+diff --git a/emulator/src/stats/profiler.rs b/emulator/src/stats/profiler.rs
+index 4162cb0..7bb28ae 100644
+--- a/emulator/src/stats/profiler.rs
++++ b/emulator/src/stats/profiler.rs
+@@ -97,6 +97,13 @@ impl CallPathProfiler {
+         self.add_call_path_sample(metric, ram_usage);
+     }
+ 
++    /// PATCH (call-graph): drop the current call path back to root. Used to resync after a
++    /// call/return heuristic mismatch instead of disabling profiling entirely.
++    pub fn reset_call_path(&mut self) {
++        self.prefix_stack.clear();
++        self.call_path.clear();
++    }
++
+     /// Internal implementation of pop_call_path
+     fn internal_pop_call_path(&mut self) {
+         assert!(self.call_path.len() >= 3);
+diff --git a/emulator/src/stats/stats.rs b/emulator/src/stats/stats.rs
+index 69368c4..4d87cfa 100644
+--- a/emulator/src/stats/stats.rs
++++ b/emulator/src/stats/stats.rs
+@@ -292,13 +292,15 @@ impl Stats {
+             );
+         }
+     }
+-    fn call_stack_error(&mut self, msg: &str) {
+-        if self.use_colors {
+-            println!("\x1B[1;31m{}\x1B[0m", msg);
+-        } else {
+-            println!("{}", msg);
+-        }
+-        self.disable_call_stack = true;
++    fn call_stack_error(&mut self, _msg: &str) {
++        // PATCH (call-graph): call/return heuristic mismatches are unavoidable on real code
++        // (tail calls, precompile trampolines, non-standard returns, _start->main). The original
++        // code gave up on the WHOLE call stack at the first one (disable_call_stack=true), which
++        // makes the profile flat for any non-trivial guest. We instead treat a mismatch as a
++        // cost-accounting hiccup only: the caller already popped one frame from BOTH the stats
++        // call stack and the profiler path (in sync), so the stacks stay aligned — we just skip
++        // this return's cost reconciliation (the caller `return`s) and keep profiling with the
++        // stack intact, preserving call depth. The tree is approximate at these points but real.
+     }
+ 
+     pub fn check_roi(&mut self, inst_ctx: &InstContext) {

@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+#
+# zisk-runner — shell wrapper around the ZisK CLI, the parity twin of sp1-runner.
+#
+# A single entrypoint for both local emulation (Mac/CPU) and remote proving (box/GPU).
+# It is agnostic of the guest's input/output types: it passes the input file straight
+# to the ZisK tools and emits the SAME report.json schema as sp1-runner, so the
+# downstream comparison tooling works unchanged.
+#
+#   zisk-runner --elf E --input I --mode execute          [--public-values PV] [--report R]
+#   zisk-runner --elf E --input I --hints H --mode prove-compressed --output O [--public-values PV] [--report R] [--skip-verify]
+#   zisk-runner --mode verify --proof O                   [--report R]
+#
+# Modes:
+#   execute           emulate (ziskemu -m) -> step count (≈ SP1 cycles) + public values
+#   prove-compressed  default recursive STARK proof (≈ SP1 prove-compressed)   [DEFAULT]
+#   prove-plonk       STARK + on-chain PLONK wrap (≈ SP1 groth16) — supported, unused by default
+#   prove-minimal     smaller STARK (-c), slower — supported, unused by default
+#   verify            verify an existing proof cryptographically
+#
+# Proving backend (env ZISK_PROVE_BACKEND):
+#   remote (default)  `cargo-zisk remote prove …`  — talks to the box's coordinator/worker (multi-GPU)
+#   local             `cargo-zisk prove --asm --gpu …` — single-process (adds --gpu when supported)
+#
+# ⚠️ ZisK is v1.0.0-alpha and CLI flags/output formats shift between versions. Every
+# external invocation here is overridable via env (see CONFIG) and the output parsing
+# is best-effort. Confirm against your installed version with `cargo-zisk prove --help`
+# and `ziskemu --help`, then adjust the regexes / flags below or via the env knobs.
+set -uo pipefail
+# ziskup installs the ZisK binaries here; a fresh/non-interactive shell may not
+# have it on PATH yet. Harmless on the Mac (the dir just won't exist).
+export PATH="$HOME/.zisk/bin:$PATH"
+
+# ── CONFIG (override via env) ────────────────────────────────────────────────
+ZISK_EMU_BIN="${ZISK_EMU_BIN:-ziskemu}"          # emulator
+ZISK_CLI_BIN="${ZISK_CLI_BIN:-cargo-zisk}"       # main CLI
+ZISK_PROVE_BACKEND="${ZISK_PROVE_BACKEND:-remote}"
+ZISK_COORDINATOR_URL="${ZISK_COORDINATOR_URL:-http://127.0.0.1:7000}"
+ZISK_EMU_EXTRA_FLAGS="${ZISK_EMU_EXTRA_FLAGS:-}"
+ZISK_PROVE_EXTRA_FLAGS="${ZISK_PROVE_EXTRA_FLAGS:-}"
+ZISK_VERIFY_EXTRA_FLAGS="${ZISK_VERIFY_EXTRA_FLAGS:-}"
+
+# ── arg parsing (same flags as sp1-runner) ───────────────────────────────────
+ELF="" INPUT="" HINTS="" MODE="execute" PROOF="" OUTPUT="" PV="" REPORT="" SKIP_VERIFY=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --elf)            ELF="$2"; shift 2 ;;
+    --input)          INPUT="$2"; shift 2 ;;
+    --hints)          HINTS="$2"; shift 2 ;;
+    --mode)           MODE="$2"; shift 2 ;;
+    --proof)          PROOF="$2"; shift 2 ;;
+    --output)         OUTPUT="$2"; shift 2 ;;
+    --public-values)  PV="$2"; shift 2 ;;
+    --report)         REPORT="$2"; shift 2 ;;
+    --skip-verify)    SKIP_VERIFY=1; shift ;;
+    -h|--help)        sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
+    *) echo "ERROR: unknown arg '$1'" >&2; exit 2 ;;
+  esac
+done
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+# now — best-effort high-res clock (seconds.fraction). Falls back gracefully on
+# macOS bash 3.2 / BSD date (no %N): then only second precision, which is fine for
+# the local emulation profile (the benchmark prove_secs runs on the Linux box).
+now() {
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then echo "${EPOCHREALTIME/,/.}"; return; fi
+  local t; t="$(date +%s.%N 2>/dev/null)"
+  case "$t" in *N|"") date +%s ;; *) echo "$t" ;; esac
+}
+elapsed() { awk -v a="$1" -v b="$2" 'BEGIN{ d=b-a; if (d<0) d=0; printf "%.3f", d }'; }
+ensure_parent() { local d; d="$(dirname "$1")"; [[ -n "$d" ]] && mkdir -p "$d"; }
+# jnum — emit a JSON number or `null` for an empty value.
+jnum() { [[ -n "$1" ]] && printf '%s' "$1" || printf 'null'; }
+jbool() { [[ "$1" == 1 ]] && printf 'true' || printf 'false'; }
+
+write_report() { # $1 = json body
+  [[ -z "$REPORT" ]] && return 0
+  ensure_parent "$REPORT"
+  printf '%s\n' "$1" > "$REPORT"
+  echo "Report        : $REPORT"
+}
+
+echo "== zisk-runner =="
+echo "Mode     : $MODE"
+
+case "$MODE" in
+  # ──────── EXECUTE (emulate) ────────
+  execute)
+    [[ -n "$ELF" && -n "$INPUT" ]] || { echo "ERROR: execute needs --elf and --input" >&2; exit 2; }
+    echo "ELF      : $ELF"
+    echo "Input    : $INPUT"
+    emu_log="$(mktemp -t zisk-emu)"
+    t0="$(now)"
+    # -m logs metrics (steps/duration). -o writes the program output (public values)
+    # if a path is given; harmless if the version ignores it.
+    # shellcheck disable=SC2086
+    if [[ -n "$PV" ]]; then ensure_parent "$PV"; fi
+    "$ZISK_EMU_BIN" -e "$ELF" -i "$INPUT" -m ${PV:+-o "$PV"} $ZISK_EMU_EXTRA_FLAGS 2>&1 | tee "$emu_log"
+    rc=${PIPESTATUS[0]}
+    t1="$(now)"
+    dt="$(elapsed "$t0" "$t1")"
+    [[ "$rc" == 0 ]] || { echo "ERROR: ziskemu exited $rc" >&2; rm -f "$emu_log"; exit "$rc"; }
+    # Best-effort: pull the step count out of the emulator metrics. ZisK calls
+    # cycles "steps". Match the first integer on a line mentioning "steps".
+    steps="$(grep -iE 'steps?' "$emu_log" | grep -oE '[0-9][0-9,]*' | head -n1 | tr -d ',')"
+    pv_bytes=""; [[ -n "$PV" && -f "$PV" ]] && pv_bytes="$(wc -c < "$PV" | tr -d ' ')"
+    rm -f "$emu_log"
+    echo "Steps         : ${steps:-<unparsed>}"
+    echo "Time          : ${dt}s"
+    write_report "$(cat <<JSON
+{
+  "mode": "execute",
+  "steps": $(jnum "$steps"),
+  "elapsed_secs": $(jnum "$dt"),
+  "public_values_bytes": $(jnum "$pv_bytes")
+}
+JSON
+)"
+    ;;
+
+  # ──────── PROVE ────────
+  # Verified against cargo-zisk v1.0.0-alpha source (cli/.../embedded/prove.rs):
+  #   * `-o` is the PROOF FILE path (not a dir) → no glob/lift needed.
+  #   * local `cargo-zisk prove --hints` REQUIRES `--asm`; `remote prove` does NOT take --asm.
+  #   * default (no -c/--plonk) = the standard STARK proof (our "compressed" analog).
+  #   * GPU is OPT-IN: prove.rs does `if self.gpu { builder.gpu() }` — WITHOUT `--gpu` it proves
+  #     on CPU. The `--gpu` flag exists only on a GPU build (cfg(not(cpu-only)); hidden on the Mac).
+  #     So the local backend ADDS `--gpu` when the installed build supports it (auto-detected).
+  #     (The real multi-GPU path is the distributed backend → the worker runs with --gpu.)
+  prove-compressed|prove-plonk|prove-minimal)
+    [[ -n "$ELF" && -n "$INPUT" ]] || { echo "ERROR: prove needs --elf and --input" >&2; exit 2; }
+    [[ -n "$OUTPUT" ]] || { echo "ERROR: prove needs --output" >&2; exit 2; }
+    echo "ELF      : $ELF"
+    echo "Input    : $INPUT"
+    [[ -n "$HINTS" ]] && echo "Hints    : $HINTS"
+    echo "Backend  : $ZISK_PROVE_BACKEND"
+    ensure_parent "$OUTPUT"
+
+    extra="$ZISK_PROVE_EXTRA_FLAGS"
+    case "$MODE" in
+      prove-plonk)   extra="$extra --plonk" ;;   # on-chain (≈ SP1 groth16)
+      prove-minimal) extra="$extra -c" ;;        # smaller STARK, slower
+    esac
+
+    if [[ "$ZISK_PROVE_BACKEND" == "local" ]]; then
+      # Single-process. Needs a prior `cargo-zisk setup -e <elf> --asm --hints`.
+      set -- "$ZISK_CLI_BIN" prove -e "$ELF" -i "$INPUT" -o "$OUTPUT"
+      # --asm --hints: reth guest proves with precompile hints (needs --asm).
+      # -u / --unlock-mapped-memory: the ASM emulator mmaps the ROM with MAP_LOCKED by
+      # default; unprivileged Docker boxes (vast.ai) cap memlock at 64 KB → the locked
+      # mmap fails (errno 11). -u disables locking (no perf cost with lots of RAM). It
+      # only applies with --asm, so it's added on the same branch. Override off with
+      # ZISK_LOCK_MEM=1 if you're on a box where memlock is unlimited and want locking.
+      [[ -n "$HINTS" ]] && { set -- "$@" --asm --hints "$HINTS"; [[ "${ZISK_LOCK_MEM:-0}" == 1 ]] || set -- "$@" -u; }
+      # GPU is opt-in (see header) → add --gpu when the build supports it, else it runs on CPU.
+      # ZISK_LOCAL_GPU: auto (default) | 1 (force --gpu) | 0 (force CPU).
+      if [[ "${ZISK_LOCAL_GPU:-auto}" == 1 ]] \
+         || { [[ "${ZISK_LOCAL_GPU:-auto}" == auto ]] && "$ZISK_CLI_BIN" prove --help 2>/dev/null | grep -qiE '(^|[[:space:]])-g,|--gpu'; }; then
+        set -- "$@" --gpu
+        echo "GPU      : --gpu (local prove)"
+      else
+        echo "GPU      : OFF (cargo-zisk prove has no --gpu here → CPU prove; set ZISK_LOCAL_GPU=1 to force)"
+      fi
+    else
+      # Distributed via the coordinator/workers. Needs a prior
+      # `cargo-zisk remote setup -e <elf> --hints` against the same coordinator.
+      set -- "$ZISK_CLI_BIN" remote prove --coordinator "$ZISK_COORDINATOR_URL" \
+        -e "$ELF" -i "$INPUT" -o "$OUTPUT" --timeout 0
+      [[ -n "$HINTS" ]] && set -- "$@" --hints "$HINTS"
+    fi
+    # shellcheck disable=SC2206
+    [[ -n "$extra" ]] && set -- "$@" $extra
+
+    echo "Cmd      : $*"
+    t0="$(now)"
+    "$@"
+    rc=$?
+    t1="$(now)"
+    [[ "$rc" == 0 ]] || { echo "ERROR: prove exited $rc" >&2; exit "$rc"; }
+    prove_dt="$(elapsed "$t0" "$t1")"
+    echo "Prove         : ${prove_dt}s"
+
+    # `-o` wrote the proof directly to $OUTPUT.
+    if [[ -f "$OUTPUT" ]]; then
+      proof_bytes="$(wc -c < "$OUTPUT" | tr -d ' ')"
+      echo "Proof saved   : $OUTPUT ($proof_bytes bytes)"
+    else
+      proof_bytes=""
+      echo "WARN: no proof at $OUTPUT after prove — proof_bytes unknown" >&2
+    fi
+
+    # Optional verify after generation (default on, like sp1-runner).
+    verify_dt=""
+    if [[ "$SKIP_VERIFY" == 0 && -f "$OUTPUT" ]]; then
+      tv0="$(now)"
+      if "$ZISK_CLI_BIN" verify -p "$OUTPUT" $ZISK_VERIFY_EXTRA_FLAGS; then
+        tv1="$(now)"; verify_dt="$(elapsed "$tv0" "$tv1")"
+        echo "Verify OK     : ${verify_dt}s"
+      else
+        echo "WARN: post-prove verify failed (proof kept)" >&2
+      fi
+    fi
+
+    total_dt="$(elapsed "$t0" "$(now)")"
+    write_report "$(cat <<JSON
+{
+  "mode": "$MODE",
+  "prove_secs": $(jnum "$prove_dt"),
+  "verify_secs": $(jnum "$verify_dt"),
+  "total_secs": $(jnum "$total_dt"),
+  "proof_bytes": $(jnum "$proof_bytes"),
+  "verified": $(jbool $([[ -n "$verify_dt" ]] && echo 1 || echo 0)),
+  "backend": "$ZISK_PROVE_BACKEND"
+}
+JSON
+)"
+    ;;
+
+  # ──────── VERIFY ────────
+  verify)
+    [[ -n "$PROOF" ]] || { echo "ERROR: verify needs --proof" >&2; exit 2; }
+    echo "Proof    : $PROOF"
+    t0="$(now)"
+    "$ZISK_CLI_BIN" verify -p "$PROOF" $ZISK_VERIFY_EXTRA_FLAGS
+    rc=$?
+    t1="$(now)"
+    [[ "$rc" == 0 ]] || { echo "ERROR: verify failed ($rc)" >&2; exit "$rc"; }
+    verify_dt="$(elapsed "$t0" "$t1")"
+    echo "Verify OK     : ${verify_dt}s"
+    write_report "$(cat <<JSON
+{
+  "mode": "verify",
+  "verify_secs": $(jnum "$verify_dt"),
+  "verified": true
+}
+JSON
+)"
+    ;;
+
+  *)
+    echo "ERROR: unknown mode '$MODE' (execute|prove-compressed|prove-minimal|prove-plonk|verify)" >&2
+    exit 2 ;;
+esac

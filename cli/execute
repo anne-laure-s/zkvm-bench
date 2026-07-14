@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+#
+# execute — run a guest locally (no proof; the deterministic cycle/step count), by
+# delegating to that guest's stack. Thin root dispatcher over `infra/<stack>-infra/run
+# execute`, driven by guests.registry (via reg.sh).
+#
+#   ./execute --guest <name> --input <path>              # input-based: rsp · zisk · fibonacci
+#   ./execute --guest openvm --block <n> [--rpc <url>]   # block-based: openvm (block + rpc-cache)
+#   ./execute --list
+#
+# Monad executes as a BATCH over all its witnesses (execute + verify) → run guests/monad/ev.sh.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"                 # repo root (cli/ lives one level down)
+source "$HERE/reg.sh"
+
+die()   { echo "execute: $*" >&2; exit 2; }
+usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; /^set -euo/d'; exit "${1:-0}"; }
+abs()   { case "$1" in /*) echo "$1";; *) echo "$ROOT/$1";; esac; }
+
+GUEST="" INPUT="" BLOCK="" RPC=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --guest) GUEST="${2:?}"; shift 2 ;;
+    --input) INPUT="${2:?}"; shift 2 ;;
+    --block) BLOCK="${2:?}"; shift 2 ;;
+    --rpc)   RPC="${2:?}";   shift 2 ;;
+    --list)  echo "guests (guests.registry):"; reg_list; exit 0 ;;
+    -h|--help) usage 0 ;;
+    *) die "unknown argument '$1' (see --help)" ;;
+  esac
+done
+[[ -n "$GUEST" ]] || { echo "execute: --guest is required" >&2; reg_list >&2; exit 1; }
+reg_lookup "$GUEST" || die "unknown guest '$GUEST' (run --list to see them)."
+
+case "$REG_EXEC" in
+  input)
+    [[ -n "$INPUT" ]] || die "$GUEST ($REG_DESC): --input <path> required"
+    elf="$ROOT/guests/$REG_RUNG/$REG_RUNG.elf"
+    [[ -f "$elf" ]] || die "$GUEST ($REG_DESC): ELF not found: $elf  (build it: ./gen-elf --guest $GUEST)"
+    echo "== execute: $GUEST ($REG_DESC) =="
+    ( cd "$ROOT/$REG_INFRA" && ./run execute ELF="$elf" INPUT="$(abs "$INPUT")" )
+    ;;
+  block)
+    [[ -n "$BLOCK" ]] || die "$GUEST ($REG_DESC): --block <n> required"
+    echo "== execute: $GUEST ($REG_DESC) · block $BLOCK =="
+    ( cd "$ROOT/$REG_INFRA" && ./run execute BLOCK="$BLOCK" ${RPC:+RPC_URL="$RPC"} )
+    ;;
+  batch)
+    die "$GUEST ($REG_DESC): Monad executes as a batch over all witnesses (execute + verify) —
+  run:  guests/monad/ev.sh"
+    ;;
+  *) die "$GUEST: unrecognized exec mode '$REG_EXEC' in guests.registry" ;;
+esac

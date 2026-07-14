@@ -1,0 +1,38 @@
+[package]
+name = "sp1-runner"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "sp1-runner"
+path = "src/main.rs"
+
+[dependencies]
+sp1-sdk = { version = "=6.2.4", features = ["blocking"], default-features = false }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+bincode = "1"
+
+[features]
+# native-gnark builds a Go library (gnark FFI) for LOCAL groth16 — on by default
+# for local/CUDA builds. The NETWORK client doesn't need it (the cluster does the
+# wrap), so it can build with --no-default-features --features network (no Go).
+default = ["native-gnark"]
+native-gnark = ["sp1-sdk/native-gnark"]
+cuda = ["sp1-sdk/cuda"]
+# profiling = enable SP1's sampling profiler. At runtime, set TRACE_FILE=out.json
+# (+ optional TRACE_SAMPLE_RATE=N) on an `--mode execute` run to emit a Gecko trace —
+# open it in profiler.firefox.com for a function-level flamegraph / call tree.
+# Build: cargo build --release --no-default-features --features profiling
+profiling = ["sp1-sdk/profiling"]
+# network = remote prover (self-hosted sp1-cluster via its network-gateway).
+# Build the client with: cargo build --release --no-default-features --features network
+# Runtime: SP1_PROVER=network NETWORK_RPC_URL=<gateway> NETWORK_PRIVATE_KEY=<key>
+#
+# `reserved-capacity` flips the SDK's default NetworkMode to Reserved (= "hosted"
+# fulfillment). Without it the client defaults to Mainnet/auction mode and calls
+# `get_proof_request_params`, which the self-hosted network-gateway does NOT
+# implement (returns gRPC Unimplemented). Reserved mode skips that call — it's the
+# mode the gateway expects. See sp1-sdk network/mod.rs NetworkMode::default().
+network = ["sp1-sdk/network", "sp1-sdk/reserved-capacity"]

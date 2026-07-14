@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+#
+# gen-elf — build the guest ELF for a guest, by delegating to that guest's stack.
+#
+# Thin root dispatcher over `infra/<stack>-infra/run build-elf`, driven by guests.registry
+# (via reg.sh). Guests whose ELF is pre-supplied (monad-*) return a clear error.
+#
+#   ./gen-elf --guest <name> [--eth-dir <checkout>]
+#   ./gen-elf --list
+#
+# The ELF lands in guests/<name>/<name>.elf. Building needs the guest's toolchain
+# (cargo prove / cargo-zisk / cargo-openvm) + its vendor checkout.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"                 # repo root (cli/ lives one level down)
+source "$HERE/reg.sh"
+
+die()   { echo "gen-elf: $*" >&2; exit 2; }
+usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; /^set -euo/d'; exit "${1:-0}"; }
+abs()   { case "$1" in /*) echo "$1";; *) echo "$ROOT/$1";; esac; }
+
+GUEST="" ETH_DIR=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --guest)   GUEST="${2:?}"; shift 2 ;;
+    --eth-dir) ETH_DIR="${2:?}"; shift 2 ;;
+    --list)    echo "guests (guests.registry):"; reg_list; exit 0 ;;
+    -h|--help) usage 0 ;;
+    *) die "unknown argument '$1' (see --help)" ;;
+  esac
+done
+[[ -n "$GUEST" ]] || { echo "gen-elf: --guest is required" >&2; reg_list >&2; exit 1; }
+reg_lookup "$GUEST" || die "unknown guest '$GUEST' (run --list to see them)."
+
+case "$REG_ELF" in
+  build)
+    ethkv=""
+    if [[ "$REG_ETHVAR" != "-" ]]; then
+      dir="$(abs "${ETH_DIR:-$REG_VENDOR}")"
+      [[ -d "$dir" ]] || die "$GUEST ($REG_DESC): checkout not found: $dir (clone it there, or pass --eth-dir)"
+      ethkv="$REG_ETHVAR=$dir"
+    fi
+    echo "== gen-elf: $GUEST ($REG_DESC) → guests/$REG_RUNG/$REG_RUNG.elf =="
+    ( cd "$ROOT/$REG_INFRA" && ./run build-elf GUEST="$REG_RUNG" ${ethkv:+"$ethkv"} )
+    ;;
+  presupplied)
+    die "$GUEST ($REG_DESC): ELF is pre-supplied (guests/monad/monad-zkvm-guest-*.elf), not built here."
+    ;;
+  *) die "$GUEST: unrecognized elf mode '$REG_ELF' in guests.registry" ;;
+esac

@@ -1,0 +1,40 @@
+# Root .gitignore.
+# Per-stack build artifacts (target/, proofs/, runs/, extracted images, …) are covered by each
+# infra/<stack>-infra/.gitignore — git honors those nested files, so they are not repeated here.
+
+# Upstream clones — external code, tens of GB, not this project's (see README).
+/vendor/
+
+# ── guests/ : ignore build outputs + large/regenerable inputs; keep the small data ───────────
+# Compiled guest ELFs — rebuild with `cli/gen-elf`. (Monad's ELFs are pre-supplied → kept.)
+guests/rsp/*.elf
+guests/zisk-reth/*.elf
+guests/openvm-reth/*.elf
+guests/fibonacci/*.elf
+
+# Block witnesses / inputs — large; regenerate with `cli/gen-witness` (or mint on the box).
+# KEPT on purpose: `*.commit` pins (small — they pin the ELF + inputs together), NOT matched below.
+guests/*/inputs/*.bin
+guests/*/inputs/*.hints
+guests/*/inputs/*.input.json
+guests/*/inputs/*.stdin
+guests/*/inputs/rpc-cache/
+
+# Execute reports — regenerable locally via `./run execute`. They feed profiling/results.html
+# (itself regenerated, not shipped), so they are NOT committed; re-run `./run execute` then results.py.
+guests/*/inputs/*.exec-report.json
+
+# Monad guest is pre-supplied and NOT regenerable. The whole inputs/ dir (witnesses ~79 MB + their
+# post_state_root ground-truth) is kept OUT of git — a fresh clone must copy it in (provenance:
+# guests/monad/README.md). Execute outputs + the exec-verified.csv recap regenerate via ev.sh → ignored.
+guests/monad/execute-out/
+guests/monad/inputs/
+guests/monad/exec-verified.csv
+
+# ── profiling/ : all generated output (regenerate: `profiling/results.py`, `profiling/hotspots.py`) ─
+profiling/results/
+
+# ── Python / OS ──────────────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+.DS_Store
