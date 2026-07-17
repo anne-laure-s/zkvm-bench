@@ -1,0 +1,155 @@
+diff --git a/crates/sdk/src/lib.rs b/crates/sdk/src/lib.rs
+index 9f4d1c98e..5fc1980d3 100644
+--- a/crates/sdk/src/lib.rs
++++ b/crates/sdk/src/lib.rs
+@@ -527,8 +527,35 @@ where
+         Ok(prover)
+     }
+ 
++    /// Multi-GPU app prover: fans continuation-segment proofs across `max_concurrency`
++    /// blocking tasks, each pinned to a GPU ordinal (see AsyncAppProver::prove). Pair the
++    /// result with `prover(exe)?.agg_prover` to aggregate into a single STARK.
++    #[cfg(feature = "async")]
++    pub fn async_app_prover(
++        &self,
++        exe: impl Into<ExecutableFormat>,
++        max_concurrency: usize,
++    ) -> Result<crate::prover::AsyncAppProver<E, VB>, SdkError>
++    where
++        E: 'static,
++        VB: Clone + Send + Sync + 'static,
++        VB::VmConfig: Send + Sync,
++    {
++        let exe = self.convert_to_exe(exe)?;
++        let app_pk = self.app_pk();
++        let prover = crate::prover::AsyncAppProver::<E, VB>::new(
++            self.app_vm_builder.clone(),
++            app_pk.app_vm_pk.clone(), // app_vm_pk is already Arc<VmProvingKey>
++            exe,
++            app_pk.leaf_verifier_program_commit(),
++            max_concurrency,
++        )?;
++        Ok(prover)
++    }
++
+     // ======================== Keygen Related Methods ========================
+ 
++
+     /// Generates the app proving key once and caches it. Future calls will return the cached key.
+     ///
+     /// # Panics
+diff --git a/crates/sdk/src/prover/app.rs b/crates/sdk/src/prover/app.rs
+index ec797798f..1e645046e 100644
+--- a/crates/sdk/src/prover/app.rs
++++ b/crates/sdk/src/prover/app.rs
+@@ -378,6 +378,12 @@ mod async_prover {
+             let pure_interpreter = vm.interpreter(&self.app_exe)?;
+             let mut tasks = Vec::with_capacity(segments.len());
+             let mut num_ins_last = 0;
++            // [multi-gpu] number of GPUs to fan segment proofs across (1 = stock path).
++            let num_gpus: i32 = std::env::var("OPENVM_NUM_GPUS")
++                .ok().and_then(|s| s.parse().ok()).filter(|&n| n >= 1).unwrap_or(1);
++            #[cfg(not(feature = "cuda"))]
++            let _ = num_gpus;
++
+             let user_pv_proof: Arc<OnceLock<UserPublicValuesProof<CHUNK, Val<E::SC>>>> =
+                 Arc::new(OnceLock::new());
+             for (seg_idx, segment) in segments.into_iter().enumerate() {
+@@ -403,7 +409,24 @@ mod async_prover {
+                                         thread_id = ?std::thread::current().id()
+                                     )
+                                     .entered();
++                                    // [multi-gpu] pin THIS blocking thread to a GPU ordinal
++                                    // before any device allocation in local(). Direct cudart FFI:
++                                    // openvm-sdk doesn't depend on openvm-cuda-common, but the cuda
++                                    // build links cudart (via openvm-cuda-backend) so these symbols
++                                    // resolve at final link.
++                                    #[cfg(feature = "cuda")]
++                                    {
++                                        extern "C" {
++                                            fn cudaSetDevice(device: i32) -> i32;
++                                            fn cudaFree(ptr: *mut core::ffi::c_void) -> i32;
++                                        }
++                                        let __dev = (seg_idx as i32) % num_gpus;
++                                        let __rc = unsafe { cudaSetDevice(__dev) };
++                                        assert_eq!(__rc, 0, "cudaSetDevice failed: {__rc}");
++                                        unsafe { cudaFree(core::ptr::null_mut()); }
++                                    }
+                                     let mut worker = async_worker.local()?;
++
+                                     let instance = &mut worker.instance;
+                                     let vm = &mut instance.vm;
+                                     let preflight_interpreter = &mut instance.interpreter;
+@@ -470,5 +493,72 @@ mod async_prover {
+             }
+             Ok(cont_proof)
+         }
++
++        /// [multi-gpu path ①] Prove ONLY the continuation segments assigned to this worker
++        /// (`seg_idx % num_workers == worker_id`), sequentially, on the single visible GPU
++        /// (run each worker process with a distinct CUDA_VISIBLE_DEVICES). Pure execution
++        /// advances the state through ALL segments (cheap, CPU); only assigned segments are
++        /// proven (GPU). Returns the (index, proof) pairs plus the user-public-values proof IF
++        /// this worker proved the terminal segment. The union of all workers is aggregated
++        /// separately (reconstruct ContinuationVmProof -> AggStarkProver).
++        pub fn prove_shard(
++            &self,
++            input: StdIn<Val<E::SC>>,
++            worker_id: usize,
++            num_workers: usize,
++        ) -> eyre::Result<(
++            Vec<(usize, openvm_stark_backend::proof::Proof<E::SC>)>,
++            Option<UserPublicValuesProof<CHUNK, Val<E::SC>>>,
++        )>
++        where
++            <VB::VmConfig as VmExecutionConfig<Val<E::SC>>>::Executor: Executor<Val<E::SC>>
++                + MeteredExecutor<Val<E::SC>>
++                + PreflightExecutor<Val<E::SC>, VB::RecordArena>,
++        {
++            assert!(self.vm_config().as_ref().continuation_enabled);
++            check_max_constraint_degrees(self.vm_config().as_ref(), &self.fri_params());
++            let mut pure = self.local()?;
++            pure.instance.reset_state(input.clone());
++            let mut state = pure.instance.state_mut().take().unwrap();
++            let metered_ctx = pure.instance.vm.build_metered_ctx(&self.app_exe);
++            let metered_interpreter = pure.instance.vm.metered_interpreter(&self.app_exe)?;
++            let (segments, _) = metered_interpreter.execute_metered(input, metered_ctx)?;
++            drop(metered_interpreter);
++            let pure_interpreter = pure.instance.vm.interpreter(&self.app_exe)?;
++            let mut out: Vec<(usize, openvm_stark_backend::proof::Proof<E::SC>)> = Vec::new();
++            let mut user_pv: Option<UserPublicValuesProof<CHUNK, Val<E::SC>>> = None;
++            let mut num_ins_last = 0;
++            for (seg_idx, segment) in segments.into_iter().enumerate() {
++                state = pure_interpreter.execute_from_state(state, Some(num_ins_last))?;
++                num_ins_last = segment.num_insns;
++                if seg_idx % num_workers != worker_id {
++                    continue;
++                }
++                let start_state = state.clone();
++                let mut worker = self.local()?;
++                let instance = &mut worker.instance;
++                let vm = &mut instance.vm;
++                let preflight_interpreter = &mut instance.interpreter;
++                let (segment_proof, final_memory) = vm.prove(
++                    preflight_interpreter,
++                    start_state,
++                    Some(segment.num_insns),
++                    &segment.trace_heights,
++                )?;
++                if let Some(final_memory) = final_memory {
++                    let top_tree = vm.memory_top_tree().unwrap();
++                    user_pv = Some(UserPublicValuesProof::compute(
++                        vm.config().as_ref().memory_config.memory_dimensions(),
++                        vm.config().as_ref().num_public_values,
++                        &vm_poseidon2_hasher(),
++                        &final_memory.memory,
++                        top_tree,
++                    ));
++                }
++                out.push((seg_idx, segment_proof));
++            }
++            Ok((out, user_pv))
++        }
+     }
+ }
++

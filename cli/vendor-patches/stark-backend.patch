@@ -1,0 +1,19 @@
+diff --git a/crates/cuda-common/src/common.rs b/crates/cuda-common/src/common.rs
+index 5a5c91af..cb246ef6 100644
+--- a/crates/cuda-common/src/common.rs
++++ b/crates/cuda-common/src/common.rs
+@@ -34,3 +34,14 @@ pub fn set_device() -> Result<i32, CudaError> {
+ pub fn reset_device() -> Result<(), CudaError> {
+     check(unsafe { cudaDeviceReset() })
+ }
++
++/// Pin the CURRENT host thread to CUDA device `ordinal` and eagerly create its context.
++/// Multi-GPU fan-out: each segment-proving thread calls this before allocating, so all of
++/// its proof work lands on GPU `ordinal`.
++pub fn set_device_ordinal(ordinal: i32) -> Result<(), CudaError> {
++    unsafe {
++        check(cudaSetDevice(ordinal))?;
++        check(cudaFree(std::ptr::null_mut()))?;
++    }
++    Ok(())
++}

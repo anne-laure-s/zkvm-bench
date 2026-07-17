@@ -1,0 +1,915 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 4c5c4d33..62f3a153 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -6212,22 +6212,6 @@ dependencies = [
+ [[package]]
+ name = "k256"
+ version = "0.13.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "f6e3919bbaa2945715f0bb6d3934a173d1e9a59ac23767fbaaef277265a7411b"
+-dependencies = [
+- "cfg-if",
+- "ecdsa",
+- "elliptic-curve",
+- "once_cell",
+- "serdect",
+- "sha2 0.10.9",
+- "signature",
+-]
+-
+-[[package]]
+-name = "k256"
+-version = "0.13.4"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "ecdsa",
+  "elliptic-curve",
+@@ -6242,6 +6226,21 @@ dependencies = [
+  "serde",
+ ]
+ 
++[[package]]
++name = "k256"
++version = "0.13.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f6e3919bbaa2945715f0bb6d3934a173d1e9a59ac23767fbaaef277265a7411b"
++dependencies = [
++ "cfg-if",
++ "ecdsa",
++ "elliptic-curve",
++ "once_cell",
++ "serdect",
++ "sha2 0.10.9",
++ "signature",
++]
++
+ [[package]]
+ name = "keccak"
+ version = "0.1.6"
+@@ -7523,7 +7522,6 @@ dependencies = [
+ [[package]]
+ name = "openvm"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "bytemuck",
+  "num-bigint",
+@@ -7536,7 +7534,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-algebra-circuit"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "blstrs",
+  "cfg-if",
+@@ -7569,7 +7566,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-algebra-complex-macros"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-macros-common",
+  "quote",
+@@ -7579,7 +7575,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-algebra-guest"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "halo2curves-axiom 0.7.2 (git+https://github.com/axiom-crypto/halo2curves.git?tag=v0.7.2)",
+  "num-bigint",
+@@ -7595,7 +7590,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-algebra-moduli-macros"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "num-bigint",
+  "num-prime",
+@@ -7607,7 +7601,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-algebra-transpiler"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-algebra-guest",
+  "openvm-instructions",
+@@ -7621,7 +7614,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-benchmarks-prove"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "clap",
+  "derive_more 1.0.0",
+@@ -7648,7 +7640,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-benchmarks-utils"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "cargo_metadata 0.18.1",
+  "clap",
+@@ -7663,7 +7654,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-bigint-circuit"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "cfg-if",
+  "derive-new 0.6.0",
+@@ -7689,7 +7679,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-bigint-guest"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-platform",
+  "strum_macros 0.26.4",
+@@ -7698,7 +7687,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-bigint-transpiler"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-bigint-guest",
+  "openvm-instructions",
+@@ -7713,7 +7701,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-build"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "cargo_metadata 0.18.1",
+  "eyre",
+@@ -7735,7 +7722,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-circuit"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "abi_stable",
+  "backtrace",
+@@ -7778,7 +7764,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-circuit-derive"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "itertools 0.14.0",
+  "proc-macro2",
+@@ -7789,7 +7774,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-circuit-primitives"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "derive-new 0.6.0",
+  "itertools 0.14.0",
+@@ -7807,7 +7791,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-circuit-primitives-derive"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "itertools 0.14.0",
+  "quote",
+@@ -7817,7 +7800,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-continuations"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "derivative",
+  "openvm-circuit",
+@@ -7833,7 +7815,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-cuda-backend"
+ version = "1.4.0"
+-source = "git+https://github.com/openvm-org/stark-backend.git?tag=v1.4.0#2d4c6da0c84f43b15fcdac84ce13fd2325148c66"
+ dependencies = [
+  "bincode 2.0.1",
+  "bincode_derive",
+@@ -7865,7 +7846,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-cuda-builder"
+ version = "1.4.0"
+-source = "git+https://github.com/openvm-org/stark-backend.git?tag=v1.4.0#2d4c6da0c84f43b15fcdac84ce13fd2325148c66"
+ dependencies = [
+  "cc",
+  "glob",
+@@ -7874,7 +7854,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-cuda-common"
+ version = "1.4.0"
+-source = "git+https://github.com/openvm-org/stark-backend.git?tag=v1.4.0#2d4c6da0c84f43b15fcdac84ce13fd2325148c66"
+ dependencies = [
+  "bytesize",
+  "ctor",
+@@ -7901,7 +7880,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-custom-insn"
+ version = "0.1.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+@@ -7911,7 +7889,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-ecc-circuit"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "blstrs",
+  "cfg-if",
+@@ -7944,7 +7921,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-ecc-guest"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "ecdsa",
+  "elliptic-curve",
+@@ -7963,7 +7939,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-ecc-sw-macros"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-macros-common",
+  "quote",
+@@ -7973,7 +7948,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-ecc-transpiler"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-ecc-guest",
+  "openvm-instructions",
+@@ -7987,7 +7961,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-instructions"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "backtrace",
+  "derive-new 0.6.0",
+@@ -8004,7 +7977,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-instructions-derive"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "quote",
+  "syn 2.0.117",
+@@ -8013,7 +7985,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-keccak256"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-keccak256-guest",
+  "tiny-keccak",
+@@ -8022,7 +7993,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-keccak256-circuit"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "cfg-if",
+  "derive-new 0.6.0",
+@@ -8050,7 +8020,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-keccak256-guest"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-platform",
+ ]
+@@ -8058,7 +8027,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-keccak256-transpiler"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-instructions",
+  "openvm-instructions-derive",
+@@ -8096,7 +8064,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-macros-common"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "syn 2.0.117",
+ ]
+@@ -8104,7 +8071,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-mod-circuit-builder"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "cuda-runtime-sys",
+  "itertools 0.14.0",
+@@ -8166,7 +8132,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-native-circuit"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "cfg-if",
+  "derive-new 0.6.0",
+@@ -8197,7 +8162,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-native-compiler"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "backtrace",
+  "itertools 0.14.0",
+@@ -8221,7 +8185,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-native-compiler-derive"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "quote",
+  "syn 2.0.117",
+@@ -8230,7 +8193,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-native-recursion"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "cfg-if",
+  "itertools 0.14.0",
+@@ -8259,7 +8221,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-native-transpiler"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-instructions",
+  "openvm-transpiler",
+@@ -8269,7 +8230,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-pairing"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "group 0.13.0",
+  "halo2curves-axiom 0.7.2 (git+https://github.com/axiom-crypto/halo2curves.git?tag=v0.7.2)",
+@@ -8293,7 +8253,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-pairing-circuit"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "cfg-if",
+  "derive-new 0.6.0",
+@@ -8324,7 +8283,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-pairing-guest"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "blstrs",
+  "halo2curves-axiom 0.7.2 (git+https://github.com/axiom-crypto/halo2curves.git?tag=v0.7.2)",
+@@ -8345,7 +8303,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-pairing-transpiler"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-instructions",
+  "openvm-pairing-guest",
+@@ -8358,7 +8315,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-platform"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "libm",
+  "openvm-custom-insn",
+@@ -8368,7 +8324,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-poseidon2-air"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "derivative",
+  "lazy_static",
+@@ -8427,14 +8382,14 @@ dependencies = [
+  "ark-ec",
+  "ark-ff 0.5.0",
+  "aurora-engine-modexp",
+- "k256 0.13.4 (git+https://github.com/openvm-org/openvm.git?branch=main)",
++ "k256 0.13.4",
+  "openvm-curve-utils",
+  "openvm-ecc-guest",
+  "openvm-keccak256",
+  "openvm-kzg",
+  "openvm-pairing",
+  "openvm-sha2",
+- "p256 0.13.2 (git+https://github.com/openvm-org/openvm.git?branch=main)",
++ "p256 0.13.2",
+  "revm 38.0.0",
+  "revm-primitives 23.0.0",
+ ]
+@@ -8479,7 +8434,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-rv32-adapters"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "derive-new 0.6.0",
+  "itertools 0.14.0",
+@@ -8496,7 +8450,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-rv32im-circuit"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "cfg-if",
+  "derive-new 0.6.0",
+@@ -8523,7 +8476,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-rv32im-guest"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-custom-insn",
+  "p3-field",
+@@ -8533,7 +8485,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-rv32im-transpiler"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-instructions",
+  "openvm-instructions-derive",
+@@ -8549,7 +8500,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-sdk"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "alloy-sol-types",
+  "bitcode",
+@@ -8602,6 +8552,7 @@ dependencies = [
+  "snark-verifier-sdk",
+  "tempfile",
+  "thiserror 1.0.69",
++ "tokio",
+  "toml 0.8.23",
+  "tracing",
+ ]
+@@ -8609,7 +8560,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-sha2"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-sha256-guest",
+  "sha2 0.10.9",
+@@ -8618,7 +8568,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-sha256-air"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-circuit-primitives",
+  "openvm-stark-backend",
+@@ -8629,7 +8578,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-sha256-circuit"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "cfg-if",
+  "derive-new 0.6.0",
+@@ -8655,7 +8603,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-sha256-guest"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-platform",
+ ]
+@@ -8663,7 +8610,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-sha256-transpiler"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "openvm-instructions",
+  "openvm-instructions-derive",
+@@ -8677,7 +8623,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-stark-backend"
+ version = "1.4.0"
+-source = "git+https://github.com/openvm-org/stark-backend.git?tag=v1.4.0#2d4c6da0c84f43b15fcdac84ce13fd2325148c66"
+ dependencies = [
+  "bitcode",
+  "cfg-if",
+@@ -8706,7 +8651,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-stark-sdk"
+ version = "1.4.0"
+-source = "git+https://github.com/openvm-org/stark-backend.git?tag=v1.4.0#2d4c6da0c84f43b15fcdac84ce13fd2325148c66"
+ dependencies = [
+  "dashmap",
+  "derivative",
+@@ -8798,7 +8742,6 @@ dependencies = [
+ [[package]]
+ name = "openvm-transpiler"
+ version = "1.7.0"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "elf",
+  "eyre",
+@@ -8828,19 +8771,6 @@ dependencies = [
+ [[package]]
+ name = "p256"
+ version = "0.13.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
+-dependencies = [
+- "ecdsa",
+- "elliptic-curve",
+- "primeorder",
+- "sha2 0.10.9",
+-]
+-
+-[[package]]
+-name = "p256"
+-version = "0.13.2"
+-source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
+ dependencies = [
+  "ecdsa",
+  "elliptic-curve",
+@@ -8855,6 +8785,18 @@ dependencies = [
+  "serde",
+ ]
+ 
++[[package]]
++name = "p256"
++version = "0.13.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
++dependencies = [
++ "ecdsa",
++ "elliptic-curve",
++ "primeorder",
++ "sha2 0.10.9",
++]
++
+ [[package]]
+ name = "p3-air"
+ version = "0.4.3"
+diff --git a/Cargo.toml b/Cargo.toml
+index 9a88141c..e9d04108 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -12,7 +12,7 @@ members = [
+     "crates/kzg",
+     "crates/kzg/tests/programs/verify_kzg",
+ ]
+-exclude = []
++exclude = [".vendor"]
+ resolver = "3"
+ 
+ [workspace.package]
+@@ -163,3 +163,67 @@ opt-level = 3
+ [profile.bench-with-debug]
+ inherits = "release"
+ debug = 1
++
++# BEGIN openvm-infra multi-gpu patch (auto-generated)
++[patch."https://github.com/openvm-org/openvm.git"]
++k256 = { path = ".vendor/openvm/guest-libs/k256" }
++openvm = { path = ".vendor/openvm/crates/toolchain/openvm" }
++openvm-algebra-circuit = { path = ".vendor/openvm/extensions/algebra/circuit" }
++openvm-algebra-complex-macros = { path = ".vendor/openvm/extensions/algebra/complex-macros" }
++openvm-algebra-guest = { path = ".vendor/openvm/extensions/algebra/guest" }
++openvm-algebra-moduli-macros = { path = ".vendor/openvm/extensions/algebra/moduli-macros" }
++openvm-algebra-transpiler = { path = ".vendor/openvm/extensions/algebra/transpiler" }
++openvm-benchmarks-prove = { path = ".vendor/openvm/benchmarks/prove" }
++openvm-benchmarks-utils = { path = ".vendor/openvm/benchmarks/utils" }
++openvm-bigint-circuit = { path = ".vendor/openvm/extensions/bigint/circuit" }
++openvm-bigint-guest = { path = ".vendor/openvm/extensions/bigint/guest" }
++openvm-bigint-transpiler = { path = ".vendor/openvm/extensions/bigint/transpiler" }
++openvm-build = { path = ".vendor/openvm/crates/toolchain/build" }
++openvm-circuit = { path = ".vendor/openvm/crates/vm" }
++openvm-circuit-derive = { path = ".vendor/openvm/crates/vm/derive" }
++openvm-circuit-primitives = { path = ".vendor/openvm/crates/circuits/primitives" }
++openvm-circuit-primitives-derive = { path = ".vendor/openvm/crates/circuits/primitives/derive" }
++openvm-continuations = { path = ".vendor/openvm/crates/continuations" }
++openvm-custom-insn = { path = ".vendor/openvm/crates/toolchain/custom_insn" }
++openvm-ecc-circuit = { path = ".vendor/openvm/extensions/ecc/circuit" }
++openvm-ecc-guest = { path = ".vendor/openvm/extensions/ecc/guest" }
++openvm-ecc-sw-macros = { path = ".vendor/openvm/extensions/ecc/sw-macros" }
++openvm-ecc-transpiler = { path = ".vendor/openvm/extensions/ecc/transpiler" }
++openvm-instructions = { path = ".vendor/openvm/crates/toolchain/instructions" }
++openvm-instructions-derive = { path = ".vendor/openvm/crates/toolchain/instructions/derive" }
++openvm-keccak256 = { path = ".vendor/openvm/guest-libs/keccak256" }
++openvm-keccak256-circuit = { path = ".vendor/openvm/extensions/keccak256/circuit" }
++openvm-keccak256-guest = { path = ".vendor/openvm/extensions/keccak256/guest" }
++openvm-keccak256-transpiler = { path = ".vendor/openvm/extensions/keccak256/transpiler" }
++openvm-macros-common = { path = ".vendor/openvm/crates/toolchain/macros" }
++openvm-mod-circuit-builder = { path = ".vendor/openvm/crates/circuits/mod-builder" }
++openvm-native-circuit = { path = ".vendor/openvm/extensions/native/circuit" }
++openvm-native-compiler = { path = ".vendor/openvm/extensions/native/compiler" }
++openvm-native-compiler-derive = { path = ".vendor/openvm/extensions/native/compiler/derive" }
++openvm-native-recursion = { path = ".vendor/openvm/extensions/native/recursion" }
++openvm-native-transpiler = { path = ".vendor/openvm/extensions/native/transpiler" }
++openvm-pairing = { path = ".vendor/openvm/guest-libs/pairing" }
++openvm-pairing-circuit = { path = ".vendor/openvm/extensions/pairing/circuit" }
++openvm-pairing-guest = { path = ".vendor/openvm/extensions/pairing/guest" }
++openvm-pairing-transpiler = { path = ".vendor/openvm/extensions/pairing/transpiler" }
++openvm-platform = { path = ".vendor/openvm/crates/toolchain/platform" }
++openvm-poseidon2-air = { path = ".vendor/openvm/crates/circuits/poseidon2-air" }
++openvm-rv32-adapters = { path = ".vendor/openvm/extensions/rv32-adapters" }
++openvm-rv32im-circuit = { path = ".vendor/openvm/extensions/rv32im/circuit" }
++openvm-rv32im-guest = { path = ".vendor/openvm/extensions/rv32im/guest" }
++openvm-rv32im-transpiler = { path = ".vendor/openvm/extensions/rv32im/transpiler" }
++openvm-sdk = { path = ".vendor/openvm/crates/sdk" }
++openvm-sha2 = { path = ".vendor/openvm/guest-libs/sha2" }
++openvm-sha256-air = { path = ".vendor/openvm/crates/circuits/sha256-air" }
++openvm-sha256-circuit = { path = ".vendor/openvm/extensions/sha256/circuit" }
++openvm-sha256-guest = { path = ".vendor/openvm/extensions/sha256/guest" }
++openvm-sha256-transpiler = { path = ".vendor/openvm/extensions/sha256/transpiler" }
++openvm-transpiler = { path = ".vendor/openvm/crates/toolchain/transpiler" }
++p256 = { path = ".vendor/openvm/guest-libs/p256" }
++[patch."https://github.com/openvm-org/stark-backend.git"]
++openvm-cuda-backend = { path = ".vendor/stark-backend/crates/cuda-backend" }
++openvm-cuda-builder = { path = ".vendor/stark-backend/crates/cuda-builder" }
++openvm-cuda-common = { path = ".vendor/stark-backend/crates/cuda-common" }
++openvm-stark-backend = { path = ".vendor/stark-backend/crates/stark-backend" }
++openvm-stark-sdk = { path = ".vendor/stark-backend/crates/stark-sdk" }
++# END openvm-infra multi-gpu patch
+diff --git a/bin/reth-benchmark/Cargo.toml b/bin/reth-benchmark/Cargo.toml
+index e71e5039..19c42c97 100644
+--- a/bin/reth-benchmark/Cargo.toml
++++ b/bin/reth-benchmark/Cargo.toml
+@@ -49,7 +49,7 @@ openvm-stark-sdk = { git = "https://github.com/openvm-org/stark-backend.git", ta
+ openvm-transpiler = { git = "https://github.com/openvm-org/openvm.git", branch = "main", default-features = false }
+ openvm-circuit = { git = "https://github.com/openvm-org/openvm.git", branch = "main", default-features = false }
+ openvm-benchmarks-prove = { git = "https://github.com/openvm-org/openvm.git", branch = "main", default-features = false, features = ["parallel"] }
+-openvm-sdk = { git = "https://github.com/openvm-org/openvm.git", branch = "main", default-features = false }
++openvm-sdk = { git = "https://github.com/openvm-org/openvm.git", branch = "main", default-features = false, features = ["async"] }
+ openvm-native-circuit = { git = "https://github.com/openvm-org/openvm.git", branch = "main", default-features = false }
+ toml.workspace = true
+ 
+diff --git a/bin/reth-benchmark/src/lib.rs b/bin/reth-benchmark/src/lib.rs
+index 95a9800b..d03c19af 100644
+--- a/bin/reth-benchmark/src/lib.rs
++++ b/bin/reth-benchmark/src/lib.rs
+@@ -20,11 +20,11 @@ use openvm_stateless_executor::{
+ use openvm_rpc_proxy::{RpcExecutor, DEFAULT_PREIMAGE_CACHE_NIBBLES};
+ use openvm_sdk::{
+     config::{AppConfig, SdkVmBuilder, SdkVmConfig},
+-    fs::read_object_from_file,
++    fs::{read_object_from_file, write_object_to_file},
+     keygen::{AggProvingKey, AppProvingKey},
+     prover::verify_app_proof,
+     types::VersionedVmStarkProof,
+-    DefaultStarkEngine, Sdk, StdIn,
++    DefaultStarkEngine, Sdk, StdIn, SC,
+ };
+ use openvm_stark_sdk::engine::StarkFriEngine;
+ use openvm_transpiler::{elf::Elf, openvm_platform::memory::MEM_SIZE};
+@@ -50,6 +50,11 @@ pub enum BenchMode {
+     ProveApp,
+     /// Generate a full end-to-end STARK proof with aggregation.
+     ProveStark,
++    /// [multi-gpu ①] Prove only THIS worker's shard of continuation segments (one GPU/process).
++    ProveSegments,
++    /// [multi-gpu ①] Aggregate serialized segment proofs (from all workers) into the final STARK.
++    Aggregate,
++
+     /// Generate a full end-to-end halo2 proof for EVM verifier.
+     #[cfg(feature = "evm-verify")]
+     ProveEvm,
+@@ -67,6 +72,9 @@ impl std::fmt::Display for BenchMode {
+             Self::ExecuteMetered => write!(f, "execute_metered"),
+             Self::ProveApp => write!(f, "prove_app"),
+             Self::ProveStark => write!(f, "prove_stark"),
++            Self::ProveSegments => write!(f, "prove_segments"),
++            Self::Aggregate => write!(f, "aggregate"),
++
+             #[cfg(feature = "evm-verify")]
+             Self::ProveEvm => write!(f, "prove_evm"),
+             Self::MakeInput => write!(f, "make_input"),
+@@ -126,6 +134,22 @@ pub struct HostArgs {
+     #[arg(long, default_value_t = false)]
+     pub skip_comparison: bool,
+ 
++    /// Number of GPUs ONE process fans segment proofs across (1 = stock single-GPU path).
++    #[arg(long, env = "OPENVM_NUM_GPUS", default_value_t = 1)]
++    pub num_gpus: usize,
++
++    /// [multi-gpu ①] this worker's id in 0..num_workers (mode=prove-segments).
++    #[arg(long, default_value_t = 0)]
++    pub worker_id: usize,
++    /// [multi-gpu ①] total workers = GPUs (mode=prove-segments / aggregate).
++    #[arg(long, default_value_t = 1)]
++    pub num_workers: usize,
++    /// [multi-gpu ①] dir for serialized segment proofs (prove-segments writes, aggregate reads).
++    #[arg(long)]
++    pub segments_out: Option<PathBuf>,
++
++
++
+     /// The number of nibbles to precompute for the preimage lookup table.
+     /// Higher values increase startup time but reduce RPC calls for missing storage keys.
+     #[clap(long, default_value_t = DEFAULT_PREIMAGE_CACHE_NIBBLES, value_parser = clap::value_parser!(u8).range(..=8))]
+@@ -331,8 +355,26 @@ pub async fn run_reth_benchmark(args: HostArgs, openvm_client_eth_elf: &[u8]) ->
+                         verify_app_proof(&app_vk, &proof)?;
+                     }
+                     BenchMode::ProveStark => {
+-                        let mut prover = sdk.prover(elf)?.with_program_name(program_name);
+-                        let proof = prover.prove(stdin)?;
++                        let proof = if args.num_gpus > 1 {
++                            // [multi-gpu] fan app-segment proofs across GPUs, then aggregate.
++                            unsafe { std::env::set_var("OPENVM_NUM_GPUS", args.num_gpus.to_string()); }
++                            let async_prover = sdk.async_app_prover(elf.clone(), args.num_gpus)?;
++                            let app_proof = tokio::task::block_in_place(|| {
++                                tokio::runtime::Handle::current()
++                                    .block_on(async_prover.prove(stdin))
++                            })?;
++                            let mut agg = sdk.prover(elf)?;
++                            let leaf = agg.agg_prover.generate_leaf_proofs(&app_proof)?;
++                            agg.agg_prover.aggregate_leaf_proofs(
++                                leaf,
++                                app_proof.user_public_values.public_values,
++                            )?
++                        } else {
++                            let mut prover =
++                                sdk.prover(elf)?.with_program_name(program_name);
++                            prover.prove(stdin)?
++                        };
++
+                         let block_hash = proof
+                             .user_public_values
+                             .iter()
+@@ -363,7 +405,72 @@ pub async fn run_reth_benchmark(args: HostArgs, openvm_client_eth_elf: &[u8]) ->
+                         let block_hash = &proof.user_public_values;
+                         println!("block_hash (prove_evm): {}", ToHexExt::encode_hex(block_hash));
+                     }
++                    BenchMode::ProveSegments => {
++                        let dir = args
++                            .segments_out
++                            .clone()
++                            .expect("--segments-out required for prove-segments");
++                        std::fs::create_dir_all(&dir)?;
++                        let nw = args.num_workers.max(1);
++                        let prover = sdk.async_app_prover(elf, nw)?;
++                        let (segs, user_pv) = prover.prove_shard(stdin, args.worker_id, nw)?;
++                        for (idx, proof) in &segs {
++                            write_object_to_file(dir.join(format!("seg-{idx}.bitcode")), proof)?;
++                        }
++                        if let Some(pv) = user_pv {
++                            write_object_to_file(dir.join("user-pv.bitcode"), &pv)?;
++                        }
++                        println!(
++                            "worker {}/{} wrote {} segment proofs to {}",
++                            args.worker_id, nw, segs.len(), dir.display()
++                        );
++                    }
++                    BenchMode::Aggregate => {
++                        let dir = args
++                            .segments_out
++                            .clone()
++                            .expect("--segments-out required for aggregate");
++                        let mut entries: Vec<(usize, std::path::PathBuf)> = std::fs::read_dir(&dir)?
++                            .filter_map(|e| e.ok().map(|e| e.path()))
++                            .filter_map(|p| {
++                                let n = p.file_name()?.to_str()?.to_string();
++                                let idx = n
++                                    .strip_prefix("seg-")?
++                                    .strip_suffix(".bitcode")?
++                                    .parse::<usize>()
++                                    .ok()?;
++                                Some((idx, p))
++                            })
++                            .collect();
++                        entries.sort_by_key(|(i, _)| *i);
++                        println!("aggregating {} segment proofs from {}", entries.len(), dir.display());
++                        let app_proof: ContinuationVmProof<SC> = ContinuationVmProof {
++                            per_segment: entries
++                                .iter()
++                                .map(|(_, p)| read_object_from_file(p))
++                                .collect::<eyre::Result<Vec<_>>>()?,
++                            user_public_values: read_object_from_file(dir.join("user-pv.bitcode"))?,
++                        };
++                        let mut stark = sdk.prover(elf)?.with_program_name(program_name);
++                        let leaf = stark.agg_prover.generate_leaf_proofs(&app_proof)?;
++                        let proof = stark
++                            .agg_prover
++                            .aggregate_leaf_proofs(leaf, app_proof.user_public_values.public_values)?;
++                        let block_hash = proof
++                            .user_public_values
++                            .iter()
++                            .map(|pv| pv.as_canonical_u32() as u8)
++                            .collect::<Vec<u8>>();
++                        println!("block_hash (aggregate): {}", ToHexExt::encode_hex(&block_hash));
++                        if let Some(output_dir) = args.output_dir.as_ref() {
++                            let versioned_proof = VersionedVmStarkProof::new(proof)?;
++                            let json = serde_json::to_vec_pretty(&versioned_proof)?;
++                            fs::write(output_dir.join("proof.json"), json)?;
++                            println!("wrote proof json to {}", output_dir.display());
++                        }
++                    }
+                     BenchMode::GenerateFixtures => {
++
+                         let mut prover = sdk.prover(elf)?.with_program_name(program_name);
+                         let app_proof = prover.app_prover.prove(stdin)?;
+                         let leaf_proofs = prover.agg_prover.generate_leaf_proofs(&app_proof)?;
+diff --git a/crates/rpc-proxy/src/main.rs b/crates/rpc-proxy/src/main.rs
+index 3d29c715..90d0caec 100644
+--- a/crates/rpc-proxy/src/main.rs
++++ b/crates/rpc-proxy/src/main.rs
+@@ -15,6 +15,7 @@ use reqwest::Client;
+ use reth_chainspec::{HOLESKY, HOODI, MAINNET, SEPOLIA};
+ use reth_evm_ethereum::EthEvmConfig;
+ use serde_json::{json, Value};
++use std::path::PathBuf;
+ use std::sync::Arc;
+ use tracing::{debug, error, field, info, instrument};
+ use tracing_actix_web::TracingLogger;
+@@ -26,6 +27,7 @@ struct AppState {
+     provider: DynProvider,
+     evm_config: Arc<EthEvmConfig>,
+     lookup: Arc<PreimageLookup>,
++    witness_cache_dir: Option<PathBuf>,
+ }
+ 
+ #[derive(Parser, Debug)]
+@@ -51,6 +53,12 @@ struct Args {
+     /// Higher values increase startup time but reduce RPC calls for missing storage keys.
+     #[clap(long, default_value_t = DEFAULT_PREIMAGE_CACHE_NIBBLES, value_parser = clap::value_parser!(u8).range(..=8))]
+     pub preimage_cache_nibbles: u8,
++
++    /// Optional directory to cache `debug_executionWitness` results by block number.
++    /// The (expensive) re-execution is then done once per block and reused across
++    /// callers (e.g. RSP and ZisK both request the same block) and across restarts.
++    #[clap(long)]
++    pub witness_cache_dir: Option<PathBuf>,
+ }
+ 
+ /// This function is the entry point for all incoming RPC requests.
+@@ -172,12 +180,40 @@ async fn handle_debug_execution_witness(
+     }
+ 
+     let block_id = params_vec[0];
++
++    // Disk cache keyed by concrete block number: the expensive re-execution is done ONCE
++    // per block and reused (RSP and ZisK both call debug_executionWitness(N)) and across
++    // restarts. Only concrete numbers are cached (tags like "latest" are not stable).
++    let cache_path = match (&data.witness_cache_dir, block_id) {
++        (Some(dir), BlockNumberOrTag::Number(n)) => Some(dir.join(format!("witness/{n}.json"))),
++        _ => None,
++    };
++    if let Some(p) = &cache_path {
++        if let Ok(bytes) = std::fs::read(p) {
++            if let Ok(cached) = serde_json::from_slice::<Value>(&bytes) {
++                debug!(?block_id, "witness cache hit");
++                return HttpResponse::Ok().json(json!({
++                    "jsonrpc": "2.0", "id": id, "result": cached
++                }));
++            }
++        }
++    }
++
+     match execution_witness(data.evm_config.clone(), &data.provider, block_id, &data.lookup).await {
+-        Ok(witness) => HttpResponse::Ok().json(json!({
+-            "jsonrpc": "2.0",
+-            "id": id,
+-            "result": witness
+-        })),
++        Ok(witness) => {
++            let result = serde_json::to_value(&witness).unwrap_or(Value::Null);
++            if let Some(p) = &cache_path {
++                if let Some(parent) = p.parent() {
++                    let _ = std::fs::create_dir_all(parent);
++                }
++                let _ = std::fs::write(p, serde_json::to_vec(&result).unwrap_or_default());
++            }
++            HttpResponse::Ok().json(json!({
++                "jsonrpc": "2.0",
++                "id": id,
++                "result": result
++            }))
++        }
+         Err(e) => {
+             error!(error = format!("{e:#}"), "Preflight function failed");
+             HttpResponse::InternalServerError().json(json!({
+@@ -223,6 +259,7 @@ async fn main() -> eyre::Result<()> {
+         provider: provider.erased(),
+         evm_config,
+         lookup,
++        witness_cache_dir: args.witness_cache_dir,
+     });
+ 
+     info!(

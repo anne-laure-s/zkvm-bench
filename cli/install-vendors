@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# install-vendors.sh — fetch the external vendored dependencies and apply this repo's patches.
+#
+# vendor/ is gitignored (external upstream code, tens of GB — not this project's, see README).
+# A fresh clone has no vendor/. Run this once to reproduce it:
+#
+#   ./cli/install-vendors
+#
+# It clones each upstream repo at a PINNED commit, then applies the local patches stored in
+# cli/vendor-patches/ (RSP_BENCH warn-on-mismatch, the execution-witness feature, the EW
+# storage-trie Digest fix, RSP_RPC_CU, getProof chunking; the proxy's --witness-cache-dir).
+# openvm-eth additionally [patch]es openvm + stark-backend to path-deps under its own .vendor/,
+# so those two are cloned into vendor/openvm-eth/.vendor/ (openvm ~150 MB) and patched as well.
+# It does NOT build — the farm/`./run` invocations run `cargo build` themselves.
+#
+# Idempotent: re-running skips repos already present and patches already applied.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENDOR="$ROOT/vendor"
+PATCHES="$ROOT/cli/vendor-patches"
+mkdir -p "$VENDOR"
+
+# Warn early about missing SYSTEM build prerequisites (the vendored crates need these to compile;
+# without them you only find out mid-`cargo build`, e.g. sp1-prover-types fails without protoc).
+check_prereqs() {
+  command -v git >/dev/null 2>&1 || { echo "FATAL: git not found (needed to fetch vendors)"; exit 1; }
+  local missing=()
+  for c in cargo protoc cc pkg-config cmake clang; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "⚠️  Missing build prerequisites: ${missing[*]}" >&2
+    echo "   On Debian/Ubuntu:" >&2
+    echo "     sudo apt-get update && sudo apt-get install -y protobuf-compiler build-essential pkg-config libssl-dev cmake clang" >&2
+    echo "   (protoc=protobuf-compiler, cc=build-essential). Cloning continues; the build will fail until these are present." >&2
+    echo >&2
+  fi
+}
+check_prereqs
+
+# install <dir> <git-url> <commit-or-tag> [patch-file]
+install() {
+  local name="$1" url="$2" ref="$3" patch="${4:-}"
+  local dir="$VENDOR/$name"
+
+  if [ -d "$dir/.git" ]; then
+    echo "== $name: already present ($(git -C "$dir" rev-parse --short HEAD)) — skipping clone"
+  else
+    echo "== $name: cloning $url"
+    mkdir -p "$(dirname "$dir")"
+    git clone "$url" "$dir"
+    echo "   checkout $ref"
+    git -C "$dir" -c advice.detachedHead=false checkout --quiet "$ref"
+  fi
+
+  if [ -n "$patch" ]; then
+    local pf="$PATCHES/$patch"
+    [ -f "$pf" ] || { echo "   WARN: patch $patch not found in $PATCHES" >&2; return; }
+    if git -C "$dir" apply --reverse --check "$pf" 2>/dev/null; then
+      echo "   already patched ($patch) — skipping"
+    elif git -C "$dir" apply --check "$pf" 2>/dev/null; then
+      git -C "$dir" apply "$pf"
+      echo "   applied $patch"
+    else
+      echo "   WARN: $patch does not apply cleanly (upstream drift?) — apply it manually:" >&2
+      echo "         git -C $dir apply $pf" >&2
+    fi
+  fi
+}
+
+#        dir                url                                                 commit/tag   patch
+install rsp                 https://github.com/succinctlabs/rsp                 c2734ce      rsp.patch
+install openvm-eth          https://github.com/axiom-crypto/openvm-eth          0373b3b9     openvm-eth.patch
+# openvm-eth [patch]es openvm + stark-backend to LOCAL checkouts under its .vendor/ (path deps in
+# its Cargo.toml). Without these the proxy build fails: "failed to read .vendor/openvm/.../Cargo.toml".
+install openvm-eth/.vendor/openvm        https://github.com/openvm-org/openvm.git        v1.7.0  openvm.patch
+install openvm-eth/.vendor/stark-backend https://github.com/openvm-org/stark-backend.git v1.4.0  stark-backend.patch
+install zisk-eth-client     https://github.com/0xPolygonHermez/zisk-eth-client  v0.10.0      # clean checkout, no patch
+
+echo
+echo "Vendors ready in $VENDOR/ (rsp, openvm-eth, zisk-eth-client)."
+echo "Next: run the farm (it builds what it needs), e.g.:"
+echo "  ALCHEMY_URL=https://eth-mainnet.g.alchemy.com/v2/<key> ./witness-farm.sh <block>"
