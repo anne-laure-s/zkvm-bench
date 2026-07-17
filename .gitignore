@@ -20,9 +20,15 @@ guests/*/inputs/*.input.json
 guests/*/inputs/*.stdin
 guests/*/inputs/rpc-cache/
 
+# Collected witnesses (witness-farm.sh writes RSP/ZisK witnesses here) — large, regenerable.
+guests/*/fixtures/*.bin
+guests/*/fixtures/*.hints
+
 # Execute reports — regenerable locally via `./run execute`. They feed profiling/results.html
 # (itself regenerated, not shipped), so they are NOT committed; re-run `./run execute` then results.py.
 guests/*/inputs/*.exec-report.json
+# RSP writes a per-run execution report to ./report.csv (its default --report-path). Regenerable.
+/report.csv
 
 # Monad guest is pre-supplied and NOT regenerable. The whole inputs/ dir (witnesses ~79 MB + their
 # post_state_root ground-truth) is kept OUT of git — a fresh clone must copy it in (provenance:
@@ -33,6 +39,11 @@ guests/monad/exec-verified.csv
 
 # ── profiling/ : all generated output (regenerate: `profiling/results.py`, `profiling/hotspots.py`) ─
 profiling/results/
+
+# ── witness-farm.sh outputs (the script itself is tracked; its generated output is not) ────────
+/wcache/
+/witness-farm-logs/
+/witness-farm.csv
 
 # ── Python / OS ──────────────────────────────────────────────────────────────────────────────
 __pycache__/

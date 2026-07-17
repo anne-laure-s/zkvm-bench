@@ -32,7 +32,11 @@ guest_build_elf() {
 # Generate the block witness LOCALLY (execute-only) and copy it to $INPUT.
 # This is the byte-identical bincode(EthClientExecutorInput) the guest reads.
 guest_gen_input() {
-  local rsp="${RSP_DIR:?set RSP_DIR to your RSP checkout}"
+  # Resolve RSP_DIR to an ABSOLUTE path: gen-input runs RSP after `cd "$rsp"`, so a
+  # relative --cache-dir (e.g. "vendor/rsp/cache") would double to "$rsp/$rsp/cache"
+  # — RSP writes the input there while the cache_file check below looks at the
+  # (repo-root-relative) path and misses it. Absolute keeps both sides in sync.
+  local rsp; rsp="$(cd "${RSP_DIR:?set RSP_DIR to your RSP checkout}" && pwd)"
   local chain="${CHAIN_ID:-1}"
   local cache="$rsp/cache"
   local args=(--block-number "${BLOCK:?set BLOCK}" --chain-id "$chain" --cache-dir "$cache")

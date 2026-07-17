@@ -118,8 +118,18 @@ guest_gen_input() {
   ( cd "$dir" && cargo run --release --bin input-gen -- -c "$kind" rpc -u "$RPC_URL" -b "$BLOCK" )
 
   echo "== hints-gen =="
+  # hints-gen runs from inside `$dir`, so point it at the inputs dir RELATIVE to $dir
+  # (input-gen wrote it there). Using $indir here — which is repo-root-relative — doubled
+  # the path (".../vendor/zisk-eth-client/vendor/zisk-eth-client/reth-inputs") and failed.
+  #
+  # NON-FATAL: hints are a proving-time optimization, not the witness. ziskos v1.0.0-alpha's
+  # native secp256r1 inverse fcall aborts on blocks that call p256verify (RIP-7212); the
+  # prover's emulator regenerates hints correctly at prove time. So if hints-gen fails we
+  # ship the (valid) input WITHOUT hints instead of losing the whole witness.
+  local hints_ok=1
   ( cd "$dir" && RUSTFLAGS="--cfg zisk_hints" cargo build --release -p hints-gen \
-      && ./target/release/hints-gen -f "$indir" )
+      && ./target/release/hints-gen -f "${kind}-inputs" ) \
+    || { echo "WARN: hints-gen failed (likely secp256r1/p256verify on this block) — shipping input without hints" >&2; hints_ok=0; }
 
   # Locate the per-block input + hints. Files are named
   # <chain>_<block>_<txs>_<mgas>_zec_<client>.bin (+ matching .hints in <client>-hints/).
@@ -132,15 +142,21 @@ guest_gen_input() {
   [[ -n "$src_in" && -f "$src_in" ]] || { echo "ERROR: could not find generated input for block $BLOCK under $indir" >&2; return 1; }
   cp "$src_in" "$INPUT"
 
-  local src_hints="${ZISK_HINTS_SRC:-}"
-  if [[ -z "$src_hints" ]]; then
-    src_hints="$(find "$hintsdir" -type f -name "*${BLOCK}*.hints" 2>/dev/null | head -n1)"
-    [[ -z "$src_hints" ]] && src_hints="$(find "$hintsdir" -type f -name "*.hints" -newer "$src_in" 2>/dev/null | head -n1)"
+  # Only look for hints if hints-gen actually succeeded — never ship a partial/stale .hints.
+  local src_hints=""
+  if [[ "$hints_ok" == 1 ]]; then
+    src_hints="${ZISK_HINTS_SRC:-}"
+    if [[ -z "$src_hints" ]]; then
+      src_hints="$(find "$hintsdir" -type f -name "*${BLOCK}*.hints" 2>/dev/null | head -n1)"
+      [[ -z "$src_hints" ]] && src_hints="$(find "$hintsdir" -type f -name "*.hints" -newer "$src_in" 2>/dev/null | head -n1)"
+    fi
   fi
   if [[ -n "$src_hints" && -e "$src_hints" ]]; then
     cp -R "$src_hints" "${HINTS:-${INPUT%.bin}.hints}"
-  else
+  elif [[ "$hints_ok" == 1 ]]; then
     echo "WARN: no hints artifact matched for block $BLOCK under $hintsdir — set ZISK_HINTS_SRC" >&2
+  else
+    echo "INFO: shipping input without hints for block $BLOCK (hints-gen failed; prover regenerates)" >&2
   fi
   echo "Input from : $src_in"
   echo "Hints from : ${src_hints:-<none>}  (client kind: $kind)"

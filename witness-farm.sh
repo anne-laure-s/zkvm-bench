@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# witness-farm.sh — set up and run continuous RSP + ZisK witness generation.
+#
+#   Samples every STRIDE (default 50) blocks starting from `latest` (or a given block),
+#   going forward, and NEVER waits: if the next stride block isn't mined yet, it proves
+#   the current `latest` (minus a reorg margin) and re-anchors forward from there.
+#
+#   Per block: ZisK first (it always needs the proxy's debug_executionWitness; this also warms
+#   the shared witness cache), then RSP with a per-block fallback — proxy/EW first (cache hit),
+#   and if that doesn't produce a clean witness, retry the same block via getProof. Keep
+#   whichever validates. Covers both failure modes: issue #181 gas-mismatch (getProof fails →
+#   EW saves it) AND proxy under-collection (EW fails → getProof saves it).
+#
+# Usage:
+#   ALCHEMY_URL=https://eth-mainnet.g.alchemy.com/v2/<key> ./witness-farm.sh            # from latest
+#   ALCHEMY_URL=... ./witness-farm.sh 22500000                                          # from a block
+#   ALCHEMY_URL=... STRIDE=100 MARGIN=12 MAX_BLOCKS=200 ./witness-farm.sh               # tuned
+#
+# Env knobs: STRIDE MARGIN PROXY_PORT NIBBLES RETRY_CU RSP_RPC_CU MAX_BLOCKS MAX_FAILS RETRY_RPC RETRY_PAUSE
+# Must be run from the repo root (it lives there).
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+: "${ALCHEMY_URL:?export ALCHEMY_URL=https://eth-mainnet.g.alchemy.com/v2/<key>}"
+STRIDE="${STRIDE:-50}"
+MARGIN="${MARGIN:-12}"                       # reorg safety when proving `latest`
+PROXY_PORT="${PROXY_PORT:-8545}"
+PROXY_URL="http://127.0.0.1:${PROXY_PORT}"
+NIBBLES="${NIBBLES:-7}"                       # proxy preimage cache (startup cost vs per-block RPC)
+RETRY_CU="${RETRY_CU:-400}"                   # keep under Alchemy Free ~500 CU/s
+MAX_BLOCKS="${MAX_BLOCKS:-0}"                 # 0 = forever
+MAX_FAILS="${MAX_FAILS:-5}"                   # stop after N consecutive RSP failures (fork/version wall); 0 = never
+RETRY_RPC="${RETRY_RPC:-1}"                   # per-guest retries on a TRANSIENT network failure; 0 = off
+RETRY_PAUSE="${RETRY_PAUSE:-30}"              # seconds to wait before a network retry
+RSP_RPC_CU="${RSP_RPC_CU:-400}"; export RSP_RPC_CU   # RSP self-throttle (CU/s); was hardcoded 100. getProof fallback goes direct to Alchemy so it isn't re-capped by the proxy.
+START_BLOCK="${1:-${START_BLOCK:-}}"          # positional $1 wins, else START_BLOCK env, else latest
+# Patterns that mean "transient network/proxy failure" (worth retrying) rather than a real gap.
+NET_RE='error sending request|connection|timed out|timeout|dns error|429|reset by peer|failed to fetch execution witness|assign requested address|os error 49'
+
+OPENVM_DIR="$ROOT/vendor/openvm-eth"
+PROXY_BIN="$OPENVM_DIR/target/release/openvm-rpc-proxy"
+RSP_DIR="$ROOT/vendor/rsp"
+RSP_EW_BIN="$RSP_DIR/target-ew/release/rsp"    # --features execution-witness → debug_executionWitness
+RSP_BASIC_BIN="$RSP_DIR/target/release/rsp"    # no feature → eth_getProof (fallback)
+RSP_EW_CACHE="$RSP_DIR/ew-cache"
+RSP_BASIC_CACHE="$RSP_DIR/basic-cache"
+WCACHE="$ROOT/wcache"                         # proxy witness cache (shared RSP↔ZisK, resumable)
+OUT="$ROOT/witness-farm.csv"
+LOGDIR="$ROOT/witness-farm-logs"
+RSP_FIX="$ROOT/guests/rsp/fixtures"           # collected RSP witnesses
+ZISK_FIX="$ROOT/guests/zisk-reth/fixtures"    # collected ZisK witnesses (+ hints)
+mkdir -p "$LOGDIR" "$WCACHE" "$RSP_FIX" "$ZISK_FIX"
+
+log(){ echo "$(date +%H:%M:%S)  $*" >&2; }   # stderr: never pollutes $(tip) capture
+rpc(){ curl -s "$1" -X POST -H 'content-type: application/json' \
+         -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":$3}"; }
+tip(){  # current mainnet tip as decimal (retries on RPC hiccup — not a block-wait)
+  local r
+  while :; do
+    r=$(rpc "$ALCHEMY_URL" eth_blockNumber '[]' | python3 -c 'import sys,json;print(int(json.load(sys.stdin)["result"],16))' 2>/dev/null)
+    # Must be a plausible mainnet height. A blank/0/garbage value (e.g. an RPC error or
+    # an interrupted curl) would otherwise poison `next` and stride over junk blocks.
+    case "$r" in ''|*[!0-9]*) r= ;; esac
+    if [ -n "$r" ] && [ "$r" -gt 1000000 ]; then echo "$r"; return; fi
+    log "tip query bad/empty ('$r'), retrying in 5s…"; sleep 5
+  done
+}
+is_done(){ awk -F, -v b="$1" '$2==b && $4=="ok" && $6=="ok"{f=1} END{exit !f}' "$OUT" 2>/dev/null; }
+
+# ---------- setup ----------
+command -v cargo >/dev/null   || { echo "cargo not found"; exit 1; }
+command -v python3 >/dev/null || { echo "python3 not found"; exit 1; }
+
+log "building proxy (witness cache)…"
+( cd "$OPENVM_DIR" && cargo build -p openvm-rpc-proxy --release ) || { echo "proxy build failed"; exit 1; }
+log "building RSP (execution-witness / proxy path)…"
+( cd "$RSP_DIR" && cargo build --release --bin rsp --features execution-witness --target-dir target-ew ) \
+  || { echo "rsp (ew) build failed"; exit 1; }
+log "building RSP (getProof fallback)…"
+( cd "$RSP_DIR" && cargo build --release --bin rsp ) \
+  || { echo "rsp (basic) build failed"; exit 1; }
+[ -x "$RSP_EW_BIN" ]    || { echo "rsp ew binary missing: $RSP_EW_BIN"; exit 1; }
+[ -x "$RSP_BASIC_BIN" ] || { echo "rsp basic binary missing: $RSP_BASIC_BIN"; exit 1; }
+[ -x "$PROXY_BIN" ]     || { echo "proxy binary missing: $PROXY_BIN"; exit 1; }
+
+# ---------- start proxy if not already up ----------
+started_proxy=0; PROXY_PID=""
+if rpc "$PROXY_URL" eth_chainId '[]' | grep -q '"result"'; then
+  log "proxy already up on :$PROXY_PORT — reusing"
+else
+  log "starting proxy (nibbles=$NIBBLES — preimage precompute can take minutes)…"
+  "$PROXY_BIN" --rpc-url "$ALCHEMY_URL" --bind-address "127.0.0.1:$PROXY_PORT" \
+      --rpc-retry-cu "$RETRY_CU" --preimage-cache-nibbles "$NIBBLES" \
+      --witness-cache-dir "$WCACHE" > "$LOGDIR/proxy.log" 2>&1 &
+  PROXY_PID=$!; started_proxy=1
+  log "proxy pid=$PROXY_PID — waiting for readiness…"
+  until rpc "$PROXY_URL" eth_chainId '[]' | grep -q '"result"'; do
+    kill -0 "$PROXY_PID" 2>/dev/null || { echo "proxy died during startup:"; tail -30 "$LOGDIR/proxy.log"; exit 1; }
+    sleep 5
+  done
+  log "proxy ready."
+fi
+cleanup(){ [ "$started_proxy" = 1 ] && [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null; log "farm stopped."; }
+trap cleanup EXIT
+# INT/TERM must EXIT (a plain signal trap resumes the loop after the handler — that's
+# why Ctrl-C didn't stop it). exit 130 → fires the EXIT trap → cleanup runs once.
+trap 'echo >&2; log "interrupted — stopping…"; exit 130' INT TERM
+
+[ -f "$OUT" ] || echo "ts,block,kind,rsp,rsp_src,zisk,secs" > "$OUT"
+
+# Run RSP once with a given binary/rpc/cache. Prints ok|DIVERGED|FAIL; RSP output → logfile.
+#   ok       = exit 0 and no host mismatch warning (clean, valid witness)
+#   DIVERGED = exit 0 but a state-root/gas mismatch was warned (RSP_BENCH host patch) → bad witness
+#   FAIL     = non-zero exit (guest MismatchedStateRoot panic, crash, RPC error, …)
+run_rsp(){  # $1=block $2=binary $3=rpc $4=cachedir $5=logfile
+  if "$2" --block-number "$1" --chain-id 1 --rpc-url "$3" --cache-dir "$4" > "$5" 2>&1; then
+    grep -qiE 'state.?root mismatch|gas used mismatch' "$5" && echo DIVERGED || echo ok
+  else
+    echo FAIL
+  fi
+}
+
+# True if any of the given log files shows a transient network/proxy error.
+net_fail(){ grep -qiE "$NET_RE" "$@" 2>/dev/null; }
+
+# When BOTH backends fail, classify WHY by the getProof (basic) attempt — the decisive fallback
+# (EW is expected to under-collect on some blocks, so its MismatchedStateRoot mustn't mask the
+# real reason basic failed). Distinguishes a fixable size-limit and a transient from a real gap.
+fail_reason(){  # $1=block
+  local basic="$LOGDIR/rsp-basic-$1.log" ew="$LOGDIR/rsp-ew-$1.log"
+  if grep -qiE '413|payload reached size limit|size limit' "$basic" 2>/dev/null; then
+    echo toobig         # getProof request too large — now chunked in BasicRpcDb; re-run to pick up the fix
+  elif net_fail "$basic" "$ew"; then
+    echo rpc            # transient: network/proxy
+  elif grep -qiE 'MismatchedStateRoot|state.?root mismatch|gas used mismatch' "$basic" 2>/dev/null; then
+    echo gap            # getProof executed fully but still diverged → genuinely unbenchable
+  else
+    echo other
+  fi
+}
+
+# ---------- generate one block: ZisK (proxy, warms cache) then RSP (EW → getProof fallback) ----------
+gen_block(){
+  local b="$1" kind="$2" t0 rsp zisk src cache try
+  if is_done "$b"; then log "skip $b (already done)"; LAST_RSP=ok; return; fi
+  t0=$SECONDS
+
+  # 1) ZisK first: it always needs the proxy's debug_executionWitness, and building it here warms
+  #    the shared witness cache so RSP's EW attempt below is a cache hit (not a ~10-min cold build).
+  #    Retries on a transient network failure (a blip mid-build aborts the whole ~30-min build).
+  try=0
+  while :; do
+    log ">> $b ($kind) — ZisK (proxy)…"
+    if ( cd "$ROOT" && infra/zisk-infra/run gen-input GUEST=zisk-reth \
+           ZISK_ETH_DIR=vendor/zisk-eth-client BLOCK="$b" RPC_URL="$PROXY_URL" ) \
+         > "$LOGDIR/zisk-$b.log" 2>&1; then
+      zisk=ok
+      cp -f "$ROOT/guests/zisk-reth/inputs/1-$b.bin"   "$ZISK_FIX/1-$b.bin"   2>/dev/null \
+        || { log "WARN: ZisK witness not found for $b"; zisk=NOFILE; }
+      cp -f "$ROOT/guests/zisk-reth/inputs/1-$b.hints" "$ZISK_FIX/1-$b.hints" 2>/dev/null || true
+      break
+    fi
+    zisk=FAIL
+    # Retry only a TRANSIENT network failure — NOT a deterministic proxy build failure. A
+    # "Cannot find storage key preimage" (a storage-deletion orphan deeper than
+    # --preimage-cache-nibbles) fails identically on retry, so don't waste a ~3-min rebuild on it.
+    if [ "$try" -lt "$RETRY_RPC" ] && net_fail "$LOGDIR/zisk-$b.log" \
+       && ! grep -qiE 'cannot find storage key preimage' "$LOGDIR/proxy.log" 2>/dev/null; then
+      try=$((try+1)); log "ZisK $b: transient network failure — retry $try/$RETRY_RPC in ${RETRY_PAUSE}s…"
+      sleep "$RETRY_PAUSE"; continue
+    fi
+    grep -qiE 'cannot find storage key preimage' "$LOGDIR/proxy.log" 2>/dev/null \
+      && log "ZisK $b: proxy witness build failed (preimage/nibbles limit) — not retryable"
+    break
+  done
+
+  # 2) RSP with per-block fallback: proxy/EW first (cache hit); if it doesn't produce a clean
+  #    witness, try the SAME block via getProof — DIRECT to Alchemy (getProof needs no proxy;
+  #    going direct avoids the extra hop and the proxy's CU cap). Keep whichever validates.
+  #    Retries the whole pair on a transient network failure.
+  try=0
+  while :; do
+    log ">> $b ($kind) — RSP via proxy/EW…"
+    rsp=$(run_rsp "$b" "$RSP_EW_BIN" "$PROXY_URL" "$RSP_EW_CACHE" "$LOGDIR/rsp-ew-$b.log"); src=ew
+    if [ "$rsp" != ok ]; then
+      log ">> $b ($kind) — RSP/EW=$rsp → fallback getProof (direct)…"
+      rsp=$(run_rsp "$b" "$RSP_BASIC_BIN" "$ALCHEMY_URL" "$RSP_BASIC_CACHE" "$LOGDIR/rsp-basic-$b.log"); src=basic
+    fi
+    if [ "$rsp" = ok ]; then
+      [ "$src" = ew ] && cache="$RSP_EW_CACHE" || cache="$RSP_BASIC_CACHE"
+      cp -f "$cache/input/1/$b.bin" "$RSP_FIX/1-$b.bin" 2>/dev/null \
+        || { log "WARN: RSP witness not found for $b ($src)"; rsp=NOFILE; }
+      break
+    fi
+    # both backends failed → classify why
+    src=$(fail_reason "$b")     # rpc (transient) | gap (unbenchable) | other
+    if [ "$src" = rpc ] && [ "$try" -lt "$RETRY_RPC" ]; then
+      try=$((try+1)); log "RSP $b: transient network failure — retry $try/$RETRY_RPC in ${RETRY_PAUSE}s…"
+      sleep "$RETRY_PAUSE"; continue
+    fi
+    break
+  done
+
+  echo "$(date +%FT%T),$b,$kind,$rsp,$src,$zisk,$((SECONDS-t0))" >> "$OUT"
+  log "<< $b — zisk=$zisk rsp=$rsp($src)  ($((SECONDS-t0))s)"
+  LAST_RSP="$rsp"            # signal to the loop's consecutive-fail guard
+}
+
+# ---------- never-wait loop ----------
+if [ -n "$START_BLOCK" ]; then next="$START_BLOCK"; else next="$(tip)"; fi
+log "farm: next=$next stride=$STRIDE margin=$MARGIN  (out=$OUT)"
+count=0; fails=0; LAST_RSP=ok
+while :; do
+  safe=$(( $(tip) - MARGIN ))
+  if [ "$next" -le "$safe" ]; then
+    target="$next"; kind=stride; next=$(( next + STRIDE ))          # historical / caught up: stride
+  else
+    target="$safe"; kind=latest; next=$(( safe + STRIDE ))          # future not mined: prove latest, re-anchor
+  fi
+  gen_block "$target" "$kind"
+  # Consecutive-fail guard: a FAIL here means BOTH backends (EW and getProof) failed on the
+  # block. If that happens N times in a row it's systemic (real fork/version wall, dead proxy,
+  # network down) — bail rather than grind for minutes/block forever.
+  if [ "$LAST_RSP" = ok ]; then fails=0; else fails=$(( fails + 1 )); fi
+  if [ "$MAX_FAILS" -gt 0 ] && [ "$fails" -ge "$MAX_FAILS" ]; then
+    log "STOP: $fails consecutive RSP failures — likely a fork/version wall near block $target. Stopping."
+    break
+  fi
+  count=$((count+1))
+  if [ "$MAX_BLOCKS" -gt 0 ] && [ "$count" -ge "$MAX_BLOCKS" ]; then log "reached MAX_BLOCKS=$MAX_BLOCKS"; break; fi
+done
