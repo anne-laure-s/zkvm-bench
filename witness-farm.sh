@@ -72,9 +72,9 @@ tip(){  # current mainnet tip as decimal (retries on RPC hiccup — not a block-
 # NIB<M> rows fail the "M >= NIBBLES" test → the block is re-attempted at the deeper depth.
 is_done(){
   awk -F, -v b="$1" -v nib="${NIBBLES:-7}" '
-    $2==b && $4=="ok" {
-      if ($6=="ok") f=1
-      else if ($6 ~ /^NIB[0-9]+$/ && substr($6,4)+0 >= nib) f=1
+    $2==b {
+      if ($4=="ok" && $6=="ok") f=1                                # full ZisK+RSP pair collected
+      else if ($6 ~ /^NIB[0-9]+$/ && substr($6,4)+0 >= nib) f=1    # ZisK unbenchable at this depth → done (RSP skipped/irrelevant)
     }
     END{ exit !f }' "$OUT" 2>/dev/null
 }
@@ -224,40 +224,41 @@ gen_block(){
     break
   done
 
-  # 2) RSP with per-block fallback: proxy/EW first (cache hit); if it doesn't produce a clean
-  #    witness, try the SAME block via getProof — DIRECT to Alchemy (getProof needs no proxy;
-  #    going direct avoids the extra hop and the proxy's CU cap). Keep whichever validates.
-  #    Retries the whole pair on a transient network failure.
-  try=0
-  while :; do
-    # If ZisK just hit a preimage miss on the proxy for THIS block (zisk=NIB*), RSP/EW would
-    # fail identically — it consumes the same debug_executionWitness the proxy can't build. Skip
-    # the doomed ~20-min EW re-execution and go STRAIGHT to getProof (direct to Alchemy, no proxy).
-    if [ "${zisk#NIB}" != "$zisk" ]; then
-      log ">> $b ($kind) — RSP/EW skipped (ZisK hit preimage miss → EW can't build) → getProof (direct)…"
-      rsp=$(run_rsp "$b" "$RSP_BASIC_BIN" "$ALCHEMY_URL" "$RSP_BASIC_CACHE" "$LOGDIR/rsp-basic-$b.log"); src=basic
-    else
+  # 2) RSP — but ONLY if ZisK could build a witness. A NIB* block (proxy preimage miss at this
+  #    nibble depth) can never be built by ZisK, so a comparable ZisK+RSP benchmark pair is
+  #    impossible. Don't spend RSP's time on it (EW fails identically; getProof can be a ~20-min
+  #    storm) collecting a witness we can't compare — record rsp=skip and move on. is_done treats
+  #    the NIB block as done (regardless of RSP); a higher-NIBBLES second pass re-attempts it.
+  if [ "${zisk#NIB}" != "$zisk" ]; then
+    rsp=skip; src=nib
+    log ">> $b ($kind) — RSP skipped (ZisK unbenchable at nibbles=$NIBBLES: $zisk) — needs a higher-NIBBLES second pass"
+  else
+    # proxy/EW first (cache hit from the ZisK build above); if it doesn't produce a clean witness,
+    # try the SAME block via getProof — DIRECT to Alchemy (no proxy hop / CU cap). Keep whichever
+    # validates. Retries the whole pair on a transient network failure.
+    try=0
+    while :; do
       log ">> $b ($kind) — RSP via proxy/EW…"
       rsp=$(run_rsp "$b" "$RSP_EW_BIN" "$PROXY_URL" "$RSP_EW_CACHE" "$LOGDIR/rsp-ew-$b.log"); src=ew
       if [ "$rsp" != ok ]; then
         log ">> $b ($kind) — RSP/EW=$rsp → fallback getProof (direct)…"
         rsp=$(run_rsp "$b" "$RSP_BASIC_BIN" "$ALCHEMY_URL" "$RSP_BASIC_CACHE" "$LOGDIR/rsp-basic-$b.log"); src=basic
       fi
-    fi
-    if [ "$rsp" = ok ]; then
-      [ "$src" = ew ] && cache="$RSP_EW_CACHE" || cache="$RSP_BASIC_CACHE"
-      cp -f "$cache/input/1/$b.bin" "$RSP_FIX/1-$b.bin" 2>/dev/null \
-        || { log "WARN: RSP witness not found for $b ($src)"; rsp=NOFILE; }
+      if [ "$rsp" = ok ]; then
+        [ "$src" = ew ] && cache="$RSP_EW_CACHE" || cache="$RSP_BASIC_CACHE"
+        cp -f "$cache/input/1/$b.bin" "$RSP_FIX/1-$b.bin" 2>/dev/null \
+          || { log "WARN: RSP witness not found for $b ($src)"; rsp=NOFILE; }
+        break
+      fi
+      # both backends failed → classify why
+      src=$(fail_reason "$b")     # rpc (transient) | gap (unbenchable) | other
+      if [ "$src" = rpc ] && [ "$try" -lt "$RETRY_RPC" ]; then
+        try=$((try+1)); log "RSP $b: transient network failure — retry $try/$RETRY_RPC in ${RETRY_PAUSE}s…"
+        sleep "$RETRY_PAUSE"; continue
+      fi
       break
-    fi
-    # both backends failed → classify why
-    src=$(fail_reason "$b")     # rpc (transient) | gap (unbenchable) | other
-    if [ "$src" = rpc ] && [ "$try" -lt "$RETRY_RPC" ]; then
-      try=$((try+1)); log "RSP $b: transient network failure — retry $try/$RETRY_RPC in ${RETRY_PAUSE}s…"
-      sleep "$RETRY_PAUSE"; continue
-    fi
-    break
-  done
+    done
+  fi
 
   echo "$(date +%FT%T),$b,$kind,$rsp,$src,$zisk,$((SECONDS-t0))" >> "$OUT"
   log "<< $b — zisk=$zisk rsp=$rsp($src)  ($((SECONDS-t0))s)"
@@ -286,7 +287,10 @@ while :; do
   # Consecutive-fail guard: a FAIL here means BOTH backends (EW and getProof) failed on the
   # block. If that happens N times in a row it's systemic (real fork/version wall, dead proxy,
   # network down) — bail rather than grind for minutes/block forever.
-  if [ "$LAST_RSP" = ok ]; then fails=0; else fails=$(( fails + 1 )); fi
+  # A NIB skip (rsp=skip) is a deterministic classification, not a systemic failure — it proves the
+  # pipeline works (the proxy re-executed far enough to hit the preimage). Don't let it trip the
+  # wall. Only real RSP failures (FAIL/DIVERGED/NOFILE) count toward the consecutive-fail streak.
+  case "$LAST_RSP" in ok|skip) fails=0 ;; *) fails=$(( fails + 1 )) ;; esac
   if [ "$MAX_FAILS" -gt 0 ] && [ "$fails" -ge "$MAX_FAILS" ]; then
     log "STOP: $fails consecutive RSP failures — likely a fork/version wall near block $target. Stopping."
     break
