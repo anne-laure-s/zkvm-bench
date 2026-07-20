@@ -81,4 +81,4 @@ install zisk-eth-client     https://github.com/0xPolygonHermez/zisk-eth-client  
 echo
 echo "Vendors ready in $VENDOR/ (rsp, openvm-eth, zisk-eth-client)."
 echo "Next: run the farm (it builds what it needs), e.g.:"
-echo "  ALCHEMY_URL=https://eth-mainnet.g.alchemy.com/v2/<key> ./witness-farm.sh <block>"
+echo "  ALCHEMY_URL=https://eth-mainnet.g.alchemy.com/v2/<key> ./cli/witness-farm <block>"

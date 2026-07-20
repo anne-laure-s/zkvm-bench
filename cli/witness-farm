@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# witness-farm.sh — set up and run continuous RSP + ZisK witness generation.
+# cli/witness-farm — set up and run continuous RSP + ZisK witness generation.
 #
 #   Samples every STRIDE (default 50) blocks starting from `latest` (or a given block),
 #   going forward, and NEVER waits: if the next stride block isn't mined yet, it proves
@@ -12,15 +12,17 @@
 #   EW saves it) AND proxy under-collection (EW fails → getProof saves it).
 #
 # Usage:
-#   ALCHEMY_URL=https://eth-mainnet.g.alchemy.com/v2/<key> ./witness-farm.sh            # from latest
-#   ALCHEMY_URL=... ./witness-farm.sh 22500000                                          # from a block
-#   ALCHEMY_URL=... STRIDE=100 MARGIN=12 MAX_BLOCKS=200 ./witness-farm.sh               # tuned
+#   ALCHEMY_URL=https://eth-mainnet.g.alchemy.com/v2/<key> ./cli/witness-farm            # from latest
+#   ALCHEMY_URL=... ./cli/witness-farm 22500000                                          # from a block
+#   ALCHEMY_URL=... STRIDE=100 MARGIN=12 MAX_BLOCKS=200 ./cli/witness-farm               # tuned
 #
 # Env knobs: STRIDE MARGIN PROXY_PORT NIBBLES RETRY_CU RSP_RPC_CU MAX_BLOCKS MAX_FAILS RETRY_RPC RETRY_PAUSE
-# Must be run from the repo root (it lives there).
+#            PROXY_START_TRIES RSP_SKIP_EXEC
+# Lives in cli/ but writes its outputs (witness-farm.csv, wcache/, witness-farm-logs/) to the repo
+# root; run it from the repo root: ./cli/witness-farm
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # repo root (this script lives in cli/)
 : "${ALCHEMY_URL:?export ALCHEMY_URL=https://eth-mainnet.g.alchemy.com/v2/<key>}"
 STRIDE="${STRIDE:-50}"
 MARGIN="${MARGIN:-12}"                       # reorg safety when proving `latest`
