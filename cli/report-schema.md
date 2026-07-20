@@ -27,8 +27,10 @@ The `zkvm` / `guest` / `block` core is injected by `./run execute` (the dispatch
 runners are guest-agnostic (they only see an ELF + input, or a block number).
 
 ## 2. Prove report — `report.json`
-Written into the run record (`results/…/report.json`) by `./run prove`
-/ `cluster*/submit.sh`. **Common core** + backend extras.
+Written into the run record (`results/…/report.json`) by `./run prove` / `./run prove-cluster`
+(the uniform cluster-prove verb `cli/prove-farm` drives) / `cluster*/submit.sh`. **Common core** +
+backend extras. The run record also carries the **proof** (`proof.bin` / `segments/`) and a detailed
+**proving log** (`prove.log`, or `worker-*.log` + `aggregate.log` for OpenVM).
 
 | field | type | emitted by | meaning |
 |-------|------|-----------|---------|

@@ -91,6 +91,13 @@ prove_remote() {
   local remote_runner="${REMOTE_RUNNER:-sp1-runner}"
   local prover_prefix=""
   [[ -n "${REMOTE_PROVER:-}" ]] && prover_prefix="SP1_PROVER=$REMOTE_PROVER "
+  # Network backend (the self-hosted 16-GPU cluster): the box runner needs the gateway URL + a key
+  # (AUTH_MODE=none, but the SDK requires one to exist) — mirror cluster-native/submit.sh. Defaults
+  # assume the gateway is local to the box (localhost:50061); override NETWORK_RPC_URL for another.
+  if [[ "${REMOTE_PROVER:-}" == network ]]; then
+    prover_prefix+="NETWORK_RPC_URL=${NETWORK_RPC_URL:-http://localhost:50061} "
+    prover_prefix+="NETWORK_PRIVATE_KEY=${NETWORK_PRIVATE_KEY:-0x0000000000000000000000000000000000000000000000000000000000000001} "
+  fi
   local ssh=(ssh -p "$port" "$REMOTE")
 
   local elf_name; elf_name="$(basename "$ELF")"

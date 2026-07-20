@@ -18,8 +18,12 @@
 #
 # Consumers (explicit paths, no GUEST):
 #   ./run execute ELF=<path> INPUT=<path>            (local CPU run -> rich report + pv)
-#   ./run prove   ELF=<path> INPUT=<path> REMOTE=user@host [PORT=p] [MODE=m]
+#   ./run prove   ELF=<path> INPUT=<path> REMOTE=user@host [PORT=p] [MODE=m]   (single-box: SP1_PROVER default cuda)
 #   ./run verify  ELF=<path> INPUT=<path> PROOF=<path>
+#
+# Uniform cluster-prove (guest-aware; driven by cli/prove-farm — resolves the guest's ELF+witness,
+# forces the NETWORK backend = 16-GPU gateway, fetches back proof + prove.log + report.json):
+#   ./run prove-cluster GUEST=<name> BLOCK=<n> REMOTE=user@host [PORT=p] [MODE=m] [WITNESS=<path>]
 #
 # Examples:
 #   ./run build-elf GUEST=fibonacci
@@ -109,6 +113,19 @@ case "$cmd" in
   prove)
     ELF="$(abspath "${ELF:?set ELF=path to the guest ELF}")"
     INPUT="$(abspath "${INPUT:?set INPUT=path to the input file}")"
+    prove_remote
+    ;;
+  prove-cluster)
+    # Uniform cluster-prove verb (driven by cli/prove-farm). Resolve this guest's ELF + witness
+    # from GUEST/BLOCK, force the NETWORK backend (the 16-GPU gateway, not single-box cuda that
+    # plain `prove` defaults to), then prove + fetch the run record via prove_remote.
+    : "${GUEST:?set GUEST=<name>}" "${BLOCK:?set BLOCK=<n>}"
+    tag="${CHAIN_ID:-1}-$BLOCK"
+    ELF="$GUESTS_DIR/$GUEST/$GUEST.elf"
+    INPUT="${WITNESS:-$GUESTS_DIR/$GUEST/fixtures/$tag.bin}"
+    [[ -f "$INPUT" ]] || INPUT="$GUESTS_DIR/$GUEST/inputs/$tag.bin"
+    ELF="$(abspath "$ELF")"; INPUT="$(abspath "$INPUT")"
+    REMOTE_PROVER="${REMOTE_PROVER:-network}"   # → cluster via the network-gateway
     prove_remote
     ;;
   verify)

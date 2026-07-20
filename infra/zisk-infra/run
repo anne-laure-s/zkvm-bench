@@ -29,6 +29,9 @@
 #   ./run execute ELF=<path> INPUT=<path>            (local emulation -> report + pv)
 #   ./run prove   ELF=<path> INPUT=<path> REMOTE=user@host [PORT=p] [MODE=m] [HINTS=<path>]
 #   ./run verify  ELF=<path> INPUT=<path> PROOF=<path>
+#   ./run prove-cluster GUEST=<name> BLOCK=<n> REMOTE=user@host [PORT=p] [MODE=m] [WITNESS=<path>]
+#       (uniform cluster-prove — resolves the guest's ELF+witness+sibling .hints; prove_remote's
+#        default backend is the coordinator/cluster; driven by cli/prove-farm)
 #
 # Examples:
 #   ./run build-elf GUEST=zisk-reth ZISK_ETH_DIR=../../vendor/zisk-eth-client
@@ -120,6 +123,20 @@ case "$cmd" in
   prove)
     ELF="$(abspath "${ELF:?set ELF=path to the guest ELF}")"
     INPUT="$(abspath "${INPUT:?set INPUT=path to the input file}")"
+    [[ -n "${HINTS:-}" ]] && HINTS="$(abspath "$HINTS")"
+    prove_remote
+    ;;
+  prove-cluster)
+    # Uniform cluster-prove verb (driven by cli/prove-farm). Resolve this guest's ELF + witness
+    # (+ sibling .hints) from GUEST/BLOCK, then prove + fetch via prove_remote — whose default
+    # backend is already the coordinator (cluster), not a single local prover.
+    : "${GUEST:?set GUEST=<name>}" "${BLOCK:?set BLOCK=<n>}"
+    tag="${CHAIN_ID:-1}-$BLOCK"
+    ELF="$GUESTS_DIR/$GUEST/$GUEST.elf"
+    INPUT="${WITNESS:-$GUESTS_DIR/$GUEST/fixtures/$tag.bin}"
+    [[ -f "$INPUT" ]] || INPUT="$GUESTS_DIR/$GUEST/inputs/$tag.bin"
+    ELF="$(abspath "$ELF")"; INPUT="$(abspath "$INPUT")"
+    [[ -z "${HINTS:-}" && -f "${INPUT%.bin}.hints" ]] && HINTS="${INPUT%.bin}.hints"
     [[ -n "${HINTS:-}" ]] && HINTS="$(abspath "$HINTS")"
     prove_remote
     ;;

@@ -28,7 +28,7 @@ STARK) — not that the raw work-units are interchangeable. The shared report co
 | **`guests/monad/`** | The special **Monad** guest — block-replay ELFs (SP1 + ZisK) + `ev.sh` (execute-and-verify) + witnesses, for the cross-zkVM **execution**-time comparison. See `guests/monad/README.md`. |
 | **`profiling/`** | Execution-analysis tools: **`hotspots.py`** (prover-agnostic hotspot profiler — *where* the cost goes) and **`results.py`** (cross-zkVM work-unit report → `results/results.html` — *how much* work per block). |
 | **`vendor/`** | Upstream clones (Axiom / Succinct / Polygon): `openvm-eth`, `rsp`, `zisk-eth-client` — the witness/guest **sources** from which the ELFs are built. Not this project's code; do not reorganize. |
-| **`cli/`** | Guest-agnostic driver CLIs, run from the repo root — `cli/gen-elf` · `cli/gen-witness` · `cli/execute` (each `--guest <name>`, `--list`; delegate to the guest's stack — `zisk` witness and `monad-*` return a clear error). Also holds `guests.registry` + `reg.sh`, the single source of truth (each guest → stack, params, per-capability mode `elf`/`witness`/`exec`; add a guest = add a row), and `report-schema.md`, the shared `report.json` contract every runner emits. |
+| **`cli/`** | Guest-agnostic driver CLIs, run from the repo root — `cli/gen-elf` · `cli/gen-witness` · `cli/execute` · `cli/prove-farm` (each `--guest <name>`, `--list`; delegate to the guest's stack — `zisk` witness and `monad-*` return a clear error). Plus the two bulk **farm** drivers `cli/witness-farm` (collect witnesses) → `cli/prove-farm` (prove them on the cluster, via the uniform `run prove-cluster` verb). Also holds `guests.registry` + `reg.sh`, the single source of truth (each guest → stack, params, per-capability mode `elf`/`witness`/`exec`; add a guest = add a row), and `report-schema.md`, the shared `report.json` contract every runner emits. |
 
 This is a single git repo. The only nested git repos are the upstream clones under `vendor/` (each
 keeps its own `.git`, and `vendor/` is git-ignored). Build outputs and large regenerable inputs are
@@ -72,8 +72,14 @@ Or drive any guest from the repo root via `cli/` (delegates to its stack; `--lis
 cli/gen-elf     --guest rsp                                            # build guests/rsp/rsp.elf
 cli/gen-witness --guest rsp  --block 20000000 --rpc <archive-rpc>      # -> guests/rsp/inputs/
 cli/execute     --guest rsp  --input guests/rsp/inputs/1-20000000.bin  # local cycle/step count
+cli/prove-farm  --guest rsp  --remote user@box --port p 20000000       # prove on the cluster -> proof + logs + report
 cli/gen-witness --guest zisk --block 20000000                         # error: needs a debug node (see message)
 ```
+
+For **bulk** runs, the two farm drivers pair up: `cli/witness-farm` continuously collects RSP + ZisK
+witnesses, and `cli/prove-farm --guest <g> --remote user@box` batch-proves them on the cluster — each
+block via the uniform `infra/<stack>/run prove-cluster` verb (proof + detailed log + `report.json`).
+See [`cli/README.md`](cli/README.md#farming-collect--prove).
 
 See each `infra/<stack>-infra/README.md` for the full producer/consumer pipeline and the
 `cluster/` GPU-proving flows.

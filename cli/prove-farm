@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+#
+# prove-farm — batch-prove collected witnesses on a remote cluster, for ANY guest/stack.
+# The prove-side analog of cli/execute: pick a guest (guests.registry, via reg.sh) and, per block,
+# loop the UNIFORM verb `infra/<stack>/run prove-cluster GUEST=<g> BLOCK=<n> REMOTE=...`. Each stack
+# implements that verb behind one contract (resolve its own elf/witness, drive ITS cluster backend,
+# fetch back a run record) — so this driver has ZERO per-stack branching. Adding a stack = a
+# guests.registry row + a `prove-cluster` verb, nothing here.
+#
+# The contract each `run prove-cluster` must satisfy (see cli/report-schema.md):
+#   fetches to  infra/<stack>/results/<tag>/<mode>-<run>/  a run record with
+#     proof.bin (or segments/) · a detailed proving log · report.json  (+ pv/vkey/env best-effort)
+#   exit 0 iff the proof was produced AND fetched back.
+#
+# The cluster stays a pure proving service: `run prove-cluster` (via prove_remote) does the ssh/scp;
+# NOTHING here runs on the box. Bring up the box + runner/gateway via that stack's cluster*/ scripts.
+#
+#   ./prove-farm --guest rsp    --remote root@ssh.vast.ai --port 12345 [--mode prove-compressed] [BLOCKS...]
+#   ./prove-farm --guest zisk   --remote root@ssh.vast.ai --port 12345 [BLOCKS...]
+#   ./prove-farm --guest openvm --remote root@ssh.vast.ai --port 12345 --num-gpus 8 20000000
+#   ./prove-farm --list
+#
+# With no BLOCKS, proves every witness found for the guest (guests/<rung>/fixtures|inputs/<tag>.bin).
+# Outputs (repo root, gitignored): prove-farm.csv, prove-farm-logs/. Run records land under the
+# stack's own results/ (written by run prove-cluster), same as a manual `run prove-cluster`.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"                  # repo root (cli/ lives one level down)
+source "$HERE/reg.sh"
+
+die(){ echo "prove-farm: $*" >&2; exit 2; }
+log(){ printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
+usage(){ sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit "${1:-0}"; }
+
+GUEST="rsp"; REMOTE=""; PORT=""; MODE=""; NUM_GPUS=""; WITNESS_DIR=""; CHAIN_ID="1"; MAX_BLOCKS=0
+BLOCKS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --guest)       GUEST="${2:?}"; shift 2 ;;
+    --remote)      REMOTE="${2:?}"; shift 2 ;;
+    --port)        PORT="${2:?}"; shift 2 ;;
+    --mode)        MODE="${2:?}"; shift 2 ;;
+    --num-gpus)    NUM_GPUS="${2:?}"; shift 2 ;;
+    --witness-dir) WITNESS_DIR="${2:?}"; shift 2 ;;
+    --chain-id)    CHAIN_ID="${2:?}"; shift 2 ;;
+    --max-blocks)  MAX_BLOCKS="${2:?}"; shift 2 ;;
+    --list)        echo "guests (guests.registry):"; reg_list; exit 0 ;;
+    -h|--help)     usage 0 ;;
+    -*)            die "unknown argument '$1' (see --help)" ;;
+    *)             BLOCKS+=("$1"); shift ;;
+  esac
+done
+
+reg_lookup "$GUEST" || die "unknown guest '$GUEST' (run --list to see them)."
+[ -n "$REMOTE" ] || die "--remote user@host required (the cluster box; run prove-cluster submits there)."
+INFRA="$ROOT/$REG_INFRA"
+[ -x "$INFRA/run" ] || die "no stack dispatcher at $INFRA/run for guest '$GUEST'."
+[ "$REG_EXEC" = batch ] && die "$GUEST ($REG_DESC): batch guests (Monad) prove via guests/monad/, not here."
+
+OUT="$ROOT/prove-farm.csv"
+LOGDIR="$ROOT/prove-farm-logs"; mkdir -p "$LOGDIR"
+[ -f "$OUT" ] || echo "ts,block,guest,mode,status,prove_secs,total_secs,proof_bytes,run_dir" > "$OUT"
+trap 'echo >&2; log "interrupted — stopping…"; exit 130' INT TERM
+
+# Already proven OK for this block+guest? (re-runs skip successes, retry FAILs / new blocks)
+is_proven(){ awk -F, -v b="$1" -v g="$GUEST" '$2==b && $3==g && $5=="ok"{f=1} END{exit !f}' "$OUT" 2>/dev/null; }
+
+# report.json (shared prove contract) -> "prove_secs<TAB>total_secs<TAB>proof_bytes" (jq if present, else grep).
+parse_report(){
+  local f="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '[.prove_secs, .total_secs, .proof_bytes] | map(. // "") | @tsv' "$f" 2>/dev/null
+  else
+    local ps ts pb
+    ps=$(grep -oE '"prove_secs"[[:space:]]*:[[:space:]]*[0-9.]+' "$f" 2>/dev/null | grep -oE '[0-9.]+$')
+    ts=$(grep -oE '"total_secs"[[:space:]]*:[[:space:]]*[0-9.]+' "$f" 2>/dev/null | grep -oE '[0-9.]+$')
+    pb=$(grep -oE '"proof_bytes"[[:space:]]*:[[:space:]]*[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+$')
+    printf '%s\t%s\t%s\n' "$ps" "$ts" "$pb"
+  fi
+}
+
+# Witness dir (for block auto-discovery): farm writes fixtures/, gen-input writes inputs/.
+WDIR="$WITNESS_DIR"
+if [ -z "$WDIR" ]; then
+  for d in "$ROOT/guests/$REG_RUNG/fixtures" "$ROOT/guests/$REG_RUNG/inputs"; do
+    [ -d "$d" ] && { WDIR="$d"; break; }
+  done
+  WDIR="${WDIR:-$ROOT/guests/$REG_RUNG/fixtures}"
+fi
+
+# Blocks: explicit args, else every witness tag in WDIR (<chain>-<block>.bin).
+if [ "${#BLOCKS[@]}" -eq 0 ]; then
+  while IFS= read -r bn; do [ -n "$bn" ] && BLOCKS+=("$bn"); done < <(
+    find "$WDIR" -maxdepth 1 -name "$CHAIN_ID-*.bin" 2>/dev/null \
+      | sed -E "s|.*/$CHAIN_ID-([0-9]+)\.bin\$|\1|" | grep -E '^[0-9]+$' | sort -un)
+fi
+[ "${#BLOCKS[@]}" -gt 0 ] || die "no blocks given and no witnesses ($CHAIN_ID-<block>.bin) in $WDIR."
+
+log "prove-farm: guest=$GUEST ($REG_DESC) stack=$REG_INFRA remote=$REMOTE mode=${MODE:-<default>}  (out=$OUT)"
+count=0
+for b in "${BLOCKS[@]}"; do
+  if is_proven "$b"; then log "skip $b (already proven)"; continue; fi
+  tag="$CHAIN_ID-$b"
+  plog="$LOGDIR/prove-$GUEST-$b.log"
+  ref="$LOGDIR/.ref-$b"; : > "$ref"          # mtime marker to locate the record this run produces
+  t0=$SECONDS
+  log ">> prove $b ($GUEST) → $REMOTE"
+
+  # ONE uniform call — the stack's prove-cluster resolves its own artifacts + drives its cluster.
+  ( cd "$INFRA" && ./run prove-cluster GUEST="$REG_RUNG" BLOCK="$b" CHAIN_ID="$CHAIN_ID" REMOTE="$REMOTE" \
+      ${PORT:+PORT="$PORT"} ${MODE:+MODE="$MODE"} ${NUM_GPUS:+NUM_GPUS="$NUM_GPUS"} \
+      ${WITNESS_DIR:+WITNESS="$WITNESS_DIR/$tag.bin"} ) > "$plog" 2>&1
+  rc=$?
+
+  # Locate the run record (fetched back to the stack's results/ by run prove-cluster): newest
+  # report.json under results/ that mentions the tag and is newer than our marker.
+  rep="$(find "$INFRA/results" -path "*$tag*" -name report.json -newer "$ref" 2>/dev/null | head -n1)"
+  [ -z "$rep" ] && rep="$(find "$INFRA/results" -name report.json -newer "$ref" 2>/dev/null | head -n1)"
+  rm -f "$ref"
+  run_dir="${rep%/report.json}"
+
+  # Require the PROOF, not just the report (a run record must carry the proof + detailed logs).
+  proof=""; [ -n "$run_dir" ] && { for p in "$run_dir/proof.bin" "$run_dir"/segments; do [ -e "$p" ] && { proof="$p"; break; }; done; }
+
+  if [ "$rc" = 0 ] && [ -n "$rep" ] && [ -n "$proof" ]; then
+    IFS=$'\t' read -r ps ts pb < <(parse_report "$rep")
+    echo "$(date +%FT%T),$b,$GUEST,${MODE:-},ok,${ps:-},${ts:-},${pb:-},$run_dir" >> "$OUT"
+    log "<< $b ok — prove=${ps:-?}s total=${ts:-?}s proof=${pb:-?}B  record=$run_dir  (wall $((SECONDS-t0))s)"
+  else
+    reason="rc=$rc"; [ -n "$rep" ] || reason="$reason no-report"; [ -n "$proof" ] || reason="$reason no-proof"
+    echo "$(date +%FT%T),$b,$GUEST,${MODE:-},FAIL,,,,${run_dir:-}" >> "$OUT"
+    log "<< $b FAIL ($reason) — see $plog  (wall $((SECONDS-t0))s)"
+  fi
+
+  count=$((count+1))
+  if [ "$MAX_BLOCKS" -gt 0 ] && [ "$count" -ge "$MAX_BLOCKS" ]; then log "reached --max-blocks=$MAX_BLOCKS"; break; fi
+done
+log "prove-farm: done ($count block(s) this run)."

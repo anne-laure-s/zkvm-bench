@@ -32,6 +32,8 @@
 # Consumers (block- or path-based, no GUEST needed beyond defaults):
 #   ./run execute BLOCK=<n> [CHAIN_ID=1] [RPC_URL=…]          (local emulation -> cycles)
 #   ./run prove   BLOCK=<n> REMOTE=user@host [PORT=p] [NUM_GPUS=8] [REMOTE_INFRA=…] [RSYNC_CACHE=1]
+#   ./run prove-cluster GUEST=<name> BLOCK=<n> REMOTE=user@host [PORT=p] [NUM_GPUS=k]
+#       (uniform cluster-prove alias of `prove` — block-based, already multi-GPU; driven by cli/prove-farm)
 #   ./run verify  PROOF=<path>                                (cryptographic verify)
 #
 # Examples:
@@ -115,6 +117,13 @@ case "$cmd" in
     execute_local
     ;;
   prove)
+    : "${BLOCK:?set BLOCK=<block number>}"
+    prove_remote
+    ;;
+  prove-cluster)
+    # Uniform cluster-prove verb (driven by cli/prove-farm). OpenVM is block-based: prove_remote
+    # mints the witness on the box from BLOCK and already fans out across the box's GPUs (the
+    # cluster). GUEST is accepted for interface uniformity but not needed here.
     : "${BLOCK:?set BLOCK=<block number>}"
     prove_remote
     ;;

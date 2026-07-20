@@ -45,6 +45,11 @@ profiling/results/
 /witness-farm-logs/
 /witness-farm.csv
 
+# ── cli/prove-farm outputs (the driver is tracked; its proof records + logs are not) ───────────
+/prove-runs/
+/prove-farm-logs/
+/prove-farm.csv
+
 # ── Python / OS ──────────────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
