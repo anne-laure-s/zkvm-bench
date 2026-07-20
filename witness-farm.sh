@@ -32,6 +32,7 @@ MAX_BLOCKS="${MAX_BLOCKS:-0}"                 # 0 = forever
 MAX_FAILS="${MAX_FAILS:-5}"                   # stop after N consecutive RSP failures (fork/version wall); 0 = never
 RETRY_RPC="${RETRY_RPC:-1}"                   # per-guest retries on a TRANSIENT network failure; 0 = off
 RETRY_PAUSE="${RETRY_PAUSE:-30}"              # seconds to wait before a network retry
+PROXY_START_TRIES="${PROXY_START_TRIES:-5}"   # relaunch the proxy this many times if it dies on a transient net/DNS blip at startup
 RSP_RPC_CU="${RSP_RPC_CU:-400}"; export RSP_RPC_CU   # RSP self-throttle (CU/s); was hardcoded 100. getProof fallback goes direct to Alchemy so it isn't re-capped by the proxy.
 START_BLOCK="${1:-${START_BLOCK:-}}"          # positional $1 wins, else START_BLOCK env, else latest
 # Patterns that mean "transient network/proxy failure" (worth retrying) rather than a real gap.
@@ -65,7 +66,18 @@ tip(){  # current mainnet tip as decimal (retries on RPC hiccup — not a block-
     log "tip query bad/empty ('$r'), retrying in 5s…"; sleep 5
   done
 }
-is_done(){ awk -F, -v b="$1" '$2==b && $4=="ok" && $6=="ok"{f=1} END{exit !f}' "$OUT" 2>/dev/null; }
+# A block counts as done (skip it) when RSP is ok AND ZisK is either ok, or a deterministic
+# preimage/nibbles failure recorded at a depth >= the CURRENT NIBBLES (re-running at the
+# same-or-shallower depth fails identically). Bumping NIBBLES for a second pass makes those
+# NIB<M> rows fail the "M >= NIBBLES" test → the block is re-attempted at the deeper depth.
+is_done(){
+  awk -F, -v b="$1" -v nib="${NIBBLES:-7}" '
+    $2==b && $4=="ok" {
+      if ($6=="ok") f=1
+      else if ($6 ~ /^NIB[0-9]+$/ && substr($6,4)+0 >= nib) f=1
+    }
+    END{ exit !f }' "$OUT" 2>/dev/null
+}
 
 # ---------- setup ----------
 command -v cargo >/dev/null   || { echo "cargo not found"; exit 1; }
@@ -89,14 +101,28 @@ if rpc "$PROXY_URL" eth_chainId '[]' | grep -q '"result"'; then
   log "proxy already up on :$PROXY_PORT — reusing"
 else
   log "starting proxy (nibbles=$NIBBLES — preimage precompute can take minutes)…"
-  "$PROXY_BIN" --rpc-url "$ALCHEMY_URL" --bind-address "127.0.0.1:$PROXY_PORT" \
-      --rpc-retry-cu "$RETRY_CU" --preimage-cache-nibbles "$NIBBLES" \
-      --witness-cache-dir "$WCACHE" > "$LOGDIR/proxy.log" 2>&1 &
-  PROXY_PID=$!; started_proxy=1
-  log "proxy pid=$PROXY_PID — waiting for readiness…"
-  until rpc "$PROXY_URL" eth_chainId '[]' | grep -q '"result"'; do
-    kill -0 "$PROXY_PID" 2>/dev/null || { echo "proxy died during startup:"; tail -30 "$LOGDIR/proxy.log"; exit 1; }
-    sleep 5
+  # The proxy does a one-shot eth_chainId at startup and EXITS if it fails, so a single
+  # transient DNS/network blip at launch is otherwise fatal. Relaunch up to
+  # PROXY_START_TRIES times when the death log looks transient (NET_RE); bail fast on a
+  # real config error (bad URL, key, bind). net_fail() isn't defined yet here → grep NET_RE inline.
+  try=0
+  while :; do
+    try=$((try+1))
+    "$PROXY_BIN" --rpc-url "$ALCHEMY_URL" --bind-address "127.0.0.1:$PROXY_PORT" \
+        --rpc-retry-cu "$RETRY_CU" --preimage-cache-nibbles "$NIBBLES" \
+        --witness-cache-dir "$WCACHE" > "$LOGDIR/proxy.log" 2>&1 &
+    PROXY_PID=$!; started_proxy=1
+    log "proxy pid=$PROXY_PID (attempt $try/$PROXY_START_TRIES) — waiting for readiness…"
+    while ! rpc "$PROXY_URL" eth_chainId '[]' | grep -q '"result"'; do
+      kill -0 "$PROXY_PID" 2>/dev/null && { sleep 5; continue; }
+      # process is gone before it became ready → transient blip (retry) vs real error (fatal)
+      if [ "$try" -lt "$PROXY_START_TRIES" ] && grep -qiE "$NET_RE" "$LOGDIR/proxy.log"; then
+        log "proxy died on a transient network/DNS blip — retrying in ${RETRY_PAUSE}s…"; tail -3 "$LOGDIR/proxy.log" >&2
+        sleep "$RETRY_PAUSE"; continue 2   # relaunch (outer while)
+      fi
+      echo "proxy died during startup:"; tail -30 "$LOGDIR/proxy.log"; exit 1
+    done
+    break   # became ready
   done
   log "proxy ready."
 fi
@@ -113,8 +139,20 @@ trap 'echo >&2; log "interrupted — stopping…"; exit 130' INT TERM
 #   DIVERGED = exit 0 but a state-root/gas mismatch was warned (RSP_BENCH host patch) → bad witness
 #   FAIL     = non-zero exit (guest MismatchedStateRoot panic, crash, RPC error, …)
 run_rsp(){  # $1=block $2=binary $3=rpc $4=cachedir $5=logfile
-  if "$2" --block-number "$1" --chain-id 1 --rpc-url "$3" --cache-dir "$4" > "$5" 2>&1; then
+  # The in-zkVM re-execution (~8s) validates the witness against the actual GUEST program
+  # (re-executes statelessly, re-checks the state root). Gas/state-root divergences are ALSO
+  # caught host-side (warnings → the DIVERGED grep below) regardless, but the zkVM pass is the
+  # only check against the proven program itself — so KEEP IT BY DEFAULT. Set RSP_SKIP_EXEC=1
+  # to skip it (pure witness collection, trading guest-side validation for ~8s/block). Falls
+  # back gracefully if the binary predates the flag (else every block would FAIL on "unexpected argument").
+  local skip=""; [ "${RSP_SKIP_EXEC:-0}" = 1 ] && skip="--skip-client-execution"
+  if "$2" --block-number "$1" --chain-id 1 --rpc-url "$3" --cache-dir "$4" $skip > "$5" 2>&1; then
     grep -qiE 'state.?root mismatch|gas used mismatch' "$5" && echo DIVERGED || echo ok
+  elif [ -n "$skip" ] && grep -qiE 'unexpected argument|unrecognized subcommand|--skip-client-execution' "$5"; then
+    # old binary without the flag → retry without it (no speedup, but not broken)
+    if "$2" --block-number "$1" --chain-id 1 --rpc-url "$3" --cache-dir "$4" > "$5" 2>&1; then
+      grep -qiE 'state.?root mismatch|gas used mismatch' "$5" && echo DIVERGED || echo ok
+    else echo FAIL; fi
   else
     echo FAIL
   fi
@@ -128,8 +166,10 @@ net_fail(){ grep -qiE "$NET_RE" "$@" 2>/dev/null; }
 # real reason basic failed). Distinguishes a fixable size-limit and a transient from a real gap.
 fail_reason(){  # $1=block
   local basic="$LOGDIR/rsp-basic-$1.log" ew="$LOGDIR/rsp-ew-$1.log"
-  if grep -qiE '413|payload reached size limit|size limit' "$basic" 2>/dev/null; then
-    echo toobig         # getProof request too large — now chunked in BasicRpcDb; re-run to pick up the fix
+  if grep -qiE 'BodyOmmersHashDiff|OmmersHash|block is invalid' "$basic" 2>/dev/null; then
+    echo premerge       # pre-Merge (PoW) block with UNCLES — the stateless witness omits ommers → invalid
+  elif grep -qiE 'HTTP error 413|payload reached size limit|413 with body' "$basic" 2>/dev/null; then
+    echo toobig         # getProof request too large (specific patterns; bare "413" matches hex in hashes)
   elif net_fail "$basic" "$ew"; then
     echo rpc            # transient: network/proxy
   elif grep -qiE 'MismatchedStateRoot|state.?root mismatch|gas used mismatch' "$basic" 2>/dev/null; then
@@ -151,6 +191,10 @@ gen_block(){
   try=0
   while :; do
     log ">> $b ($kind) — ZisK (proxy)…"
+    # Snapshot the shared proxy.log length so the preimage check below is scoped to THIS
+    # block's proxy activity. proxy.log is shared across every block of the run; grepping the
+    # whole file would let a stale "preimage" line from an earlier block misclassify this one.
+    plog0=$(wc -c < "$LOGDIR/proxy.log" 2>/dev/null || echo 0); plog0=${plog0//[^0-9]/}; plog0=${plog0:-0}
     if ( cd "$ROOT" && infra/zisk-infra/run gen-input GUEST=zisk-reth \
            ZISK_ETH_DIR=vendor/zisk-eth-client BLOCK="$b" RPC_URL="$PROXY_URL" ) \
          > "$LOGDIR/zisk-$b.log" 2>&1; then
@@ -160,17 +204,23 @@ gen_block(){
       cp -f "$ROOT/guests/zisk-reth/inputs/1-$b.hints" "$ZISK_FIX/1-$b.hints" 2>/dev/null || true
       break
     fi
+    # Deterministic preimage/nibbles failure? The proxy reports "cannot find storage key
+    # preimage" (a storage-deletion orphan deeper than --preimage-cache-nibbles $NIBBLES) when
+    # it can't build the EW. ZisK has no getProof fallback, so it can NEVER build this witness at
+    # this depth → mark zisk=NIB<NIBBLES> (not plain FAIL). is_done then skips the block at the
+    # current depth but re-attempts it on a second pass run with a higher NIBBLES.
+    if tail -c "+$((plog0 + 1))" "$LOGDIR/proxy.log" 2>/dev/null \
+         | grep -qiE 'cannot find storage key preimage'; then
+      zisk="NIB${NIBBLES}"
+      log "ZisK $b: proxy witness build failed (preimage miss at nibbles=$NIBBLES) — marked $zisk; needs a higher-NIBBLES second pass"
+      break
+    fi
     zisk=FAIL
-    # Retry only a TRANSIENT network failure — NOT a deterministic proxy build failure. A
-    # "Cannot find storage key preimage" (a storage-deletion orphan deeper than
-    # --preimage-cache-nibbles) fails identically on retry, so don't waste a ~3-min rebuild on it.
-    if [ "$try" -lt "$RETRY_RPC" ] && net_fail "$LOGDIR/zisk-$b.log" \
-       && ! grep -qiE 'cannot find storage key preimage' "$LOGDIR/proxy.log" 2>/dev/null; then
+    # Otherwise retry only a TRANSIENT network failure (a blip mid-build aborts the whole build).
+    if [ "$try" -lt "$RETRY_RPC" ] && net_fail "$LOGDIR/zisk-$b.log"; then
       try=$((try+1)); log "ZisK $b: transient network failure — retry $try/$RETRY_RPC in ${RETRY_PAUSE}s…"
       sleep "$RETRY_PAUSE"; continue
     fi
-    grep -qiE 'cannot find storage key preimage' "$LOGDIR/proxy.log" 2>/dev/null \
-      && log "ZisK $b: proxy witness build failed (preimage/nibbles limit) — not retryable"
     break
   done
 
@@ -180,11 +230,19 @@ gen_block(){
   #    Retries the whole pair on a transient network failure.
   try=0
   while :; do
-    log ">> $b ($kind) — RSP via proxy/EW…"
-    rsp=$(run_rsp "$b" "$RSP_EW_BIN" "$PROXY_URL" "$RSP_EW_CACHE" "$LOGDIR/rsp-ew-$b.log"); src=ew
-    if [ "$rsp" != ok ]; then
-      log ">> $b ($kind) — RSP/EW=$rsp → fallback getProof (direct)…"
+    # If ZisK just hit a preimage miss on the proxy for THIS block (zisk=NIB*), RSP/EW would
+    # fail identically — it consumes the same debug_executionWitness the proxy can't build. Skip
+    # the doomed ~20-min EW re-execution and go STRAIGHT to getProof (direct to Alchemy, no proxy).
+    if [ "${zisk#NIB}" != "$zisk" ]; then
+      log ">> $b ($kind) — RSP/EW skipped (ZisK hit preimage miss → EW can't build) → getProof (direct)…"
       rsp=$(run_rsp "$b" "$RSP_BASIC_BIN" "$ALCHEMY_URL" "$RSP_BASIC_CACHE" "$LOGDIR/rsp-basic-$b.log"); src=basic
+    else
+      log ">> $b ($kind) — RSP via proxy/EW…"
+      rsp=$(run_rsp "$b" "$RSP_EW_BIN" "$PROXY_URL" "$RSP_EW_CACHE" "$LOGDIR/rsp-ew-$b.log"); src=ew
+      if [ "$rsp" != ok ]; then
+        log ">> $b ($kind) — RSP/EW=$rsp → fallback getProof (direct)…"
+        rsp=$(run_rsp "$b" "$RSP_BASIC_BIN" "$ALCHEMY_URL" "$RSP_BASIC_CACHE" "$LOGDIR/rsp-basic-$b.log"); src=basic
+      fi
     fi
     if [ "$rsp" = ok ]; then
       [ "$src" = ew ] && cache="$RSP_EW_CACHE" || cache="$RSP_BASIC_CACHE"
@@ -209,6 +267,13 @@ gen_block(){
 # ---------- never-wait loop ----------
 if [ -n "$START_BLOCK" ]; then next="$START_BLOCK"; else next="$(tip)"; fi
 log "farm: next=$next stride=$STRIDE margin=$MARGIN  (out=$OUT)"
+# Pre-Merge guard: PoW blocks (< 15,537,394 = the Merge, 2022-09-15) have UNCLES that the stateless
+# witness omits → rsp=FAIL(premerge). Also catches a dropped digit in START_BLOCK (2556230 vs 25562300).
+if [ -n "$START_BLOCK" ] && [ "$START_BLOCK" -lt 15537394 ]; then
+  log "⚠️  START_BLOCK=$START_BLOCK is PRE-MERGE (< 15537394, Sept 2022) — those PoW blocks have uncles"
+  log "    RSP can't validate → rsp=FAIL(premerge). Dropped a digit? (recent ≈ ${START_BLOCK}0). Ctrl-C to abort; continuing in 8s…"
+  sleep 8
+fi
 count=0; fails=0; LAST_RSP=ok
 while :; do
   safe=$(( $(tip) - MARGIN ))

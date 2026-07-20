@@ -1,3 +1,29 @@
+diff --git a/bin/continuous/src/main.rs b/bin/continuous/src/main.rs
+index ce8bde9..61f40f3 100644
+--- a/bin/continuous/src/main.rs
++++ b/bin/continuous/src/main.rs
+@@ -59,7 +59,7 @@ async fn main() -> eyre::Result<()> {
+             http_provider.clone(),
+             elf,
+             block_execution_strategy_factory,
+-            prover_client,
++            Some(prover_client),
+             PersistToPostgres::new(db_pool.clone()),
+             config,
+         )
+diff --git a/bin/eth-proofs/src/main.rs b/bin/eth-proofs/src/main.rs
+index 57d4fdd..19b5530 100644
+--- a/bin/eth-proofs/src/main.rs
++++ b/bin/eth-proofs/src/main.rs
+@@ -71,7 +71,7 @@ async fn main() -> eyre::Result<()> {
+         http_provider.clone(),
+         elf,
+         block_execution_strategy_factory,
+-        client,
++        Some(client),
+         eth_proofs_client,
+         config,
+     )
 diff --git a/bin/host/Cargo.toml b/bin/host/Cargo.toml
 index 75420c6..a7cdc9e 100644
 --- a/bin/host/Cargo.toml
@@ -14,6 +40,65 @@ index 75420c6..a7cdc9e 100644
  [dev-dependencies]
  serde.workspace = true
  alloy-network.workspace = true
+diff --git a/bin/host/src/cli.rs b/bin/host/src/cli.rs
+index 83b8150..5b245d2 100644
+--- a/bin/host/src/cli.rs
++++ b/bin/host/src/cli.rs
+@@ -46,6 +46,12 @@ pub struct HostArgs {
+     #[clap(long)]
+     /// Whether to track the cycle count of opcodes.
+     pub opcode_tracking: bool,
++
++    /// Skip re-executing the block inside the zkVM emulator (cycle counting). The client input
++    /// (witness) is still generated, validated on the host, and written to --cache-dir; only the
++    /// ~8s emulated execution is skipped. For pure witness collection this is all we need.
++    #[clap(long)]
++    pub skip_client_execution: bool,
+ }
+ 
+ impl HostArgs {
+@@ -98,7 +104,7 @@ impl HostArgs {
+             cache_dir: self.cache_dir.clone(),
+             custom_beneficiary: self.custom_beneficiary,
+             prove_mode: self.prove.then_some(SP1ProofMode::Compressed),
+-            skip_client_execution: false,
++            skip_client_execution: self.skip_client_execution,
+             opcode_tracking: self.opcode_tracking,
+         };
+ 
+diff --git a/bin/host/src/main.rs b/bin/host/src/main.rs
+index c0c157f..e3ef517 100644
+--- a/bin/host/src/main.rs
++++ b/bin/host/src/main.rs
+@@ -51,7 +51,14 @@ async fn main() -> eyre::Result<()> {
+         args.opcode_tracking,
+     );
+ 
+-    let prover_client = Arc::new(EnvProver::new().await);
++    // The prover is only needed to re-execute inside the zkVM or to prove. When neither happens
++    // (--skip-client-execution without --prove, i.e. pure witness collection) skip creating it —
++    // `EnvProver::new()` builds the whole RISC-V STARK machine (~7.5s), pure waste in that mode.
++    let prover_client = if args.prove || !args.skip_client_execution {
++        Some(Arc::new(EnvProver::new().await))
++    } else {
++        None
++    };
+ 
+     let elf = include_elf!("rsp-client").to_vec();
+     let block_execution_strategy_factory =
+diff --git a/bin/host/tests/cycle_count_diff.rs b/bin/host/tests/cycle_count_diff.rs
+index fab63d9..0284bc8 100644
+--- a/bin/host/tests/cycle_count_diff.rs
++++ b/bin/host/tests/cycle_count_diff.rs
+@@ -50,7 +50,7 @@ async fn test_in_zkvm() {
+         elf,
+         Some(provider),
+         block_execution_strategy_factory,
+-        client,
++        Some(client),
+         Hook::new(is_base_branch),
+         config,
+     )
 diff --git a/crates/executor/client/src/executor.rs b/crates/executor/client/src/executor.rs
 index 6234d57..b3aff44 100644
 --- a/crates/executor/client/src/executor.rs
@@ -36,10 +121,21 @@ index 6234d57..b3aff44 100644
          // Convert the output to an execution outcome.
          let executor_outcome = ExecutionOutcome::new(
 diff --git a/crates/executor/host/src/full_executor.rs b/crates/executor/host/src/full_executor.rs
-index 3a65126..e907361 100644
+index 3a65126..f35b471 100644
 --- a/crates/executor/host/src/full_executor.rs
 +++ b/crates/executor/host/src/full_executor.rs
-@@ -92,7 +92,10 @@ pub trait BlockExecutor<C: ExecutorComponents> {
+@@ -27,7 +27,9 @@ pub async fn build_executor<C, P>(
+     elf: Vec<u8>,
+     provider: Option<P>,
+     evm_config: C::EvmConfig,
+-    client: Arc<C::Prover>,
++    // `None` when the caller only needs the client input (witness) collected/cached and neither
++    // proves nor re-executes in the zkVM — then no prover is created and its ~7.5s init is skipped.
++    client: Option<Arc<C::Prover>>,
+     hooks: C::Hooks,
+     config: Config,
+ ) -> eyre::Result<EitherExecutor<C, P>>
+@@ -92,7 +94,10 @@ pub trait BlockExecutor<C: ExecutorComponents> {
              let input_block_hash = client_input.current_block.header.hash_slow();
  
              if input_block_hash != executed_block_hash {
@@ -51,6 +147,173 @@ index 3a65126..e907361 100644
              }
  
              info!(?executed_block_hash, "Execution successful");
+@@ -149,22 +154,22 @@ where
+ 
+     fn client(&self) -> Arc<C::Prover> {
+         match self {
+-            Either::Left(ref executor) => executor.client.clone(),
+-            Either::Right(ref executor) => executor.client.clone(),
++            Either::Left(ref executor) => executor.client(),
++            Either::Right(ref executor) => executor.client(),
+         }
+     }
+ 
+     fn pk(&self) -> Arc<<C::Prover as Prover>::ProvingKey> {
+         match self {
+-            Either::Left(ref executor) => executor.pk.clone(),
+-            Either::Right(ref executor) => executor.pk.clone(),
++            Either::Left(ref executor) => executor.pk(),
++            Either::Right(ref executor) => executor.pk(),
+         }
+     }
+ 
+     fn vk(&self) -> Arc<SP1VerifyingKey> {
+         match self {
+-            Either::Left(ref executor) => executor.vk.clone(),
+-            Either::Right(ref executor) => executor.vk.clone(),
++            Either::Left(ref executor) => executor.vk(),
++            Either::Right(ref executor) => executor.vk(),
+         }
+     }
+ 
+@@ -183,9 +188,11 @@ where
+ {
+     provider: P,
+     host_executor: HostExecutor<C::EvmConfig, C::ChainSpec>,
+-    client: Arc<C::Prover>,
+-    pk: Arc<<C::Prover as Prover>::ProvingKey>,
+-    vk: Arc<SP1VerifyingKey>,
++    // `None` in collect-only mode (no prover created); the accessors below then panic if reached,
++    // which never happens because `process_client` only touches them to execute-in-zkVM or prove.
++    client: Option<Arc<C::Prover>>,
++    pk: Option<Arc<<C::Prover as Prover>::ProvingKey>>,
++    vk: Option<Arc<SP1VerifyingKey>>,
+     hooks: C::Hooks,
+     config: Config,
+ }
+@@ -199,14 +206,23 @@ where
+         provider: P,
+         elf: Vec<u8>,
+         evm_config: C::EvmConfig,
+-        client: Arc<C::Prover>,
++        client: Option<Arc<C::Prover>>,
+         hooks: C::Hooks,
+         config: Config,
+     ) -> eyre::Result<Self> {
+-        // Setup the proving key.
+-        let pk =
+-            client.setup(Elf::from(elf.as_slice())).await.map_err(|err| eyre::eyre!("{err}"))?;
+-        let vk = pk.verifying_key().clone();
++        // Setup the proving key — only when a prover is present. `setup` is part of the ~7.5s
++        // startup cost; in collect-only mode (client `None`) we skip it entirely.
++        let (pk, vk) = match &client {
++            Some(client) => {
++                let pk = client
++                    .setup(Elf::from(elf.as_slice()))
++                    .await
++                    .map_err(|err| eyre::eyre!("{err}"))?;
++                let vk = pk.verifying_key().clone();
++                (Some(Arc::new(pk)), Some(Arc::new(vk)))
++            }
++            None => (None, None),
++        };
+ 
+         Ok(Self {
+             provider,
+@@ -215,8 +231,8 @@ where
+                 Arc::new(C::try_into_chain_spec(&config.genesis)?),
+             ),
+             client,
+-            pk: Arc::new(pk),
+-            vk: Arc::new(vk),
++            pk,
++            vk,
+             hooks,
+             config,
+         })
+@@ -295,15 +311,15 @@ where
+     }
+ 
+     fn client(&self) -> Arc<C::Prover> {
+-        self.client.clone()
++        self.client.clone().expect("prover not initialized (collect-only: --skip-client-execution without --prove)")
+     }
+ 
+     fn pk(&self) -> Arc<<C::Prover as Prover>::ProvingKey> {
+-        self.pk.clone()
++        self.pk.clone().expect("proving key not initialized (collect-only: --skip-client-execution without --prove)")
+     }
+ 
+     fn vk(&self) -> Arc<SP1VerifyingKey> {
+-        self.vk.clone()
++        self.vk.clone().expect("verifying key not initialized (collect-only: --skip-client-execution without --prove)")
+     }
+ 
+     fn config(&self) -> &Config {
+@@ -326,9 +342,9 @@ where
+     C: ExecutorComponents,
+ {
+     cache_dir: PathBuf,
+-    client: Arc<C::Prover>,
+-    pk: Arc<<C::Prover as Prover>::ProvingKey>,
+-    vk: Arc<SP1VerifyingKey>,
++    client: Option<Arc<C::Prover>>,
++    pk: Option<Arc<<C::Prover as Prover>::ProvingKey>>,
++    vk: Option<Arc<SP1VerifyingKey>>,
+     hooks: C::Hooks,
+     config: Config,
+ }
+@@ -339,17 +355,25 @@ where
+ {
+     pub async fn try_new(
+         elf: Vec<u8>,
+-        client: Arc<C::Prover>,
++        client: Option<Arc<C::Prover>>,
+         hooks: C::Hooks,
+         cache_dir: PathBuf,
+         config: Config,
+     ) -> eyre::Result<Self> {
+-        // Setup the proving key.
+-        let pk =
+-            client.setup(Elf::from(elf.as_slice())).await.map_err(|err| eyre::eyre!("{err}"))?;
+-        let vk = pk.verifying_key().clone();
++        // Setup the proving key — only when a prover is present (skipped in collect-only mode).
++        let (pk, vk) = match &client {
++            Some(client) => {
++                let pk = client
++                    .setup(Elf::from(elf.as_slice()))
++                    .await
++                    .map_err(|err| eyre::eyre!("{err}"))?;
++                let vk = pk.verifying_key().clone();
++                (Some(Arc::new(pk)), Some(Arc::new(vk)))
++            }
++            None => (None, None),
++        };
+ 
+-        Ok(Self { cache_dir, client, pk: Arc::new(pk), vk: Arc::new(vk), hooks, config })
++        Ok(Self { cache_dir, client, pk, vk, hooks, config })
+     }
+ }
+ 
+@@ -369,15 +393,15 @@ where
+     }
+ 
+     fn client(&self) -> Arc<C::Prover> {
+-        self.client.clone()
++        self.client.clone().expect("prover not initialized (collect-only: --skip-client-execution without --prove)")
+     }
+ 
+     fn pk(&self) -> Arc<<C::Prover as Prover>::ProvingKey> {
+-        self.pk.clone()
++        self.pk.clone().expect("proving key not initialized (collect-only: --skip-client-execution without --prove)")
+     }
+ 
+     fn vk(&self) -> Arc<SP1VerifyingKey> {
+-        self.vk.clone()
++        self.vk.clone().expect("verifying key not initialized (collect-only: --skip-client-execution without --prove)")
+     }
+ 
+     fn config(&self) -> &Config {
 diff --git a/crates/executor/host/src/host_executor.rs b/crates/executor/host/src/host_executor.rs
 index 893dda0..ca5f72c 100644
 --- a/crates/executor/host/src/host_executor.rs
