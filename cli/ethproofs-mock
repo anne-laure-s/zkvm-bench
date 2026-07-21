@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""ethproofs-mock — a home-made, plug-compatible stand-in for the ethproofs.org submission API.
+
+The real ethproofs clients (RSP `bin/eth-proofs`, ZisK `zisk-ethproofs`) POST proofs to an ethproofs
+endpoint. Until we have real ethproofs.org credentials, point those clients' ETHPROOFS_API_URL /
+--eth-proofs-endpoint at THIS server: it implements the same surface, records every submission, saves
+each proof, and serves a leaderboard-like status page. So the full continuous pipeline
+(chain-follow -> witness -> prove on the cluster -> submit) runs end-to-end NOW, and swapping to the
+real ethproofs.org later is a one-line config change (URL + token) — zero pipeline change.
+
+Endpoints (mirrors what the clients call):
+  POST /proofs/queued   {block_number, cluster_id}
+  POST /proofs/proving  {block_number, cluster_id}
+  POST /proofs/proved   {proof (base64), block_number, proving_cycles|proving_steps,
+                         proving_time (ms), verifier_id, cluster_id}
+  GET  /                 leaderboard (HTML)      ·  GET /proofs  (JSON records)
+
+Lenient by design (a stand-in): unknown/renamed fields are still recorded; any Bearer token is
+accepted unless --token is given.
+
+  ./cli/ethproofs-mock [--port 8547] [--store <dir>] [--token <expected-bearer>]
+
+Store (default: ethproofs-mock-data/ at the repo root, git-ignored): submissions.jsonl (append log,
+replayed on restart) + proofs/<cluster>-<block>.bin (the decoded proofs).
+"""
+import argparse, base64, json, os, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime, timezone
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+class Store:
+    """Append-only submission log + per-(cluster,block) latest state, rebuilt on restart."""
+    def __init__(self, d):
+        self.dir = d
+        self.proofs_dir = os.path.join(d, "proofs")
+        self.jsonl = os.path.join(d, "submissions.jsonl")
+        os.makedirs(self.proofs_dir, exist_ok=True)
+        self.lock = threading.Lock()
+        self.state = {}          # (cluster, block) -> latest record (no proof blob)
+        self.ids = {}            # (cluster, block) -> stable proof_id
+        self.next_id = 1
+        self._replay()
+
+    def pid(self, cluster, block):
+        # Stable proof_id per (cluster, block). The real ethproofs API returns {"proof_id": N} and
+        # the ZisK client PARSES it (RSP ignores the body) — so we must return that shape.
+        key = (cluster, block)
+        with self.lock:
+            if key not in self.ids:
+                self.ids[key] = self.next_id
+                self.next_id += 1
+            return self.ids[key]
+
+    def _replay(self):
+        if not os.path.exists(self.jsonl):
+            return
+        with open(self.jsonl) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    self.state[(r.get("cluster_id"), r.get("block_number"))] = r
+                except json.JSONDecodeError:
+                    pass
+
+    def record(self, event, body, proof_bytes=None):
+        cluster = body.get("cluster_id")
+        block = body.get("block_number")
+        rec = {
+            "ts": now_iso(),
+            "event": event,
+            "cluster_id": cluster,
+            "block_number": block,
+            # work-unit is cycles (SP1/OpenVM) or steps (ZisK) — record whichever is present
+            "proving_cycles": body.get("proving_cycles", body.get("proving_steps")),
+            "proving_time_ms": body.get("proving_time"),
+            "verifier_id": body.get("verifier_id"),
+            "proof_bytes": proof_bytes,
+        }
+        with self.lock:
+            with open(self.jsonl, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+            # keep the fullest view: merge into any existing state for this (cluster, block)
+            prev = self.state.get((cluster, block), {})
+            merged = {**prev, **{k: v for k, v in rec.items() if v is not None}}
+            merged["event"] = event
+            merged["ts"] = rec["ts"]
+            self.state[(cluster, block)] = merged
+        return rec
+
+    def save_proof(self, cluster, block, proof_b64):
+        try:
+            raw = base64.b64decode(proof_b64)
+        except (ValueError, TypeError):
+            return None
+        path = os.path.join(self.proofs_dir, f"{cluster}-{block}.bin")
+        with open(path, "wb") as f:
+            f.write(raw)
+        return len(raw)
+
+STORE = None
+TOKEN = None
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):  # quieter default access log; we print our own lines
+        pass
+
+    def _auth_ok(self):
+        if not TOKEN:
+            return True
+        return self.headers.get("Authorization", "") == f"Bearer {TOKEN}"
+
+    def _json_body(self):
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        raw = self.rfile.read(n) if n else b""
+        try:
+            return json.loads(raw or b"{}")
+        except json.JSONDecodeError:
+            return {}
+
+    def _reply(self, code, obj=None, ctype="application/json"):
+        payload = (obj if isinstance(obj, (bytes, bytearray))
+                   else json.dumps(obj if obj is not None else {"ok": True}).encode())
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_POST(self):
+        if not self._auth_ok():
+            return self._reply(401, {"error": "bad bearer token"})
+        body = self._json_body()
+        cluster, block = body.get("cluster_id"), body.get("block_number")
+        # Every /proofs/* reply is {"proof_id": N} — the ZisK client parses that shape; RSP ignores it.
+        if self.path.rstrip("/") == "/proofs/queued":
+            STORE.record("queued", body); print(f"{now_iso()}  queued   cluster={cluster} block={block}")
+            return self._reply(200, {"proof_id": STORE.pid(cluster, block)})
+        if self.path.rstrip("/") == "/proofs/proving":
+            STORE.record("proving", body); print(f"{now_iso()}  proving  cluster={cluster} block={block}")
+            return self._reply(200, {"proof_id": STORE.pid(cluster, block)})
+        if self.path.rstrip("/") == "/proofs/proved":
+            pb = STORE.save_proof(cluster, block, body["proof"]) if body.get("proof") else None
+            rec = STORE.record("proved", body, proof_bytes=pb)
+            print(f"{now_iso()}  PROVED   cluster={cluster} block={block} "
+                  f"time={rec['proving_time_ms']}ms work={rec['proving_cycles']} proof={pb}B")
+            return self._reply(200, {"proof_id": STORE.pid(cluster, block), "proof_bytes": pb})
+        return self._reply(404, {"error": f"unknown endpoint {self.path}"})
+
+    def do_GET(self):
+        if self.path.rstrip("/") == "/proofs":
+            return self._reply(200, list(STORE.state.values()))
+        # leaderboard
+        rows = sorted(STORE.state.values(),
+                      key=lambda r: (r.get("cluster_id") or 0, r.get("block_number") or 0), reverse=True)
+        def td(v): return "" if v is None else v
+        body = ["<!doctype html><meta charset=utf-8><title>ethproofs-mock</title>",
+                "<style>body{font:14px system-ui;margin:2rem}h1{font-size:1.2rem}"
+                "table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 8px;text-align:right}"
+                "td:first-child,th:first-child,.l{text-align:left}.q{color:#999}.p{color:#c60}.d{color:#080}</style>",
+                f"<h1>ethproofs-mock — {len(rows)} block(s)</h1>",
+                "<table><tr><th>cluster</th><th>block</th><th class=l>state</th>"
+                "<th>work-unit</th><th>prove (ms)</th><th>proof (B)</th><th class=l>verifier_id</th><th class=l>updated</th></tr>"]
+        for r in rows:
+            ev = r.get("event", "")
+            cls = {"queued": "q", "proving": "p", "proved": "d"}.get(ev, "")
+            body.append(f"<tr><td>{td(r.get('cluster_id'))}</td><td>{td(r.get('block_number'))}</td>"
+                        f"<td class='l {cls}'>{ev}</td><td>{td(r.get('proving_cycles'))}</td>"
+                        f"<td>{td(r.get('proving_time_ms'))}</td><td>{td(r.get('proof_bytes'))}</td>"
+                        f"<td class=l>{str(td(r.get('verifier_id')))[:18]}</td><td class=l>{td(r.get('ts'))}</td></tr>")
+        body.append("</table>")
+        return self._reply(200, "\n".join(body).encode(), ctype="text/html; charset=utf-8")
+
+def main():
+    global STORE, TOKEN
+    ap = argparse.ArgumentParser(description="home-made ethproofs.org stand-in")
+    ap.add_argument("--port", type=int, default=int(os.environ.get("ETHPROOFS_MOCK_PORT", 8547)))
+    ap.add_argument("--store", default=os.environ.get("ETHPROOFS_MOCK_STORE", os.path.join(ROOT, "ethproofs-mock-data")))
+    ap.add_argument("--token", default=os.environ.get("ETHPROOFS_MOCK_TOKEN"))
+    args = ap.parse_args()
+    STORE = Store(args.store)
+    TOKEN = args.token
+    n = len(STORE.state)
+    print(f"ethproofs-mock: http://127.0.0.1:{args.port}  store={args.store}  "
+          f"auth={'Bearer required' if TOKEN else 'open (any token)'}  ({n} block(s) replayed)")
+    print("  point the clients here:  ETHPROOFS_API_URL / --eth-proofs-endpoint = "
+          f"http://<this-host>:{args.port}")
+    try:
+        ThreadingHTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
+    except KeyboardInterrupt:
+        print("\nethproofs-mock: stopped.")
+
+if __name__ == "__main__":
+    main()

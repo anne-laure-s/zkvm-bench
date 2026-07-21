@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+#
+# ethproofs — launch a stack's continuous ethproofs submission pipeline against the SEAMS, with ONE
+# shared interface for every stack (see cli/ethproofs-pipeline.md). You give the seam URLs once; this
+# maps them to each stack's native config and starts its ethproofs client(s):
+#   ZisK → input-gen-server + ethproofs-client (env-driven)   ·   SP1 → RSP bin/eth-proofs (flags)
+#
+# Seams (shared knobs — SAME for every stack; defaults point at our home-made stand-ins):
+#   --witness-rpc URL      debug_executionWitness RPC   [default http://localhost:8545 = openvm-eth proxy]
+#   --chain-ws URL         WS to follow the tip         [REQUIRED — e.g. wss://eth-mainnet.g.alchemy.com/v2/<key>]
+#   --ethproofs-url URL    ethproofs API                [default http://localhost:8547 = cli/ethproofs-mock]
+#   --ethproofs-token T    ethproofs API token          [default dev]
+#   --ethproofs-cluster N  ethproofs cluster id         [default 1]
+#   --block-interval N     prove every Nth block        [default 100 = ethproofs cadence]
+#   --coordinator URL      prover seam (ZisK coordinator; required for a real ZisK run)
+#   --ws-port N            input-gen-server WS port (ZisK) [default 8765]
+#   --build                cargo build the stack's ethproofs binaries first
+#   --dry-run              print the mapped config + commands, don't build/launch
+#
+#   ./cli/ethproofs --guest zisk --chain-ws wss://…alchemy…/<key> --coordinator http://<box>:7000
+#   ./cli/ethproofs --guest rsp  --chain-ws wss://…alchemy…/<key>
+#
+# Runs the stack's ethproofs client(s); the SEAMS themselves run separately (and hot-swap by URL):
+# cli/ethproofs-mock (ethproofs) · the openvm-eth proxy (witness) · the prover cluster/coordinator.
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+GUEST=""; WITNESS_RPC="http://localhost:8545"; CHAIN_WS=""; ETHPROOFS_URL="http://localhost:8547"
+ETHPROOFS_TOKEN="dev"; ETHPROOFS_CLUSTER="1"; BLOCK_INTERVAL="100"; COORDINATOR=""; WS_PORT="8765"
+DRY_RUN=0; BUILD=0
+while [ $# -gt 0 ]; do case "$1" in
+  --guest)            GUEST="${2:?}"; shift 2 ;;
+  --witness-rpc)      WITNESS_RPC="${2:?}"; shift 2 ;;
+  --chain-ws)         CHAIN_WS="${2:?}"; shift 2 ;;
+  --ethproofs-url)    ETHPROOFS_URL="${2:?}"; shift 2 ;;
+  --ethproofs-token)  ETHPROOFS_TOKEN="${2:?}"; shift 2 ;;
+  --ethproofs-cluster)ETHPROOFS_CLUSTER="${2:?}"; shift 2 ;;
+  --block-interval)   BLOCK_INTERVAL="${2:?}"; shift 2 ;;
+  --coordinator)      COORDINATOR="${2:?}"; shift 2 ;;
+  --ws-port)          WS_PORT="${2:?}"; shift 2 ;;
+  --build)            BUILD=1; shift ;;
+  --dry-run)          DRY_RUN=1; shift ;;
+  -h|--help)          sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
+  *)                  echo "ethproofs: unknown arg '$1' (see --help)" >&2; exit 2 ;;
+esac; done
+
+die(){ echo "ethproofs: $*" >&2; exit 2; }
+log(){ printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
+[ -n "$GUEST" ] || die "--guest zisk|rsp required"
+[ -n "$CHAIN_WS" ] || die "--chain-ws <wss://…> required (to follow the tip)"
+
+# TCP preflight of a URL (warn only). Localhost connects are instant; remote may hang, so keep it best-effort.
+preflight(){ local url="$1" name="$2" hp h p
+  [ -n "$url" ] || return
+  hp="${url#*://}"; h="${hp%%[:/]*}"; p="${hp##*:}"; p="${p%%/*}"
+  case "$url" in https://*) [ "$p" = "$h" ] && p=443 ;; http://*|ws://*) [ "$p" = "$h" ] && p=80 ;; wss://*) [ "$p" = "$h" ] && p=443 ;; esac
+  case "$p" in ''|*[!0-9]*) return ;; esac
+  (exec 3<>"/dev/tcp/$h/$p") 2>/dev/null || log "⚠️  $name ($h:$p) not reachable — is it up?"
+}
+
+LOGDIR="$ROOT/ethproofs-logs"; mkdir -p "$LOGDIR"
+CHILDREN=()
+cleanup(){ for pid in ${CHILDREN[@]:-}; do kill "$pid" 2>/dev/null; done; [ "$DRY_RUN" = 1 ] || log "ethproofs: stopped."; }
+trap cleanup EXIT
+trap 'echo >&2; log "interrupted — stopping…"; exit 130' INT TERM
+
+wait_port(){ local p="$1" i; for i in $(seq 1 30); do (exec 3<>"/dev/tcp/localhost/$p") 2>/dev/null && return 0; sleep 1; done; return 1; }
+
+case "$GUEST" in
+  zisk)
+    DIR="$ROOT/vendor/zisk-ethproofs"
+    [ -d "$DIR" ] || die "vendor/zisk-ethproofs missing — run cli/install-vendors"
+    INPUTS="$LOGDIR/zisk-inputs"
+    # shared seams → ZisK native config (input-gen-server witness+chain-follow; ethproofs-client prover+submit)
+    igs_env=( "RPC_URL=$WITNESS_RPC" "RPC_WS_URL=$CHAIN_WS" "BLOCK_MODULUS=$BLOCK_INTERVAL" "WS_PORT=$WS_PORT" "INPUTS_FOLDER=$INPUTS" )
+    cli_env=( "INPUT_GEN_SERVER_URL=ws://localhost:$WS_PORT" "COORDINATOR_URL=$COORDINATOR"
+              "ETHPROOFS_API_URL=$ETHPROOFS_URL" "ETHPROOFS_API_TOKEN=$ETHPROOFS_TOKEN" "ETHPROOFS_CLUSTER=$ETHPROOFS_CLUSTER"
+              "INPUTS_FOLDER=$INPUTS" )
+    igs_bin="$DIR/target/release/input-gen-server"; cli_bin="$DIR/target/release/ethproofs-client"
+    if [ "$DRY_RUN" = 1 ]; then
+      echo "# ZisK ethproofs pipeline — seams mapped to native config:"
+      echo "## input-gen-server (witness + chain-follow)"; printf '   %s\n' "${igs_env[@]}"; echo "   $igs_bin"
+      echo "## ethproofs-client -s (prove on coordinator + submit)"; printf '   %s\n' "${cli_env[@]}"; echo "   $cli_bin -s"
+      exit 0
+    fi
+    [ -n "$COORDINATOR" ] || die "--coordinator <url> required for a ZisK run (the prover seam)"
+    preflight "$WITNESS_RPC" witness; preflight "$ETHPROOFS_URL" ethproofs; preflight "$COORDINATOR" coordinator
+    if [ ! -x "$igs_bin" ] || [ ! -x "$cli_bin" ]; then
+      [ "$BUILD" = 1 ] || die "binaries missing — (cd $DIR && cargo build --release --bin input-gen-server --bin ethproofs-client)  [or pass --build]"
+      log "building zisk-ethproofs…"; ( cd "$DIR" && cargo build --release --bin input-gen-server --bin ethproofs-client ) || die "build failed"
+    fi
+    mkdir -p "$INPUTS"
+    log "input-gen-server → WS :$WS_PORT  (witness=$WITNESS_RPC, ÷$BLOCK_INTERVAL)"
+    env "${igs_env[@]}" "$igs_bin" > "$LOGDIR/zisk-input-gen-server.log" 2>&1 & CHILDREN+=("$!")
+    wait_port "$WS_PORT" || log "⚠️  input-gen-server WS :$WS_PORT not up yet — see $LOGDIR/zisk-input-gen-server.log"
+    log "ethproofs-client -s → coordinator=$COORDINATOR, ethproofs=$ETHPROOFS_URL"
+    env "${cli_env[@]}" "$cli_bin" -s > "$LOGDIR/zisk-ethproofs-client.log" 2>&1 & CHILDREN+=("$!")
+    log "ZisK ethproofs pipeline running. Logs: $LOGDIR/zisk-*.log . Ctrl-C to stop."
+    wait
+    ;;
+  rsp)
+    DIR="$ROOT/vendor/rsp"
+    [ -d "$DIR" ] || die "vendor/rsp missing — run cli/install-vendors"
+    bin="$DIR/target/release/eth-proofs"
+    args=( --http-rpc-url "$WITNESS_RPC" --ws-rpc-url "$CHAIN_WS" --block-interval "$BLOCK_INTERVAL"
+           --eth-proofs-endpoint "$ETHPROOFS_URL" --eth-proofs-api-token "$ETHPROOFS_TOKEN" --eth-proofs-cluster-id "$ETHPROOFS_CLUSTER" )
+    # prover seam — bin/eth-proofs picks the prover from SP1_PROVER (from_env). Same knob as ZisK:
+    #   --coordinator <gateway> → SP1_PROVER=network (the distributed cluster) ; else single-box cuda.
+    if [ -n "$COORDINATOR" ]; then
+      prover_env=( "SP1_PROVER=network" "NETWORK_RPC_URL=$COORDINATOR"
+                   "NETWORK_PRIVATE_KEY=${NETWORK_PRIVATE_KEY:-0x0000000000000000000000000000000000000000000000000000000000000001}" )
+      prover_desc="network → $COORDINATOR"; build_flags="--no-default-features --features network"   # network client — no CUDA needed
+    else
+      prover_env=( "SP1_PROVER=cuda" ); build_flags=""
+      prover_desc="cuda single-box (pass --coordinator <gateway> to prove on the cluster)"
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+      echo "# SP1 (RSP bin/eth-proofs) ethproofs pipeline — seams → flags + prover env:"
+      printf '   %s\n' "${prover_env[@]}"
+      echo "   $bin ${args[*]}"
+      echo "   build: (cd vendor/rsp && cargo build --release --bin eth-proofs $build_flags)"
+      exit 0
+    fi
+    preflight "$WITNESS_RPC" witness; preflight "$ETHPROOFS_URL" ethproofs; [ -n "$COORDINATOR" ] && preflight "$COORDINATOR" gateway
+    if [ ! -x "$bin" ]; then
+      [ "$BUILD" = 1 ] || die "binary missing — (cd $DIR && cargo build --release --bin eth-proofs $build_flags)  [or pass --build]"
+      log "building rsp eth-proofs ($prover_desc)…"; ( cd "$DIR" && cargo build --release --bin eth-proofs $build_flags ) || die "build failed"
+    fi
+    log "RSP bin/eth-proofs → prover=$prover_desc, witness=$WITNESS_RPC, ethproofs=$ETHPROOFS_URL, ÷$BLOCK_INTERVAL. Logs: $LOGDIR/rsp-eth-proofs.log . Ctrl-C to stop."
+    env "${prover_env[@]}" "$bin" "${args[@]}" > "$LOGDIR/rsp-eth-proofs.log" 2>&1 & CHILDREN+=("$!")
+    wait
+    ;;
+  *) die "unknown guest '$GUEST' (zisk|rsp)" ;;
+esac

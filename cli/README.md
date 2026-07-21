@@ -26,9 +26,32 @@ Two continuous drivers pair up for bulk witness→proof runs (outputs at the rep
   RETRY_CU RSP_RPC_CU PROXY_START_TRIES RSP_SKIP_EXEC MAX_BLOCKS`. Deterministic proxy preimage
   failures at the current `--preimage-cache-nibbles` are marked `zisk=NIB<n>` and skipped (a higher
   `NIBBLES` re-attempts them); RSP is skipped for those blocks too (no comparable pair possible).
-- **`cli/prove-farm --guest <g> --remote user@host [--port p] [--mode m] [--num-gpus k]`** — batch-prove
-  those witnesses on the remote cluster and record timings (`prove-farm.csv`). The prove-side analog of
-  `cli/execute`: registry-driven, resumable, **zero per-stack branching**.
+- **`cli/prove-farm --guest <g> --remote user@host [--port p] [--mode m] [--num-gpus k]`** — prove those
+  witnesses on the remote cluster and record timings (`prove-farm.csv`). The prove-side analog of
+  `cli/execute`: registry-driven, resumable, **zero per-stack branching**. One-shot by default;
+  **`--watch`** makes it a **continuous consumer** (re-scan the queue, one proof at a time = natural
+  backpressure for one cluster, idle-sleep when caught up), and **`--newest-first`** proves nearest the
+  tip first (the RTP "prove-latest" policy — older un-proven blocks wait).
+
+**The continuous pipeline** = the producer + the consumer, decoupled by the `fixtures/` queue on disk:
+
+```sh
+cli/witness-farm 25559000 &                                             # producer: follow the tip → queue
+cli/prove-farm --guest rsp --remote user@box --port p --watch --newest-first   # consumer: drain, prove-latest
+```
+
+(For real-time proving you'd swap witness-farm's hosted-RPC witness source for a co-located reth node,
+and size the cluster so a block proves under the slot — but the glue above is the same.)
+
+## ethproofs submission
+
+To submit block proofs to [ethproofs.org](https://ethproofs.org), each stack has its own continuous
+client (SP1 = RSP `bin/eth-proofs`; ZisK = `zisk-ethproofs`, vendored). The pipeline is built with
+**swappable seams + home-made stand-ins** — witness (Alchemy+proxy → reth node), prover (cluster),
+ethproofs endpoint (**`cli/ethproofs-mock`** → ethproofs.org) — so it runs end-to-end with no
+ethproofs account, and each piece hot-swaps by config. Full wiring:
+[ethproofs-pipeline.md](ethproofs-pipeline.md). The stand-in server: **`cli/ethproofs-mock`** (implements
+`/proofs/{queued,proving,proved}`, saves proofs, serves a leaderboard).
 
 `prove-farm` delegates each block to the uniform verb **`infra/<stack>/run prove-cluster GUEST=<g>
 BLOCK=<n> REMOTE=...`**, which each stack implements behind ONE contract — resolve its own ELF/witness,

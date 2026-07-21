@@ -11,11 +11,35 @@ index ce8bde9..61f40f3 100644
              PersistToPostgres::new(db_pool.clone()),
              config,
          )
+diff --git a/bin/eth-proofs/Cargo.toml b/bin/eth-proofs/Cargo.toml
+index 4d8afdd..65db218 100644
+--- a/bin/eth-proofs/Cargo.toml
++++ b/bin/eth-proofs/Cargo.toml
+@@ -42,3 +42,6 @@ sp1-build.workspace = true
+ [features]
+ default = ["cuda"]
+ cuda = ["sp1-sdk/cuda", "rsp-host-executor/cuda"]
++# Distributed-cluster proving via SP1_PROVER=network (the network prover is behind sp1-sdk's `network`
++# feature). Build the network client with: --no-default-features --features network (no CUDA needed).
++network = ["sp1-sdk/network"]
 diff --git a/bin/eth-proofs/src/main.rs b/bin/eth-proofs/src/main.rs
-index 57d4fdd..19b5530 100644
+index 57d4fdd..c62f486 100644
 --- a/bin/eth-proofs/src/main.rs
 +++ b/bin/eth-proofs/src/main.rs
-@@ -71,7 +71,7 @@ async fn main() -> eyre::Result<()> {
+@@ -63,15 +63,18 @@ async fn main() -> eyre::Result<()> {
+         subscription.into_stream().filter(|h| ready(h.number % args.block_interval == 0));
+ 
+     if args.moongate_endpoint.is_some() {
+-        tracing::warn!("moongate_endpoint is not supported in SP1 v6, using local CudaProver");
++        tracing::warn!("moongate_endpoint is not supported in SP1 v6; select the prover via SP1_PROVER");
+     }
+-    let client = Arc::new(ProverClient::builder().cuda().build().await);
++    // Prover is the env-selectable "prover seam" (driven by cli/ethproofs): SP1_PROVER=network +
++    // NETWORK_RPC_URL=<gateway> proves on the distributed cluster; SP1_PROVER=cuda proves single-box.
++    // from_env() returns an EnvProver that dispatches at runtime — one type across all backends.
++    let client = Arc::new(ProverClient::from_env().await);
+ 
+     let executor = FullExecutor::<EthExecutorComponents<_, _>, _>::try_new(
          http_provider.clone(),
          elf,
          block_execution_strategy_factory,

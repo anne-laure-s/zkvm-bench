@@ -117,7 +117,14 @@ else
     log "proxy pid=$PROXY_PID (attempt $try/$PROXY_START_TRIES) — waiting for readiness…"
     while ! rpc "$PROXY_URL" eth_chainId '[]' | grep -q '"result"'; do
       kill -0 "$PROXY_PID" 2>/dev/null && { sleep 5; continue; }
-      # process is gone before it became ready → transient blip (retry) vs real error (fatal)
+      # process is gone before it became ready → decide: quota (fatal) · transient blip (retry) · other (fatal)
+      # A monthly-capacity / quota 429 is NOT transient — it 429s on every retry (even though 429 ∈ NET_RE).
+      # Fail fast with a clear message rather than burning PROXY_START_TRIES retries mislabelled "transient".
+      if grep -qiE 'capacity limit|monthly capacity|scaling policy|quota|compute units' "$LOGDIR/proxy.log"; then
+        echo "proxy: Alchemy CAPACITY/QUOTA exceeded (429) — NOT a transient blip. The free tier's monthly CU" >&2
+        echo "       cap is used up. Upgrade to Pay-As-You-Go, use another RPC key/provider, or a reth node." >&2
+        tail -4 "$LOGDIR/proxy.log" >&2; exit 1
+      fi
       if [ "$try" -lt "$PROXY_START_TRIES" ] && grep -qiE "$NET_RE" "$LOGDIR/proxy.log"; then
         log "proxy died on a transient network/DNS blip — retrying in ${RETRY_PAUSE}s…"; tail -3 "$LOGDIR/proxy.log" >&2
         sleep "$RETRY_PAUSE"; continue 2   # relaunch (outer while)

@@ -50,6 +50,12 @@ profiling/results/
 /prove-farm-logs/
 /prove-farm.csv
 
+# ── cli/ethproofs-mock store (the home-made ethproofs.org stand-in; the server is tracked, its data not)
+/ethproofs-mock-data/
+
+# ── cli/ethproofs launcher logs + input-gen-server inputs (the launcher is tracked, its runtime output not)
+/ethproofs-logs/
+
 # ── Python / OS ──────────────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
