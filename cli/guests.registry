@@ -12,6 +12,11 @@
 rsp        | infra/sp1-infra    | rsp         | RSP_DIR        | vendor/rsp             | build       | rpc         | input | SP1 · reth (RSP)
 openvm     | infra/openvm-infra | openvm-reth | OPENVM_ETH_DIR | vendor/openvm-eth      | build       | rpc         | block | OpenVM · reth
 zisk       | infra/zisk-infra   | zisk-reth   | ZISK_ETH_DIR   | vendor/zisk-eth-client | build       | rpc-debug   | input | ZisK · reth
-monad-sp1  | guests/monad       | -           | -              | -                      | presupplied | presupplied | batch | Monad guest on SP1
-monad-zisk | guests/monad       | -           | -              | -                      | presupplied | presupplied | batch | Monad guest on ZisK
+# monad: guest program presupplied in guests/monad/. `exec=batch` = EXECUTE+verify via guests/monad/ev.sh.
+# Both variants are ALSO PROVABLE via cli/prove-farm: each routes to its stack (run_guest=monad-<zkvm> →
+# guests/monad-<zkvm>/{monad-<zkvm>.elf, inputs/<tag>.bin}, built by that dir's gen-inputs). The inputs
+# differ per zkVM: ZisK wants the ziskos length-prefixed format; SP1's runner takes the raw witness
+# (it write_slice()s the file as one opaque buffer).
+monad-sp1  | infra/sp1-infra    | monad-sp1   | -              | -                      | presupplied | presupplied | batch | Monad guest on SP1
+monad-zisk | infra/zisk-infra   | monad-zisk  | -              | -                      | presupplied | presupplied | batch | Monad guest on ZisK
 fibonacci  | infra/sp1-infra    | fibonacci   | -              | -                      | build       | toy         | input | SP1 example guest

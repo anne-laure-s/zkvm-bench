@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# guests/monad-zisk/gen-inputs — build ZisK prover inputs from the pre-supplied Monad witnesses.
+#
+# The Monad witnesses (guests/monad/inputs/<tag>.witness) are RAW bytes. The ZisK prover — like the
+# ziskemu emulator — reads a length-PREFIXED input file: <8-byte LE length><witness><zero-pad to 8>.
+# guests/monad/ev.sh does exactly this padding for EXECUTION; here we persist it as
+# guests/monad-zisk/inputs/<tag>.bin so `cli/prove-farm --guest monad-zisk` finds a standard
+# <chain>-<block>.bin witness queue and infra/zisk-infra prove-cluster can prove it.
+#
+# (No .hints: Monad has no reth-style hints-gen, and hints are an optional proving-time optimisation —
+#  the prover regenerates them. See infra/zisk-infra/scripts/core.sh prove_remote.)
+#
+#   ./gen-inputs [--force] [TAGS...]     # default: every witness; TAGS look like 1-25224730
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC="$HERE/../monad/inputs"
+OUT="$HERE/inputs"; mkdir -p "$OUT"
+[ -d "$SRC" ] || { echo "gen-inputs: no Monad witnesses at $SRC" >&2; exit 1; }
+
+FORCE=0; TAGS=()
+for a in "$@"; do case "$a" in --force) FORCE=1 ;; *) TAGS+=("$a") ;; esac; done
+
+list_witnesses() {
+  if [ "${#TAGS[@]}" -gt 0 ]; then printf '%s\n' "${TAGS[@]/#/$SRC/}" | sed 's/$/.witness/'
+  else find "$SRC" -maxdepth 1 -name '*.witness' | sort; fi
+}
+
+n=0
+while IFS= read -r w; do
+  [ -f "$w" ] || { echo "gen-inputs: skip (missing) $w" >&2; continue; }
+  tag="$(basename "$w" .witness)"; bin="$OUT/$tag.bin"
+  if [ "$FORCE" != 1 ] && [ -f "$bin" ] && [ "$bin" -nt "$w" ]; then continue; fi
+  python3 - "$w" "$bin" <<'PY'
+import sys, struct
+d = open(sys.argv[1], "rb").read(); n = len(d); pad = (-(8 + n)) % 8
+open(sys.argv[2], "wb").write(struct.pack("<Q", n) + d + b"\x00" * pad)
+PY
+  n=$((n + 1))
+done < <(list_witnesses)
+echo "gen-inputs: wrote/updated $n input(s) → $OUT  (re-run with --force to rebuild all)"

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# guests/monad-sp1/gen-inputs — build SP1 prover inputs from the pre-supplied Monad witnesses.
+#
+# Unlike ZisK (which needs the ziskos length-prefixed file format), the SP1 runner reads --input as a
+# single OPAQUE buffer and write_slice()s it into SP1Stdin (see infra/sp1-infra/sp1-runner/src/main.rs);
+# the guest reads it back verbatim with read_vec(). So the SP1 input is just the RAW witness — this copies
+# guests/monad/inputs/<tag>.witness → guests/monad-sp1/inputs/<tag>.bin so `cli/prove-farm --guest
+# monad-sp1` finds a standard <chain>-<block>.bin witness queue.
+#
+#   ./gen-inputs [--force] [TAGS...]     # default: every witness; TAGS look like 1-25224730
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC="$HERE/../monad/inputs"
+OUT="$HERE/inputs"; mkdir -p "$OUT"
+[ -d "$SRC" ] || { echo "gen-inputs: no Monad witnesses at $SRC" >&2; exit 1; }
+
+FORCE=0; TAGS=()
+for a in "$@"; do case "$a" in --force) FORCE=1 ;; *) TAGS+=("$a") ;; esac; done
+
+list_witnesses() {
+  if [ "${#TAGS[@]}" -gt 0 ]; then printf '%s\n' "${TAGS[@]/#/$SRC/}" | sed 's/$/.witness/'
+  else find "$SRC" -maxdepth 1 -name '*.witness' | sort; fi
+}
+
+n=0
+while IFS= read -r w; do
+  [ -f "$w" ] || { echo "gen-inputs: skip (missing) $w" >&2; continue; }
+  tag="$(basename "$w" .witness)"; bin="$OUT/$tag.bin"
+  if [ "$FORCE" != 1 ] && [ -f "$bin" ] && [ "$bin" -nt "$w" ]; then continue; fi
+  cp -f "$w" "$bin"          # SP1 input = raw witness bytes (no length prefix / padding)
+  n=$((n + 1))
+done < <(list_witnesses)
+echo "gen-inputs: wrote/updated $n input(s) → $OUT  (re-run with --force to rebuild all)"

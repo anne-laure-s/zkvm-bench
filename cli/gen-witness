@@ -49,7 +49,7 @@ case "$REG_WIT" in
   Otherwise use an offline sample from guests/$REG_RUNG/inputs/ (see its README to regenerate)."
     ;;
   presupplied)
-    die "$GUEST ($REG_DESC): witnesses are pre-supplied, not generated — see $REG_INFRA/witnesses/<block>.witness."
+    die "$GUEST ($REG_DESC): witnesses are pre-supplied, not generated — see guests/monad/inputs/<block>.witness."
     ;;
   toy)
     die "$GUEST ($REG_DESC): toy guest, not a block witness:  ( cd $REG_INFRA && ./run gen-input GUEST=$REG_RUNG N=<n> )"

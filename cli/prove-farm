@@ -64,8 +64,10 @@ done
 reg_lookup "$GUEST" || die "unknown guest '$GUEST' (run --list to see them)."
 [ -n "$REMOTE" ] || die "--remote user@host required (the cluster box; run prove-cluster submits there)."
 INFRA="$ROOT/$REG_INFRA"
-[ -x "$INFRA/run" ] || die "no stack dispatcher at $INFRA/run for guest '$GUEST'."
-[ "$REG_EXEC" = batch ] && die "$GUEST ($REG_DESC): batch guests (Monad) prove via guests/monad/, not here."
+# A guest is provable here iff its stack exposes the `prove-cluster` dispatcher. `exec=batch` guests
+# (Monad) are fine AS LONG AS their registry row routes to a real infra (monad-zisk → infra/zisk-infra);
+# a batch guest still pointing at guests/monad (monad-sp1, no SP1 inputs yet) fails this check clearly.
+[ -x "$INFRA/run" ] || die "no stack dispatcher at $INFRA/run for guest '$GUEST' (batch guests must route to a real infra — see guests.registry)."
 
 OUT="$ROOT/prove-farm.csv"
 LOGDIR="$ROOT/prove-farm-logs"; mkdir -p "$LOGDIR"

@@ -97,8 +97,13 @@ prove_remote() {
   [[ -f "$ELF"   ]] || { echo "ERROR: ELF not found: $ELF (build it: ./run build-elf GUEST=...)" >&2; return 1; }
   [[ -f "$INPUT" ]] || { echo "ERROR: input not found: $INPUT (generate it: ./run gen-input GUEST=...)" >&2; return 1; }
 
-  local hints; hints="$(_hints_for "$INPUT")"
-  [[ -e "$hints" ]] || { echo "ERROR: hints not found: $hints (generate them with ./run gen-input)" >&2; return 1; }
+  # Hints are a proving-time OPTIMIZATION, not part of the witness — the prover's emulator regenerates
+  # them at prove time if absent (see guests/zisk-reth/guest.sh, and submit.sh which already treats
+  # --hints as optional). So ship them when present, prove without them otherwise (slower, still valid).
+  # This is what lets hints-less witnesses prove — e.g. monad (no reth hints-gen), or reth blocks whose
+  # hints-gen failed (secp256r1/p256verify).
+  local hints have_hints=0; hints="$(_hints_for "$INPUT")"
+  [[ -e "$hints" ]] && have_hints=1 || echo "NOTE: no hints for $INPUT — proving without them (prover regenerates; slower)." >&2
 
   local port="${PORT:-22}" mode="${MODE:-prove-compressed}" ws="${REMOTE_WS:-/workspace}"
   local remote_runner="${REMOTE_RUNNER:-zisk-runner}"
@@ -118,7 +123,7 @@ prove_remote() {
   echo "== prove =="
   echo "ELF       : $ELF"
   echo "Input     : $INPUT"
-  echo "Hints     : $hints"
+  echo "Hints     : $([[ $have_hints == 1 ]] && echo "$hints" || echo '(none — prover regenerates)')"
   echo "Remote    : $REMOTE:$port (mode=$mode, backend=$backend)"
   echo "Run dir   : $run_dir"
 
@@ -140,9 +145,9 @@ prove_remote() {
     echo "ELF already present on remote, skipping upload."
   fi
 
-  echo "Uploading input + hints..."
+  echo "Uploading input${have_hints:+ + hints}..."
   scp -P "$port" "$INPUT" "$REMOTE:$ws/inputs/$in_name"
-  scp -rP "$port" "$hints" "$REMOTE:$ws/inputs/$hints_name"
+  [[ $have_hints == 1 ]] && scp -rP "$port" "$hints" "$REMOTE:$ws/inputs/$hints_name"
 
   # Record the run context (hardware, versions) — what the benchmark ran on.
   {
@@ -168,10 +173,10 @@ prove_remote() {
 
   # Run the proof, streaming output live AND capturing the full proving log to a
   # file. `pipefail` so a prover failure still propagates through the `tee`.
+  local hints_arg=""; [[ $have_hints == 1 ]] && hints_arg="--hints $ws/inputs/$hints_name"
   "${ssh[@]}" "set -o pipefail; ${logpref}ZISK_PROVE_BACKEND=$backend $remote_runner \
     --elf $ws/elfs/$elf_name \
-    --input $ws/inputs/$in_name \
-    --hints $ws/inputs/$hints_name \
+    --input $ws/inputs/$in_name $hints_arg \
     --mode $mode \
     --output $ws/proofs/$base.proof.bin \
     --public-values $ws/proofs/$base.pv.bin \
