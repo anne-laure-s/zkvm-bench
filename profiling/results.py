@@ -16,7 +16,7 @@ Host-dependent `elapsed_secs` is omitted; proving times are NOT aggregated here
     profiling/results.py            # -> profiling/results/results.html
     profiling/results.py --out foo.html
 """
-import json, glob, os, sys, html
+import json, glob, os, sys, html, statistics
 
 HERE = os.path.dirname(os.path.abspath(__file__))   # profiling/
 REPO = os.path.dirname(HERE)                         # repo root
@@ -29,8 +29,9 @@ STACKS = [
 ]
 
 def scan(guest):
-    """(block -> work-unit value, set of ELF commits seen) from that guest's exec-report.json files."""
-    out, commits = {}, set()
+    """(block -> work-unit, ELF commits seen, block -> gas) from that guest's exec-report.json files.
+    `gas` is block-level (only SP1/RSP reports carry it) — feeds the work-unit/gas efficiency view."""
+    out, commits, gas = {}, set(), {}
     for f in sorted(glob.glob(os.path.join(REPO, f"guests/{guest}/inputs/*.exec-report.json"))):
         tag = os.path.basename(f)[:-len(".exec-report.json")]
         blk = tag.split("-")[-1]
@@ -41,7 +42,9 @@ def scan(guest):
         if val:                                  # truthy: skips None AND a 0 from an SP1 --no-gas run
             out[blk] = int(val)
             commits.add(j.get("commit"))          # None for legacy reports without the field
-    return out, commits
+            if j.get("gas"):
+                gas[blk] = int(j["gas"])
+    return out, commits, gas
 
 def main():
     out_path = os.path.join(HERE, "results", "results.html")
@@ -51,6 +54,9 @@ def main():
     scanned = {name: scan(name) for name, *_ in STACKS}
     data = {name: v[0] for name, v in scanned.items()}
     commits = {name: v[1] for name, v in scanned.items()}
+    GAS = {}                                     # block -> gas (block-level; filled by whichever stack records it, i.e. RSP)
+    for name, *_ in STACKS:
+        GAS.update(scanned[name][2])
     sets = [set(data[name]) for name, *_ in STACKS if data[name]]
     common = sorted(set.intersection(*sets), key=int) if len(sets) == len(STACKS) else []
     union = sorted(set().union(*sets), key=int) if sets else []
@@ -68,6 +74,16 @@ def main():
             print(f"WARNING: {name} exec-reports span MULTIPLE ELF commits {sorted(c[:12] for c in cs)} — "
                   f"not comparable; regenerate them from a single commit.", file=sys.stderr)
         commit_note[name] = (sorted(cs)[0][:12] if len(cs) == 1 else ("mixed" if cs else "n/a"))
+
+    # #4 work-unit / gas efficiency: gas is block-level (from the RSP report), so each stack's
+    # work/gas is a "trace per unit of EVM work" metric. Flag blocks costing a stack >1.5× its
+    # median ratio — expensive to prove relative to their gas.
+    ratio_med, outliers = {}, {}
+    for name, *_ in STACKS:
+        r = {b: data[name][b] / GAS[b] for b in data[name] if GAS.get(b)}
+        ratio_med[name] = statistics.median(r.values()) if len(r) >= 5 else None
+        outliers[name] = ({b for b, x in r.items() if x > ratio_med[name] * 1.5}
+                          if ratio_med[name] else set())
 
     SLOT = {1: ("#2a78d6", "#3987e5"), 2: ("#1baf7a", "#199e70"),
             3: ("#eda100", "#c98500"), 5: ("#4a3aa7", "#9085e9")}
@@ -93,20 +109,26 @@ def main():
     tiles += (f'<div class="tile accent"><div class="tile-v">{len(common)}</div>'
               f'<div class="tile-l">blocks common to all three<span class="u">apples-to-apples set</span></div></div>')
 
-    heads = '<th class="blk">Block</th>' + "".join(
+    heads = '<th class="blk">Block</th><th>gas<span class="u">Mgas</span></th>' + "".join(
         f'<th><span class="dot" style="background:var(--s{slot})"></span>{html.escape(label)}'
         f'<span class="u">{unit}</span></th>' for name, unit, label, slot in STACKS)
     rows = []
     for blk in union:
         is_common = blk in common
         cells = f'<td class="blk">{blk}{" ★" if is_common else ""}</td>'
+        g = GAS.get(blk)
+        cells += f'<td class="num{"" if g else " none"}">{f"{g/1e6:.1f}" if g else "—"}</td>'
         for name, *_ in STACKS:
             v = data[name].get(blk)
-            cells += f'<td class="{"num" if v is not None else "num none"}">{fmt(v)}</td>'
+            cls = "num" if v is not None else "num none"
+            mark = " ‡" if blk in outliers.get(name, ()) else ""
+            cells += f'<td class="{cls}">{fmt(v)}{mark}</td>'
         rows.append(f'<tr class="{"common" if is_common else ""}">{cells}</tr>')
     tbody = "\n".join(rows)
     commit_footer = " · ".join(f"{html.escape(lbl)} <code>{html.escape(commit_note[name])}</code>"
                                for name, unit, lbl, slot in STACKS)
+    eff_footer = (" · ".join(f"{html.escape(lbl)} {ratio_med[name]:.2f}"
+                             for name, unit, lbl, slot in STACKS if ratio_med[name]) or "n/a")
 
     doc = f"""<!doctype html>
 <html lang="en">
@@ -186,6 +208,7 @@ def main():
 
     <footer>★ = block present in all three stacks ({len(common)} of {len(union)}).
     Values are the deterministic work-unit; “—” = not generated for that stack.
+    ‡ = work-unit/gas &gt; 1.5× the stack median ({eff_footer} work-units/gas) — costly to prove vs its gas.
     ELF commit per guest: {commit_footer}.
     Regenerate with <code>profiling/results.py</code>.</footer>
   </div>
@@ -197,6 +220,8 @@ def main():
     print(f"wrote {out_path}")
     print("  stacks: " + " · ".join(f"{lbl} {len(data[n])}" for n, u, lbl, s in STACKS))
     print("  commit: " + " · ".join(f"{lbl} {commit_note[n]}" for n, u, lbl, s in STACKS))
+    print("  gas: %d blocks · work/gas outliers (>1.5× median): %s" % (
+        len(GAS), " · ".join(f"{lbl} {len(outliers[n])}" for n, u, lbl, s in STACKS)))
     print(f"  {len(common)} common blocks / {len(union)} union")
 
 if __name__ == "__main__":
