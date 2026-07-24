@@ -58,6 +58,20 @@ and the Monad `monad-execution` guest (C++) both render out of the box.
 
 # re-render the HTML from an existing profile.json (fast; design tweaks, --meta, --labels)
 ./hotspots.py render --json results/reth/profile.json --out results/reth --title "reth guest"
+
+# diff two existing profiles per module/function (text) — e.g. Monad vs reth on the same zkVM:
+./hotspots.py diff --json results/monad-sp1/profile.json --json results/rsp-sp1/profile.json \
+    --label Monad --label reth
+
+# before/after a guest change, in one shot: profile the SAME inputs through both ELFs, then diff:
+./hotspots.py compare --backend sp1 \
+    --elf-before OLD/monad-zkvm-guest-sp1.elf --elf-after ../guests/monad/monad-zkvm-guest-sp1.elf \
+    -i ../guests/monad/inputs/1-25229957.witness --verify-roots ../guests/monad/inputs --out results/cmp
+
+# many blocks → ONE mean-per-block profile (+ per-function cv) instead of one tab each:
+./hotspots.py profile --backend zisk --elf ../guests/zisk-reth/zisk-reth.elf \
+    -i ../guests/zisk-reth/inputs/1-25229951.bin -i ../guests/zisk-reth/inputs/1-25229957.bin \
+    --aggregate --out results/reth-agg
 ```
 
 Open `<out>/index.html` in a browser.
@@ -75,7 +89,10 @@ Open `<out>/index.html` in a browser.
 | `--name FILE` | HTML filename (default `index.html`) |
 | `--emu PATH` | *(zisk)* ziskemu path (default `~/.zisk/bin/ziskemu`) |
 | `--tab-prefix STR` | *(profile)* prefix every tab key → namespaces a guest so several profiles merge without colliding |
+| `--aggregate [LABEL]` | *(profile)* fold ALL inputs into one **mean-per-block** profile (+ per-function `cv` = cross-block variability) instead of one tab each — for many blocks |
 | `--json` *(render, repeatable)* | `render --json a --json b` merges several guests' profiles into one report |
+
+`diff` / `compare` are separate sub-commands (text output) — see **Diffing profiles** below.
 
 ### Comparing multiple guests
 `profile` takes a single `--elf`, so profile each guest on its own, then `render` **merges** their
@@ -95,6 +112,33 @@ RSP's `1-25229957` and Monad's `25229957` would otherwise land on the same key:
 ```
 `render` **errors** (rather than silently dropping a tab) if two profiles share a key — re-run the
 colliding guest with a different `--tab-prefix`.
+
+### Diffing profiles — `diff` / `compare`
+Beyond merging into tabs, you can **subtract** two profiles to see *where* they differ (text output).
+Each side is **aggregated** first (mean over its inputs), so pass as many `-i` blocks as you like.
+
+```sh
+# two EXISTING profiles — module + top-function deltas (Δ = A over B):
+./hotspots.py diff --json results/monad-sp1/profile.json --json results/rsp-sp1/profile.json \
+    --label Monad --label reth
+```
+This is how you attribute the "Monad engine generates +N % more trace than reth" headline to specific
+modules/functions (`monad`, `zkvm_keccak256`, `embedded_alloc` … vs `revm_interpreter`, `rsp_mpt`, `sha3` …).
+
+`compare` is the **before/after** tool for a guest change — it profiles the SAME inputs through two
+ELFs and prints the diff in one command (Δ = *after* over *before*; **negative = the change made it cheaper**):
+
+```sh
+./hotspots.py compare --backend sp1 \
+    --elf-before /path/OLD/monad-zkvm-guest-sp1.elf \
+    --elf-after  ../guests/monad/monad-zkvm-guest-sp1.elf \
+    -i ../guests/monad/inputs/1-25229957.witness -i ../guests/monad/inputs/1-25229951.witness \
+    --verify-roots ../guests/monad/inputs --out results/monad-cmp   # --out saves before/after profile.json
+```
+Keep the OLD ELF around before rebuilding. `--verify-roots` runs inside `compare` too, so you see
+*cheaper* **and** *still-correct* (root PASS/MISMATCH) per block in one go. Run from `profiling/`
+(or pass `--runner` / `--emu`) so the default backend paths resolve. `diff` compares by function name,
+so after a heavy refactor read the **per-module** rows (robust to renames); the total `Δ%` is always right.
 
 #### `--meta` — add block info a guest doesn't print
 Cards are driven by each tab's `meta`. The reth guest prints `txs` / `gas` / block `hash`

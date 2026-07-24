@@ -26,7 +26,7 @@ Common JSON schema (what a backend must produce, per input tag):
 To add a backend: write `profile_<name>(args) -> dict` in that schema and register it in BACKENDS.
 The renderer, module extraction, --meta/--labels and CLI are already shared.
 """
-import argparse, glob, json, os, re, subprocess, tempfile, time
+import argparse, glob, json, os, re, statistics, subprocess, tempfile, time
 
 # ─────────────────────────── common (prover-agnostic) ───────────────────────────
 
@@ -62,6 +62,43 @@ def _root_file(dirpath, tag):
         p = os.path.join(dirpath, cand + '.post_state_root')
         if os.path.exists(p): return p
     return None
+
+def _aggregate(data, top=200):
+    """Fold several per-input profiles (common schema) into ONE mean-per-block profile: functions /
+    modules = mean count across the N inputs (absent = 0); categories / opcodes = mean cost; meta =
+    mean of numeric fields. Each function also gets `cv` (coeff. of variation across blocks — how
+    stable that hotspot is). Used by `profile --aggregate` and by `diff`. No call-tree."""
+    entries = [e for e in data.values() if isinstance(e, dict)]
+    n = len(entries) or 1
+    perentry = [{f['name']: f['count'] for f in e.get('functions', [])} for e in entries]
+    fmod = {}
+    for e in entries:
+        for f in e.get('functions', []): fmod.setdefault(f['name'], f.get('module', 'other'))
+    funcs = []
+    for nm in fmod:
+        vals = [pe.get(nm, 0) for pe in perentry]
+        mean = sum(vals) / n
+        cv = (statistics.pstdev(vals) / mean) if (mean and len(vals) > 1) else 0.0
+        funcs.append({'name': nm, 'module': fmod[nm], 'count': round(mean), 'cv': round(cv, 3)})
+    funcs.sort(key=lambda x: -x['count'])
+    modtot = {}
+    for e in entries:
+        for m, c in e.get('modules', {}).items(): modtot[m] = modtot.get(m, 0) + c
+    modtot = {m: round(c / n) for m, c in modtot.items()}
+    def _meancost(key):
+        agg = {}
+        for e in entries:
+            for x in e.get(key, []): agg[x['name']] = agg.get(x['name'], 0.0) + x.get('cost', 0)
+        tot = sum(agg.values()) or 1
+        return [{'name': k, 'cost': round(v / n), 'pct': round(100 * v / tot, 1)}
+                for k, v in sorted(agg.items(), key=lambda x: -x[1])]
+    meta = {'n': len(entries)}
+    for k in ('steps', 'cost', 'emu', 'gas', 'txs'):
+        vals = [e['meta'][k] for e in entries if isinstance(e.get('meta', {}).get(k), (int, float))]
+        if vals: meta[k] = round(sum(vals) / len(vals), 3) if k == 'emu' else round(sum(vals) / len(vals))
+    return {'meta': meta, 'total_count': round(sum(e.get('total_count', 0) for e in entries) / n),
+            'functions': funcs[:top], 'modules': modtot,
+            'categories': _meancost('categories'), 'opcodes': _meancost('opcodes')[:12]}
 
 def render_html(data, args):
     if getattr(args, 'meta', None):
@@ -392,6 +429,12 @@ def cmd_profile(args):
     for k, v in _BACKEND_CFG.get(args.backend, {}).items():
         if getattr(args, k, None) is None: setattr(args, k, v)
     data = BACKENDS[args.backend](args)
+    if getattr(args, 'aggregate', None):
+        agg = _aggregate(data, top=args.top)
+        var = sorted((f for f in agg['functions'] if f.get('cv')), key=lambda x: -x['cv'])[:8]
+        print("aggregate over %d inputs — most variable functions (cv across blocks): %s" % (
+            len(data), ", ".join(f"{f['name'][:24]}={f['cv']:.2f}" for f in var) or "—"), flush=True)
+        data = {args.aggregate: agg}
     if getattr(args, 'tab_prefix', ''):
         data = {args.tab_prefix + k: v for k, v in data.items()}
     # Stamp the resolved display cfg into each entry so `render` reproduces the same
@@ -426,6 +469,53 @@ def cmd_render(args):
     if getattr(args, 'note', None) is None:       args.note = disp.get('note')
     render_html(data, args)
 
+def _diff(dA, dB, la, lb, top):
+    """Aggregate two profile-data dicts and print per-module / per-function deltas (A over B)."""
+    ea, eb = _aggregate(dA, top=10**9), _aggregate(dB, top=10**9)
+    ta, tb = ea['total_count'] or 1, eb['total_count'] or 1
+    print(f"=== hotspots diff: {la} vs {lb} ===")
+    print(f"total attributed: {la} {ta:,} · {lb} {tb:,} · Δ {(ta - tb) / tb * 100:+.1f}% ({la} over {lb})\n")
+    print(f"  {'module':<22}{la[:10]:>12}{lb[:10]:>12}{'Δcount':>13}{'Δ%oftot':>10}")
+    rows = [(m, ea['modules'].get(m, 0), eb['modules'].get(m, 0))
+            for m in set(ea['modules']) | set(eb['modules'])]
+    for m, a, b in sorted(rows, key=lambda x: -abs(x[1] - x[2]))[:top]:
+        print(f"  {m[:22]:<22}{a:>12,}{b:>12,}{a - b:>+13,}{(a / ta - b / tb) * 100:>+9.2f}%")
+    fa = {f['name']: f['count'] for f in ea['functions']}
+    fb = {f['name']: f['count'] for f in eb['functions']}
+    print(f"\n  top {top} function movers (Δcount):")
+    for nm in sorted(set(fa) | set(fb), key=lambda k: -abs(fa.get(k, 0) - fb.get(k, 0)))[:top]:
+        a, b = fa.get(nm, 0), fb.get(nm, 0)
+        print(f"  {nm[:44]:<44}{a:>12,}{b:>12,}{a - b:>+13,}")
+
+def cmd_diff(args):
+    """Per-module / per-function delta between two EXISTING profiles (each aggregated). Text output —
+    e.g. `diff --json <monad>/profile.json --json <rsp>/profile.json --label Monad --label reth`
+    shows WHERE one guest spends more trace than the other on the same zkVM."""
+    if len(args.json) != 2:
+        raise SystemExit("diff needs exactly two --json (A then B)")
+    A, B = json.load(open(args.json[0])), json.load(open(args.json[1]))
+    lbls = args.label or []
+    la = lbls[0] if len(lbls) > 0 else (os.path.basename(os.path.dirname(args.json[0])) or 'A')
+    lb = lbls[1] if len(lbls) > 1 else (os.path.basename(os.path.dirname(args.json[1])) or 'B')
+    _diff(A, B, la, lb, args.top)
+
+def cmd_compare(args):
+    """Profile the SAME inputs through two ELFs (before/after a guest change) and print the diff — the
+    one-shot before/after tool. Δ (after over before) < 0 means the change made the guest cheaper."""
+    la, lb = args.label_after or 'after', args.label_before or 'before'
+    def _run(elf, which):
+        args.elf = elf
+        print(f"== profiling {which}: {elf} ==", flush=True)
+        return BACKENDS[args.backend](args)
+    before = _run(args.elf_before, lb)
+    after = _run(args.elf_after, la)
+    if args.out:
+        os.makedirs(args.out, exist_ok=True)
+        json.dump(before, open(os.path.join(args.out, 'before.profile.json'), 'w'))
+        json.dump(after,  open(os.path.join(args.out, 'after.profile.json'), 'w'))
+        print(f"profiles -> {args.out}/{{before,after}}.profile.json", flush=True)
+    _diff(after, before, la, lb, args.top)
+
 def main():
     p = argparse.ArgumentParser(prog='hotspots', description='zkVM guest hotspot profiler + HTML report.')
     sub = p.add_subparsers(dest='cmd', required=True)
@@ -455,11 +545,35 @@ def main():
             sp.add_argument('--tab-prefix', dest='tab_prefix', default='',
                             help='prefix every tab/tag key — namespaces a guest so profiles merge cleanly '
                                  '(e.g. --tab-prefix rsp- , then: render --json a --json b)')
+            sp.add_argument('--aggregate', nargs='?', const='aggregate', default=None,
+                            help='fold ALL inputs into one mean-per-block profile (optional label, default '
+                                 '"aggregate") instead of one tab each — for many blocks; adds per-function cv')
         else:
             sp.add_argument('--json', action='append', required=True,
                             help='profile.json to render; repeat (--json a --json b) to merge several guests into one report')
+    spd = sub.add_parser('diff', help='compare two existing profiles per module/function (e.g. Monad vs reth)')
+    spd.add_argument('--json', action='append', required=True, help='exactly two profile.json: A then B')
+    spd.add_argument('--label', action='append', help='labels for A and B (default: their folder names)')
+    spd.add_argument('--top', type=int, default=25, help='rows to show (default 25)')
+
+    spc = sub.add_parser('compare', help='profile the SAME inputs through two ELFs (before/after a change) and diff')
+    spc.add_argument('--backend', choices=sorted(BACKENDS), default='zisk')
+    spc.add_argument('--elf-before', dest='elf_before', required=True)
+    spc.add_argument('--elf-after',  dest='elf_after',  required=True)
+    spc.add_argument('-i', '--input', action='append', required=True, help='input (repeatable) — the SAME for both ELFs')
+    spc.add_argument('--emu', default='~/.zisk/bin/ziskemu', help='[zisk] ziskemu path')
+    spc.add_argument('--runner', default='../infra/sp1-infra/sp1-runner/target-prof/release/sp1-runner',
+                     help='[sp1] sp1-runner built with --features profiling')
+    spc.add_argument('--sample-rate', dest='sample_rate', type=int, default=200, help='[sp1] TRACE_SAMPLE_RATE')
+    spc.add_argument('--costs', default=_SP1_DEFAULT_COSTS, help='[sp1] rv64im_costs.json path')
+    spc.add_argument('--verify-roots', dest='verify_roots', help='dir with <tag>.post_state_root to verify output[:32]')
+    spc.add_argument('--top', type=int, default=25, help='rows in the diff (default 25)')
+    spc.add_argument('--out', help='optional dir to save before/after profile.json')
+    spc.add_argument('--label-before', dest='label_before', help='label for the before ELF (default "before")')
+    spc.add_argument('--label-after',  dest='label_after',  help='label for the after ELF (default "after")')
+
     a = p.parse_args()
-    (cmd_profile if a.cmd == 'profile' else cmd_render)(a)
+    {'profile': cmd_profile, 'render': cmd_render, 'diff': cmd_diff, 'compare': cmd_compare}[a.cmd](a)
 
 if __name__ == '__main__':
     main()

@@ -13,8 +13,10 @@ zkVMs** (different VMs). The report says so and never mixes units on one scale.
 Host-dependent `elapsed_secs` is omitted; proving times are NOT aggregated here
 (run/box/tuning-dependent — see ../cli/report-schema.md).
 
-    profiling/results.py            # -> profiling/results/results.html
+    profiling/results.py                          # -> profiling/results/results.html
     profiling/results.py --out foo.html
+    profiling/results.py --snapshot snap.json     # also dump {stack: {commit, blocks}} for regression tracking
+    profiling/results.py --baseline snap.json     # diff current vs a snapshot (exit 1 on a same-commit change)
 """
 import json, glob, os, sys, html, statistics
 
@@ -84,6 +86,32 @@ def main():
         ratio_med[name] = statistics.median(r.values()) if len(r) >= 5 else None
         outliers[name] = ({b for b, x in r.items() if x > ratio_med[name] * 1.5}
                           if ratio_med[name] else set())
+
+    # #2 regression tracking: snapshot = {stack: {commit, blocks}}; --baseline diffs current vs a
+    # snapshot. A changed work-unit at the SAME commit is a determinism break (exit 1); a change
+    # across an ELF bump (commit moved) is expected/informational.
+    snapshot = {name: {"commit": commit_note[name], "blocks": data[name]} for name, *_ in STACKS}
+    if "--snapshot" in sys.argv:
+        sp = sys.argv[sys.argv.index("--snapshot") + 1]
+        json.dump(snapshot, open(sp, "w"), indent=2, sort_keys=True)
+        print(f"snapshot -> {sp}", file=sys.stderr)
+    regressed = False
+    if "--baseline" in sys.argv:
+        base = json.load(open(sys.argv[sys.argv.index("--baseline") + 1]))
+        print("=== baseline diff ===", file=sys.stderr)
+        for name, unit, lbl, slot in STACKS:
+            b = base.get(name, {}); bblk = b.get("blocks", {})
+            moved = (b.get("commit") != commit_note[name])
+            changed = [(k, int(bblk[k]), data[name][k]) for k in set(bblk) & set(data[name])
+                       if int(bblk[k]) != data[name][k]]
+            for k, ov, nv in sorted(changed, key=lambda x: int(x[0])):
+                d = (nv - ov) / ov * 100 if ov else 0
+                if not moved: regressed = True
+                why = "ELF bump — expected" if moved else "⚠ SAME commit — determinism break"
+                print(f"  {lbl} {k}: {ov:,} -> {nv:,} ({d:+.2f}%)  [{why}]", file=sys.stderr)
+            added = len(set(data[name]) - set(bblk)); removed = len(set(bblk) - set(data[name]))
+            print(f"  {lbl}: {len(changed)} changed · {added} added · {removed} removed"
+                  + (f" · commit {b.get('commit')}→{commit_note[name]}" if moved else ""), file=sys.stderr)
 
     SLOT = {1: ("#2a78d6", "#3987e5"), 2: ("#1baf7a", "#199e70"),
             3: ("#eda100", "#c98500"), 5: ("#4a3aa7", "#9085e9")}
@@ -223,6 +251,10 @@ def main():
     print("  gas: %d blocks · work/gas outliers (>1.5× median): %s" % (
         len(GAS), " · ".join(f"{lbl} {len(outliers[n])}" for n, u, lbl, s in STACKS)))
     print(f"  {len(common)} common blocks / {len(union)} union")
+    if regressed:
+        print("REGRESSION: work-unit(s) changed at the SAME ELF commit — see the baseline diff above.",
+              file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
