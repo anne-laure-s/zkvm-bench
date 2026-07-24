@@ -21,11 +21,12 @@
 _inject_report_meta() {
   local rep="$1"; [[ -f "$rep" ]] || return 0
   python3 - "$@" <<'PY'
-import json,sys
+import json,sys,os
 a=sys.argv[1:]; rep,zkvm,guest=a[0],a[1],a[2]
 block=int(a[3]) if len(a)>=4 and a[3].isdigit() else None
 d=json.load(open(rep))
-core={"mode":d.get("mode","execute"),"zkvm":zkvm,"guest":guest,"block":block}
+commit=(os.environ.get("REPORT_COMMIT") or "").strip() or None
+core={"mode":d.get("mode","execute"),"zkvm":zkvm,"guest":guest,"block":block,"commit":commit}
 json.dump({**core,**{k:v for k,v in d.items() if k not in core}},open(rep,"w"),indent=2)
 PY
 }
@@ -44,7 +45,11 @@ execute_local() {
   OPENVM_CACHE_DIR="${OPENVM_CACHE_DIR:-$IN_DIR/rpc-cache}" \
     "$RUNNER" --mode execute --block "$BLOCK" --chain "$CHAIN_ID" ${RPC_URL:+--rpc "$RPC_URL"} \
       --public-values "$pv" --report "$report"
-  _inject_report_meta "$report" OpenVM "${GUEST:-openvm-reth}" "$BLOCK"
+  local g="${GUEST:-openvm-reth}" commit_file
+  commit_file="$GUESTS_DIR/$g/$g.commit"
+  [[ -f "$commit_file" ]] && export REPORT_COMMIT="$(cat "$commit_file")"
+  _inject_report_meta "$report" OpenVM "$g" "$BLOCK"
+  unset REPORT_COMMIT
   echo "Report : $report"
 }
 

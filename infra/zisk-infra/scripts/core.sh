@@ -61,7 +61,8 @@ else:
     inp=a[2]; m=re.search(r'guests/([^/]+)/',inp); guest=m.group(1) if m else None
     stem=os.path.splitext(os.path.basename(inp))[0]; seg=stem.split('-')[-1]
     block=int(seg) if seg.isdigit() else None
-core={"mode":d.get("mode","execute"),"zkvm":zkvm,"guest":guest,"block":block}
+commit=(os.environ.get("REPORT_COMMIT") or "").strip() or None
+core={"mode":d.get("mode","execute"),"zkvm":zkvm,"guest":guest,"block":block,"commit":commit}
 json.dump({**core,**{k:v for k,v in d.items() if k not in core}},open(rep,"w"),indent=2)
 PY
 }
@@ -83,7 +84,10 @@ execute_local() {
   echo "Input  : $INPUT"
   "$RUNNER" --elf "$ELF" --input "$INPUT" --mode execute \
     --public-values "$pv" --report "$report"
+  local commit_file="${ELF%.elf}.commit"
+  [[ -f "$commit_file" ]] && export REPORT_COMMIT="$(cat "$commit_file")"
   _inject_report_meta "$report" ZisK "$INPUT"
+  unset REPORT_COMMIT
   echo "Report : $report"
   echo "PV     : $pv"
 }

@@ -26,7 +26,7 @@ Common JSON schema (what a backend must produce, per input tag):
 To add a backend: write `profile_<name>(args) -> dict` in that schema and register it in BACKENDS.
 The renderer, module extraction, --meta/--labels and CLI are already shared.
 """
-import argparse, json, os, re, subprocess, tempfile, time
+import argparse, glob, json, os, re, subprocess, tempfile, time
 
 # ─────────────────────────── common (prover-agnostic) ───────────────────────────
 
@@ -53,6 +53,15 @@ def module(name):
     if mod in ('memcpy','memmove','memset','memcmp','bcmp','strlen'): mod = 'mem'
     if mod in ('operator','malloc','free','sys_alloc_aligned','sys_free','_Znwm','_Znam','_ZdlPv'): mod = 'alloc'
     return mod
+
+def _root_file(dirpath, tag):
+    """post_state_root file for a tag, tolerant of the `1-` chain prefix (zisk keeps it in the tag,
+    sp1 strips it; the files are named 1-<block>.post_state_root). Returns a path or None."""
+    base = re.sub(r'^1-', '', tag)
+    for cand in (tag, base, '1-' + base):
+        p = os.path.join(dirpath, cand + '.post_state_root')
+        if os.path.exists(p): return p
+    return None
 
 def render_html(data, args):
     if getattr(args, 'meta', None):
@@ -89,7 +98,7 @@ def _zisk_run(emu, elf, inp, extra, disasm=None, out=None):
     cmd = [emu, '-e', elf, '-i', inp] + extra
     if disasm: cmd += ['--disasm', disasm]
     if out: cmd += ['-o', out]
-    return subprocess.run(cmd, capture_output=True, text=True).stdout
+    return subprocess.run(cmd, capture_output=True, text=True)   # caller reads .stdout / checks .returncode
 
 def _zisk_report(txt):
     num = lambda p: (int(re.search(p, txt).group(1).replace(',', '')) if re.search(p, txt) else None)
@@ -135,18 +144,22 @@ def profile_zisk(args):
         tag = os.path.splitext(os.path.basename(inp))[0]
         print(f"[{tag}] profiling…", flush=True)
         t0 = time.time()                                    # 1) fast pass: emu time + steps
-        mtxt = _zisk_run(emu, args.elf, inp, ['-m'])
+        mtxt = _zisk_run(emu, args.elf, inp, ['-m']).stdout
         md = re.search(r'duration=([\d.]+)', mtxt)
         emu_s = float(md.group(1)) if md else round(time.time() - t0, 3)
         with tempfile.NamedTemporaryFile(suffix='.disasm', delete=False) as tf:
             dpath = tf.name
         outbin = dpath + '.out' if args.verify_roots else None
-        txt = _zisk_run(emu, args.elf, inp, ['-X','-S','--sdk','--opcodes','-H','12'], disasm=dpath, out=outbin)
+        p = _zisk_run(emu, args.elf, inp, ['-X','-S','--sdk','--opcodes','-H','12'], disasm=dpath, out=outbin)
+        txt = p.stdout
         meta, cats, ops = _zisk_report(txt)
+        if p.returncode != 0 or meta.get('steps') is None:
+            raise SystemExit(f"[{tag}] ziskemu failed (rc={p.returncode}) or emitted no step count "
+                             f"(bad ELF/input?).\n{(p.stderr or txt)[-1500:]}")
         meta['emu'] = emu_s
         if args.verify_roots:
-            rf = os.path.join(args.verify_roots, tag + '.post_state_root')
-            if os.path.exists(rf):
+            rf = _root_file(args.verify_roots, tag)
+            if rf:
                 exp = ''.join(ch for ch in open(rf).read() if ch in '0123456789abcdefABCDEF').lower()[-64:]
                 got = open(outbin, 'rb').read()[:32].hex() if outbin and os.path.exists(outbin) else ''
                 meta['root'] = '0x' + exp
@@ -175,9 +188,14 @@ def profile_zisk(args):
 # Input is the RAW witness/.bin (the runner wraps it via SP1Stdin::write_slice); no
 # LE64 framing (that's zisk-only).
 
-_SP1_DEFAULT_COSTS = os.path.expanduser(
-    '~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/'
-    'sp1-core-executor-6.2.4/src/artifacts/rv64im_costs.json')
+def _default_sp1_costs():
+    """Locate rv64im_costs.json in the cargo registry via glob, so it survives a different registry
+    hash or an sp1-core-executor version bump (newest match wins). Override with --costs."""
+    pat = os.path.expanduser('~/.cargo/registry/src/*/sp1-core-executor-*/src/artifacts/rv64im_costs.json')
+    hits = sorted(glob.glob(pat))
+    return hits[-1] if hits else pat   # pattern itself if nothing found -> a clear error on open
+
+_SP1_DEFAULT_COSTS = _default_sp1_costs()
 
 # RISC-V mnemonic (opcode_counts key) → (cost-model event [User variant], category)
 _SP1_OPMAP = {
@@ -271,7 +289,6 @@ def _sp1_gecko(gecko_path, top, tree_prune=0.003):
     pcol = th['stackTable']['schema']['prefix']; scol = th['samples']['schema']['stack']
     # resolve every frame once: frame_idx -> (display name, module)
     demap = _cxxfilt([strings[f[loc]] for f in frames])
-    raw = {strings[f[loc]]: None for f in frames}  # keep insertion cheap; demap keyed by raw
     fname = [None] * len(frames); fmod = [None] * len(frames)
     for i, f in enumerate(frames):
         dm = demap[strings[f[loc]]]
@@ -345,11 +362,14 @@ def profile_sp1(args):
             meta = {'steps': report['cycles'], 'cost': cost,
                     'emu': round(report.get('elapsed_secs', time.time()-t0), 3)}
             if args.verify_roots:
-                rf = os.path.join(args.verify_roots, tag + '.post_state_root')
-                if os.path.exists(rf) and os.path.exists(pv):
+                rf = _root_file(args.verify_roots, tag)
+                if rf and os.path.exists(pv):
                     exp = ''.join(ch for ch in open(rf).read() if ch in '0123456789abcdefABCDEF').lower()[-64:]
                     got = open(pv, 'rb').read()[:32].hex()
                     meta['root'] = '0x' + exp; meta['root_ok'] = (got == exp)
+            if not os.path.exists(gecko):
+                raise SystemExit(f"[{tag}] no Gecko trace at {gecko} — is the runner built with "
+                                 f"--features profiling? (expected under target-prof/…/sp1-runner)")
             tot, funcs, modtot, tree = _sp1_gecko(gecko, args.top)
         data[tag] = {'meta': meta, 'total_count': tot, 'functions': funcs,
                      'modules': modtot, 'categories': cats, 'opcodes': ops, 'tree': tree}

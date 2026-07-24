@@ -29,8 +29,8 @@ STACKS = [
 ]
 
 def scan(guest):
-    """block -> work-unit value, from that guest's exec-report.json files."""
-    out = {}
+    """(block -> work-unit value, set of ELF commits seen) from that guest's exec-report.json files."""
+    out, commits = {}, set()
     for f in sorted(glob.glob(os.path.join(REPO, f"guests/{guest}/inputs/*.exec-report.json"))):
         tag = os.path.basename(f)[:-len(".exec-report.json")]
         blk = tag.split("-")[-1]
@@ -38,19 +38,36 @@ def scan(guest):
             continue
         j = json.load(open(f))
         val = j.get("cycles", j.get("steps"))   # SP1/OpenVM: cycles · ZisK: steps
-        if val is not None:
+        if val:                                  # truthy: skips None AND a 0 from an SP1 --no-gas run
             out[blk] = int(val)
-    return out
+            commits.add(j.get("commit"))          # None for legacy reports without the field
+    return out, commits
 
 def main():
     out_path = os.path.join(HERE, "results", "results.html")
     if "--out" in sys.argv:
         out_path = sys.argv[sys.argv.index("--out") + 1]
 
-    data = {name: scan(name) for name, *_ in STACKS}
+    scanned = {name: scan(name) for name, *_ in STACKS}
+    data = {name: v[0] for name, v in scanned.items()}
+    commits = {name: v[1] for name, v in scanned.items()}
     sets = [set(data[name]) for name, *_ in STACKS if data[name]]
     common = sorted(set.intersection(*sets), key=int) if len(sets) == len(STACKS) else []
     union = sorted(set().union(*sets), key=int) if sets else []
+
+    if not union:
+        print("results: no exec-report.json under guests/*/inputs/ — run `./run execute` per block "
+              "first (they are git-ignored / regenerated locally).", file=sys.stderr)
+
+    # ELF commit each column was built from; warn if a guest mixed commits (work-units are only
+    # comparable within one ELF version — see cli/report-schema.md).
+    commit_note = {}
+    for name, *_ in STACKS:
+        cs = {c for c in commits[name] if c}
+        if len(cs) > 1:
+            print(f"WARNING: {name} exec-reports span MULTIPLE ELF commits {sorted(c[:12] for c in cs)} — "
+                  f"not comparable; regenerate them from a single commit.", file=sys.stderr)
+        commit_note[name] = (sorted(cs)[0][:12] if len(cs) == 1 else ("mixed" if cs else "n/a"))
 
     SLOT = {1: ("#2a78d6", "#3987e5"), 2: ("#1baf7a", "#199e70"),
             3: ("#eda100", "#c98500"), 5: ("#4a3aa7", "#9085e9")}
@@ -88,6 +105,8 @@ def main():
             cells += f'<td class="{"num" if v is not None else "num none"}">{fmt(v)}</td>'
         rows.append(f'<tr class="{"common" if is_common else ""}">{cells}</tr>')
     tbody = "\n".join(rows)
+    commit_footer = " · ".join(f"{html.escape(lbl)} <code>{html.escape(commit_note[name])}</code>"
+                               for name, unit, lbl, slot in STACKS)
 
     doc = f"""<!doctype html>
 <html lang="en">
@@ -167,6 +186,7 @@ def main():
 
     <footer>★ = block present in all three stacks ({len(common)} of {len(union)}).
     Values are the deterministic work-unit; “—” = not generated for that stack.
+    ELF commit per guest: {commit_footer}.
     Regenerate with <code>profiling/results.py</code>.</footer>
   </div>
 </body>
@@ -176,6 +196,7 @@ def main():
     open(out_path, "w").write(doc)
     print(f"wrote {out_path}")
     print("  stacks: " + " · ".join(f"{lbl} {len(data[n])}" for n, u, lbl, s in STACKS))
+    print("  commit: " + " · ".join(f"{lbl} {commit_note[n]}" for n, u, lbl, s in STACKS))
     print(f"  {len(common)} common blocks / {len(union)} union")
 
 if __name__ == "__main__":
