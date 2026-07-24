@@ -14,11 +14,15 @@
 #   --block-interval N     prove every Nth block        [default 100 = ethproofs cadence]
 #   --coordinator URL      prover seam (ZisK coordinator; required for a real ZisK run)
 #   --ws-port N            input-gen-server WS port (ZisK) [default 8765]
+#   --mock                 SP1 only: SP1_PROVER=mock (fake proofs) — TEST the pipeline plumbing end-to-end
+#                          (chain-follow → witness → "prove" → submit) with NO cluster/GPU. Still needs a
+#                          witness RPC. The cheapest way to validate the whole flow against ethproofs-mock.
 #   --build                cargo build the stack's ethproofs binaries first
 #   --dry-run              print the mapped config + commands, don't build/launch
 #
 #   ./cli/ethproofs --guest zisk --chain-ws wss://…alchemy…/<key> --coordinator http://<box>:7000
-#   ./cli/ethproofs --guest rsp  --chain-ws wss://…alchemy…/<key>
+#   ./cli/ethproofs --guest rsp  --chain-ws wss://…alchemy…/<key>              # single-box cuda
+#   ./cli/ethproofs --guest rsp  --chain-ws wss://…alchemy…/<key> --mock       # plumbing test → ethproofs-mock, no cluster
 #
 # Runs the stack's ethproofs client(s); the SEAMS themselves run separately (and hot-swap by URL):
 # cli/ethproofs-mock (ethproofs) · the openvm-eth proxy (witness) · the prover cluster/coordinator.
@@ -27,9 +31,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 GUEST=""; WITNESS_RPC="http://localhost:8545"; CHAIN_WS=""; ETHPROOFS_URL="http://localhost:8547"
 ETHPROOFS_TOKEN="dev"; ETHPROOFS_CLUSTER="1"; BLOCK_INTERVAL="100"; COORDINATOR=""; WS_PORT="8765"
-DRY_RUN=0; BUILD=0
+DRY_RUN=0; BUILD=0; MOCK=0
 while [ $# -gt 0 ]; do case "$1" in
   --guest)            GUEST="${2:?}"; shift 2 ;;
+  --mock)             MOCK=1; shift ;;                  # SP1: SP1_PROVER=mock (fake proofs) — test the plumbing, no cluster/GPU
   --witness-rpc)      WITNESS_RPC="${2:?}"; shift 2 ;;
   --chain-ws)         CHAIN_WS="${2:?}"; shift 2 ;;
   --ethproofs-url)    ETHPROOFS_URL="${2:?}"; shift 2 ;;
@@ -70,6 +75,7 @@ case "$GUEST" in
   zisk)
     DIR="$ROOT/vendor/zisk-ethproofs"
     [ -d "$DIR" ] || die "vendor/zisk-ethproofs missing — run cli/install-vendors"
+    [ "$MOCK" = 1 ] && die "--mock is SP1-only (SP1_PROVER=mock). ZisK's --skip-proving does NOT submit /proved, so there's no fake-proof plumbing test — use --coordinator, or test the plumbing with '--guest rsp --mock'."
     INPUTS="$LOGDIR/zisk-inputs"
     # shared seams → ZisK native config (input-gen-server witness+chain-follow; ethproofs-client prover+submit)
     igs_env=( "RPC_URL=$WITNESS_RPC" "RPC_WS_URL=$CHAIN_WS" "BLOCK_MODULUS=$BLOCK_INTERVAL" "WS_PORT=$WS_PORT" "INPUTS_FOLDER=$INPUTS" )
@@ -104,15 +110,18 @@ case "$GUEST" in
     bin="$DIR/target/release/eth-proofs"
     args=( --http-rpc-url "$WITNESS_RPC" --ws-rpc-url "$CHAIN_WS" --block-interval "$BLOCK_INTERVAL"
            --eth-proofs-endpoint "$ETHPROOFS_URL" --eth-proofs-api-token "$ETHPROOFS_TOKEN" --eth-proofs-cluster-id "$ETHPROOFS_CLUSTER" )
-    # prover seam — bin/eth-proofs picks the prover from SP1_PROVER (from_env). Same knob as ZisK:
-    #   --coordinator <gateway> → SP1_PROVER=network (the distributed cluster) ; else single-box cuda.
-    if [ -n "$COORDINATOR" ]; then
+    # prover seam — bin/eth-proofs picks the prover from SP1_PROVER (from_env):
+    #   --mock → mock (fake proofs, plumbing test) · --coordinator <gateway> → network cluster · else single-box cuda.
+    if [ "$MOCK" = 1 ]; then
+      prover_env=( "SP1_PROVER=mock" ); build_flags="--no-default-features"   # mock is never feature-gated
+      prover_desc="mock (fake proofs — plumbing test, no cluster/GPU)"
+    elif [ -n "$COORDINATOR" ]; then
       prover_env=( "SP1_PROVER=network" "NETWORK_RPC_URL=$COORDINATOR"
                    "NETWORK_PRIVATE_KEY=${NETWORK_PRIVATE_KEY:-0x0000000000000000000000000000000000000000000000000000000000000001}" )
-      prover_desc="network → $COORDINATOR"; build_flags="--no-default-features --features network"   # network client — no CUDA needed
+      prover_desc="network → $COORDINATOR"; build_flags="--no-default-features --features network"
     else
       prover_env=( "SP1_PROVER=cuda" ); build_flags=""
-      prover_desc="cuda single-box (pass --coordinator <gateway> to prove on the cluster)"
+      prover_desc="cuda single-box (--coordinator <gateway> for the cluster, --mock for a no-cluster plumbing test)"
     fi
     if [ "$DRY_RUN" = 1 ]; then
       echo "# SP1 (RSP bin/eth-proofs) ethproofs pipeline — seams → flags + prover env:"

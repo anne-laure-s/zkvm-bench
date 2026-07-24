@@ -19,6 +19,8 @@
 #   ./prove-farm --guest zisk   --remote root@ssh.vast.ai --port 12345 [BLOCKS...]
 #   ./prove-farm --guest openvm --remote root@ssh.vast.ai --port 12345 --num-gpus 8 20000000
 #   ./prove-farm --guest rsp    --remote root@ssh.vast.ai --port 12345 --watch --newest-first
+#   ./prove-farm --guest rsp    --remote … --port … --watch --ethproofs-url http://localhost:8547  # + submit
+#   ./prove-farm --guest rsp    --mock --watch --ethproofs-url http://localhost:8547   # NO box: mock-cluster prover
 #   ./prove-farm --list
 #
 # With no BLOCKS, proves every witness found for the guest (guests/<rung>/fixtures|inputs/<tag>.bin).
@@ -26,6 +28,15 @@
 # time (natural backpressure for one cluster), idle-sleeping --interval seconds when caught up. Pair it
 # with cli/witness-farm (the producer following the tip) → the continuous proving pipeline. With
 # --newest-first it proves nearest the tip first (RTP policy); older un-proven blocks wait.
+# --ethproofs-url = also SUBMIT each finished proof to an ethproofs API (cli/ethproofs-mock now,
+# ethproofs.org later) via cli/ethproofs-submit → this becomes the full witness→prove→submit consumer:
+#     cli/witness-farm (produce) │ cli/prove-farm --watch (prove) │ cli/ethproofs-submit (submit)
+# Without it, prove-farm just proves (benchmark mode). The witness is fetched ONCE (by witness-farm)
+# and reused here with zero RPC — prove/submit as many times as you like (mock now, real cluster later).
+# --mock = MOCK-CLUSTER stand-in for the prover seam: emit a valid run record locally (fake proof, no
+# box), so the WHOLE decoupled pipeline (witness-farm → prove-farm → ethproofs-submit) runs on a real
+# block with NO external dep. Tests the plumbing, not the prover — the sibling of ethproofs-mock and
+# SP1_PROVER=mock. Drop --mock (add --remote) to prove for real on the cluster.
 # Outputs (repo root, gitignored): prove-farm.csv, prove-farm-logs/. Run records land under the
 # stack's own results/ (written by run prove-cluster), same as a manual `run prove-cluster`.
 set -uo pipefail
@@ -39,21 +50,26 @@ log(){ printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
 usage(){ sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit "${1:-0}"; }
 
 GUEST="rsp"; REMOTE=""; PORT=""; MODE=""; NUM_GPUS=""; WITNESS_DIR=""; CHAIN_ID="1"; MAX_BLOCKS=0
-WATCH=0; INTERVAL=30; NEWEST_FIRST=0
+WATCH=0; INTERVAL=30; NEWEST_FIRST=0; MOCK=0
+ETHPROOFS_URL=""; ETHPROOFS_TOKEN="dev"; ETHPROOFS_CLUSTER=""    # cluster defaults to the guest (distinct per prover); --ethproofs-url to also submit
 BLOCKS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --guest)        GUEST="${2:?}"; shift 2 ;;
-    --remote)       REMOTE="${2:?}"; shift 2 ;;
-    --port)         PORT="${2:?}"; shift 2 ;;
-    --mode)         MODE="${2:?}"; shift 2 ;;
-    --num-gpus)     NUM_GPUS="${2:?}"; shift 2 ;;
-    --witness-dir)  WITNESS_DIR="${2:?}"; shift 2 ;;
-    --chain-id)     CHAIN_ID="${2:?}"; shift 2 ;;
-    --max-blocks)   MAX_BLOCKS="${2:?}"; shift 2 ;;
-    --watch)        WATCH=1; shift ;;                 # continuous: keep draining the witness queue
-    --interval)     INTERVAL="${2:?}"; shift 2 ;;     # watch: idle sleep (s) when caught up
-    --newest-first) NEWEST_FIRST=1; shift ;;          # prove nearest the tip first (RTP policy)
+    --guest)             GUEST="${2:?}"; shift 2 ;;
+    --remote)            REMOTE="${2:?}"; shift 2 ;;
+    --port)              PORT="${2:?}"; shift 2 ;;
+    --mode)              MODE="${2:?}"; shift 2 ;;
+    --num-gpus)          NUM_GPUS="${2:?}"; shift 2 ;;
+    --witness-dir)       WITNESS_DIR="${2:?}"; shift 2 ;;
+    --chain-id)          CHAIN_ID="${2:?}"; shift 2 ;;
+    --max-blocks)        MAX_BLOCKS="${2:?}"; shift 2 ;;
+    --watch)             WATCH=1; shift ;;                 # continuous: keep draining the witness queue
+    --interval)          INTERVAL="${2:?}"; shift 2 ;;     # watch: idle sleep (s) when caught up
+    --newest-first)      NEWEST_FIRST=1; shift ;;          # prove nearest the tip first (RTP policy)
+    --mock)              MOCK=1; shift ;;                   # mock-cluster: fake the prover (no box) — plumbing test
+    --ethproofs-url)     ETHPROOFS_URL="${2:?}"; shift 2 ;;   # also submit each proof to this ethproofs API
+    --ethproofs-token)   ETHPROOFS_TOKEN="${2:?}"; shift 2 ;;
+    --ethproofs-cluster) ETHPROOFS_CLUSTER="${2:?}"; shift 2 ;;
     --list)         echo "guests (guests.registry):"; reg_list; exit 0 ;;
     -h|--help)      usage 0 ;;
     -*)             die "unknown argument '$1' (see --help)" ;;
@@ -62,12 +78,29 @@ while [ $# -gt 0 ]; do
 done
 
 reg_lookup "$GUEST" || die "unknown guest '$GUEST' (run --list to see them)."
-[ -n "$REMOTE" ] || die "--remote user@host required (the cluster box; run prove-cluster submits there)."
+[ "$MOCK" = 1 ] || [ -n "$REMOTE" ] || die "--remote user@host required (the cluster box), or --mock for the mock-cluster stand-in (no box)."
 INFRA="$ROOT/$REG_INFRA"
 # A guest is provable here iff its stack exposes the `prove-cluster` dispatcher. `exec=batch` guests
 # (Monad) are fine AS LONG AS their registry row routes to a real infra (monad-zisk → infra/zisk-infra);
 # a batch guest still pointing at guests/monad (monad-sp1, no SP1 inputs yet) fails this check clearly.
 [ -x "$INFRA/run" ] || die "no stack dispatcher at $INFRA/run for guest '$GUEST' (batch guests must route to a real infra — see guests.registry)."
+# zkVM identity (from the stack) — passed to ethproofs-submit so a submission says WHAT proved it.
+case "$REG_INFRA" in
+  */sp1-infra)    VM=SP1 ;;
+  */zisk-infra)   VM=ZisK ;;
+  */openvm-infra) VM=OpenVM ;;
+  *)              VM="" ;;
+esac
+# Cluster id = the proving DEPLOYMENT's identity: "<n>gpu-<vm>" (e.g. 16gpu-SP1) on a GPU cluster, or
+# "local-<vm>" for the mock/local stand-in. It encodes the zkVM, so SP1 vs ZisK are distinct clusters and
+# the (cluster,block) identity separates rsp from zisk. Override with --ethproofs-cluster <your id> for
+# real ethproofs (id assigned at registration). Pass --num-gpus to record the GPU count in the label.
+if [ -z "$ETHPROOFS_CLUSTER" ]; then
+  if   [ "$MOCK" = 1 ];    then ETHPROOFS_CLUSTER="local${VM:+-$VM}"
+  elif [ -n "$NUM_GPUS" ]; then ETHPROOFS_CLUSTER="${NUM_GPUS}gpu${VM:+-$VM}"
+  else                          ETHPROOFS_CLUSTER="${VM:-cluster}"
+  fi
+fi
 
 OUT="$ROOT/prove-farm.csv"
 LOGDIR="$ROOT/prove-farm-logs"; mkdir -p "$LOGDIR"
@@ -110,16 +143,41 @@ scan_unproven(){
   } | grep -E '^[0-9]+$' | $SORT | while IFS= read -r b; do is_proven "$b" || echo "$b"; done
 }
 
+# mock_prove — the prover-seam STAND-IN: emit a valid run record locally, no cluster/box. Completes the
+# home-made stand-ins (witness=proxy, ethproofs=mock) so the WHOLE decoupled pipeline runs with no
+# external dep. The proof is FAKE (random bytes) — tests the pipeline plumbing, not the prover.
+mock_prove(){  # $1=block $2=plog → writes $INFRA/results/<tag>/mock-run/{proof.bin,report.json}
+  local b="$1" plog="$2" tag rd pb
+  tag="$CHAIN_ID-$b"; rd="$INFRA/results/$tag/mock-run"; mkdir -p "$rd" || return 1
+  # Self-identifying: the proof bytes BEGIN with a MOCK-PROOF magic, so this fake is unmistakable anywhere
+  # it travels (a real proof never starts with this). report.json also marks mode=mock/backend=mock-cluster.
+  { printf 'MOCK-PROOF/mock-cluster NOT-A-REAL-PROOF '; head -c "$((300 + b % 700))" /dev/urandom; } \
+    > "$rd/proof.bin" 2>/dev/null || return 1
+  pb=$(wc -c < "$rd/proof.bin"); pb=${pb//[^0-9]/}
+  # report.json in the shared prove contract (cli/report-schema.md); marked mock so it's never mistaken for real.
+  printf '{"mode":"mock","block":%s,"prove_secs":0,"total_secs":0,"proof_bytes":%s,"verified":null,"vkey_hash":"0xmock%s","backend":"mock-cluster"}\n' \
+    "$b" "$pb" "$b" > "$rd/report.json" || return 1
+  printf 'mock-cluster: fake run record for block %s (%s B proof) — pipeline plumbing test, NOT a real proof.\n' "$b" "$pb" > "$plog"
+  return 0
+}
+
 # prove_one — one uniform call to the stack's prove-cluster (resolves its own artifacts + drives ITS
 # cluster), then locate the fetched run record, require the PROOF (not just the report), and record it.
+# With --mock the prove step is the mock-cluster stand-in (local, no box); everything downstream is identical.
 prove_one(){
   local b="$1" tag plog ref t0 rc rep run_dir proof ps ts pb reason p
+  LAST_OK=0; LAST_RUN_DIR=""            # globals: signal success + run record to the submit step
   tag="$CHAIN_ID-$b"; plog="$LOGDIR/prove-$GUEST-$b.log"; ref="$LOGDIR/.ref-$b"; : > "$ref"; t0=$SECONDS
-  log ">> prove $b ($GUEST) → $REMOTE"
-  ( cd "$INFRA" && ./run prove-cluster GUEST="$REG_RUNG" BLOCK="$b" CHAIN_ID="$CHAIN_ID" REMOTE="$REMOTE" \
-      ${PORT:+PORT="$PORT"} ${MODE:+MODE="$MODE"} ${NUM_GPUS:+NUM_GPUS="$NUM_GPUS"} \
-      ${WITNESS_DIR:+WITNESS="$WITNESS_DIR/$tag.bin"} ) > "$plog" 2>&1
-  rc=$?
+  if [ "$MOCK" = 1 ]; then
+    log ">> prove $b ($GUEST) → mock-cluster (no box)"
+    mock_prove "$b" "$plog"; rc=$?
+  else
+    log ">> prove $b ($GUEST) → $REMOTE"
+    ( cd "$INFRA" && ./run prove-cluster GUEST="$REG_RUNG" BLOCK="$b" CHAIN_ID="$CHAIN_ID" REMOTE="$REMOTE" \
+        ${PORT:+PORT="$PORT"} ${MODE:+MODE="$MODE"} ${NUM_GPUS:+NUM_GPUS="$NUM_GPUS"} \
+        ${WITNESS_DIR:+WITNESS="$WITNESS_DIR/$tag.bin"} ) > "$plog" 2>&1
+    rc=$?
+  fi
   rep="$(find "$INFRA/results" -path "*$tag*" -name report.json -newer "$ref" 2>/dev/null | head -n1)"
   [ -z "$rep" ] && rep="$(find "$INFRA/results" -name report.json -newer "$ref" 2>/dev/null | head -n1)"
   rm -f "$ref"; run_dir="${rep%/report.json}"
@@ -128,6 +186,7 @@ prove_one(){
     IFS=$'\t' read -r ps ts pb < <(parse_report "$rep")
     echo "$(date +%FT%T),$b,$GUEST,${MODE:-},ok,${ps:-},${ts:-},${pb:-},$run_dir" >> "$OUT"
     log "<< $b ok — prove=${ps:-?}s total=${ts:-?}s proof=${pb:-?}B  record=$run_dir  (wall $((SECONDS-t0))s)"
+    LAST_OK=1; LAST_RUN_DIR="$run_dir"
   else
     reason="rc=$rc"; [ -n "$rep" ] || reason="$reason no-report"; [ -n "$proof" ] || reason="$reason no-proof"
     echo "$(date +%FT%T),$b,$GUEST,${MODE:-},FAIL,,,,${run_dir:-}" >> "$OUT"
@@ -135,7 +194,24 @@ prove_one(){
   fi
 }
 
-log "prove-farm: guest=$GUEST ($REG_DESC) stack=$REG_INFRA remote=$REMOTE mode=${MODE:-<default>}$([ "$WATCH" = 1 ] && echo ' [watch]')$([ "$NEWEST_FIRST" = 1 ] && echo ' [newest-first]')  (out=$OUT)"
+# submit_one — hand a finished proof to the ethproofs seam (cli/ethproofs-submit → mock/ethproofs.org).
+# No-op unless --ethproofs-url was given. Never fatal: a submit failure is logged, proving continues.
+submit_one(){  # $1=block  $2=run_dir
+  local b="$1" rd="$2" slog
+  [ -n "$ETHPROOFS_URL" ] || return 0
+  slog="$LOGDIR/submit-$GUEST-$b.log"
+  [ -n "$rd" ] || { log "submit $b: no run record — skip"; return 1; }
+  log ">> submit $b → $ETHPROOFS_URL"
+  if "$HERE/ethproofs-submit" --run-dir "$rd" --block "$b" ${VM:+--vm "$VM"} --guest "$GUEST" \
+        --ethproofs-url "$ETHPROOFS_URL" --token "$ETHPROOFS_TOKEN" --cluster "$ETHPROOFS_CLUSTER" \
+        > "$slog" 2>&1; then
+    log "<< submit $b ok  ($(tail -n1 "$slog"))"
+  else
+    log "<< submit $b FAILED — see $slog"
+  fi
+}
+
+log "prove-farm: guest=$GUEST ($REG_DESC) stack=$REG_INFRA remote=$([ "$MOCK" = 1 ] && echo mock-cluster || echo "$REMOTE") mode=${MODE:-<default>}$([ "$WATCH" = 1 ] && echo ' [watch]')$([ "$NEWEST_FIRST" = 1 ] && echo ' [newest-first]')$([ "$MOCK" = 1 ] && echo ' [mock-cluster]')${ETHPROOFS_URL:+ [submit→$ETHPROOFS_URL cluster=$ETHPROOFS_CLUSTER]}  (out=$OUT)"
 
 if [ "$WATCH" = 1 ]; then
   # Continuous consumer. Always prove the HEAD of the un-proven queue and re-scan after each proof —
@@ -149,6 +225,7 @@ if [ "$WATCH" = 1 ]; then
     if [ -z "$b" ]; then log "idle — queue empty; sleeping ${INTERVAL}s"; sleep "$INTERVAL"; continue; fi
     log "backlog=$(printf '%s\n' "$q" | grep -c .) — next=$b"
     prove_one "$b"
+    [ "$LAST_OK" = 1 ] && submit_one "$b" "$LAST_RUN_DIR"
   done
 else
   [ -n "$(scan_unproven | head -n1)" ] || die "nothing to prove (no un-proven $CHAIN_ID-<block>.bin in $WDIR, or all already proven)."
@@ -156,6 +233,7 @@ else
   while IFS= read -r b; do
     [ -n "$b" ] || continue
     prove_one "$b"; count=$((count+1))
+    [ "$LAST_OK" = 1 ] && submit_one "$b" "$LAST_RUN_DIR"
     [ "$MAX_BLOCKS" -gt 0 ] && [ "$count" -ge "$MAX_BLOCKS" ] && { log "reached --max-blocks=$MAX_BLOCKS"; break; }
   done < <(scan_unproven)
   log "prove-farm: done ($count block(s) this run)."

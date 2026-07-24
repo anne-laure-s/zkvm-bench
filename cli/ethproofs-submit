@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""cli/ethproofs-submit — stack-agnostic ethproofs submitter (the "submit" seam as a thin CLI).
+
+Takes a prove run record (proof.bin [or segments/] + report.json — the shared prove contract from
+cli/report-schema.md) and POSTs the 3-endpoint ethproofs lifecycle (queued -> proving -> proved) to
+an ethproofs API: cli/ethproofs-mock now, ethproofs.org later (same surface, config-only swap). Any
+prover that emits the shared report.json + a proof file can submit with NO stack-specific code —
+unlike RSP's bin/eth-proofs, which bundles witness+prove+submit into one process.
+
+Pairs with cli/prove-farm: `prove-farm --watch --ethproofs-url <url>` calls this after each proof, so
+the continuous pipeline is  witness-farm -> prove-farm -> ethproofs-submit  (three swappable seams).
+The witness is fetched ONCE (by witness-farm); prove+submit reuse it with zero RPC.
+
+  cli/ethproofs-submit --run-dir <dir> --block <N> [--vm SP1] [--guest rsp] [--ethproofs-url http://localhost:8547]
+                       [--token dev] [--cluster 1] [--cycles N | --steps N] [--public-inputs D]
+                       [--verifier-id 0x..] [--proving-time-ms N] [--minimal] [--proved-only] [--dry-run]
+
+CANONICAL fields (report.json -> ethproofs /proofs/proved) — match EXACTLY what RSP bin/eth-proofs and
+ZisK api.rs send, so swapping to the real ethproofs.org is config-only:
+  proof.bin (bytes) -> proof (base64)          |  --block / report.block  -> block_number
+  report.prove_secs x 1000 -> proving_time(ms) |  --cluster               -> cluster_id
+  report.vkey_hash -> verifier_id              |  report.cycles OR .steps -> proving_cycles
+      (BOTH SP1 cycles and ZisK steps go in `proving_cycles` — there is NO `proving_steps` in the API)
+EXTRA fields (mock leaderboard only; NOT sent by the real clients — dropped by --minimal):
+  --vm / report.zkvm -> vm  ·  --guest / report.guest -> guest  ·  --public-inputs / <run>/*.pv.bin
+  mock:true  (from report mode=mock / backend=mock-cluster / MOCK-PROOF magic; warns if sent non-local)
+"""
+import argparse, base64, glob, hashlib, io, json, os, sys, tarfile, urllib.error, urllib.parse, urllib.request
+
+MOCK_MAGIC = b"MOCK-PROOF"   # prove-farm --mock writes proof bytes starting with this (see mock_prove)
+
+
+def pv_digest(run_dir):
+    """A short, stable digest of the committed public values (the proof's public inputs/outputs) — from
+    the run record's *.pv.bin. Identifies non-block proofs (e.g. fibonacci) and pins what was proven."""
+    for p in sorted(glob.glob(os.path.join(run_dir, "*.pv.bin"))):
+        try:
+            return "sha256:" + hashlib.sha256(open(p, "rb").read()).hexdigest()[:16]
+        except OSError:
+            pass
+    return None
+
+
+def read_report(run_dir):
+    p = os.path.join(run_dir, "report.json")
+    if not os.path.isfile(p):
+        return {}
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"ethproofs-submit: warning: could not read {p}: {e}", file=sys.stderr)
+        return {}
+
+
+def read_proof(run_dir):
+    """Return (proof_bytes, kind). proof.bin as-is; segments/ dir packed to a tar; else error."""
+    bin_path = os.path.join(run_dir, "proof.bin")
+    seg_dir = os.path.join(run_dir, "segments")
+    if os.path.isfile(bin_path):
+        with open(bin_path, "rb") as f:
+            return f.read(), "proof.bin"
+    if os.path.isdir(seg_dir):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            tar.add(seg_dir, arcname="segments")
+        return buf.getvalue(), "segments/ (tar)"
+    raise SystemExit(f"ethproofs-submit: no proof.bin or segments/ in {run_dir!r} — is that a finished run record?")
+
+
+def post(url, token, path, obj, dry):
+    body = json.dumps(obj).encode()
+    if dry:
+        redacted = {k: (f"<{len(v)} b64 chars>" if k == "proof" else v) for k, v in obj.items()}
+        print(f"  POST {url}{path}  {json.dumps(redacted)}")
+        return {"proof_id": "<dry-run>"}
+    req = urllib.request.Request(url + path, data=body, method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        raise SystemExit(f"ethproofs-submit: {path} -> HTTP {e.code}: {e.read().decode(errors='replace')[:300]}")
+    except urllib.error.URLError as e:
+        raise SystemExit(f"ethproofs-submit: {path} -> cannot reach {url} ({e.reason}) — is the ethproofs API up?")
+    try:
+        return json.loads(raw or b"{}")
+    except json.JSONDecodeError:
+        return {"raw": raw.decode(errors="replace")}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="stack-agnostic ethproofs submitter (proof + report.json -> API)")
+    ap.add_argument("--run-dir", required=True, help="prove run record dir (proof.bin|segments/ + report.json)")
+    ap.add_argument("--block", type=int, help="block number (else report.block)")
+    ap.add_argument("--ethproofs-url", default=os.environ.get("ETHPROOFS_API_URL", "http://localhost:8547"))
+    ap.add_argument("--token", default=os.environ.get("ETHPROOFS_API_TOKEN", "dev"))
+    ap.add_argument("--cluster", default=os.environ.get("ETHPROOFS_CLUSTER", "1"),
+                    help="cluster id — ONE per prover deployment (rsp and zisk are different clusters). "
+                         "Numeric for real ethproofs; any string for the mock (e.g. the guest name).")
+    ap.add_argument("--vm", help="zkVM (SP1/ZisK/OpenVM); else report.zkvm — identifies what proved it")
+    ap.add_argument("--guest", help="guest program (rsp/zisk-reth/monad-sp1/…); else report.guest")
+    ap.add_argument("--public-inputs", help="public-inputs digest; else derived from the run's *.pv.bin")
+    ap.add_argument("--cycles", type=int, help="work-unit override (SP1/OpenVM); else report.cycles")
+    ap.add_argument("--steps", type=int, help="work-unit override (ZisK); else report.steps")
+    ap.add_argument("--verifier-id", help="vk / verifier id; else report.vkey_hash")
+    ap.add_argument("--proving-time-ms", type=int, help="else report.prove_secs x 1000")
+    ap.add_argument("--minimal", action="store_true",
+                    help="send ONLY the canonical ethproofs fields (block_number, cluster_id, proof, "
+                         "proving_cycles, proving_time, verifier_id) — drop vm/guest/mock/public_inputs. "
+                         "Use for the real ethproofs.org if it rejects unknown fields.")
+    ap.add_argument("--proved-only", action="store_true", help="skip queued/proving, POST only /proved")
+    ap.add_argument("--dry-run", action="store_true", help="print the requests, don't send")
+    args = ap.parse_args()
+
+    url = args.ethproofs_url.rstrip("/")
+    # cluster_id: send as int when it's numeric (real ethproofs expects an int), else as-is (a mock name).
+    cluster = int(args.cluster) if str(args.cluster).lstrip("-").isdigit() else args.cluster
+    rep = read_report(args.run_dir)
+
+    block = args.block if args.block is not None else rep.get("block")
+    if block is None:
+        raise SystemExit("ethproofs-submit: block unknown — pass --block (report.json has none for SP1/ZisK)")
+
+    proof_bytes, kind = read_proof(args.run_dir)
+    proof_b64 = base64.b64encode(proof_bytes).decode()
+
+    # MOCK detection — mark fake proofs so they can NEVER be mistaken for real ones. Signalled three ways:
+    # report.json mode=mock / backend=mock-cluster, or the proof's self-identifying MOCK-PROOF magic.
+    is_mock = (rep.get("mode") == "mock" or rep.get("backend") == "mock-cluster"
+               or proof_bytes[:len(MOCK_MAGIC)] == MOCK_MAGIC)
+
+    # identity — WHAT was proven (vm + guest + mock flag). These are EXTRA fields the real ethproofs
+    # clients (bin/eth-proofs, zisk api.rs) do NOT send — kept for the mock's leaderboard, but DROPPED
+    # under --minimal (use that against a strict ethproofs.org that rejects unknown fields). Flags win,
+    # else the report's zkvm/guest.
+    vm = args.vm if args.vm is not None else rep.get("zkvm")
+    guest = args.guest if args.guest is not None else rep.get("guest")
+    ident = {}
+    if not args.minimal:
+        if vm is not None:
+            ident["vm"] = vm
+        if guest is not None:
+            ident["guest"] = guest
+        if is_mock:
+            ident["mock"] = True
+
+    # Safety: never let a fake proof pass for real on a REAL (non-local) ethproofs endpoint.
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if is_mock and host not in ("localhost", "127.0.0.1", "::1", ""):
+        print(f"ethproofs-submit: ⚠️  MOCK proof → non-local endpoint ({host}). This is NOT a real proof; "
+              f"a real ethproofs would reject it (verification fails). Submitting anyway (it's marked mock).",
+              file=sys.stderr)
+
+    # work-unit → ALWAYS `proving_cycles`, matching BOTH real clients: RSP cycles and ZisK *steps* both go
+    # in that field (there is no `proving_steps` in the ethproofs API). Explicit override wins, else report.
+    work = next((v for v in (args.steps, args.cycles, rep.get("steps"), rep.get("cycles")) if v is not None), None)
+    proved = {"block_number": block, "cluster_id": cluster, "proof": proof_b64, **ident}
+    if work is not None:
+        proved["proving_cycles"] = work
+
+    ptime = args.proving_time_ms
+    if ptime is None and rep.get("prove_secs") is not None:
+        ptime = round(float(rep["prove_secs"]) * 1000)
+    if ptime is not None:
+        proved["proving_time"] = ptime
+
+    vid = args.verifier_id if args.verifier_id is not None else rep.get("vkey_hash")
+    if vid is not None:
+        proved["verifier_id"] = vid
+
+    pi = None if args.minimal else (args.public_inputs if args.public_inputs is not None else pv_digest(args.run_dir))
+    if pi is not None:
+        proved["public_inputs"] = pi
+
+    lifecycle = {"block_number": block, "cluster_id": cluster, **ident}
+    print(f"ethproofs-submit: {'[MOCK] ' if is_mock else ''}{'[minimal] ' if args.minimal else ''}vm={vm} guest={guest} block={block} cluster={cluster} -> {url}  "
+          f"(proof={len(proof_bytes)}B from {kind}, time={ptime}ms, work={proved.get('proving_cycles')}, vk={str(vid)[:14]}, pi={pi})")
+
+    if not args.proved_only:
+        post(url, args.token, "/proofs/queued", lifecycle, args.dry_run)
+        post(url, args.token, "/proofs/proving", lifecycle, args.dry_run)
+    resp = post(url, args.token, "/proofs/proved", proved, args.dry_run)
+    print(f"ethproofs-submit: proved OK — response {json.dumps(resp)}")
+
+
+if __name__ == "__main__":
+    main()

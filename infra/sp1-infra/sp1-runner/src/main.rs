@@ -86,8 +86,9 @@ enum Mode {
     ProveCore,
     ProveCompressed,
     ProveGroth16,
-    /// Verify an existing proof against expected public values
-    /// (requires --proof, --elf and --public-values; no guest input needed)
+    /// Verify an existing proof (requires --proof and --elf; no guest input needed).
+    /// --public-values is OPTIONAL: given → also bind the proof to those expected PV;
+    /// omitted → cryptographic verify only.
     Verify,
 }
 
@@ -376,16 +377,14 @@ fn main() -> Result<()> {
                 .with_context(|| format!("loading proof {}", proof_path.display()))?;
             println!("Proof loaded  : {}", proof_path.display());
 
-            // Expected public values the caller wants the proof to be bound to.
-            // Without this check, a cryptographically valid proof for *different*
-            // public values would still pass — so it is required in verify mode.
-            let expected_pv_path = args
+            // OPTIONAL: expected public values to BIND the proof to. Given → cross-check (a valid proof
+            // for *different* PV would otherwise pass). Omitted → cryptographic verify only, which is
+            // enough for cli/ethproofs-mock's --verify-cmd (it has the proof, not the block's expected PV).
+            let expected_pv = args
                 .public_values
                 .as_ref()
-                .context("--public-values (expected public values) is required in verify mode")?;
-            let expected_pv = fs::read(expected_pv_path).with_context(|| {
-                format!("reading expected public values {}", expected_pv_path.display())
-            })?;
+                .map(|p| fs::read(p).with_context(|| format!("reading expected public values {}", p.display())))
+                .transpose()?;
 
             let t_verify = Instant::now();
             prover
@@ -394,29 +393,32 @@ fn main() -> Result<()> {
             let verify_dt = t_verify.elapsed();
             println!("Verify OK     : {:.2}s", verify_dt.as_secs_f64());
 
-            // Bind the proof to the expected public values.
+            // Bind the proof to the expected public values, when provided.
             let proof_pv = proof.public_values.as_slice();
-            if proof_pv != expected_pv.as_slice() {
-                anyhow::bail!(
-                    "public values mismatch: proof commits {} bytes that differ from \
-                     the expected {} bytes in {}",
-                    proof_pv.len(),
-                    expected_pv.len(),
-                    expected_pv_path.display()
-                );
-            }
-            println!(
-                "PV match OK   : {} bytes match {}",
-                proof_pv.len(),
-                expected_pv_path.display()
-            );
+            let pv_match = match &expected_pv {
+                Some(exp) => {
+                    if proof_pv != exp.as_slice() {
+                        anyhow::bail!(
+                            "public values mismatch: proof commits {} bytes that differ from the expected {} bytes",
+                            proof_pv.len(),
+                            exp.len()
+                        );
+                    }
+                    println!("PV match OK   : {} bytes", proof_pv.len());
+                    true
+                }
+                None => {
+                    println!("PV check      : skipped (no --public-values — cryptographic verify only)");
+                    false
+                }
+            };
 
             serde_json::json!({
                 "mode": "verify",
                 "verify_secs": verify_dt.as_secs_f64(),
                 "vkey_hash": vkey_hex,
                 "public_values_bytes": proof_pv.len(),
-                "public_values_match": true,
+                "public_values_match": pv_match,
                 "verified": true,
             })
         }

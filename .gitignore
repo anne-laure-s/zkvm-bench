@@ -44,6 +44,7 @@ profiling/results/
 /wcache/
 /witness-farm-logs/
 /witness-farm.csv
+/witness-farm-parallel-logs/
 
 # ── cli/prove-farm outputs (the driver is tracked; its proof records + logs are not) ───────────
 /prove-runs/

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# cli/ethproofs-verify — REAL proof verifier, meant as cli/ethproofs-mock's --verify-cmd:
+#   cli/ethproofs-mock --verify-cmd cli/ethproofs-verify
+# The mock then calls, per /proofs/proved:
+#   ethproofs-verify <proof_path> <block> <verifier_id> [vm] [guest]
+# exit 0 = valid, non-zero = invalid → the mock records ✓/✗.
+#
+# It replaces the mock's default STRUCTURAL check with a real cryptographic one:
+#   · MOCK proofs (mock-cluster magic) → ALWAYS rejected (a fake must never verify).
+#   · ZisK → `cargo-zisk verify -p <proof>` (self-contained).
+#   · SP1  → `sp1-runner --mode verify --elf guests/<guest>/<guest>.elf --proof <proof>`
+#            (cryptographic verify; needs the guest ELF, hence the vm/guest args from the mock).
+# Anything it can't positively verify → reject (fail-safe).
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+proof="${1:?usage: ethproofs-verify <proof_path> <block> <verifier_id> [vm] [guest]}"
+block="${2:-}"; vid="${3:-}"; vm="${4:-}"; guest="${5:-}"
+[ -f "$proof" ] || { echo "verify: proof not found: $proof" >&2; exit 3; }
+
+# 1) A mock-cluster proof is FAKE — never let it verify (defence in depth; the mock also marks it).
+if head -c 16 "$proof" 2>/dev/null | grep -qa 'MOCK-PROOF'; then
+  echo "verify: MOCK-PROOF (mock-cluster fake) — REJECT" >&2; exit 1
+fi
+
+CARGO_ZISK="$(command -v cargo-zisk || echo "$HOME/.zisk/bin/cargo-zisk")"
+SP1_RUNNER=""
+for c in "$ROOT/infra/sp1-infra/sp1-runner/target/release/sp1-runner" \
+         "$ROOT/infra/sp1-infra/sp1-runner/target-prof/release/sp1-runner"; do
+  [ -x "$c" ] && { SP1_RUNNER="$c"; break; }
+done
+
+case "$(printf '%s' "$vm" | tr '[:upper:]' '[:lower:]')" in
+  zisk)
+    [ -x "$CARGO_ZISK" ] || { echo "verify: cargo-zisk not found ($CARGO_ZISK)" >&2; exit 3; }
+    echo "verify: ZisK proof $proof via cargo-zisk" >&2
+    "$CARGO_ZISK" verify -p "$proof" ;;
+  sp1)
+    [ -n "$SP1_RUNNER" ] || { echo "verify: sp1-runner not built (cd infra/sp1-infra/sp1-runner && cargo build --release)" >&2; exit 3; }
+    elf="$ROOT/guests/${guest:-rsp}/${guest:-rsp}.elf"
+    [ -f "$elf" ] || { echo "verify: SP1 guest ELF not found: $elf (pass the right --guest)" >&2; exit 3; }
+    echo "verify: SP1 proof $proof against ELF $elf via sp1-runner" >&2
+    SP1_PROVER=cpu "$SP1_RUNNER" --mode verify --elf "$elf" --proof "$proof" ;;
+  *)
+    echo "verify: unknown/empty vm '${vm}' — cannot pick a verifier, REJECT (pass vm=SP1|ZisK)" >&2; exit 2 ;;
+esac

@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# witness-farm-parallel — run N cli/witness-farm workers over DISJOINT block ranges against ONE shared
+# openvm-eth proxy, to actually use a paid Alchemy tier's CU/s.
+#
+# WHY: a single block's witness fetch is SERIAL (~600 CU/s, latency-bound — the proxy re-executes the
+# block and getProof's each touched account one at a time). N blocks in parallel ≈ N×600 CU/s, up to the
+# proxy's shared --rpc-retry-cu ceiling. Per-block latency is unchanged; BATCH throughput ≈ N×.
+#
+#   ALCHEMY_URL=… ./cli/witness-farm-parallel [--jobs 8] [--stride 100] [--per-job 0] <start-block>
+#
+#   --jobs N     parallel workers (default 8). The CU ceiling is SHARED across workers, so ~RETRY_CU/600
+#                (~16 at RETRY_CU=9000) saturates it — beyond that, no gain. RAM is usually the real cap.
+#   --stride S   block cadence (default 100 = ethproofs). Worker i does start+i·S, start+(i+N)·S, …
+#   --per-job M  MAX_BLOCKS per worker (default 0 = until Ctrl-C). Total ≈ N·M blocks.
+#   --dry-run    print the plan (proxy cmd + per-worker ranges) and exit.
+#
+# ONE shared proxy (the ~2 GB preimage table can't be duplicated per worker). Each worker gets its own
+# CSV + LOGDIR (no shared-file races). NIB/preimage detection is effectively OFF under parallelism
+# (workers reuse the shared proxy and never see its log) — fine for NIB-free ranges; if a range is
+# NIB-heavy, generate it single-threaded (cli/witness-farm) so NIB blocks are marked, not just FAIL'd.
+#
+# Env passthrough to workers: RETRY_CU PROXY_CONCURRENCY NIBBLES RSP_SKIP_EXEC RSP_RPC_CU MARGIN.
+# Outputs: witness-farm-parallel-logs/{proxy.log, worker-<i>/…, worker-<i>.csv}; merged → witness-farm.csv.
+# Witnesses land in the usual guests/{rsp,zisk-reth}/fixtures/ — feed cli/prove-farm as always.
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+JOBS=8; STRIDE=100; PER_JOB=0; START=""; DRY=0
+while [ $# -gt 0 ]; do case "$1" in
+  --jobs)    JOBS="${2:?}"; shift 2 ;;
+  --stride)  STRIDE="${2:?}"; shift 2 ;;
+  --per-job) PER_JOB="${2:?}"; shift 2 ;;
+  --dry-run) DRY=1; shift ;;
+  -h|--help) sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
+  -*)        echo "witness-farm-parallel: unknown arg '$1' (see --help)" >&2; exit 2 ;;
+  *)         START="$1"; shift ;;
+esac; done
+[ -n "$START" ] || { echo "usage: ALCHEMY_URL=… $0 [--jobs N] [--stride S] [--per-job M] <start-block>" >&2; exit 2; }
+[ "$DRY" = 1 ] || : "${ALCHEMY_URL:?export ALCHEMY_URL=https://eth-mainnet.g.alchemy.com/v2/<key>}"
+
+RETRY_CU="${RETRY_CU:-9000}"; PROXY_CONCURRENCY="${PROXY_CONCURRENCY:-64}"; NIBBLES="${NIBBLES:-7}"
+PROXY_PORT="${PROXY_PORT:-8545}"; PROXY_URL="http://127.0.0.1:$PROXY_PORT"
+OPENVM_DIR="$ROOT/vendor/openvm-eth"; PROXY_BIN="$OPENVM_DIR/target/release/openvm-rpc-proxy"
+RSP_DIR="$ROOT/vendor/rsp"; WCACHE="$ROOT/wcache"
+LOGROOT="$ROOT/witness-farm-parallel-logs"; OUT_MAIN="$ROOT/witness-farm.csv"
+WSTRIDE=$(( JOBS * STRIDE ))
+log(){ echo "$(date +%H:%M:%S)  [parallel] $*" >&2; }
+rpc(){ curl -s "$1" -X POST -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":[]}"; }
+
+if [ "$DRY" = 1 ]; then
+  echo "# proxy (shared): $PROXY_BIN --rpc-url <ALCHEMY> --bind-address 127.0.0.1:$PROXY_PORT \\"
+  echo "#   --rpc-retry-cu $RETRY_CU --rpc-concurrency $PROXY_CONCURRENCY --preimage-cache-nibbles $NIBBLES --witness-cache-dir $WCACHE"
+  echo "# $JOBS workers, per-worker step=$WSTRIDE, per-job=${PER_JOB} (0=∞):"
+  for i in $(seq 0 $((JOBS-1))); do
+    echo "#   worker $i: STRIDE=$WSTRIDE MAX_BLOCKS=$PER_JOB OUT=worker-$i.csv  witness-farm $((START + i*STRIDE))"
+  done
+  exit 0
+fi
+
+mkdir -p "$LOGROOT" "$WCACHE"
+
+# ---- build once (workers would each rebuild, serializing on cargo's lock; do it up front) ----
+log "building proxy + RSP once…"
+( cd "$OPENVM_DIR" && cargo build -p openvm-rpc-proxy --release ) || { echo "proxy build failed"; exit 1; }
+( cd "$RSP_DIR" && cargo build --release --bin rsp --features execution-witness --target-dir target-ew ) || { echo "rsp (ew) build failed"; exit 1; }
+( cd "$RSP_DIR" && cargo build --release --bin rsp ) || { echo "rsp build failed"; exit 1; }
+
+PROXY_PID=""; WORKERS=()
+merge_csvs(){   # rebuild witness-farm.csv = existing rows + all worker rows, deduped by block (col 2)
+  [ -f "$OUT_MAIN" ] || echo "ts,block,kind,rsp,rsp_src,zisk,secs" > "$OUT_MAIN"
+  local tmp="$OUT_MAIN.tmp"
+  { head -1 "$OUT_MAIN"
+    { tail -n +2 "$OUT_MAIN" 2>/dev/null; cat "$LOGROOT"/worker-*.csv 2>/dev/null | grep -v '^ts,block'; } \
+      | awk -F, 'NF>1 && !seen[$2]++'
+  } > "$tmp" && mv "$tmp" "$OUT_MAIN"
+}
+cleanup(){
+  for pid in ${WORKERS[@]:-}; do kill "$pid" 2>/dev/null; done
+  [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null
+  merge_csvs 2>/dev/null; log "merged worker CSVs → $OUT_MAIN . stopped."
+}
+trap cleanup EXIT
+trap 'echo >&2; log "interrupted — stopping all…"; exit 130' INT TERM
+
+# ---- one shared proxy, owned by this launcher (reused, not restarted, by every worker) ----
+if rpc "$PROXY_URL" eth_chainId | grep -q '"result"'; then
+  log "proxy already up on :$PROXY_PORT — reusing (leave it as-is)"
+else
+  log "starting shared proxy (nibbles=$NIBBLES, retry-cu=$RETRY_CU, concurrency=$PROXY_CONCURRENCY) — preimage precompute can take minutes…"
+  "$PROXY_BIN" --rpc-url "$ALCHEMY_URL" --bind-address "127.0.0.1:$PROXY_PORT" \
+    --rpc-retry-cu "$RETRY_CU" --rpc-concurrency "$PROXY_CONCURRENCY" \
+    --preimage-cache-nibbles "$NIBBLES" --witness-cache-dir "$WCACHE" > "$LOGROOT/proxy.log" 2>&1 &
+  PROXY_PID=$!
+  for _ in $(seq 1 150); do
+    rpc "$PROXY_URL" eth_chainId | grep -q '"result"' && break
+    kill -0 "$PROXY_PID" 2>/dev/null || { echo "proxy died during startup:"; tail -20 "$LOGROOT/proxy.log"; exit 1; }
+    sleep 2
+  done
+  rpc "$PROXY_URL" eth_chainId | grep -q '"result"' || { echo "proxy not ready after ~5min — see $LOGROOT/proxy.log"; exit 1; }
+  log "proxy ready (pid=$PROXY_PID)."
+fi
+
+# ---- launch N workers over disjoint ranges (worker i: start+i·STRIDE, stepping by N·STRIDE) ----
+log "launching $JOBS workers: stride=$STRIDE (per-worker step=$WSTRIDE), per-job=${PER_JOB:-∞}, from $START"
+for i in $(seq 0 $((JOBS-1))); do
+  wstart=$(( START + i * STRIDE )); wdir="$LOGROOT/worker-$i"; mkdir -p "$wdir"
+  # `env` (not a bare NAME=val prefix) so the CONDITIONAL vars work: ${VAR:+NAME=val} expands after the
+  # shell has already decided assignment-vs-command, so as a bare prefix it'd be run as a command.
+  env OUT="$LOGROOT/worker-$i.csv" LOGDIR="$wdir" STRIDE="$WSTRIDE" MAX_BLOCKS="$PER_JOB" \
+    ALCHEMY_URL="$ALCHEMY_URL" RETRY_CU="$RETRY_CU" PROXY_CONCURRENCY="$PROXY_CONCURRENCY" NIBBLES="$NIBBLES" \
+    ${RSP_SKIP_EXEC:+RSP_SKIP_EXEC="$RSP_SKIP_EXEC"} ${RSP_RPC_CU:+RSP_RPC_CU="$RSP_RPC_CU"} ${MARGIN:+MARGIN="$MARGIN"} \
+    "$ROOT/cli/witness-farm" "$wstart" > "$wdir/worker.log" 2>&1 &
+  WORKERS+=("$!")
+  log "  worker $i → start=$wstart  (log: worker-$i/worker.log, csv: worker-$i.csv)"
+  sleep 1   # small stagger so N workers don't thundering-herd the cargo lock / proxy readiness check
+done
+
+log "$JOBS workers running. Watch: tail -f $LOGROOT/worker-*/worker.log  ·  CU/s: your Alchemy dashboard. Ctrl-C to stop all."
+wait

@@ -1,572 +1,3 @@
-diff --git a/Cargo.lock b/Cargo.lock
-index 4c5c4d33..62f3a153 100644
---- a/Cargo.lock
-+++ b/Cargo.lock
-@@ -6212,22 +6212,6 @@ dependencies = [
- [[package]]
- name = "k256"
- version = "0.13.4"
--source = "registry+https://github.com/rust-lang/crates.io-index"
--checksum = "f6e3919bbaa2945715f0bb6d3934a173d1e9a59ac23767fbaaef277265a7411b"
--dependencies = [
-- "cfg-if",
-- "ecdsa",
-- "elliptic-curve",
-- "once_cell",
-- "serdect",
-- "sha2 0.10.9",
-- "signature",
--]
--
--[[package]]
--name = "k256"
--version = "0.13.4"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "ecdsa",
-  "elliptic-curve",
-@@ -6242,6 +6226,21 @@ dependencies = [
-  "serde",
- ]
- 
-+[[package]]
-+name = "k256"
-+version = "0.13.4"
-+source = "registry+https://github.com/rust-lang/crates.io-index"
-+checksum = "f6e3919bbaa2945715f0bb6d3934a173d1e9a59ac23767fbaaef277265a7411b"
-+dependencies = [
-+ "cfg-if",
-+ "ecdsa",
-+ "elliptic-curve",
-+ "once_cell",
-+ "serdect",
-+ "sha2 0.10.9",
-+ "signature",
-+]
-+
- [[package]]
- name = "keccak"
- version = "0.1.6"
-@@ -7523,7 +7522,6 @@ dependencies = [
- [[package]]
- name = "openvm"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "bytemuck",
-  "num-bigint",
-@@ -7536,7 +7534,6 @@ dependencies = [
- [[package]]
- name = "openvm-algebra-circuit"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "blstrs",
-  "cfg-if",
-@@ -7569,7 +7566,6 @@ dependencies = [
- [[package]]
- name = "openvm-algebra-complex-macros"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-macros-common",
-  "quote",
-@@ -7579,7 +7575,6 @@ dependencies = [
- [[package]]
- name = "openvm-algebra-guest"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "halo2curves-axiom 0.7.2 (git+https://github.com/axiom-crypto/halo2curves.git?tag=v0.7.2)",
-  "num-bigint",
-@@ -7595,7 +7590,6 @@ dependencies = [
- [[package]]
- name = "openvm-algebra-moduli-macros"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "num-bigint",
-  "num-prime",
-@@ -7607,7 +7601,6 @@ dependencies = [
- [[package]]
- name = "openvm-algebra-transpiler"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-algebra-guest",
-  "openvm-instructions",
-@@ -7621,7 +7614,6 @@ dependencies = [
- [[package]]
- name = "openvm-benchmarks-prove"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "clap",
-  "derive_more 1.0.0",
-@@ -7648,7 +7640,6 @@ dependencies = [
- [[package]]
- name = "openvm-benchmarks-utils"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "cargo_metadata 0.18.1",
-  "clap",
-@@ -7663,7 +7654,6 @@ dependencies = [
- [[package]]
- name = "openvm-bigint-circuit"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "cfg-if",
-  "derive-new 0.6.0",
-@@ -7689,7 +7679,6 @@ dependencies = [
- [[package]]
- name = "openvm-bigint-guest"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-platform",
-  "strum_macros 0.26.4",
-@@ -7698,7 +7687,6 @@ dependencies = [
- [[package]]
- name = "openvm-bigint-transpiler"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-bigint-guest",
-  "openvm-instructions",
-@@ -7713,7 +7701,6 @@ dependencies = [
- [[package]]
- name = "openvm-build"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "cargo_metadata 0.18.1",
-  "eyre",
-@@ -7735,7 +7722,6 @@ dependencies = [
- [[package]]
- name = "openvm-circuit"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "abi_stable",
-  "backtrace",
-@@ -7778,7 +7764,6 @@ dependencies = [
- [[package]]
- name = "openvm-circuit-derive"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "itertools 0.14.0",
-  "proc-macro2",
-@@ -7789,7 +7774,6 @@ dependencies = [
- [[package]]
- name = "openvm-circuit-primitives"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "derive-new 0.6.0",
-  "itertools 0.14.0",
-@@ -7807,7 +7791,6 @@ dependencies = [
- [[package]]
- name = "openvm-circuit-primitives-derive"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "itertools 0.14.0",
-  "quote",
-@@ -7817,7 +7800,6 @@ dependencies = [
- [[package]]
- name = "openvm-continuations"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "derivative",
-  "openvm-circuit",
-@@ -7833,7 +7815,6 @@ dependencies = [
- [[package]]
- name = "openvm-cuda-backend"
- version = "1.4.0"
--source = "git+https://github.com/openvm-org/stark-backend.git?tag=v1.4.0#2d4c6da0c84f43b15fcdac84ce13fd2325148c66"
- dependencies = [
-  "bincode 2.0.1",
-  "bincode_derive",
-@@ -7865,7 +7846,6 @@ dependencies = [
- [[package]]
- name = "openvm-cuda-builder"
- version = "1.4.0"
--source = "git+https://github.com/openvm-org/stark-backend.git?tag=v1.4.0#2d4c6da0c84f43b15fcdac84ce13fd2325148c66"
- dependencies = [
-  "cc",
-  "glob",
-@@ -7874,7 +7854,6 @@ dependencies = [
- [[package]]
- name = "openvm-cuda-common"
- version = "1.4.0"
--source = "git+https://github.com/openvm-org/stark-backend.git?tag=v1.4.0#2d4c6da0c84f43b15fcdac84ce13fd2325148c66"
- dependencies = [
-  "bytesize",
-  "ctor",
-@@ -7901,7 +7880,6 @@ dependencies = [
- [[package]]
- name = "openvm-custom-insn"
- version = "0.1.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "proc-macro2",
-  "quote",
-@@ -7911,7 +7889,6 @@ dependencies = [
- [[package]]
- name = "openvm-ecc-circuit"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "blstrs",
-  "cfg-if",
-@@ -7944,7 +7921,6 @@ dependencies = [
- [[package]]
- name = "openvm-ecc-guest"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "ecdsa",
-  "elliptic-curve",
-@@ -7963,7 +7939,6 @@ dependencies = [
- [[package]]
- name = "openvm-ecc-sw-macros"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-macros-common",
-  "quote",
-@@ -7973,7 +7948,6 @@ dependencies = [
- [[package]]
- name = "openvm-ecc-transpiler"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-ecc-guest",
-  "openvm-instructions",
-@@ -7987,7 +7961,6 @@ dependencies = [
- [[package]]
- name = "openvm-instructions"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "backtrace",
-  "derive-new 0.6.0",
-@@ -8004,7 +7977,6 @@ dependencies = [
- [[package]]
- name = "openvm-instructions-derive"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "quote",
-  "syn 2.0.117",
-@@ -8013,7 +7985,6 @@ dependencies = [
- [[package]]
- name = "openvm-keccak256"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-keccak256-guest",
-  "tiny-keccak",
-@@ -8022,7 +7993,6 @@ dependencies = [
- [[package]]
- name = "openvm-keccak256-circuit"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "cfg-if",
-  "derive-new 0.6.0",
-@@ -8050,7 +8020,6 @@ dependencies = [
- [[package]]
- name = "openvm-keccak256-guest"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-platform",
- ]
-@@ -8058,7 +8027,6 @@ dependencies = [
- [[package]]
- name = "openvm-keccak256-transpiler"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-instructions",
-  "openvm-instructions-derive",
-@@ -8096,7 +8064,6 @@ dependencies = [
- [[package]]
- name = "openvm-macros-common"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "syn 2.0.117",
- ]
-@@ -8104,7 +8071,6 @@ dependencies = [
- [[package]]
- name = "openvm-mod-circuit-builder"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "cuda-runtime-sys",
-  "itertools 0.14.0",
-@@ -8166,7 +8132,6 @@ dependencies = [
- [[package]]
- name = "openvm-native-circuit"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "cfg-if",
-  "derive-new 0.6.0",
-@@ -8197,7 +8162,6 @@ dependencies = [
- [[package]]
- name = "openvm-native-compiler"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "backtrace",
-  "itertools 0.14.0",
-@@ -8221,7 +8185,6 @@ dependencies = [
- [[package]]
- name = "openvm-native-compiler-derive"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "quote",
-  "syn 2.0.117",
-@@ -8230,7 +8193,6 @@ dependencies = [
- [[package]]
- name = "openvm-native-recursion"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "cfg-if",
-  "itertools 0.14.0",
-@@ -8259,7 +8221,6 @@ dependencies = [
- [[package]]
- name = "openvm-native-transpiler"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-instructions",
-  "openvm-transpiler",
-@@ -8269,7 +8230,6 @@ dependencies = [
- [[package]]
- name = "openvm-pairing"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "group 0.13.0",
-  "halo2curves-axiom 0.7.2 (git+https://github.com/axiom-crypto/halo2curves.git?tag=v0.7.2)",
-@@ -8293,7 +8253,6 @@ dependencies = [
- [[package]]
- name = "openvm-pairing-circuit"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "cfg-if",
-  "derive-new 0.6.0",
-@@ -8324,7 +8283,6 @@ dependencies = [
- [[package]]
- name = "openvm-pairing-guest"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "blstrs",
-  "halo2curves-axiom 0.7.2 (git+https://github.com/axiom-crypto/halo2curves.git?tag=v0.7.2)",
-@@ -8345,7 +8303,6 @@ dependencies = [
- [[package]]
- name = "openvm-pairing-transpiler"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-instructions",
-  "openvm-pairing-guest",
-@@ -8358,7 +8315,6 @@ dependencies = [
- [[package]]
- name = "openvm-platform"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "libm",
-  "openvm-custom-insn",
-@@ -8368,7 +8324,6 @@ dependencies = [
- [[package]]
- name = "openvm-poseidon2-air"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "derivative",
-  "lazy_static",
-@@ -8427,14 +8382,14 @@ dependencies = [
-  "ark-ec",
-  "ark-ff 0.5.0",
-  "aurora-engine-modexp",
-- "k256 0.13.4 (git+https://github.com/openvm-org/openvm.git?branch=main)",
-+ "k256 0.13.4",
-  "openvm-curve-utils",
-  "openvm-ecc-guest",
-  "openvm-keccak256",
-  "openvm-kzg",
-  "openvm-pairing",
-  "openvm-sha2",
-- "p256 0.13.2 (git+https://github.com/openvm-org/openvm.git?branch=main)",
-+ "p256 0.13.2",
-  "revm 38.0.0",
-  "revm-primitives 23.0.0",
- ]
-@@ -8479,7 +8434,6 @@ dependencies = [
- [[package]]
- name = "openvm-rv32-adapters"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "derive-new 0.6.0",
-  "itertools 0.14.0",
-@@ -8496,7 +8450,6 @@ dependencies = [
- [[package]]
- name = "openvm-rv32im-circuit"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "cfg-if",
-  "derive-new 0.6.0",
-@@ -8523,7 +8476,6 @@ dependencies = [
- [[package]]
- name = "openvm-rv32im-guest"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-custom-insn",
-  "p3-field",
-@@ -8533,7 +8485,6 @@ dependencies = [
- [[package]]
- name = "openvm-rv32im-transpiler"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-instructions",
-  "openvm-instructions-derive",
-@@ -8549,7 +8500,6 @@ dependencies = [
- [[package]]
- name = "openvm-sdk"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "alloy-sol-types",
-  "bitcode",
-@@ -8602,6 +8552,7 @@ dependencies = [
-  "snark-verifier-sdk",
-  "tempfile",
-  "thiserror 1.0.69",
-+ "tokio",
-  "toml 0.8.23",
-  "tracing",
- ]
-@@ -8609,7 +8560,6 @@ dependencies = [
- [[package]]
- name = "openvm-sha2"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-sha256-guest",
-  "sha2 0.10.9",
-@@ -8618,7 +8568,6 @@ dependencies = [
- [[package]]
- name = "openvm-sha256-air"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-circuit-primitives",
-  "openvm-stark-backend",
-@@ -8629,7 +8578,6 @@ dependencies = [
- [[package]]
- name = "openvm-sha256-circuit"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "cfg-if",
-  "derive-new 0.6.0",
-@@ -8655,7 +8603,6 @@ dependencies = [
- [[package]]
- name = "openvm-sha256-guest"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-platform",
- ]
-@@ -8663,7 +8610,6 @@ dependencies = [
- [[package]]
- name = "openvm-sha256-transpiler"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "openvm-instructions",
-  "openvm-instructions-derive",
-@@ -8677,7 +8623,6 @@ dependencies = [
- [[package]]
- name = "openvm-stark-backend"
- version = "1.4.0"
--source = "git+https://github.com/openvm-org/stark-backend.git?tag=v1.4.0#2d4c6da0c84f43b15fcdac84ce13fd2325148c66"
- dependencies = [
-  "bitcode",
-  "cfg-if",
-@@ -8706,7 +8651,6 @@ dependencies = [
- [[package]]
- name = "openvm-stark-sdk"
- version = "1.4.0"
--source = "git+https://github.com/openvm-org/stark-backend.git?tag=v1.4.0#2d4c6da0c84f43b15fcdac84ce13fd2325148c66"
- dependencies = [
-  "dashmap",
-  "derivative",
-@@ -8798,7 +8742,6 @@ dependencies = [
- [[package]]
- name = "openvm-transpiler"
- version = "1.7.0"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "elf",
-  "eyre",
-@@ -8828,19 +8771,6 @@ dependencies = [
- [[package]]
- name = "p256"
- version = "0.13.2"
--source = "registry+https://github.com/rust-lang/crates.io-index"
--checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
--dependencies = [
-- "ecdsa",
-- "elliptic-curve",
-- "primeorder",
-- "sha2 0.10.9",
--]
--
--[[package]]
--name = "p256"
--version = "0.13.2"
--source = "git+https://github.com/openvm-org/openvm.git?branch=main#425913bdc743ef44236daf472ec53c2c05b75fa1"
- dependencies = [
-  "ecdsa",
-  "elliptic-curve",
-@@ -8855,6 +8785,18 @@ dependencies = [
-  "serde",
- ]
- 
-+[[package]]
-+name = "p256"
-+version = "0.13.2"
-+source = "registry+https://github.com/rust-lang/crates.io-index"
-+checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
-+dependencies = [
-+ "ecdsa",
-+ "elliptic-curve",
-+ "primeorder",
-+ "sha2 0.10.9",
-+]
-+
- [[package]]
- name = "p3-air"
- version = "0.4.3"
 diff --git a/Cargo.toml b/Cargo.toml
 index 9a88141c..e9d04108 100644
 --- a/Cargo.toml
@@ -826,8 +257,174 @@ index 95a9800b..d03c19af 100644
                          let mut prover = sdk.prover(elf)?.with_program_name(program_name);
                          let app_proof = prover.app_prover.prove(stdin)?;
                          let leaf_proofs = prover.agg_prover.generate_leaf_proofs(&app_proof)?;
+diff --git a/crates/rpc-proxy/Cargo.toml b/crates/rpc-proxy/Cargo.toml
+index 74eab098..56e7c848 100644
+--- a/crates/rpc-proxy/Cargo.toml
++++ b/crates/rpc-proxy/Cargo.toml
+@@ -32,6 +32,7 @@ risc0-ethereum-trie = { git = "https://github.com/risc0/risc0-ethereum.git", tag
+ 
+ clap = { workspace = true, features = ["derive", "env"] }
+ itertools = { workspace = true }
++futures = "0.3"                          # bounded-concurrency getProof fan-out (buffer_unordered)
+ rayon.workspace = true
+ eyre.workspace = true
+ actix-web.workspace = true
+diff --git a/crates/rpc-proxy/src/db/preflight.rs b/crates/rpc-proxy/src/db/preflight.rs
+index 5ce06d98..0e9b7b51 100644
+--- a/crates/rpc-proxy/src/db/preflight.rs
++++ b/crates/rpc-proxy/src/db/preflight.rs
+@@ -16,6 +16,7 @@ use alloy_primitives::{
+ };
+ use alloy_trie::{TrieAccount as StateAccount, EMPTY_ROOT_HASH};
+ use eyre::{ensure, Context, ContextCompat, Result};
++use futures::{stream, StreamExt, TryStreamExt};
+ use itertools::Itertools;
+ use revm::{
+     context::DBErrorMarker,
+@@ -96,11 +97,29 @@ impl<D> PreflightDb<D> {
+ impl<N: Network, P: Provider<N>> PreflightDb<ProviderDb<N, P>> {
+     /// Fetches all the EIP-1186 storage proofs from the `access_list` and stores them in the DB.
+     pub(crate) async fn add_access_list(&mut self, access_list: &AccessList) -> Result<()> {
+-        for AccessListItem { address, storage_keys } in &access_list.0 {
+-            if let Some(keys) = self.proofs.missing_proof(address, storage_keys) {
+-                let proof = self.inner.get_proof(*address, keys).await?;
+-                self.proofs.add(proof).context("invalid eth_getProof response")?;
+-            }
++        // Collect the missing (address, keys) up front (read-only), then fetch the eth_getProof calls
++        // with BOUNDED CONCURRENCY instead of one at a time (which is latency-bound). The upstream CU
++        // limiter (`--rpc-retry-cu`) still paces them — this just lets the fan-out approach that ceiling.
++        let known = &self.proofs;
++        let to_fetch: Vec<(Address, Vec<StorageKey>)> = access_list
++            .0
++            .iter()
++            .filter_map(|AccessListItem { address, storage_keys }| {
++                known.missing_proof(address, storage_keys).map(|keys| (*address, keys))
++            })
++            .collect();
++
++        let concurrency = self.inner.getproof_concurrency();
++        let inner = &self.inner;
++        let fetched: Vec<EIP1186AccountProofResponse> = stream::iter(
++            to_fetch.into_iter().map(|(address, keys)| inner.get_proof(address, keys)),
++        )
++        .buffer_unordered(concurrency)
++        .try_collect()
++        .await?;
++
++        for proof in fetched {
++            self.proofs.add(proof).context("invalid eth_getProof response")?;
+         }
+ 
+         Ok(())
+@@ -164,12 +183,29 @@ impl<N: Network, P: Provider<N>> PreflightDb<ProviderDb<N, P>> {
+             ));
+         }
+ 
++        // Fetch the missing proofs with BOUNDED CONCURRENCY (see `add_access_list`): collect what's
++        // missing (read-only), fan out the eth_getProof calls, then add the results.
++        let known = &self.proofs;
++        let to_fetch: Vec<(Address, Vec<StorageKey>)> = self
++            .accounts
++            .iter()
++            .filter_map(|(address, storage_keys)| {
++                known.missing_proof(address, storage_keys).map(|keys| (*address, keys))
++            })
++            .collect();
++
++        let concurrency = self.inner.getproof_concurrency();
++        let inner = &self.inner;
++        let fetched: Vec<EIP1186AccountProofResponse> = stream::iter(
++            to_fetch.into_iter().map(|(address, keys)| inner.get_proof(address, keys)),
++        )
++        .buffer_unordered(concurrency)
++        .try_collect()
++        .await?;
++
+         let proofs = &mut self.proofs;
+-        for (address, storage_keys) in &self.accounts {
+-            if let Some(keys) = proofs.missing_proof(address, storage_keys) {
+-                let proof = self.inner.get_proof(*address, keys).await?;
+-                proofs.add(proof).context("invalid eth_getProof response")?;
+-            }
++        for proof in fetched {
++            proofs.add(proof).context("invalid eth_getProof response")?;
+         }
+ 
+         let state_nodes = self
+diff --git a/crates/rpc-proxy/src/db/provider.rs b/crates/rpc-proxy/src/db/provider.rs
+index f6062428..dd4f33e5 100644
+--- a/crates/rpc-proxy/src/db/provider.rs
++++ b/crates/rpc-proxy/src/db/provider.rs
+@@ -57,11 +57,15 @@ pub struct ProviderDb<N: Network, P: Provider<N>> {
+ pub(crate) struct ProviderConfig {
+     /// Max number of storage keys to request in a single `eth_getProof` call.
+     pub eip1186_proof_chunk_size: usize,
++    /// Max number of `eth_getProof` calls in flight at once (bounded concurrency for the preflight
++    /// fan-out). The upstream rate limiter (`--rpc-retry-cu`) still caps the CU/s; this just lets us
++    /// approach that ceiling instead of being latency-bound one serial request at a time.
++    pub getproof_concurrency: usize,
+ }
+ 
+ impl Default for ProviderConfig {
+     fn default() -> Self {
+-        Self { eip1186_proof_chunk_size: 1000 }
++        Self { eip1186_proof_chunk_size: 1000, getproof_concurrency: 64 }
+     }
+ }
+ 
+@@ -109,6 +113,11 @@ impl<N: Network, P: Provider<N>> ProviderDb<N, P> {
+         Ok(bytecode)
+     }
+ 
++    /// Bounded concurrency for the preflight `eth_getProof` fan-out (see [`ProviderConfig`]).
++    pub(crate) fn getproof_concurrency(&self) -> usize {
++        self.provider_config.getproof_concurrency.max(1)
++    }
++
+     /// Get the EIP-1186 account and storage merkle proofs.
+     pub(crate) async fn get_proof(
+         &self,
+diff --git a/crates/rpc-proxy/src/execution.rs b/crates/rpc-proxy/src/execution.rs
+index 3c8aca38..5cf6a3d0 100644
+--- a/crates/rpc-proxy/src/execution.rs
++++ b/crates/rpc-proxy/src/execution.rs
+@@ -10,7 +10,7 @@ use reth_chainspec::MAINNET;
+ use reth_ethereum_primitives::Block;
+ use reth_evm_ethereum::EthEvmConfig;
+ 
+-use crate::{execution_witness, PreimageLookup};
++use crate::{db::ProviderConfig, execution_witness, PreimageLookup};
+ 
+ /// An executor that fetches data from a [Provider] to execute blocks in the [StatelessExecutor].
+ /// This executor has an "embedded RPC proxy" and uses the RPC provider directly. It does not
+@@ -22,6 +22,8 @@ pub struct RpcExecutor<P: Provider<Ethereum> + Clone> {
+     provider: P,
+     evm_config: Arc<EthEvmConfig>,
+     lookup: Arc<PreimageLookup>,
++    /// Bounded concurrency for the preflight `eth_getProof` fan-out.
++    getproof_concurrency: usize,
+ }
+ 
+ impl<P> RpcExecutor<P>
+@@ -33,14 +35,14 @@ where
+         let evm_config = Arc::new(EthEvmConfig::ethereum(MAINNET.clone()));
+         // Initialize the preimage lookup table
+         let lookup = Arc::new(PreimageLookup::new(preimage_cache_nibbles));
+-        Self { provider, evm_config, lookup }
++        Self { provider, evm_config, lookup, getproof_concurrency: ProviderConfig::default().getproof_concurrency }
+     }
+ 
+     /// Executes the block with the given block number.
+     pub async fn execute(&self, block_number: u64) -> eyre::Result<StatelessExecutorInput> {
+         let block_id = BlockNumberOrTag::Number(block_number);
+         let execution_witness =
+-            execution_witness(self.evm_config.clone(), &self.provider, block_id, &self.lookup)
++            execution_witness(self.evm_config.clone(), &self.provider, block_id, &self.lookup, self.getproof_concurrency)
+                 .await?;
+         let parent_block_number = block_number - 1;
+         let parent_block = self
 diff --git a/crates/rpc-proxy/src/main.rs b/crates/rpc-proxy/src/main.rs
-index 3d29c715..90d0caec 100644
+index 3d29c715..c38ac9f8 100644
 --- a/crates/rpc-proxy/src/main.rs
 +++ b/crates/rpc-proxy/src/main.rs
 @@ -15,6 +15,7 @@ use reqwest::Client;
@@ -838,15 +435,26 @@ index 3d29c715..90d0caec 100644
  use std::sync::Arc;
  use tracing::{debug, error, field, info, instrument};
  use tracing_actix_web::TracingLogger;
-@@ -26,6 +27,7 @@ struct AppState {
+@@ -26,6 +27,8 @@ struct AppState {
      provider: DynProvider,
      evm_config: Arc<EthEvmConfig>,
      lookup: Arc<PreimageLookup>,
 +    witness_cache_dir: Option<PathBuf>,
++    getproof_concurrency: usize,
  }
  
  #[derive(Parser, Debug)]
-@@ -51,6 +53,12 @@ struct Args {
+@@ -47,10 +50,22 @@ struct Args {
+     #[clap(long, default_value_t = 1000)]
+     pub rpc_retry_cu: u64,
+ 
++    /// Max `eth_getProof` requests in flight at once when building a witness. The serial default
++    /// (one at a time) is latency-bound; raising this lets the fan-out approach the `--rpc-retry-cu`
++    /// ceiling (use a paid tier's CU/s). Paced by the CU limiter regardless.
++    #[clap(long, default_value_t = 64)]
++    pub rpc_concurrency: usize,
++
+     /// The number of nibbles to precompute for the preimage lookup table.
      /// Higher values increase startup time but reduce RPC calls for missing storage keys.
      #[clap(long, default_value_t = DEFAULT_PREIMAGE_CACHE_NIBBLES, value_parser = clap::value_parser!(u8).range(..=8))]
      pub preimage_cache_nibbles: u8,
@@ -859,10 +467,16 @@ index 3d29c715..90d0caec 100644
  }
  
  /// This function is the entry point for all incoming RPC requests.
-@@ -172,12 +180,40 @@ async fn handle_debug_execution_witness(
+@@ -172,12 +187,40 @@ async fn handle_debug_execution_witness(
      }
  
      let block_id = params_vec[0];
+-    match execution_witness(data.evm_config.clone(), &data.provider, block_id, &data.lookup).await {
+-        Ok(witness) => HttpResponse::Ok().json(json!({
+-            "jsonrpc": "2.0",
+-            "id": id,
+-            "result": witness
+-        })),
 +
 +    // Disk cache keyed by concrete block number: the expensive re-execution is done ONCE
 +    // per block and reused (RSP and ZisK both call debug_executionWitness(N)) and across
@@ -882,12 +496,7 @@ index 3d29c715..90d0caec 100644
 +        }
 +    }
 +
-     match execution_witness(data.evm_config.clone(), &data.provider, block_id, &data.lookup).await {
--        Ok(witness) => HttpResponse::Ok().json(json!({
--            "jsonrpc": "2.0",
--            "id": id,
--            "result": witness
--        })),
++    match execution_witness(data.evm_config.clone(), &data.provider, block_id, &data.lookup, data.getproof_concurrency).await {
 +        Ok(witness) => {
 +            let result = serde_json::to_value(&witness).unwrap_or(Value::Null);
 +            if let Some(p) = &cache_path {
@@ -905,11 +514,38 @@ index 3d29c715..90d0caec 100644
          Err(e) => {
              error!(error = format!("{e:#}"), "Preflight function failed");
              HttpResponse::InternalServerError().json(json!({
-@@ -223,6 +259,7 @@ async fn main() -> eyre::Result<()> {
+@@ -223,6 +266,8 @@ async fn main() -> eyre::Result<()> {
          provider: provider.erased(),
          evm_config,
          lookup,
 +        witness_cache_dir: args.witness_cache_dir,
++        getproof_concurrency: args.rpc_concurrency,
      });
  
      info!(
+diff --git a/crates/rpc-proxy/src/witness.rs b/crates/rpc-proxy/src/witness.rs
+index 38d66199..b3f86f95 100644
+--- a/crates/rpc-proxy/src/witness.rs
++++ b/crates/rpc-proxy/src/witness.rs
+@@ -22,6 +22,7 @@ pub async fn execution_witness<E, P, N>(
+     provider: &P,
+     block_id: BlockNumberOrTag,
+     lookup: &PreimageLookup,
++    getproof_concurrency: usize,
+ ) -> Result<ExecutionWitness>
+ where
+     E: ConfigureEvm + 'static,
+@@ -47,8 +48,11 @@ where
+     let block: <E::Primitives as NodePrimitives>::Block = rpc_block.try_into()?;
+     let recovered_block = block.try_into_recovered()?;
+ 
+-    let mut db =
+-        PreflightDb::new(ProviderDb::new(provider.clone(), ProviderConfig::default(), parent_hash));
++    let mut db = PreflightDb::new(ProviderDb::new(
++        provider.clone(),
++        ProviderConfig { getproof_concurrency, ..Default::default() },
++        parent_hash,
++    ));
+ 
+     debug!(%block_hash, "Preprocessing transactions with access lists");
+     for tx in recovered_block.body().transactions() {

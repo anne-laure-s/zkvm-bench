@@ -16,8 +16,8 @@
 #   ALCHEMY_URL=... ./cli/witness-farm 22500000                                          # from a block
 #   ALCHEMY_URL=... STRIDE=100 MARGIN=12 MAX_BLOCKS=200 ./cli/witness-farm               # tuned
 #
-# Env knobs: STRIDE MARGIN PROXY_PORT NIBBLES RETRY_CU RSP_RPC_CU MAX_BLOCKS MAX_FAILS RETRY_RPC RETRY_PAUSE
-#            PROXY_START_TRIES RSP_SKIP_EXEC
+# Env knobs: STRIDE MARGIN PROXY_PORT NIBBLES RETRY_CU PROXY_CONCURRENCY RSP_RPC_CU MAX_BLOCKS MAX_FAILS
+#            RETRY_RPC RETRY_PAUSE PROXY_START_TRIES RSP_SKIP_EXEC
 # Lives in cli/ but writes its outputs (witness-farm.csv, wcache/, witness-farm-logs/) to the repo
 # root; run it from the repo root: ./cli/witness-farm
 set -uo pipefail
@@ -29,7 +29,9 @@ MARGIN="${MARGIN:-12}"                       # reorg safety when proving `latest
 PROXY_PORT="${PROXY_PORT:-8545}"
 PROXY_URL="http://127.0.0.1:${PROXY_PORT}"
 NIBBLES="${NIBBLES:-7}"                       # proxy preimage cache (startup cost vs per-block RPC)
-RETRY_CU="${RETRY_CU:-400}"                   # keep under Alchemy Free ~500 CU/s
+RETRY_CU="${RETRY_CU:-400}"                   # proxy CU/s ceiling (--rpc-retry-cu). Free ~500; paid: raise to ~9000
+PROXY_CONCURRENCY="${PROXY_CONCURRENCY:-64}"  # max concurrent getProof in the proxy (--rpc-concurrency). The CU
+                                              # ceiling (RETRY_CU) still paces; this lets the fan-out reach it (not serial)
 MAX_BLOCKS="${MAX_BLOCKS:-0}"                 # 0 = forever
 MAX_FAILS="${MAX_FAILS:-5}"                   # stop after N consecutive RSP failures (fork/version wall); 0 = never
 RETRY_RPC="${RETRY_RPC:-1}"                   # per-guest retries on a TRANSIENT network failure; 0 = off
@@ -48,8 +50,8 @@ RSP_BASIC_BIN="$RSP_DIR/target/release/rsp"    # no feature → eth_getProof (fa
 RSP_EW_CACHE="$RSP_DIR/ew-cache"
 RSP_BASIC_CACHE="$RSP_DIR/basic-cache"
 WCACHE="$ROOT/wcache"                         # proxy witness cache (shared RSP↔ZisK, resumable)
-OUT="$ROOT/witness-farm.csv"
-LOGDIR="$ROOT/witness-farm-logs"
+OUT="${OUT:-$ROOT/witness-farm.csv}"          # CSV ledger (env-overridable → per-worker under cli/witness-farm-parallel)
+LOGDIR="${LOGDIR:-$ROOT/witness-farm-logs}"   # logs (env-overridable → per-worker; a shared proxy is reused, not restarted)
 RSP_FIX="$ROOT/guests/rsp/fixtures"           # collected RSP witnesses
 ZISK_FIX="$ROOT/guests/zisk-reth/fixtures"    # collected ZisK witnesses (+ hints)
 mkdir -p "$LOGDIR" "$WCACHE" "$RSP_FIX" "$ZISK_FIX"
@@ -111,7 +113,8 @@ else
   while :; do
     try=$((try+1))
     "$PROXY_BIN" --rpc-url "$ALCHEMY_URL" --bind-address "127.0.0.1:$PROXY_PORT" \
-        --rpc-retry-cu "$RETRY_CU" --preimage-cache-nibbles "$NIBBLES" \
+        --rpc-retry-cu "$RETRY_CU" --rpc-concurrency "$PROXY_CONCURRENCY" \
+        --preimage-cache-nibbles "$NIBBLES" \
         --witness-cache-dir "$WCACHE" > "$LOGDIR/proxy.log" 2>&1 &
     PROXY_PID=$!; started_proxy=1
     log "proxy pid=$PROXY_PID (attempt $try/$PROXY_START_TRIES) — waiting for readiness…"
@@ -203,7 +206,10 @@ gen_block(){
     # Snapshot the shared proxy.log length so the preimage check below is scoped to THIS
     # block's proxy activity. proxy.log is shared across every block of the run; grepping the
     # whole file would let a stale "preimage" line from an earlier block misclassify this one.
-    plog0=$(wc -c < "$LOGDIR/proxy.log" 2>/dev/null || echo 0); plog0=${plog0//[^0-9]/}; plog0=${plog0:-0}
+    # Only measure proxy.log if THIS run owns one (single-threaded). Under cli/witness-farm-parallel the
+    # proxy is shared/owned by the launcher (no proxy.log here) → plog0=0, NIB detection is a no-op. A bare
+    # `wc < missing` leaks a redirection error (2>/dev/null can't catch a `<` open failure), so guard it.
+    plog0=0; [ -f "$LOGDIR/proxy.log" ] && plog0=$(wc -c < "$LOGDIR/proxy.log" 2>/dev/null); plog0=${plog0//[^0-9]/}; plog0=${plog0:-0}
     if ( cd "$ROOT" && infra/zisk-infra/run gen-input GUEST=zisk-reth \
            ZISK_ETH_DIR=vendor/zisk-eth-client BLOCK="$b" RPC_URL="$PROXY_URL" ) \
          > "$LOGDIR/zisk-$b.log" 2>&1; then

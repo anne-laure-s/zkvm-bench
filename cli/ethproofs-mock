@@ -3,31 +3,40 @@
 
 The real ethproofs clients (RSP `bin/eth-proofs`, ZisK `zisk-ethproofs`) POST proofs to an ethproofs
 endpoint. Until we have real ethproofs.org credentials, point those clients' ETHPROOFS_API_URL /
---eth-proofs-endpoint at THIS server: it implements the same surface, records every submission, saves
-each proof, and serves a leaderboard-like status page. So the full continuous pipeline
+--eth-proofs-endpoint at THIS server: it implements the same surface, records every submission,
+VERIFIES + saves each proof, and serves a leaderboard-like status page. So the full continuous pipeline
 (chain-follow -> witness -> prove on the cluster -> submit) runs end-to-end NOW, and swapping to the
 real ethproofs.org later is a one-line config change (URL + token) — zero pipeline change.
 
-Endpoints (mirrors what the clients call):
-  POST /proofs/queued   {block_number, cluster_id}
-  POST /proofs/proving  {block_number, cluster_id}
-  POST /proofs/proved   {proof (base64), block_number, proving_cycles|proving_steps,
-                         proving_time (ms), verifier_id, cluster_id}
-  GET  /                 leaderboard (HTML)      ·  GET /proofs  (JSON records)
+Like the real server, this one VERIFIES the proof on /proved (it's the trust anchor, not a dumb store).
+A stdlib server can't run the SP1/ZisK verifier, so by default it MOCK-verifies (structural: a real,
+non-empty, decodable proof carrying a verifier id + a block) and records a ✓/✗ verdict. Swap in a REAL
+verifier with --verify-cmd `<cmd> <proof_path> <block> <verifier_id>` (exit 0 = valid) — the verification seam.
+
+Endpoints (mirrors what the clients call). Proof identity is (cluster_id, block) — exactly as on
+ethproofs — so run each prover as its OWN cluster (cli/prove-farm defaults the cluster to the guest, so
+rsp vs zisk land on distinct clusters). Optional vm/guest/public_inputs (sent by cli/ethproofs-submit)
+identify WHAT was proven and show on the leaderboard:
+  POST /proofs/queued   {block_number, cluster_id, [vm, guest]}
+  POST /proofs/proving  {block_number, cluster_id, [vm, guest]}
+  POST /proofs/proved   {proof (base64), block_number, proving_cycles|proving_steps, proving_time (ms),
+                         verifier_id, cluster_id, [vm, guest, public_inputs]}  -> verified, returns {proof_id, verified}
+  GET  /                 leaderboard (HTML: cluster·vm·guest·block·verified)  ·  GET /proofs  (JSON records)
 
 Lenient by design (a stand-in): unknown/renamed fields are still recorded; any Bearer token is
-accepted unless --token is given.
+accepted unless --token is given. Verification is mock by default (a real, well-formed proof passes).
 
-  ./cli/ethproofs-mock [--port 8547] [--store <dir>] [--token <expected-bearer>]
+  ./cli/ethproofs-mock [--port 8547] [--store <dir>] [--token <expected-bearer>] [--verify-cmd <cmd>]
 
 Store (default: ethproofs-mock-data/ at the repo root, git-ignored): submissions.jsonl (append log,
 replayed on restart) + proofs/<cluster>-<block>.bin (the decoded proofs).
 """
-import argparse, base64, json, os, threading, time
+import argparse, base64, json, os, subprocess, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MOCK_MAGIC = b"MOCK-PROOF"   # prove-farm --mock writes proof bytes starting with this — a fake, never real
 
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -46,8 +55,9 @@ class Store:
         self._replay()
 
     def pid(self, cluster, block):
-        # Stable proof_id per (cluster, block). The real ethproofs API returns {"proof_id": N} and
-        # the ZisK client PARSES it (RSP ignores the body) — so we must return that shape.
+        # Stable proof_id per (cluster, block) — the SAME identity ethproofs uses. Run each prover as its
+        # own cluster so rsp vs zisk don't share a key (cli/prove-farm defaults the cluster to the guest).
+        # The real ethproofs API returns {"proof_id": N}; the ZisK client PARSES it (RSP ignores it).
         key = (cluster, block)
         with self.lock:
             if key not in self.ids:
@@ -69,43 +79,81 @@ class Store:
                 except json.JSONDecodeError:
                     pass
 
-    def record(self, event, body, proof_bytes=None):
+    def record(self, event, body, proof_bytes=None, verified=None, verify_reason=None):
         cluster = body.get("cluster_id")
+        guest = body.get("guest")
         block = body.get("block_number")
         rec = {
             "ts": now_iso(),
             "event": event,
             "cluster_id": cluster,
+            "vm": body.get("vm"),                          # zkVM: SP1 / ZisK / OpenVM
+            "guest": guest,                                # guest program: rsp / zisk-reth / monad-sp1 / …
+            "mock": body.get("mock"),                      # True = a FAKE proof (mock-cluster), not real
             "block_number": block,
+            "public_inputs": body.get("public_inputs"),    # digest — identifies non-block proofs (e.g. fibonacci)
             # work-unit is cycles (SP1/OpenVM) or steps (ZisK) — record whichever is present
             "proving_cycles": body.get("proving_cycles", body.get("proving_steps")),
             "proving_time_ms": body.get("proving_time"),
             "verifier_id": body.get("verifier_id"),
             "proof_bytes": proof_bytes,
+            # server-side verdict (the SERVER verifies — see mock_verify). None until /proved.
+            "verified": verified,
+            "verify_reason": verify_reason,
         }
         with self.lock:
             with open(self.jsonl, "a") as f:
                 f.write(json.dumps(rec) + "\n")
             # keep the fullest view: merge into any existing state for this (cluster, block)
-            prev = self.state.get((cluster, block), {})
+            key = (cluster, block)
+            prev = self.state.get(key, {})
             merged = {**prev, **{k: v for k, v in rec.items() if v is not None}}
             merged["event"] = event
             merged["ts"] = rec["ts"]
-            self.state[(cluster, block)] = merged
+            self.state[key] = merged
         return rec
 
     def save_proof(self, cluster, block, proof_b64):
         try:
             raw = base64.b64decode(proof_b64)
         except (ValueError, TypeError):
-            return None
+            return None, False
         path = os.path.join(self.proofs_dir, f"{cluster}-{block}.bin")
         with open(path, "wb") as f:
             f.write(raw)
-        return len(raw)
+        return len(raw), raw[:len(MOCK_MAGIC)] == MOCK_MAGIC   # (size, is_mock — magic in the bytes)
 
 STORE = None
 TOKEN = None
+VERIFY_CMD = None   # external verifier: `<cmd> <proof_path> <block> <verifier_id> <vm> <guest>`, exit 0 = valid
+
+def mock_verify(proof_len, body, proof_path):
+    """Stand-in for ethproofs.org's proof VERIFICATION — the SERVER's job (it's the trust anchor, not a
+    dumb store). A stdlib server can't run the real SP1/ZisK verifier, so by default we MOCK-verify:
+    check the submission is a real, non-empty, decodable proof carrying a verifier id + a block. Set
+    --verify-cmd to swap in a REAL verifier (this is the verification seam). Returns (ok, reason)."""
+    if VERIFY_CMD:
+        if not proof_path:
+            return False, "no proof to verify"
+        # pass vm + guest too, so the verifier can pick the right backend (ZisK/SP1) and locate the ELF.
+        try:
+            r = subprocess.run([VERIFY_CMD, proof_path, str(body.get("block_number")),
+                                str(body.get("verifier_id") or ""), str(body.get("vm") or ""),
+                                str(body.get("guest") or "")], capture_output=True, timeout=600)
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, f"verify-cmd error: {e}"
+        if r.returncode == 0:
+            return True, "verified by --verify-cmd"
+        tail = (r.stderr or b"").decode(errors="replace").strip().splitlines()
+        return False, f"--verify-cmd rejected (exit {r.returncode}: {tail[-1] if tail else ''})"
+    # built-in mock verification (structural — catches empty / truncated / mis-fielded submissions)
+    if not proof_len:
+        return False, "no proof / empty / undecodable base64"
+    if not body.get("verifier_id"):
+        return False, "missing verifier_id (vk)"
+    if body.get("block_number") is None:
+        return False, "missing block_number"
+    return True, "mock-verified (well-formed; not cryptographically checked)"
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # quieter default access log; we print our own lines
@@ -137,20 +185,35 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth_ok():
             return self._reply(401, {"error": "bad bearer token"})
         body = self._json_body()
-        cluster, block = body.get("cluster_id"), body.get("block_number")
+        cluster = body.get("cluster_id"); guest = body.get("guest"); block = body.get("block_number")
+        vm = body.get("vm"); mock = bool(body.get("mock"))
+        # who = vm+guest, so rsp vs zisk on the SAME cluster+block are distinct in the log and the store.
+        who = f"{('vm=' + str(vm) + ' ') if vm else ''}{('guest=' + str(guest) + ' ') if guest else ''}"
+        mk = "[MOCK] " if mock else ""   # unmissable FAKE-proof marker on every log line
         # Every /proofs/* reply is {"proof_id": N} — the ZisK client parses that shape; RSP ignores it.
+        # Log lines are INBOUND requests (← = received): the prover's own status reports, NOT work this
+        # server does. 'proving'/'proved' are the CLIENT's lifecycle states — the mock only records them.
         if self.path.rstrip("/") == "/proofs/queued":
-            STORE.record("queued", body); print(f"{now_iso()}  queued   cluster={cluster} block={block}")
+            STORE.record("queued", body); print(f"{now_iso()}  ← /proofs/queued   {mk}cluster={cluster} {who}block={block}")
             return self._reply(200, {"proof_id": STORE.pid(cluster, block)})
         if self.path.rstrip("/") == "/proofs/proving":
-            STORE.record("proving", body); print(f"{now_iso()}  proving  cluster={cluster} block={block}")
+            STORE.record("proving", body); print(f"{now_iso()}  ← /proofs/proving  {mk}cluster={cluster} {who}block={block}")
             return self._reply(200, {"proof_id": STORE.pid(cluster, block)})
         if self.path.rstrip("/") == "/proofs/proved":
-            pb = STORE.save_proof(cluster, block, body["proof"]) if body.get("proof") else None
-            rec = STORE.record("proved", body, proof_bytes=pb)
-            print(f"{now_iso()}  PROVED   cluster={cluster} block={block} "
-                  f"time={rec['proving_time_ms']}ms work={rec['proving_cycles']} proof={pb}B")
-            return self._reply(200, {"proof_id": STORE.pid(cluster, block), "proof_bytes": pb})
+            pb = None; magic_mock = False
+            if body.get("proof"):
+                pb, magic_mock = STORE.save_proof(cluster, block, body["proof"])
+            if magic_mock and not mock:   # server-detected fake (proof bytes carry the MOCK-PROOF magic)
+                mock = True; body["mock"] = True; mk = "[MOCK] "
+            proof_path = os.path.join(STORE.proofs_dir, f"{cluster}-{block}.bin") if pb is not None else None
+            ok, reason = mock_verify(pb, body, proof_path)   # the SERVER verifies (mock/real via --verify-cmd)
+            rec = STORE.record("proved", body, proof_bytes=pb, verified=ok, verify_reason=reason)
+            pid = STORE.pid(cluster, block)
+            mark = "verified ✓" if ok else f"REJECTED ✗ ({reason})"
+            pi = f" pi={rec['public_inputs']}" if rec.get("public_inputs") else ""
+            print(f"{now_iso()}  ← /proofs/proved   {mk}cluster={cluster} {who}block={block}{pi} "
+                  f"time={rec['proving_time_ms']}ms work={rec['proving_cycles']} proof={pb}B  → stored proof_id={pid} · {mark}")
+            return self._reply(200, {"proof_id": pid, "proof_bytes": pb, "verified": ok, "mock": mock})
         return self._reply(404, {"error": f"unknown endpoint {self.path}"})
 
     def do_GET(self):
@@ -158,39 +221,69 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply(200, list(STORE.state.values()))
         # leaderboard
         rows = sorted(STORE.state.values(),
-                      key=lambda r: (r.get("cluster_id") or 0, r.get("block_number") or 0), reverse=True)
+                      key=lambda r: (r.get("cluster_id") or 0, str(r.get("vm") or ""),
+                                     str(r.get("guest") or ""), r.get("block_number") or 0), reverse=True)
         def td(v): return "" if v is None else v
         body = ["<!doctype html><meta charset=utf-8><title>ethproofs-mock</title>",
                 "<style>body{font:14px system-ui;margin:2rem}h1{font-size:1.2rem}"
                 "table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 8px;text-align:right}"
-                "td:first-child,th:first-child,.l{text-align:left}.q{color:#999}.p{color:#c60}.d{color:#080}</style>",
-                f"<h1>ethproofs-mock — {len(rows)} block(s)</h1>",
-                "<table><tr><th>cluster</th><th>block</th><th class=l>state</th>"
-                "<th>work-unit</th><th>prove (ms)</th><th>proof (B)</th><th class=l>verifier_id</th><th class=l>updated</th></tr>"]
+                "td:first-child,th:first-child,.l{text-align:left}.q{color:#999}.p{color:#c60}.d{color:#080}.r{color:#c00}</style>",
+                f"<h1>ethproofs-mock — {len(rows)} proof(s)</h1>",
+                "<table><tr><th>cluster</th><th class=l>vm</th><th class=l>guest</th><th>mock</th><th>block</th><th class=l>state</th>"
+                "<th>work-unit</th><th>prove (ms)</th><th>proof (B)</th><th>verified</th>"
+                "<th class=l>verifier_id</th><th class=l>updated</th></tr>"]
         for r in rows:
             ev = r.get("event", "")
             cls = {"queued": "q", "proving": "p", "proved": "d"}.get(ev, "")
-            body.append(f"<tr><td>{td(r.get('cluster_id'))}</td><td>{td(r.get('block_number'))}</td>"
+            v = r.get("verified")
+            vb = "✓" if v is True else ("✗" if v is False else "")
+            vc = "d" if v is True else ("r" if v is False else "")
+            blk = td(r.get("block_number")) or (f"pi:{str(r.get('public_inputs'))[:10]}" if r.get("public_inputs") else "")
+            body.append(f"<tr><td>{td(r.get('cluster_id'))}</td><td class=l>{td(r.get('vm'))}</td>"
+                        f"<td class=l>{td(r.get('guest'))}</td>"
+                        f"<td class='r'>{'⚠️MOCK' if r.get('mock') else ''}</td><td>{blk}</td>"
                         f"<td class='l {cls}'>{ev}</td><td>{td(r.get('proving_cycles'))}</td>"
                         f"<td>{td(r.get('proving_time_ms'))}</td><td>{td(r.get('proof_bytes'))}</td>"
+                        f"<td class='{vc}' title='{td(r.get('verify_reason'))}'>{vb}</td>"
                         f"<td class=l>{str(td(r.get('verifier_id')))[:18]}</td><td class=l>{td(r.get('ts'))}</td></tr>")
         body.append("</table>")
         return self._reply(200, "\n".join(body).encode(), ctype="text/html; charset=utf-8")
 
 def main():
-    global STORE, TOKEN
+    global STORE, TOKEN, VERIFY_CMD
+    sys.stdout.reconfigure(line_buffering=True)  # live logs even when redirected (`ethproofs-mock &`)
     ap = argparse.ArgumentParser(description="home-made ethproofs.org stand-in")
     ap.add_argument("--port", type=int, default=int(os.environ.get("ETHPROOFS_MOCK_PORT", 8547)))
     ap.add_argument("--store", default=os.environ.get("ETHPROOFS_MOCK_STORE", os.path.join(ROOT, "ethproofs-mock-data")))
     ap.add_argument("--token", default=os.environ.get("ETHPROOFS_MOCK_TOKEN"))
+    ap.add_argument("--verify-cmd", default=os.environ.get("ETHPROOFS_MOCK_VERIFY_CMD"),
+                    help="external verifier `<cmd> <proof_path> <block> <verifier_id>` (exit 0 = valid); "
+                         "omit to use the built-in mock verification")
     args = ap.parse_args()
     STORE = Store(args.store)
     TOKEN = args.token
+    VERIFY_CMD = args.verify_cmd
     n = len(STORE.state)
-    print(f"ethproofs-mock: http://127.0.0.1:{args.port}  store={args.store}  "
-          f"auth={'Bearer required' if TOKEN else 'open (any token)'}  ({n} block(s) replayed)")
-    print("  point the clients here:  ETHPROOFS_API_URL / --eth-proofs-endpoint = "
-          f"http://<this-host>:{args.port}")
+    auth = f"Bearer {TOKEN}" if TOKEN else "open (any token accepted)"
+    verify = f"external: {VERIFY_CMD}" if VERIFY_CMD else "built-in mock (well-formed check; real verifier via --verify-cmd)"
+    print(f"""ethproofs-mock — a local stand-in for the ethproofs.org API (the SERVER that receives + verifies proofs).
+It accepts what a prover submits (POST /proofs/queued · /proving · /proved), VERIFIES each proof, saves
+it, and shows a leaderboard — so the proving pipeline can submit here WITHOUT an ethproofs.org account.
+It does NOT prove anything: the log lines below are INBOUND requests (← = received) — the prover's own
+status reports, so 'proving'/'proved' are the CLIENT's states, not work done by this server. What this
+server DOES do on /proved is VERIFY the submitted proof (mock by default — see --verify-cmd) and record ✓/✗.
+
+  listening : http://127.0.0.1:{args.port}     ·  leaderboard: open it in a browser  ·  JSON: GET /proofs
+  store     : {args.store}   (submissions.jsonl + proofs/)
+  auth      : {auth}     ·  {n} block(s) recorded so far
+  verify    : {verify}
+
+To make a prover send its proofs HERE instead of ethproofs.org, set the prover's ethproofs URL to
+http://<host>:{args.port}  (<host> = 'localhost' if the prover runs on this machine, else this box's IP):
+  · SP1  (bin/eth-proofs)    :  --eth-proofs-endpoint http://<host>:{args.port}
+  · ZisK (ethproofs-client)  :  ETHPROOFS_API_URL=http://<host>:{args.port}
+  · cli/ethproofs does this for you (its --ethproofs-url defaults here).
+Ctrl-C to stop.""")
     try:
         ThreadingHTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
     except KeyboardInterrupt:
