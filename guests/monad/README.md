@@ -3,6 +3,17 @@
 Monad block-replay guests, and a comparison of **execution** times (no
 proving) against the reth clients on SP1 / ZisK / OpenVM, over the common blocks.
 
+> **Which tool does what** (the commands below are the *low-level* runners):
+> - *Where* the cost goes + side-by-side guest comparison → [`profiling/hotspots.py`](../../profiling/README.md)
+>   (`profile --backend sp1|zisk` wraps these same runners; adds `diff` / `compare` / `--aggregate`).
+>   It's how you execute/profile Monad **on SP1** — there is no SP1 `ev.sh`.
+> - `ev.sh` (here) = batch execute + state-root verify, **ZisK only** → `exec-verified.csv` (steps).
+> - `gen-inputs` (in `guests/monad-*/`) = persist per-zkVM inputs for **proving** via `cli/prove-farm` —
+>   **not** needed for execution/profiling/comparison.
+> - Input framing per backend: **SP1 = raw `.witness`**, **ZisK = `LE64(len)+witness+pad8`**.
+> - New Monad witnesses land in `guests/monad/fixtures/<block>.witness` (+ `.post_state_root`);
+>   how they're generated (Monad snapshot + block_db + `run_replay.py`) is in "Witnesses — provenance" below.
+
 > ⚠️ All commands run from the repo root.
 > The binaries are **not** on `PATH` → use their full paths.
 
