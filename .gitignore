@@ -23,6 +23,8 @@ guests/*/inputs/rpc-cache/
 # Collected witnesses (cli/witness-farm writes RSP/ZisK witnesses here) — large, regenerable.
 guests/*/fixtures/*.bin
 guests/*/fixtures/*.hints
+guests/*/fixtures/*.witness
+guests/*/fixtures/*.post_state_root
 
 # Execute reports — regenerable locally via `./run execute`. They feed profiling/results.html
 # (itself regenerated, not shipped), so they are NOT committed; re-run `./run execute` then results.py.
