@@ -1,9 +1,10 @@
 # profiling
 
-Two tools to analyze the guests' **execution** (no proving) — pick by the question you're asking:
+Three tools to analyze the guests' **execution** (no proving) — pick by the question you're asking:
 
 | Tool | Question | Scope | Output |
 |------|----------|-------|--------|
+| **`compare.py`** | ***How much more*** does guest A cost than guest B, **over many blocks**? | **one same-zkVM pair**, N blocks | terminal summary + `results/compare.html` |
 | **`hotspots.py`** | ***Where*** does the cost go? (drill into functions / opcodes / categories) | **one guest** (or several, compared) | per-run HTML — icicle + flamegraph |
 | **`results.py`** | ***How much*** work per block? | **all guests**, side by side | one cross-zkVM table (`results/results.html`) |
 
@@ -16,6 +17,7 @@ neither proves anything.
 
 | Tool | Purpose | Reads | Produces |
 |------|---------|-------|----------|
+| `compare.py` | **aggregate A-vs-B over a block set** (median/mean/spread + optional module diff) | ELFs + inputs, per axis | terminal summary, `results/compare.html`, `--json` |
 | `hotspots.py` | **execute + profile + compare** any guest, either backend (`zisk`/`sp1`) | an ELF + an input | per-run `profile.json` + HTML; `diff` / `compare` / `--aggregate` |
 | `results.py` | cross-guest "how much" table | `../guests/<name>/inputs/*.exec-report.json` | `results/results.html` |
 | `../guests/monad/ev.sh` | batch **execute + state-root verify**, **ZisK only** | `../guests/monad/inputs/*.witness` | `exec-verified.csv` (steps) + `execute-out/<tag>.bin` (framed input) |
@@ -32,6 +34,149 @@ Things that bit us and are easy to forget:
   comparable to `zisk-reth`'s report), but for Monad comparisons reach for `hotspots.py`.
 - **Input framing is per-backend** (the #1 gotcha): **SP1 reads the raw witness**; **ZisK needs it framed**
   `LE64(len)+witness+pad8`. See the recipe below.
+
+## compare.py — how much more, over a whole block set
+
+The one-command answer to *"is Monad's EVM more expensive than reth, and by how much?"* — run it
+with no arguments and it does every axis over every block both sides can run:
+
+```sh
+./compare.py                              # every axis, every common block
+./compare.py --axis zisk --limit 20       # one axis, first 20 common blocks
+./compare.py --blocks 25552005-25552088   # an explicit range (or a comma list)
+./compare.py --deep 5                     # + a per-module diff (hotspots.py)
+```
+
+**Axes** are same-zkVM guest pairs (work-units only compare within a VM):
+`zisk` = monad-zisk vs zisk-reth · `sp1` = monad-sp1 vs rsp. Input framing is handled per backend
+(SP1 raw witness · ZisK `LE64(len)+witness+pad8`), so you just name blocks.
+
+What the summary gives, per axis: median / mean / total work with the **ratio**, work **per Mgas**
+(normalises for block size; EVM gas comes from the reth ZisK guest and is pooled across axes), median
+exec seconds, then the **per-block ratio distribution** (median, p10, p90, cv) with the min/max blocks
+named, and a **small-vs-large-block** split to show whether the gap grows with block size. `--deep N`
+appends a per-module `hotspots.py diff` so you see *which* modules carry the delta.
+
+**Which blocks** — every block both sides can run, unless you bound it with `--block-min` / `--block-max`
+(or name an explicit set with `--blocks`). Bound it deliberately: the fixtures mix a **contiguous run**
+with **strided** (~every 10th block) and one-off older ones, and a median over that mixture is not a
+median over consecutive mainnet blocks. At the time of writing the contiguous run where RSP, ZisK-reth
+*and* Monad witnesses all exist is **25551991–25552607** — check what you actually have rather than
+trusting that range:
+
+```sh
+./compare.py --axis zisk --block-min 25551991 --block-max 25552607
+```
+
+**One command does the whole thing.** A single run collects and reports work-units, prover work and its
+category split, precompile counts, gas and tx counts, and the honest execution time:
+
+```sh
+./compare.py --block-min 25551991 --block-max 25552607
+```
+
+That writes the terminal summary **and** `results/compare.html` + `results/compare.json` — the report is
+the deliverable, so it needs no flag (`--no-report` skips it). `--quick` is the only other opt-out, and it drops just the expensive piece (ZisK's instrumented COST pass);
+anything already cached is still reported.
+
+**Prover work** — beyond raw steps/cycles, each backend can report what a block costs
+the *prover*: **ZisK `COST`** and **SP1 `PGU`**. Both are **trace area** — the polynomial area the prover
+commits to — so they weight each operation by its real proving cost (a keccak precompile ≫ an ADD), and
+proving time is proportional to them on any hardware:
+
+| | what it is | source |
+|---|---|---|
+| ZisK `COST` | per-op *columns × rows*, e.g. `KECCAK_COST = 25 × 3022` | `zisk core/src/zisk_ops_costs.rs`, headed *“Cost definitions: Area x Op”* |
+| SP1 `PGU` | trace area accumulated by the executor's ShapeChecker, normalised ×10/191 for cross-version stability; also sets shard boundaries | `sp1-core-executor vm/shapes.rs` + `report.rs::gas()` |
+
+PGU is what SP1's prover network prices proofs in, but it is **not GPU-specific** — it's hardware-agnostic
+trace area. The two models describe different circuits at different scales, so compare the **A/B ratio**
+within an axis, never raw COST against raw PGU. Cost note: SP1 reports PGU for free, ZisK needs a second
+**instrumented** pass whose execution is ~7× slower (~19 s/block vs ~2 s → roughly 10× the sweep). It runs
+by default and is cached; `--quick` skips it when you only want a fast look.
+
+**Diagnosing a shape from the page** — in the HTML the histogram bars are **clickable**: each opens the
+blocks that landed in it, with a synthesis and a per-block table. The point is to answer *why* a cluster
+exists without leaving the report. What it shows, and where each figure comes from:
+
+| | what it tells you | cost |
+|---|---|---|
+| gas, **tx count**, gas/tx | is this cluster made of big blocks, or many cheap txs? | free — the reth ZisK guest prints both |
+| work/Mgas per side | ratio with block size divided out, so buckets group by *efficiency* | derived |
+| **precompile counts A÷B** (SP1: keccak, secp256k1, all syscalls) | the mechanism: *“A hashes 1.9× more than B here”* | free — already in the SP1 report |
+| **% opcodes / % precompiles** of trace cost, both axes | is the block precompile-bound or plain-execution-bound? Over the ZisK sample **% opcodes separates the off-pattern blocks ~3× better than anything else shown** | free — ZisK prints the split, SP1's is derived from the same weights `hotspots.py` uses |
+| **witness bytes** per guest | the figure behind "each guest is fed its own witness" | free — `getsize` |
+
+Clicking a row in the off-pattern list goes one level deeper: a **per-opcode delta against the median
+block** for whichever guest strayed, computed in the page (no profiling), plus the ready-to-run
+`hotspots.py` command for function-level detail.
+
+Caveat: precompile counts belong to each zkVM's own syscall set, so they compare **within** an axis, not
+across. Deliberately left out: `touched_memory_addresses` (always 0) and anything needing an RPC (it would
+break the page's self-containment). Note that SP1's `DIV`/`REM` counters stay tiny even on blocks dominated
+by 256-bit modular arithmetic — that arithmetic is done in *software* (shifts/branches), so look at those
+groups instead. Collecting all this needs one re-run per axis; afterwards it's cached.
+
+**What kind of work, and how much** — the HTML breaks each guest's instructions into families
+(hashing, 256-bit arithmetic, state/trie, EVM interpreter, containers/runtime, memory) by classifying
+**function names**, since the two guests share no module names. It needs one profiling run per guest
+per sampled block (~13 s ZisK, ~24 s SP1), cached until the guest ELF changes; `--families N` sets the
+sample size (default 10), `--families 0` skips it.
+
+The sample is **stratified**: one block from the middle of each of N equal-population slices of the
+ratio distribution. That matters more than N does — sampling the endpoints (0–100 %) gives the two most
+extreme blocks 1/N of the weight each though they stand for one block in hundreds, which inflated the
+256-bit-arithmetic family 2.5× (146 M vs 59 M instructions); clustering near the median makes the
+mirror mistake, dropping tails that carry real work. Stratified is unbiased for the mean and steadier
+than a random draw of the same size. On sample size, measured rather than assumed: 5 → 10 moved every family by
+1–4 % except the EVM-interpreter row (−17 %), so **10 is the default** — the extra runs are cheap and
+cached, and they steady the one row that was still moving.
+
+Note the two profilers differ in kind: ZisK's attributes essentially every instruction, SP1's **samples**
+(1 in ~270 measured), so its family counts are scaled to the real cycle count. Ratios survive sampling;
+absolute figures on that axis are estimates, and the report says so.
+
+**Representative blocks, and why there is no "median flamegraph"** — the summary names the **real**
+blocks at the median (the typical one), p10 and p90 of the ratio. It deliberately does *not* build a
+synthetic median/decile profile: averaging is linear, so a mean-per-function profile still sums to the
+mean total (that's what `hotspots.py --aggregate` gives you, plus a per-function `cv` for spread) —
+but a **median is not linear**, so a profile whose every function carries its cross-block median sums
+to no real block's total, breaks parent ≥ children, and corresponds to no execution that ever ran. A
+real block at the quantile is honest and openable.
+
+`--spread` is the sound version of "show me a decile profile": it profiles the **real p90 and p10
+blocks** and diffs them, answering *what makes a block relatively costly*. Both sides are runs that
+actually happened. Caveat printed with the output: those are quantiles of the **ratio**, not of block
+size, so read the normalised `Δ%oftot` column rather than raw `Δcount`.
+
+**Outliers** — blocks that don't behave like the rest are listed automatically, detected on the
+per-block ratio with a **robust z-score** (median + MAD, not mean + stdev: a few odd blocks would
+inflate stdev and hide themselves). Default bar `|z| ≥ 3.5` (`--outlier-z`), 8 shown (`--show-outliers`,
+all land in `--json`, and the HTML flags them ⚠ with their z). Each line carries the block's gas and
+both work counts, plus the `hotspots.py` command to open one — they're the blocks worth a deep dive.
+
+Runs are **cached** (`results/compare-cache.json`, keyed by axis/guest/block + ELF mtime), so re-runs
+are instant and block sets grow incrementally; `--force` re-runs. The cache is written **as results
+arrive**, so an interrupted sweep keeps everything it already computed.
+
+> ⏱ **The SP1 startup cost, and how it's amortised.** The SP1 runner pays a **fixed ~6.3 s startup per
+> process** — building the `ProverClient`, before its own timer even starts. Measured with a
+> 5 297-cycle fibonacci guest: **6.31 s wall for 0.006 s of execution** (~59 s of CPU across cores). So
+> the report's `elapsed_secs` (what compare.py records) is the honest execution number, while naive
+> wall-clock per block is ~90 % startup. A real block: 7.31 s wall / 0.67 s executing, vs ZisK 0.68 s /
+> 0.08 s — SP1 is ~3× slower *per work-unit*, not 10×.
+>
+> Because that cost is per-PROCESS, not per-input, `sp1-runner` grew a **`--batch`** mode (a file of
+> input paths, one per line, `--report-dir` for the per-input JSON) and compare.py chunks each side's
+> blocks into `--jobs` batched processes. A 748-run sweep goes from 748 startups to ~6 — about **78 min
+> of pure startup removed** — while still running chunks in parallel. If the runner is older than
+> `--batch`, compare.py detects it and falls back to one process per block with a note.
+>
+> ⏱ **The reported exec time is the `--no-gas` one.** SP1's gas-estimation pass inflates execution
+> (~1.7× here), but switching it off makes the report return `cycles = 0` — so each SP1 chunk is run
+> **twice**: gas-on for cycles/PGU/precompile counts, `--no-gas` for the honest timing. The report shows
+> the latter and states the measured overhead of the former. The second pass is the cheap one, and the
+> startup is amortised across the batch either way.
 
 ## hotspots.py — where the cost goes
 ```sh

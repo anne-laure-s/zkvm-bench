@@ -36,6 +36,44 @@ SKIP = {'void','bool','int','unsigned','signed','long','short','char','double','
 def demangle(s):
     return re.sub(r'::h[0-9a-f]{16}$', '', re.sub(r'17h[0-9a-f]{16}E?$', '', s))
 
+# ─────────────────────────── work families ─────────────────────────────────────────
+# One level above `module()`. Modules identify the CRATE a symbol comes from, which makes a
+# two-guest diff unreadable when the guests share no crates: "monad +3.5M" next to
+# "zeth_mpt -4.3M" hides that both are trie work. Families classify by what the code is DOING,
+# so profiles of different codebases become comparable. First pattern wins — order matters.
+FAMILIES = [
+    ('hashing (keccak/sha)',   r'keccak|sha3|sha256|sha2|tiny_keccak|blake'),
+    # `k256` must not be bare: it is a substring of "keccak256" (84M instructions in one measured
+    # profile), which only the pattern ORDER kept out of this family. Anchored, not order-dependent.
+    ('signature recovery',     r'secp256k1|ecrecover|ecdsa|(?<![a-z0-9])k256'),
+    ('256-bit arithmetic',     r'mulmod|addmod|submod|div_rem|div_result|udivti3|umodti3|uint256'
+                               r'|intx|u256|bswap'),
+    # PartialNode / PartialTrieDb are trie node types: Boost.Outcome wrappers around them are trie
+    # work, and without naming them here ~half the C++ family was in fact mis-filed trie work.
+    ('state / trie',           r'trie|mpt|SparseState|PartialTrieDb|PartialNode|nibble|rlp|proof'),
+    ('EVM interpreter',        r'interpreter|revm|evmc|Intercode|opcode|execute_block|push<|swap<|dup<'),
+    ('memory / allocation',    r'memcpy|memmove|memset|memcmp|alloc|dealloc|Heap|free|malloc|tlsf'),
+    ('C++ abstraction layer',  r'std::|boost::|ankerl|hashbrown|immer|unordered|vector|map|hash'),
+]
+
+def family(name):
+    """Which kind of work a symbol represents — see FAMILIES."""
+    for fam, pat in FAMILIES:
+        if re.search(pat, name, re.I): return fam
+    return 'other'
+
+def families_of(profile_json):
+    """Fold a profile's per-function counts into families. -> ({family: count}, total)"""
+    d = json.load(open(profile_json))
+    e = d[list(d)[0]]
+    out, total = {}, 0
+    for fn in e.get('functions', []):
+        c = fn.get('count') or 0
+        total += c
+        fam = family(f"{fn.get('module','')}::{fn.get('name','')}")
+        out[fam] = out.get(fam, 0) + c
+    return out, total
+
 def module(name):
     """First-level module/crate for a Rust or C++ mangled-ish symbol."""
     s = name.strip()

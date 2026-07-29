@@ -70,6 +70,21 @@ struct Args {
     #[arg(long)]
     skip_verify: bool,
 
+    /// EXECUTE-mode batch: a text file with one input path per line, all run in
+    /// ONE process. Building the ProverClient costs ~6s and that cost is
+    /// per-process, not per-input — so a sweep of N blocks spawned one at a time
+    /// burns N×6s of pure startup (measured: a 5k-cycle guest still takes 6.3s
+    /// wall for 0.006s of execution). Reusing one client across inputs collapses
+    /// that to a single 6s. Per-input JSON reports land in --report-dir; a failing
+    /// input is reported and skipped rather than sinking the batch.
+    /// Ignores --input / --report / --public-values.
+    #[arg(long)]
+    batch: Option<PathBuf>,
+
+    /// Directory for the per-input reports written by --batch (named <input-stem>.json).
+    #[arg(long)]
+    report_dir: Option<PathBuf>,
+
     /// Execute mode only: skip gas calculation. This drops SP1's extra
     /// gas-estimation pass (it re-processes the whole trace to build gas +
     /// opcode/syscall counts), so execution is faster — but the report's gas
@@ -150,10 +165,13 @@ fn main() -> Result<()> {
     let elf_bytes =
         fs::read(elf_path).with_context(|| format!("reading ELF {}", elf_path.display()))?;
     println!("ELF size : {} bytes", elf_bytes.len());
-    let elf = Elf::from(elf_bytes);
+    // Clone: --batch rebuilds an Elf per input (execute() consumes it), and a few MB
+    // per iteration is nothing next to the ~6s client startup it saves.
+    let elf = Elf::from(elf_bytes.clone());
 
-    // Execute/prove modes consume an input; verify reloads a finished proof.
-    let stdin = if args.mode == Mode::Verify {
+    // Execute/prove modes consume an input; verify reloads a finished proof, and
+    // --batch reads its inputs itself.
+    let stdin = if args.mode == Mode::Verify || args.batch.is_some() {
         None
     } else {
         let input_path = args
@@ -188,6 +206,75 @@ fn main() -> Result<()> {
     #[cfg(not(feature = "network"))]
     let prover = ProverClient::from_env();
     println!("Prover initialized");
+
+    // ──────── BATCH EXECUTE ────────
+    // The expensive part (the ProverClient above) is now paid; run every input
+    // against it before exiting. Placed here deliberately: everything below is the
+    // single-input path, left untouched.
+    if let Some(batch_path) = &args.batch {
+        if args.mode != Mode::Execute {
+            anyhow::bail!("--batch is execute-mode only (got {:?})", args.mode);
+        }
+        let report_dir = args.report_dir.as_ref().context("--batch requires --report-dir")?;
+        fs::create_dir_all(report_dir)
+            .with_context(|| format!("creating report dir {}", report_dir.display()))?;
+        let listing = fs::read_to_string(batch_path)
+            .with_context(|| format!("reading batch list {}", batch_path.display()))?;
+        let inputs: Vec<&str> =
+            listing.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+        println!("Batch    : {} input(s) -> {}", inputs.len(), report_dir.display());
+
+        let mut ok = 0usize;
+        for (i, inp) in inputs.iter().enumerate() {
+            let stem = std::path::Path::new(inp)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("input{i}"));
+            let t = Instant::now();
+            // Per-input closure so one bad block is reported and skipped, not fatal.
+            let run = || -> Result<serde_json::Value> {
+                let bytes = fs::read(inp).with_context(|| format!("reading input {inp}"))?;
+                let mut s = SP1Stdin::new();
+                s.write_slice(&bytes);
+                let mut req = prover.execute(Elf::from(elf_bytes.clone()), s);
+                if args.no_gas {
+                    req = req.calculate_gas(false);
+                }
+                let (pv, rep) = req.run().map_err(|e| anyhow::anyhow!("execute failed: {e}"))?;
+                Ok(serde_json::json!({
+                    "mode": "execute",
+                    "input": inp,
+                    "cycles": rep.total_instruction_count(),
+                    "elapsed_secs": t.elapsed().as_secs_f64(),
+                    "public_values_bytes": pv.as_slice().len(),
+                    "total_syscalls": rep.total_syscall_count(),
+                    "touched_memory_addresses": rep.touched_memory_addresses,
+                    "exit_code": rep.exit_code,
+                    "gas": rep.gas(),
+                    "execution_report": serde_json::to_value(&rep).unwrap_or(serde_json::Value::Null),
+                }))
+            };
+            match run() {
+                Ok(j) => {
+                    let path = report_dir.join(format!("{stem}.json"));
+                    fs::write(&path, serde_json::to_string_pretty(&j)?)
+                        .with_context(|| format!("writing report {}", path.display()))?;
+                    println!(
+                        "[{}/{}] {stem}: cycles={} in {:.2}s",
+                        i + 1,
+                        inputs.len(),
+                        j["cycles"],
+                        t.elapsed().as_secs_f64()
+                    );
+                    ok += 1;
+                }
+                Err(e) => eprintln!("[{}/{}] {stem}: FAILED: {e:#}", i + 1, inputs.len()),
+            }
+        }
+        println!("Batch done: {ok}/{} ok", inputs.len());
+        return Ok(());
+    }
+
     let t_start = Instant::now();
 
     let report_json = match args.mode {

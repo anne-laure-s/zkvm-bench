@@ -30,6 +30,15 @@ proving) against the reth clients on SP1 / ZisK / OpenVM, over the common blocks
 
 ## Witnesses — provenance (git-ignored, ~79 MB)
 
+**Two tiers** (both git-ignored):
+- `fixtures/<block>.witness` (+ `.post_state_root`) — raw **staging**: witnesses generated **elsewhere**
+  (Monad node; see below), accumulated in bulk and `<block>`-named. **No tool in this repo reads
+  `fixtures/`** — it is a holding area, independent of `inputs/` (currently a different block range and a
+  different naming scheme).
+- `inputs/1-<block>.witness` (+ `.post_state_root`) — the **curated working set** actually consumed by
+  `ev.sh` and `guests/monad-*/gen-inputs`, batch-tagged `1-<block>`. To execute/prove a block, place its
+  witness (+ expected root) here (see "To obtain" below).
+
 The `1-<block>.witness` files are **pre-generated from a Monad node** (the Monad block-replay input) and
 are **not** regenerable through this repo — `cli/gen-witness --guest monad-*` deliberately errors
 ("pre-supplied"). Because they total ~79 MB they are **git-ignored** (see the root `.gitignore`), so a

@@ -20,6 +20,14 @@ and every build emits the shared [`report.json`](../../../cli/report-schema.md).
 - **`native-gnark` (Go/gnark FFI)** is only for LOCAL groth16 wrapping — it ships in the default
   (CPU / CUDA) builds and **needs a Go toolchain**. The `network` and `profiling` builds drop it via
   `--no-default-features` (the cluster does the wrap; profiling never proves), so they build without Go.
+- **`--batch` (execute mode) amortises a ~6 s fixed startup.** Building the `ProverClient` costs ~6.3 s
+  per PROCESS regardless of the workload — a 5 297-cycle fibonacci guest still takes 6.31 s wall for
+  0.006 s of execution. One block per process therefore spends ~90 % of its wall time starting up.
+  `--batch <file>` (one input path per line) + `--report-dir <dir>` runs them all against a single
+  client, writing `<input-stem>.json` per input; a failing input is logged and skipped, not fatal.
+  `--input` is unchanged, so `prove-farm`'s one-block-one-job shape is unaffected. Used by
+  [`profiling/compare.py`](../../../profiling/compare.py); it also makes `--no-gas` largely moot for
+  sweeps (that flag only trims the internal pass, not the startup).
 - **Why `--target-dir target-prof` for profiling.** Its feature set differs from the normal build, so a
   shared `target/` would trigger a full rebuild on every switch and clobber `target/release/sp1-runner`.
   A separate dir lets the profiling and normal binaries coexist.

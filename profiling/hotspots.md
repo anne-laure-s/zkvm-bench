@@ -35,7 +35,7 @@ and the Monad `monad-execution` guest (C++) both render out of the box.
 
 # Monad guest (C++), verifying each block's post-state root as it goes
 ./hotspots.py profile --backend zisk \
-    --elf ../guests/monad/monad-zkvm-guest-zisk.elf \
+    --elf ../guests/monad-zisk/monad-zisk.elf \
     -i ../guests/monad/execute-out/1-25229957.bin -i ../guests/monad/execute-out/1-25229951.bin \
     --out results/monad --verify-roots ../guests/monad/inputs \
     --title "Monad guest — where the proving cost goes"
@@ -45,7 +45,7 @@ and the Monad `monad-execution` guest (C++) both render out of the box.
 #       --features profiling --target-dir target-prof
 # Inputs are RAW (.witness / rsp .bin) — NO LE64 framing (that's zisk-only).
 ./hotspots.py profile --backend sp1 \
-    --elf ../guests/monad/monad-zkvm-guest-sp1.elf \
+    --elf ../guests/monad-sp1/monad-sp1.elf \
     -i ../guests/monad/inputs/1-25229951.witness -i ../guests/monad/inputs/1-25229957.witness \
     --verify-roots ../guests/monad/inputs \
     --out results/monad-sp1 --title "Monad guest on SP1 — where the proving cost goes"
@@ -65,7 +65,7 @@ and the Monad `monad-execution` guest (C++) both render out of the box.
 
 # before/after a guest change, in one shot: profile the SAME inputs through both ELFs, then diff:
 ./hotspots.py compare --backend sp1 \
-    --elf-before OLD/monad-zkvm-guest-sp1.elf --elf-after ../guests/monad/monad-zkvm-guest-sp1.elf \
+    --elf-before OLD/monad-sp1.elf --elf-after ../guests/monad-sp1/monad-sp1.elf \
     -i ../guests/monad/inputs/1-25229957.witness --verify-roots ../guests/monad/inputs --out results/cmp
 
 # many blocks → ONE mean-per-block profile (+ per-function cv) instead of one tab each:
@@ -103,7 +103,7 @@ RSP's `1-25229957` and Monad's `25229957` would otherwise land on the same key:
 ```sh
 ./hotspots.py profile --backend sp1 --elf ../guests/rsp/rsp.elf \
     -i ../guests/rsp/inputs/1-25229957.bin --tab-prefix rsp- --out results/rsp
-./hotspots.py profile --backend sp1 --elf ../guests/monad/monad-zkvm-guest-sp1.elf \
+./hotspots.py profile --backend sp1 --elf ../guests/monad-sp1/monad-sp1.elf \
     -i ../guests/monad/inputs/1-25229957.witness --verify-roots ../guests/monad/inputs \
     --tab-prefix monad- --out results/monad
 
@@ -125,13 +125,15 @@ Each side is **aggregated** first (mean over its inputs), so pass as many `-i` b
 This is how you attribute the "Monad engine generates +N % more trace than reth" headline to specific
 modules/functions (`monad`, `zkvm_keccak256`, `embedded_alloc` … vs `revm_interpreter`, `rsp_mpt`, `sha3` …).
 
-`compare` is the **before/after** tool for a guest change — it profiles the SAME inputs through two
-ELFs and prints the diff in one command (Δ = *after* over *before*; **negative = the change made it cheaper**):
+`compare` is the **before/after** tool for a guest change — one guest, **two ELFs** — profiling the SAME
+inputs through both and printing the diff in one command (Δ = *after* over *before*; **negative = cheaper**).
+To compare **two different guests** (Monad vs reth) over a whole block set instead, reach for the
+higher-level [`compare.py`](README.md); it drives this same `--aggregate` + `diff` under `--deep`:
 
 ```sh
 ./hotspots.py compare --backend sp1 \
-    --elf-before /path/OLD/monad-zkvm-guest-sp1.elf \
-    --elf-after  ../guests/monad/monad-zkvm-guest-sp1.elf \
+    --elf-before /path/OLD/monad-sp1.elf \
+    --elf-after  ../guests/monad-sp1/monad-sp1.elf \
     -i ../guests/monad/inputs/1-25229957.witness -i ../guests/monad/inputs/1-25229951.witness \
     --verify-roots ../guests/monad/inputs --out results/monad-cmp   # --out saves before/after profile.json
 ```
