@@ -17,6 +17,7 @@ reimplemented:
 | **`witness-profile`** | idle CPU → the block's deterministic work-unit, while the GPU proves (opt-in) | here |
 | **`witness-follow`** | brings them up per phase, and reports where they are | here |
 | **`witness-sim`** | rehearse the whole pipeline from an existing witness corpus, no node, no GPU | here |
+| **`patch-fetch-blocks.py`** | teaches the fetcher `--head-tag latest --confirmations N` → block-by-block instead of epoch bursts | here |
 
 ```
 chi-001 RPC ─► block_db ─► [monad replay + triedb] ─► ~/witnesses/<block>.witness
@@ -173,11 +174,26 @@ your laptop: `ssh -R 8547:localhost:8547 nyc-003`).
 
 ## Known gaps
 
-- **We follow `finalized`, ethproofs follows the tip.** Both `fetch_blocks.py` (`finalized_number()`) and
-  `run_replay.py` poll the `finalized` tag, so witnesses arrive ~13 min behind the head. Moving to
-  `latest` needs reorg handling on both sides — detect that the new head's parent isn't what we executed,
-  then `monad-mpt --rewind-to <n>` and re-fetch. The lever exists; the logic doesn't. Until then the
-  finality delay is *reported*, not hidden.
+- **Block-by-block vs epoch bursts — half closed.** Measured on nyc-003: following `finalized` makes
+  witnesses arrive in bursts of **exactly 32 blocks** (one epoch) every ~6 min, **~13–19 min** behind the
+  head (observed lags: 66, 71, 89 blocks). That delay dominates every other number in the pipeline, and
+  `--min-follow-batch 1` cannot touch it — the granularity comes from the *fetcher*, not the replay:
+  `run_replay.py` executes `contiguous_head(block_db)`, i.e. whatever has been written, so it needs no
+  change at all.
+
+  `./patch-fetch-blocks.py` adds `--head-tag latest --confirmations 2` to the monad tree's fetcher
+  (idempotent, revertible, refuses to apply if upstream moved), which gives **one block per slot at a
+  ~24 s lag** instead of ~18 min. `witness-follow` passes it through as `HEAD_TAG` / `CONFIRMATIONS`.
+
+  What is **not** done is reorg recovery. Off `finalized`, a fetched block can leave the canonical chain;
+  the fetcher hash-verifies at fetch time so nothing wrong is written silently, but the next block's parent
+  then mismatches, monad aborts and `run_replay.py` leaves an `ALERT`. Recovery is `monad-mpt --rewind-to
+  <n>` plus a re-fetch of the divergent range, and it is manual. Two confirmations avoid the single-slot
+  reorgs that make up almost all of them; deeper ones will stop the producer until someone rewinds.
+
+  Cosmetic side effect: once execution passes finality, `status.json`'s `gap_to_finalized` goes negative
+  (`run_replay.py` compares against the `finalized` tag). Harmless — the batch gate is `max(1, …)`, so a
+  negative gap simply means "execute as soon as one block is ready".
 - **triedb growth is only bounded by the DB's own thresholds.** ~6.5 MB/block until compaction and the
   0.8 history shrink take over. Sizing the file to the fs is what makes those thresholds meaningful — if
   a long catch-up still walks up to the capacity, that is a question for the monad side, not a knob here.

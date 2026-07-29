@@ -24,6 +24,7 @@
 #
 # Config (env): MONAD_DIR REPO WITNESS_DIR BLOCK_DB DB RPC NTHREADS MAX_BATCH MIN_FOLLOW_BATCH
 #               PY ETHPROOFS_URL CLUSTER QUEUE_MODULUS KEEP_RECENT
+#               HEAD_TAG CONFIRMATIONS   (block-by-block; needs ./patch-fetch-blocks.py — see README)
 set -uo pipefail
 
 MONAD_DIR="${MONAD_DIR:-$HOME/monad}"
@@ -40,8 +41,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 die(){ echo "witness-follow: $1" >&2; exit 1; }
 
+# HEAD_TAG/CONFIRMATIONS need ./patch-fetch-blocks.py applied to the monad tree's fetch_blocks.py.
+# Unpatched, the fetcher only knows `finalized` — which advances 32 blocks at a time, so witnesses arrive
+# in epoch bursts ~13-19 min behind the head. `latest` + 2 confirmations makes it one block per slot.
 fetch_cmd() {
-  echo "cd $MONAD_DIR && $PY fetch_blocks.py --rpc $RPC --block-db $BLOCK_DB 2>&1 | tee -a ~/fetch.log"
+  local extra=""
+  [ -n "${HEAD_TAG:-}" ]      && extra="$extra --head-tag $HEAD_TAG"
+  [ -n "${CONFIRMATIONS:-}" ] && extra="$extra --confirmations $CONFIRMATIONS"
+  echo "cd $MONAD_DIR && $PY fetch_blocks.py --rpc $RPC --block-db $BLOCK_DB$extra 2>&1 | tee -a ~/fetch.log"
 }
 replay_cmd() {  # $1 = catchup|tip
   local extra="--max-batch $MAX_BATCH"
