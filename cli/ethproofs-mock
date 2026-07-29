@@ -21,7 +21,19 @@ identify WHAT was proven and show on the leaderboard:
   POST /proofs/proving  {block_number, cluster_id, [vm, guest]}
   POST /proofs/proved   {proof (base64), block_number, proving_cycles|proving_steps, proving_time (ms),
                          verifier_id, cluster_id, [vm, guest, public_inputs]}  -> verified, returns {proof_id, verified}
-  GET  /                 leaderboard (HTML: cluster·vm·guest·block·verified)  ·  GET /proofs  (JSON records)
+  GET  /                 leaderboard (HTML: pipeline banner + cluster·vm·guest·block·verified)
+  GET  /proofs           JSON records   ·   GET /status   JSON pipeline state
+
+Plus ONE endpoint the real ethproofs.org does not have, because only the producer knows it:
+
+  POST /status          {chain_tip, [last_witness, queue_depth, cluster_id, vm, guest, source]}
+
+The three lifecycle POSTs above say what happened to ONE proof; they cannot say where the pipeline is as
+a whole, and above all nobody tells this server what the CHAIN's head is — so "how far behind are we?",
+the question that decides whether proving is real-time, is unanswerable from proof records alone. A
+producer (the witness follower) heartbeats POST /status with the tip it is following; GET /status and the
+leaderboard banner then answer, per pipeline: tip → last witness → block being proved → last proved →
+**last verified**, with the lag in blocks (and an estimate in seconds at 12 s/slot).
 
 Lenient by design (a stand-in): unknown/renamed fields are still recorded; any Bearer token is
 accepted unless --token is given. Verification is mock by default (a real, well-formed proof passes).
@@ -47,12 +59,15 @@ class Store:
         self.dir = d
         self.proofs_dir = os.path.join(d, "proofs")
         self.jsonl = os.path.join(d, "submissions.jsonl")
+        self.status_path = os.path.join(d, "status.json")
         os.makedirs(self.proofs_dir, exist_ok=True)
         self.lock = threading.Lock()
         self.state = {}          # (cluster, block) -> latest record (no proof blob)
         self.ids = {}            # (cluster, block) -> stable proof_id
         self.next_id = 1
+        self.pipelines = {}      # cluster (or "*") -> last producer heartbeat (POST /status)
         self._replay()
+        self._load_status()
 
     def pid(self, cluster, block):
         # Stable proof_id per (cluster, block) — the SAME identity ethproofs uses. Run each prover as its
@@ -112,6 +127,83 @@ class Store:
             merged["ts"] = rec["ts"]
             self.state[key] = merged
         return rec
+
+    # ---- pipeline status: the producer's heartbeat + what the proof records imply ------------------
+    def _load_status(self):
+        """Survive a restart: the last heartbeat is the only place the chain tip is known."""
+        try:
+            with open(self.status_path) as f:
+                self.pipelines = {k: v for k, v in json.load(f).items()}
+        except (OSError, ValueError):
+            self.pipelines = {}
+
+    def set_status(self, body):
+        """Record a producer heartbeat. Keyed by cluster so several pipelines (rsp / zisk / monad) can
+        report side by side; '*' when the producer doesn't name one."""
+        key = str(body.get("cluster_id")) if body.get("cluster_id") is not None else "*"
+        hb = {
+            "ts": now_iso(),
+            "cluster_id": body.get("cluster_id"),
+            "vm": body.get("vm"),
+            "guest": body.get("guest"),
+            "source": body.get("source"),               # free-form: who is reporting (e.g. "nyc-003")
+            "chain_tip": body.get("chain_tip"),         # the head the producer is following
+            "last_witness": body.get("last_witness"),   # newest block a witness exists for
+            "queue_depth": body.get("queue_depth"),     # witnesses waiting to be proved
+        }
+        with self.lock:
+            self.pipelines[key] = hb
+            try:
+                with open(self.status_path, "w") as f:
+                    json.dump(self.pipelines, f, indent=1)
+            except OSError:
+                pass                                     # status is a convenience, never fatal
+        return hb
+
+    def derive(self, cluster=None):
+        """Fold the proof records into a per-pipeline position. `cluster=None` folds over everything.
+        Every field is a BLOCK NUMBER (or None): where the pipeline currently is."""
+        def blocks(pred):
+            out = [r.get("block_number") for r in self.state.values()
+                   if r.get("block_number") is not None
+                   and (cluster is None or str(r.get("cluster_id")) == str(cluster))
+                   and pred(r)]
+            return max(out) if out else None
+        return {
+            "proving":  blocks(lambda r: r.get("event") == "proving"),
+            "proved":   blocks(lambda r: r.get("event") == "proved"),
+            "verified": blocks(lambda r: r.get("verified") is True),
+            "rejected": blocks(lambda r: r.get("verified") is False),
+            "proofs":   len([r for r in self.state.values()
+                             if cluster is None or str(r.get("cluster_id")) == str(cluster)]),
+        }
+
+    def status(self):
+        """The answer to 'where is the pipeline, and how far behind the chain?' — one entry per
+        pipeline. Lags are in blocks; the seconds figure is an ESTIMATE at 12 s/slot, not a measurement
+        (a real end-to-end latency needs the producer's own timestamps, single-clock)."""
+        keys = list(self.pipelines.keys()) or ["*"]
+        out = []
+        for k in keys:
+            hb = self.pipelines.get(k, {})
+            cluster = hb.get("cluster_id")
+            d = self.derive(cluster)
+            tip = hb.get("chain_tip")
+            def lag(b):
+                return (tip - b) if (isinstance(tip, int) and isinstance(b, int)) else None
+            entry = {
+                "cluster_id": cluster, "vm": hb.get("vm"), "guest": hb.get("guest"),
+                "source": hb.get("source"), "heartbeat_ts": hb.get("ts"),
+                "chain_tip": tip, "last_witness": hb.get("last_witness"),
+                "queue_depth": hb.get("queue_depth"),
+                **d,
+                "lag_blocks": {"witness": lag(hb.get("last_witness")), "proving": lag(d["proving"]),
+                               "proved": lag(d["proved"]), "verified": lag(d["verified"])},
+            }
+            lv = entry["lag_blocks"]["verified"]
+            entry["lag_secs_est"] = lv * 12 if isinstance(lv, int) else None
+            out.append(entry)
+        return out
 
     def save_proof(self, cluster, block, proof_b64):
         try:
@@ -193,6 +285,13 @@ class Handler(BaseHTTPRequestHandler):
         # Every /proofs/* reply is {"proof_id": N} — the ZisK client parses that shape; RSP ignores it.
         # Log lines are INBOUND requests (← = received): the prover's own status reports, NOT work this
         # server does. 'proving'/'proved' are the CLIENT's lifecycle states — the mock only records them.
+        if self.path.rstrip("/") == "/status":
+            # Producer heartbeat — the only source for the CHAIN tip (no proof record carries it).
+            hb = STORE.set_status(body)
+            print(f"{now_iso()}  ← /status          {('[' + str(hb['source']) + '] ') if hb.get('source') else ''}"
+                  f"cluster={hb.get('cluster_id')} tip={hb.get('chain_tip')} "
+                  f"witness={hb.get('last_witness')} queue={hb.get('queue_depth')}")
+            return self._reply(200, {"ok": True})
         if self.path.rstrip("/") == "/proofs/queued":
             STORE.record("queued", body); print(f"{now_iso()}  ← /proofs/queued   {mk}cluster={cluster} {who}block={block}")
             return self._reply(200, {"proof_id": STORE.pid(cluster, block)})
@@ -216,9 +315,45 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply(200, {"proof_id": pid, "proof_bytes": pb, "verified": ok, "mock": mock})
         return self._reply(404, {"error": f"unknown endpoint {self.path}"})
 
+    def _banner(self):
+        """Where each pipeline is, and how far behind the chain — the RTP question. Reads the producer
+        heartbeat (POST /status) for the tip; everything else is folded from the proof records."""
+        def n(v, lag=None):
+            if v is None:
+                return "<span class=s>—</span>"
+            return f"<b>{v}</b>" + (f" <span class=s>({lag:+d})</span>" if isinstance(lag, int) else "")
+        out = ["<div class=bn>"]
+        for p in STORE.status():
+            lb = p["lag_blocks"]
+            who = " · ".join(str(x) for x in (p.get("cluster_id") or "all clusters",
+                                              p.get("vm") or "", p.get("guest") or "") if x)
+            head = f"<b>{who}</b>"
+            if p.get("source"):
+                head += f" <span class=s>via {p['source']}</span>"
+            line = (f"{head}<br>chain tip {n(p['chain_tip'])} · witness {n(p['last_witness'], -lb['witness'] if isinstance(lb['witness'], int) else None)}"
+                    f" · proving {n(p['proving'], -lb['proving'] if isinstance(lb['proving'], int) else None)}"
+                    f" · proved {n(p['proved'], -lb['proved'] if isinstance(lb['proved'], int) else None)}"
+                    f" · <span class=d>verified {n(p['verified'], -lb['verified'] if isinstance(lb['verified'], int) else None)}</span>")
+            if p.get("rejected") is not None:
+                line += f" · <span class=r>rejected {p['rejected']}</span>"
+            if p.get("queue_depth") is not None:
+                line += f" · queue <b>{p['queue_depth']}</b>"
+            if p.get("lag_secs_est") is not None:
+                line += f" · <span class=s>≈{p['lag_secs_est']}s behind (12s/slot est.)</span>"
+            if not p.get("heartbeat_ts"):
+                line += ("<br><span class=w>no producer heartbeat — POST /status {chain_tip,…} to show "
+                         "the chain tip and the real lag</span>")
+            else:
+                line += f"<br><span class=s>heartbeat {p['heartbeat_ts']}</span>"
+            out.append(f"<div>{line}</div>")
+        out.append("</div>")
+        return "\n".join(out)
+
     def do_GET(self):
         if self.path.rstrip("/") == "/proofs":
             return self._reply(200, list(STORE.state.values()))
+        if self.path.rstrip("/") == "/status":
+            return self._reply(200, {"ts": now_iso(), "pipelines": STORE.status()})
         # leaderboard
         rows = sorted(STORE.state.values(),
                       key=lambda r: (r.get("cluster_id") or 0, str(r.get("vm") or ""),
@@ -228,7 +363,12 @@ class Handler(BaseHTTPRequestHandler):
                 "<style>body{font:14px system-ui;margin:2rem}h1{font-size:1.2rem}"
                 "table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 8px;text-align:right}"
                 "td:first-child,th:first-child,.l{text-align:left}.q{color:#999}.p{color:#c60}.d{color:#080}.r{color:#c00}</style>",
+                "<style>.bn{margin:0 0 1rem;padding:.6rem .8rem;border:1px solid #ccc;border-radius:6px;"
+                "font:13px ui-monospace,monospace;line-height:1.7}.bn b{font-weight:600}"
+                ".bn .s{color:#999}.bn .w{color:#c60}</style>",
                 f"<h1>ethproofs-mock — {len(rows)} proof(s)</h1>",
+                self._banner()]
+        body += [
                 "<table><tr><th>cluster</th><th class=l>vm</th><th class=l>guest</th><th>mock</th><th>block</th><th class=l>state</th>"
                 "<th>work-unit</th><th>prove (ms)</th><th>proof (B)</th><th>verified</th>"
                 "<th class=l>verifier_id</th><th class=l>updated</th></tr>"]
@@ -274,6 +414,8 @@ status reports, so 'proving'/'proved' are the CLIENT's states, not work done by 
 server DOES do on /proved is VERIFY the submitted proof (mock by default — see --verify-cmd) and record ✓/✗.
 
   listening : http://127.0.0.1:{args.port}     ·  leaderboard: open it in a browser  ·  JSON: GET /proofs
+  pipeline  : GET /status (where each pipeline is + lag vs the chain) — the producer feeds it the tip
+              with POST /status {{chain_tip, last_witness, queue_depth, cluster_id}}
   store     : {args.store}   (submissions.jsonl + proofs/)
   auth      : {auth}     ·  {n} block(s) recorded so far
   verify    : {verify}

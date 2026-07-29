@@ -95,5 +95,20 @@ there (backend = remote → the running coordinator, which must already be up):
 
 ```sh
 ./run prove  ELF=../../guests/zisk-reth/zisk-reth.elf INPUT=../../guests/zisk-reth/inputs/1-<block>.bin REMOTE=root@<HOST> PORT=<PORT>
-./run verify ELF=../../guests/zisk-reth/zisk-reth.elf INPUT=../../guests/zisk-reth/inputs/1-<block>.bin PROOF=results/zisk-reth/1-<block>/…/proof.bin
+./run verify PROOF=results/zisk-reth/1-<block>/…/proof.bin
 ```
+
+**`verify` takes the proof alone** — `cargo-zisk verify -p` carries its own verification key, so no ELF
+and above all no witness is needed (~30 ms for a 381 KB compressed proof). That is what lets verification
+run wherever the proof lands — a submitter, `cli/ethproofs-mock`, a third party — instead of only where
+the 7 MB witness happens to be. Two optional cross-checks sit on top:
+
+```sh
+./run verify PROOF=…/proof.bin EXPECTED_ROOT=../../guests/monad/fixtures/<block>.post_state_root  # 32 bytes
+./run verify PROOF=…/proof.bin ELF=<elf> INPUT=<witness>                                          # full PV re-emulation
+```
+
+`EXPECTED_ROOT` compares the post-state root committed in the proof's public values (first 32 bytes of
+`pv.bin`, per the ZisK output layout) with the root the chain actually has; it accepts hex text (with or
+without `0x`), a `.post_state_root` file, or 32 raw bytes. Either cross-check **failing is fatal** — a
+valid proof about the wrong state is a correctness failure, not a warning.

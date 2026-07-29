@@ -203,44 +203,98 @@ prove_remote() {
   echo "  report.json  (timings, proof_bytes, steps)"
   echo "  prove.log    (full ZisK proving trace)"
   echo "  env.txt      (GPU / host / versions)"
-  echo "Verify with : ./run verify ELF=$ELF INPUT=$INPUT PROOF=$run_dir/proof.bin"
+  echo "Verify with : ./run verify PROOF=$run_dir/proof.bin            (proof only — no ELF, no witness)"
+  echo "  + root    : ./run verify PROOF=$run_dir/proof.bin EXPECTED_ROOT=<0x…|path>"
 }
 
-# verify_local — verify an existing PROOF locally (cryptographic validity).
-# Requires the ZisK verify key in ~/.zisk (ziskup). Best-effort PV cross-check:
-# re-emulate the guest to recompute the expected public values and compare.
+# verify_local — verify an existing PROOF. The cryptographic check needs NOTHING but
+# the proof: the runner's `--mode verify --proof` is `cargo-zisk verify -p`, which
+# carries its own verification key (~/.zisk, via ziskup). No ELF, no witness.
+# That is the point — verification must run wherever the proof lands (the ethproofs
+# mock on a laptop, a submitter, a third party), and a 7 MB witness must never be a
+# prerequisite for it.
+#
+# On top of that, an OPTIONAL public-values cross-check — "is this proof about the
+# state root the chain actually has?" — cheapest form first:
+#
+#   EXPECTED_ROOT=<0x…|file>   compare the post-state root committed in the proof's
+#                              public values (first 32 bytes) with the expected root.
+#                              32 bytes of input, witness-free. This is what a block
+#                              proof actually claims, and what the ethproofs seam can
+#                              afford to ship. `.post_state_root` files are accepted
+#                              as-is (hex text, with or without 0x).
+#   ELF + INPUT                legacy full cross-check: re-emulate the guest to
+#                              recompute every public value. Only runs when BOTH are
+#                              present — never required.
+#
+# PV defaults to the run record's pv.bin (fetched by prove_remote).
 verify_local() {
-  : "${ELF:?}" "${INPUT:?}" "${PROOF:?set PROOF=path}"
+  : "${PROOF:?set PROOF=path}"
   [[ -x "$RUNNER" ]] || { echo "ERROR: runner not found/executable: $RUNNER" >&2; return 1; }
-  [[ -f "$ELF"    ]] || { echo "ERROR: ELF not found: $ELF" >&2; return 1; }
-  [[ -f "$INPUT"  ]] || { echo "ERROR: input not found: $INPUT" >&2; return 1; }
   [[ -f "$PROOF"  ]] || { echo "ERROR: proof not found: $PROOF (run: ./run prove ...)" >&2; return 1; }
 
   local pdir; pdir="$(dirname "$PROOF")"
+  local pv="${PV:-$pdir/pv.bin}"
   local expected_pv="$pdir/expected_pv.bin"
-  local remote_pv="$pdir/pv.bin"
 
   echo "== verify =="
   echo "Proof     : $PROOF"
 
-  # 1a. Recompute expected public values locally (emulation, cheap).
-  echo "--- recomputing expected public values (local emulation) ---"
-  "$RUNNER" --elf "$ELF" --input "$INPUT" --mode execute --public-values "$expected_pv" || \
-    echo "WARN: could not recompute expected PV (emulation failed)"
-
-  # 1b. Verify the proof cryptographically.
+  # 1. The verification itself — proof only.
   echo "--- verifying proof ---"
-  "$RUNNER" --mode verify --proof "$PROOF"
+  "$RUNNER" --mode verify --proof "$PROOF" || {
+    echo "ERROR: proof verification FAILED" >&2; return 1; }
 
-  # Cross-check the retrieved remote PV matches what we recomputed.
-  if [[ -f "$remote_pv" && -f "$expected_pv" ]]; then
-    if cmp -s "$remote_pv" "$expected_pv"; then
-      echo "Remote PV cross-check: OK"
+  # 2. Root cross-check (witness-free). A mismatch means the proof is valid but about
+  #    the WRONG state — a correctness failure, so it fails the verb.
+  if [[ -n "${EXPECTED_ROOT:-}" ]]; then
+    echo "--- cross-checking committed post-state root ---"
+    local want; want="$(_norm_root "$EXPECTED_ROOT")"
+    if [[ ! -f "$pv" ]]; then
+      echo "WARN: no public values at $pv — cannot cross-check the root (set PV=<path>)" >&2
+    elif [[ -z "$want" ]]; then
+      echo "WARN: could not read an expected root from EXPECTED_ROOT=$EXPECTED_ROOT" >&2
     else
-      echo "WARNING: remote PV differs from locally recomputed PV!" >&2
+      # ZisK writes the guest output padded (Monad guest: 256 B, root in the first 32).
+      local got; got="$(xxd -p -l 32 "$pv" | tr -d '\n')"
+      if [[ "$got" == "$want" ]]; then
+        echo "Root cross-check: OK (0x$got)"
+      else
+        echo "ERROR: root MISMATCH — proof commits 0x$got, expected 0x$want" >&2
+        return 1
+      fi
     fi
   fi
 
-  echo "Public values: $expected_pv"
-  echo "Decode with  : ./run decode-pv GUEST=<name> PV=$expected_pv"
+  # 3. Legacy full PV cross-check, only when the ELF and witness happen to be here.
+  if [[ -n "${ELF:-}" && -n "${INPUT:-}" && -f "${ELF:-}" && -f "${INPUT:-}" ]]; then
+    echo "--- recomputing expected public values (local emulation) ---"
+    if "$RUNNER" --elf "$ELF" --input "$INPUT" --mode execute --public-values "$expected_pv"; then
+      if [[ -f "$pv" ]]; then
+        cmp -s "$pv" "$expected_pv" \
+          && echo "Full PV cross-check: OK" \
+          || { echo "ERROR: public values differ from locally recomputed PV!" >&2; return 1; }
+      fi
+    else
+      echo "WARN: could not recompute expected PV (emulation failed)" >&2
+    fi
+  fi
+
+  [[ -f "$pv" ]] && echo "Public values: $pv"
+  echo "Decode with  : ./run decode-pv GUEST=<name> PV=$pv"
+}
+
+# _norm_root <0xhex|path> — echo a bare lowercase 32-byte hex root, or nothing.
+# Accepts a hex string, a file of hex text (`.post_state_root`), or 32 raw bytes.
+_norm_root() {
+  local v="$1" hex
+  if [[ -f "$v" ]]; then
+    if [[ "$(wc -c < "$v")" -eq 32 ]]; then hex="$(xxd -p "$v" | tr -d '\n')"
+    else hex="$(tr -d '[:space:]' < "$v")"; fi
+  else
+    hex="$v"
+  fi
+  hex="${hex#0x}"; hex="${hex#0X}"
+  hex="$(printf '%s' "$hex" | tr 'A-F' 'a-f')"
+  [[ "$hex" =~ ^[0-9a-f]{64}$ ]] && printf '%s' "$hex"
 }

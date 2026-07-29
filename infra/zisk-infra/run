@@ -28,7 +28,9 @@
 # Consumers (explicit paths, no GUEST):
 #   ./run execute ELF=<path> INPUT=<path>            (local emulation -> report + pv)
 #   ./run prove   ELF=<path> INPUT=<path> REMOTE=user@host [PORT=p] [MODE=m] [HINTS=<path>]
-#   ./run verify  ELF=<path> INPUT=<path> PROOF=<path>
+#   ./run verify  PROOF=<path> [EXPECTED_ROOT=<0x…|path>] [PV=<path>] [ELF=<path> INPUT=<path>]
+#       (the cryptographic check needs the PROOF ALONE — no ELF, no witness. EXPECTED_ROOT adds a
+#        32-byte cross-check of the committed post-state root; ELF+INPUT the legacy full PV re-emulation)
 #   ./run prove-cluster GUEST=<name> BLOCK=<n> REMOTE=user@host [PORT=p] [MODE=m] [WITNESS=<path>]
 #       (uniform cluster-prove — resolves the guest's ELF+witness+sibling .hints; prove_remote's
 #        default backend is the coordinator/cluster; driven by cli/prove-farm)
@@ -37,7 +39,8 @@
 #   ./run build-elf GUEST=zisk-reth ZISK_ETH_DIR=../../vendor/zisk-eth-client
 #   ./run gen-input GUEST=zisk-reth ZISK_ETH_DIR=../../vendor/zisk-eth-client BLOCK=20000000 RPC_URL=https://…
 #   ./run prove  ELF=../../guests/zisk-reth/zisk-reth.elf INPUT=../../guests/zisk-reth/inputs/1-20000000.bin REMOTE=root@ssh.vast.ai PORT=12345
-#   ./run verify ELF=../../guests/zisk-reth/zisk-reth.elf INPUT=../../guests/zisk-reth/inputs/1-20000000.bin PROOF=results/zisk-reth/1-20000000/…/proof.bin
+#   ./run verify PROOF=results/zisk-reth/1-20000000/…/proof.bin
+#   ./run verify PROOF=results/monad-zisk/1-25551992/…/proof.bin EXPECTED_ROOT=../../guests/monad/fixtures/25551992.post_state_root
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -141,9 +144,13 @@ case "$cmd" in
     prove_remote
     ;;
   verify)
-    ELF="$(abspath "${ELF:?set ELF=path to the guest ELF}")"
-    INPUT="$(abspath "${INPUT:?set INPUT=path to the input file}")"
+    # PROOF is the only requirement — verification never needs the ELF or the witness.
     PROOF="$(abspath "${PROOF:?set PROOF=path to the proof file}")"
+    [[ -n "${PV:-}" ]]    && PV="$(abspath "$PV")"
+    [[ -n "${ELF:-}" ]]   && ELF="$(abspath "$ELF")"
+    [[ -n "${INPUT:-}" ]] && INPUT="$(abspath "$INPUT")"
+    # EXPECTED_ROOT may be a hex string or a path — only absolutise the latter.
+    [[ -n "${EXPECTED_ROOT:-}" && -f "${EXPECTED_ROOT:-}" ]] && EXPECTED_ROOT="$(abspath "$EXPECTED_ROOT")"
     verify_local
     ;;
   decode-pv)

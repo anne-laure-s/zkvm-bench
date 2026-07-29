@@ -1,40 +1,88 @@
 #!/usr/bin/env bash
 # guests/monad-zisk/gen-inputs — build ZisK prover inputs from the pre-supplied Monad witnesses.
 #
-# The Monad witnesses (guests/monad/inputs/<tag>.witness) are RAW bytes. The ZisK prover — like the
-# ziskemu emulator — reads a length-PREFIXED input file: <8-byte LE length><witness><zero-pad to 8>.
-# guests/monad/ev.sh does exactly this padding for EXECUTION; here we persist it as
-# guests/monad-zisk/inputs/<tag>.bin so `cli/prove-farm --guest monad-zisk` finds a standard
-# <chain>-<block>.bin witness queue and infra/zisk-infra prove-cluster can prove it.
+# The Monad witnesses are RAW bytes. The ZisK prover — like the ziskemu emulator — reads a
+# length-PREFIXED input file: <8-byte LE length><witness><zero-pad to 8>. guests/monad/ev.sh does
+# exactly this padding for EXECUTION; here we persist it so `cli/prove-farm --guest monad-zisk` finds a
+# standard <chain>-<block>.bin witness queue and infra/zisk-infra prove-cluster can prove it.
+#
+# TWO SOURCES, mirroring the two tiers documented in guests/monad/README.md:
+#
+#   --from inputs   (default)   guests/monad/inputs/1-<block>.witness   — the curated working set
+#                    ->         guests/monad-zisk/inputs/1-<block>.bin
+#   --from fixtures             guests/monad/fixtures/<block>.witness   — the raw staging area as dumped
+#                               by the Monad replay (bare <block> names, no chain prefix)
+#                    ->         guests/monad-zisk/fixtures/1-<block>.bin
+#
+# `fixtures/` is the QUEUE side: cli/prove-farm scans fixtures/ then inputs/, so the continuous RTP path
+# is `--from fixtures`. Either way the expected post-state root travels with the witness as a
+# `<tag>.post_state_root` sibling, so a proof can be cross-checked against the root the chain actually
+# has (`infra/zisk-infra/run verify PROOF=… EXPECTED_ROOT=…`).
 #
 # (No .hints: Monad has no reth-style hints-gen, and hints are an optional proving-time optimisation —
 #  the prover regenerates them. See infra/zisk-infra/scripts/core.sh prove_remote.)
 #
-#   ./gen-inputs [--force] [TAGS...]     # default: every witness; TAGS look like 1-25224730
+#   ./gen-inputs [--from inputs|fixtures] [--to inputs|fixtures] [--limit N] [--force] [BLOCKS...]
+#
+#   ./gen-inputs                             # every curated witness -> inputs/
+#   ./gen-inputs --from fixtures --limit 3   # the 3 newest staged witnesses -> the prove-farm queue
+#   ./gen-inputs --from fixtures 25551992    # one block (a bare block or a 1-<block> tag both work)
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$HERE/../monad/inputs"
-OUT="$HERE/inputs"; mkdir -p "$OUT"
+CHAIN_ID="${CHAIN_ID:-1}"
+
+FROM=inputs; TO=""; LIMIT=0; FORCE=0; WANT=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --from)  FROM="${2:?--from inputs|fixtures}"; shift 2 ;;
+    --to)    TO="${2:?--to inputs|fixtures}"; shift 2 ;;
+    --limit) LIMIT="${2:?--limit N}"; shift 2 ;;
+    --force) FORCE=1; shift ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    *)       WANT+=("$1"); shift ;;
+  esac
+done
+case "$FROM" in inputs|fixtures) ;; *) echo "gen-inputs: --from must be inputs|fixtures" >&2; exit 2 ;; esac
+TO="${TO:-$FROM}"
+case "$TO"   in inputs|fixtures) ;; *) echo "gen-inputs: --to must be inputs|fixtures" >&2; exit 2 ;; esac
+
+SRC="$HERE/../monad/$FROM"
+OUT="$HERE/$TO"; mkdir -p "$OUT"
 [ -d "$SRC" ] || { echo "gen-inputs: no Monad witnesses at $SRC" >&2; exit 1; }
 
-FORCE=0; TAGS=()
-for a in "$@"; do case "$a" in --force) FORCE=1 ;; *) TAGS+=("$a") ;; esac; done
+# Source naming differs per tier: inputs/ is already tagged 1-<block>, fixtures/ is a bare <block>.
+src_stem() { if [ "$FROM" = inputs ]; then echo "$CHAIN_ID-$1"; else echo "$1"; fi; }
 
-list_witnesses() {
-  if [ "${#TAGS[@]}" -gt 0 ]; then printf '%s\n' "${TAGS[@]/#/$SRC/}" | sed 's/$/.witness/'
-  else find "$SRC" -maxdepth 1 -name '*.witness' | sort; fi
+# list_blocks — the block numbers to convert: the explicit list, else everything in SRC. With --limit,
+# newest first, so "the 3 newest" means the 3 nearest the tip.
+list_blocks() {
+  if [ "${#WANT[@]}" -gt 0 ]; then
+    printf '%s\n' "${WANT[@]}" | sed "s/^$CHAIN_ID-//"        # accept both 25551992 and 1-25551992
+  else
+    local all; all="$(ls "$SRC" 2>/dev/null | sed -n 's/\.witness$//p' | sed "s/^$CHAIN_ID-//")"
+    if [ "$LIMIT" -gt 0 ]; then printf '%s\n' "$all" | sort -rn | head -n "$LIMIT"
+    else printf '%s\n' "$all" | sort -n; fi
+  fi
 }
 
-n=0
-while IFS= read -r w; do
-  [ -f "$w" ] || { echo "gen-inputs: skip (missing) $w" >&2; continue; }
-  tag="$(basename "$w" .witness)"; bin="$OUT/$tag.bin"
+n=0; skipped=0
+while IFS= read -r blk; do
+  [ -n "$blk" ] || continue
+  w="$SRC/$(src_stem "$blk").witness"
+  [ -f "$w" ] || { echo "gen-inputs: skip (missing) $w" >&2; skipped=$((skipped + 1)); continue; }
+  tag="$CHAIN_ID-$blk"; bin="$OUT/$tag.bin"
   if [ "$FORCE" != 1 ] && [ -f "$bin" ] && [ "$bin" -nt "$w" ]; then continue; fi
   python3 - "$w" "$bin" <<'PY'
 import sys, struct
 d = open(sys.argv[1], "rb").read(); n = len(d); pad = (-(8 + n)) % 8
 open(sys.argv[2], "wb").write(struct.pack("<Q", n) + d + b"\x00" * pad)
 PY
+  # Carry the expected post-state root alongside the input — the cross-check anchor for verification.
+  root="${w%.witness}.post_state_root"
+  [ -f "$root" ] && cp "$root" "$OUT/$tag.post_state_root"
   n=$((n + 1))
-done < <(list_witnesses)
-echo "gen-inputs: wrote/updated $n input(s) → $OUT  (re-run with --force to rebuild all)"
+done < <(list_blocks)
+
+echo "gen-inputs: wrote/updated $n input(s) from $FROM/ → $OUT$([ "$skipped" -gt 0 ] && echo "  ($skipped missing)")"
+[ "$n" -gt 0 ] && echo "  newest tags: $(ls "$OUT" | sed -n 's/\.bin$//p' | sort -t- -k2 -n | tail -5 | tr '\n' ' ')"
+exit 0

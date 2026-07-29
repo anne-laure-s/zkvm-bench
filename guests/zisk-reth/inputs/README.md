@@ -10,8 +10,7 @@ git-ignored (large) — regenerate from the recipe below.
 # prove on a remote GPU box (hints sibling auto-detected)
 ./run prove  ELF=../../guests/zisk-reth/zisk-reth.elf INPUT=../../guests/zisk-reth/inputs/1-24628607.bin \
              REMOTE=root@<host> PORT=<port>
-./run verify ELF=../../guests/zisk-reth/zisk-reth.elf INPUT=../../guests/zisk-reth/inputs/1-24628607.bin \
-             PROOF=results/zisk-reth/1-24628607/…/proof.bin
+./run verify PROOF=results/zisk-reth/1-24628607/…/proof.bin          # proof only — no ELF, no witness
 ```
 (Override the hints path with `HINTS=<path>` if it isn't a sibling.)
 

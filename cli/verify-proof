@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# cli/verify-proof — the verification seam's implementation: given a PROOF FILE, say whether it is a
+# real, cryptographically valid proof (exit 0) or not (non-zero). Written to the contract that
+# `cli/ethproofs-mock --verify-cmd` calls:
+#
+#   verify-proof <proof_path> <block> <verifier_id> <vm> <guest>
+#
+# It needs NOTHING but the proof — no ELF, no witness (see infra/zisk-infra/scripts/core.sh
+# verify_local: `cargo-zisk verify -p` carries its own verification key, ~30 ms for a 381 KB proof).
+# That is what lets verification live wherever the proof lands — here, the ethproofs mock on a laptop —
+# while the 7 MB witness stays on the box that produced it.
+#
+# On top of the cryptographic check, an OPTIONAL cross-check that the proof is about the state the chain
+# actually has: the post-state root committed in the proof's public values vs the expected root. The
+# expected root is looked up, in order:
+#   1. $EXPECTED_ROOT                                  (explicit: hex, or a path)
+#   2. $ROOTS_DIR/<chain>-<block>.post_state_root      (explicit directory)
+#   3. guests/<guest>/{fixtures,inputs}/<chain>-<block>.post_state_root   (the queue sibling that
+#      guests/monad-zisk/gen-inputs copies next to each witness)
+#   4. guests/monad/fixtures/<block>.post_state_root   (the raw staging area)
+# Found none, it verifies cryptographically and says the root was not cross-checked — it never pretends.
+#
+# MOCK proofs (cli/prove-farm --mock writes bytes starting with the MOCK-PROOF magic) are REJECTED with
+# exit 3: a fake proof must never come back "verified". Set --allow-mock (or VERIFY_ALLOW_MOCK=1) to let
+# them pass while testing plumbing — it prints loudly that nothing was verified.
+#
+#   cli/verify-proof <proof> [block] [verifier_id] [vm] [guest]
+#   EXPECTED_ROOT=0x8bee… cli/verify-proof proof.bin 25551992 '' ZisK monad-zisk
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+CHAIN_ID="${CHAIN_ID:-1}"
+ALLOW_MOCK="${VERIFY_ALLOW_MOCK:-0}"
+MOCK_MAGIC="MOCK-PROOF"        # kept in sync with cli/prove-farm --mock and cli/ethproofs-mock
+
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --allow-mock) ALLOW_MOCK=1; shift ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+PROOF="${ARGS[0]:-}"; BLOCK="${ARGS[1]:-}"; VKEY="${ARGS[2]:-}"; VM="${ARGS[3]:-}"; GUEST="${ARGS[4]:-}"
+
+die(){ echo "verify-proof: $1" >&2; exit "${2:-2}"; }
+[ -n "$PROOF" ] || die "usage: verify-proof <proof_path> [block] [verifier_id] [vm] [guest]"
+[ -f "$PROOF" ] || die "proof not found: $PROOF"
+PROOF="$(cd "$(dirname "$PROOF")" && pwd)/$(basename "$PROOF")"
+
+# --- fake proofs: rejected unless explicitly allowed -------------------------------------------------
+if head -c "${#MOCK_MAGIC}" "$PROOF" 2>/dev/null | grep -qF "$MOCK_MAGIC"; then
+  if [ "$ALLOW_MOCK" = 1 ]; then
+    echo "verify-proof: ⚠️  MOCK proof accepted by --allow-mock — NOTHING was verified" >&2
+    exit 0
+  fi
+  die "MOCK proof ($MOCK_MAGIC magic) — fake by construction, no cryptographic verification possible" 3
+fi
+
+# --- expected root discovery (optional) --------------------------------------------------------------
+find_root() {
+  [ -n "${EXPECTED_ROOT:-}" ] && { echo "$EXPECTED_ROOT"; return; }
+  [ -n "$BLOCK" ] || return 0
+  local tag="$CHAIN_ID-$BLOCK" c
+  for c in "${ROOTS_DIR:-}/$tag.post_state_root" \
+           "$ROOT/guests/$GUEST/fixtures/$tag.post_state_root" \
+           "$ROOT/guests/$GUEST/inputs/$tag.post_state_root" \
+           "$ROOT/guests/monad/fixtures/$BLOCK.post_state_root"; do
+    [ -n "$c" ] && [ -f "$c" ] && { echo "$c"; return; }
+  done
+}
+ROOT_ARG="$(find_root)"
+
+# --- dispatch to the stack that can verify this proof ------------------------------------------------
+# Today: ZisK (proof-only verification). SP1 needs its ELF to derive the vkey and OpenVM has its own
+# verb — both are separate work; fail loudly rather than silently returning "valid".
+case "$(printf '%s' "${VM:-}" | tr 'A-Z' 'a-z'):$GUEST" in
+  zisk:*|:zisk-reth|:monad-zisk|:*zisk*)
+    [ -x "$ROOT/infra/zisk-infra/run" ] || die "infra/zisk-infra/run not found" 4
+    echo "verify-proof: ZisK · proof=$(basename "$PROOF")${BLOCK:+ block=$BLOCK}${GUEST:+ guest=$GUEST}" \
+         "${ROOT_ARG:+· root anchor: $(basename "$ROOT_ARG")}"
+    ( cd "$ROOT/infra/zisk-infra" && ./run verify PROOF="$PROOF" ${ROOT_ARG:+EXPECTED_ROOT="$ROOT_ARG"} )
+    rc=$?
+    [ -n "$ROOT_ARG" ] || echo "verify-proof: NOTE — no expected root found, the committed root was NOT cross-checked" >&2
+    exit "$rc"
+    ;;
+  *)
+    die "no verifier wired for vm='${VM:-?}' guest='${GUEST:-?}' (ZisK only for now; SP1 needs its ELF for the vkey)" 4
+    ;;
+esac
