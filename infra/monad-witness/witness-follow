@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# witness-follow — bring up (and look at) the Monad witness seam on the devcore box.
+#
+# The seam has three long-running pieces. Two already exist in the monad tree (Sam's, branch
+# sam/osaka_witness_gen) and are NOT reimplemented here — this only orchestrates them and adds the third:
+#
+#   fetch     fetch_blocks.py   raw blocks from an RPC -> block_db          (follows the chain, forever)
+#   replay    run_replay.py     block_db -> triedb, dumping zkVM witnesses  (follows block_db, forever)
+#   tap       ./witness-tap     witnesses -> queue + manifest + heartbeat, and PRUNES what is done
+#   profile   ./witness-profile idle CPU -> the block's deterministic work-unit, while the GPU proves
+#             (opt-in with PROFILE=1; needs ziskemu on this box)
+#
+# Two phases, because they have opposite needs:
+#
+#   catch-up  replay WITHOUT --zkvm-witness. The flag forces the interpreter (~4.6 vs ~8 blocks/s) and
+#             would dump ~7 MB per block for tens of thousands of blocks — hundreds of GB of witnesses
+#             nobody wants. Run this until `gap_to_finalized` is small.
+#   tip       replay WITH --zkvm-witness and small batches, plus the tap. This is the RTP producer.
+#
+#   ./witness-follow plan  [catchup|tip]     print the exact commands (default; nothing is started)
+#   ./witness-follow start [catchup|tip]     start the tmux sessions for that phase
+#   ./witness-follow status                  where everything is (read-only)
+#   ./witness-follow stop                    SIGTERM the replay/tap (leaves the fetcher alone)
+#
+# Config (env): MONAD_DIR REPO WITNESS_DIR BLOCK_DB DB RPC NTHREADS MAX_BATCH MIN_FOLLOW_BATCH
+#               PY ETHPROOFS_URL CLUSTER QUEUE_MODULUS KEEP_RECENT
+set -uo pipefail
+
+MONAD_DIR="${MONAD_DIR:-$HOME/monad}"
+REPO="${REPO:-$HOME/zkvm-bench}"
+WITNESS_DIR="${WITNESS_DIR:-$HOME/witnesses}"
+BLOCK_DB="${BLOCK_DB:-$HOME/block_db}"
+DB="${DB:-$HOME/triedb.db}"
+RPC="${RPC:-http://chi-001.devcore4.com:8545}"
+NTHREADS="${NTHREADS:-8}"
+MAX_BATCH="${MAX_BATCH:-2000}"
+MIN_FOLLOW_BATCH="${MIN_FOLLOW_BATCH:-1}"
+PY="${PY:-$HOME/.pyenv/versions/3.12.13/bin/python3}"   # a fresh tmux has no pyenv in PATH
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+die(){ echo "witness-follow: $1" >&2; exit 1; }
+
+fetch_cmd() {
+  echo "cd $MONAD_DIR && $PY fetch_blocks.py --rpc $RPC --block-db $BLOCK_DB 2>&1 | tee -a ~/fetch.log"
+}
+replay_cmd() {  # $1 = catchup|tip
+  local extra="--max-batch $MAX_BATCH"
+  [ "$1" = tip ] && extra="--min-follow-batch $MIN_FOLLOW_BATCH --zkvm-witness $WITNESS_DIR"
+  echo "cd $MONAD_DIR && $PY run_replay.py --monad-bin build/cmd/monad --monad-cli-bin build/cmd/monad-cli \
+--block-db $BLOCK_DB --db $DB --rpc $RPC --logs-dir ./logs --status-file status.json \
+--nthreads $NTHREADS $extra 2>&1 | tee -a ~/replay-$1.log"
+}
+profile_cmd() {
+  echo "cd $HERE && REPO=$REPO GUEST=${GUEST:-monad-zisk} RPC=$RPC ./witness-profile 2>&1 | tee -a ~/witness-profile.log"
+}
+tap_cmd() {
+  echo "cd $HERE && WITNESS_DIR=$WITNESS_DIR REPO=$REPO BLOCK_DB=$BLOCK_DB RPC=$RPC \
+${ETHPROOFS_URL:+ETHPROOFS_URL=$ETHPROOFS_URL }${CLUSTER:+CLUSTER=$CLUSTER }\
+${QUEUE_MODULUS:+QUEUE_MODULUS=$QUEUE_MODULUS }${KEEP_RECENT:+KEEP_RECENT=$KEEP_RECENT }\
+./witness-tap 2>&1 | tee -a ~/witness-tap.log"
+}
+
+# PROFILE=1 adds the opt-in profiler (idle CPU -> work-units); it needs ziskemu on this box.
+phase_sessions() {
+  if [ "$1" = tip ]; then
+    printf 'fetch replay-tip tap%s\n' "$([ "${PROFILE:-0}" = 1 ] && echo ' profile')"
+  else
+    echo "fetch replay-catchup"
+  fi
+}
+
+cmd_plan() {
+  local phase="${1:-catchup}"
+  echo "# phase: $phase   (nothing has been started — this only prints)"
+  echo
+  echo "tmux new-session -d -s fetch \"$(fetch_cmd)\""
+  echo
+  echo "tmux new-session -d -s replay-$phase \"$(replay_cmd "$phase")\""
+  if [ "$phase" = tip ]; then
+    echo
+    echo "# ALWAYS dry-run the tap once first — it is the only piece that deletes files:"
+    echo "$(tap_cmd | sed 's/\.\/witness-tap/.\/witness-tap --once --dry-run/')"
+    echo
+    echo "tmux new-session -d -s tap \"$(tap_cmd)\""
+    echo
+    echo "# optional (PROFILE=1): execute each block on the idle CPU for its deterministic work-unit"
+    echo "tmux new-session -d -s profile \"$(profile_cmd)\""
+  fi
+}
+
+cmd_start() {
+  local phase="${1:-catchup}" s
+  case "$phase" in catchup|tip) ;; *) die "phase must be catchup or tip" ;; esac
+  [ -d "$MONAD_DIR" ] || die "no monad tree at $MONAD_DIR"
+  [ -x "$REPO/guests/monad-zisk/gen-inputs" ] || die "no zkvm-bench clone at $REPO (git pull it first)"
+  [ -f "$MONAD_DIR/logs/ALERT" ] && die "logs/ALERT present — a previous replay batch FAILED. Read it, \
+fix the cause, then rm it. Never clear it blindly."
+  [ "$phase" = tip ] && mkdir -p "$WITNESS_DIR"
+  for s in $(phase_sessions "$phase"); do
+    if tmux has-session -t "$s" 2>/dev/null; then echo "· $s already running"; continue; fi
+    case "$s" in
+      fetch)        tmux new-session -d -s "$s" "$(fetch_cmd)" ;;
+      replay-*)     tmux new-session -d -s "$s" "$(replay_cmd "$phase")" ;;
+      tap)          tmux new-session -d -s "$s" "$(tap_cmd)" ;;
+      profile)      tmux new-session -d -s "$s" "$(profile_cmd)" ;;
+    esac
+    echo "· started $s"
+  done
+  echo; cmd_status
+}
+
+cmd_stop() {
+  local s
+  for s in replay-catchup replay-tip tap profile; do
+    tmux has-session -t "$s" 2>/dev/null || continue
+    # SIGTERM run_replay.py: it forwards to monad and exits WITHOUT writing an ALERT (a clean stop).
+    pkill -TERM -f "[r]un_replay.py" 2>/dev/null
+    pkill -TERM -f "[w]itness-tap" 2>/dev/null
+    pkill -TERM -f "[w]itness-profile" 2>/dev/null
+    sleep 3; tmux kill-session -t "$s" 2>/dev/null
+    echo "· stopped $s"
+  done
+  echo "(the fetcher is left running — the block_db is cheap and reusable)"
+}
+
+cmd_status() {
+  echo "== sessions =="; tmux ls 2>&1 | sed 's/^/  /'
+  echo "== replay =="
+  [ -f "$MONAD_DIR/status.json" ] && sed 's/^/  /' "$MONAD_DIR/status.json"
+  [ -f "$MONAD_DIR/logs/ALERT" ] && echo "  ⚠️  logs/ALERT PRESENT — the replay stopped on a failure"
+  local L; L="$(ls -t "$MONAD_DIR"/logs/monad_*.log 2>/dev/null | head -1)"
+  if [ -n "$L" ]; then
+    echo "  log: $(basename "$L")   $(grep -o 'Disk usage: 0\.[0-9]*' "$L" | tail -1)"
+    echo "  $(grep -oE 'Compaction head offset fast=[0-9]+, slow=[0-9]+' "$L" | tail -1)"
+    grep -h 'Adjust db history length' "$L" | tail -1 | sed 's/^/  /'
+  fi
+  echo "== witnesses =="
+  echo "  dump : $(ls "$WITNESS_DIR" 2>/dev/null | grep -c '\.witness$') file(s), $(du -sh "$WITNESS_DIR" 2>/dev/null | cut -f1)"
+  echo "  queue: $(ls "$REPO/guests/monad-zisk/fixtures" 2>/dev/null | grep -c '\.bin$') input(s), \
+$(ls "$REPO/guests/monad-zisk/fixtures" 2>/dev/null | grep -c '\.exec-report\.json$') profiled"
+  echo "  manif: $(( $(wc -l < "${MANIFEST:-$HOME/witness-manifest.csv}" 2>/dev/null || echo 1) - 1 )) row(s)"
+  echo "== disk =="; df -h / | tail -1 | sed 's/^/  /'; echo "  triedb: $(du -sh "$DB" 2>/dev/null | cut -f1)"
+}
+
+case "${1:-plan}" in
+  plan)   shift || true; cmd_plan "${1:-catchup}" ;;
+  start)  shift || true; cmd_start "${1:-catchup}" ;;
+  stop)   cmd_stop ;;
+  status) cmd_status ;;
+  -h|--help) sed -n '2,30p' "$0" ;;
+  *) die "unknown command '${1}' (plan | start | tip | status | stop)" ;;
+esac

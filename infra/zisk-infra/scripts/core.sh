@@ -18,7 +18,11 @@
 _artifact_rel() {
   local in="$1" rel
   case "$in" in
-    */guests/*/inputs/*)   # top-level guests/<name>/inputs/<tag>
+    */guests/*/inputs/*|*/guests/*/fixtures/*)
+                  # top-level guests/<name>/{inputs,fixtures}/<tag> — group by guest. fixtures/ is the
+                  # farm QUEUE, so without this case every farmed run record lands in a bare results/<tag>/
+                  # shared by ALL guests: two guests proving the same block become indistinguishable, and
+                  # same-named run dirs (e.g. mock-run) silently overwrite each other.
                   local a="${in##*/guests/}"; rel="${a%%/*}/${a##*/}" ;;
     */inputs/*)   rel="${in##*/inputs/}" ;;
     *)            rel="${in##*/}" ;;

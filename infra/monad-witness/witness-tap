@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""witness-tap — retention + queue + manifest + heartbeat for the Monad witness seam.
+
+The Monad replay (`run_replay.py --zkvm-witness <dir>`) dumps a witness for EVERY block it executes:
+~7 MB each, ~5 blocks/min at the tip = ~2 GB/h, and it never cleans up. This is the loop that turns that
+firehose into the three things the RTP pipeline actually needs, and nothing else:
+
+  1. QUEUE   — frame every block (the RTP target: blocks as they arrive, NOT a ÷100 sample) straight
+               from the dump dir into the prover queue, via the guest's own gen-inputs --src-dir:
+               <dump>/<block>.witness -> <repo>/guests/monad-zisk/fixtures/1-<block>.bin  (+ its root)
+               No in-repo staging copy: at one 7 MB witness per 12 s slot that would double disk and I/O
+               for nothing. Set QUEUE_MODULUS=100 for the ethproofs SAMPLING cadence instead (cheap
+               benchmark mode); 1 (the default) is real-time.
+  2. PRUNE   — a witness exists to be proved, so it is dropped once its proof is in hand. Retention is
+               therefore driven by cli/prove-farm.csv (the same source its own `is_proven` uses), not by a
+               blind ring, and a block is KEPT when it is still interesting:
+
+                 proved ok        -> drop (raw witness AND framed input; the proof is the artefact now)
+                 proof FAILED     -> keep, that is exactly what needs re-proving or debugging
+                 never proved     -> keep until it is SKIP_AFTER blocks behind the tip, then drop as
+                                     abandoned (with --newest-first the prover never comes back for it);
+                                     the abandoned count IS the coverage gap, so it is logged, not hidden
+                 sample block     -> keep forever if block % KEEP_SAMPLE == 0 — the reproducible corpus
+                                     the cross-zkVM comparison in this repo needs
+                 outlier          -> keep if the witness is >= KEEP_BIG_MB or the proof took
+                                     >= KEEP_SLOW_SECS: the heavy blocks are the ones worth profiling
+                 newest KEEP_RECENT -> always kept, so nothing in flight is pulled from under a prover
+
+               `*.exec-report.json` files are NEVER deleted: a few hundred bytes each, and they carry the
+               deterministic work-unit (ZisK steps) for a block whose 7 MB witness is long gone.
+  3. RECORD  — one manifest row per block with the timestamps the latency report joins on, plus a
+               heartbeat to the ethproofs mock (POST /status) so the dashboard knows the chain tip.
+
+Queueing every block while the prover can only take one every ~20–70 s is deliberate: --newest-first
+then always proves the freshest available block, and the fraction of blocks actually proved becomes the
+honest RTP metric (coverage), reported by profiling/rtp-latency.py alongside per-block latency.
+
+Timestamps (manifest.csv). Everything except t_block is this box's clock — deliberately, so pipeline
+latency is measured on ONE clock and never mixes in the laptop's:
+
+  block            the block number
+  t_block          the block header's own timestamp, from the RPC (chain time; empty for non-promoted)
+  t_avail          mtime of the block_db file — when the fetcher had the block locally
+  t_witness        mtime of the .witness — when the replay finished executing the block
+  t_queued         when the framed input landed in the prover queue
+  bytes            witness size
+  post_state_root  the expected root, the anchor for `run verify EXPECTED_ROOT=…`
+  promoted         1 if it went to the queue, 0 if it was ring-only
+
+Deliberately NOT here: proving and submission timings. Those come from prove-farm's report.json and the
+mock's submissions.jsonl; joining the three is the latency report, not this loop's job.
+
+Config (env, all optional except the paths' defaults being sane on nyc-003):
+  WITNESS_DIR=~/witnesses      REPO=~/zkvm-bench        BLOCK_DB=~/block_db
+  RPC=http://chi-001.devcore4.com:8545                  MANIFEST=<WITNESS_DIR>/../witness-manifest.csv
+  QUEUE_MODULUS=1 (RTP; 100 = ethproofs sampling)       INTERVAL=6
+  KEEP_RECENT=50 (raw ring)    QUEUE_KEEP=30 (framed inputs kept, newest first)
+  ETHPROOFS_URL=               CLUSTER=  VM=ZisK  GUEST=monad-zisk  SOURCE=<hostname>
+
+  ./witness-tap [--once] [--dry-run]
+
+--dry-run never deletes and never writes to the queue; it prints what it would do. Use it first: this is
+the only piece of the pipeline that removes files.
+"""
+import csv, json, os, re, socket, subprocess, sys, time, urllib.request
+
+WITNESS_RE = re.compile(r"^(\d+)\.witness$")
+
+def env(k, d=None):
+    v = os.environ.get(k)
+    return v if v not in (None, "") else d
+
+HOME          = os.path.expanduser("~")
+WITNESS_DIR   = os.path.abspath(os.path.expanduser(env("WITNESS_DIR", f"{HOME}/witnesses")))
+REPO          = os.path.abspath(os.path.expanduser(env("REPO", f"{HOME}/zkvm-bench")))
+BLOCK_DB      = os.path.abspath(os.path.expanduser(env("BLOCK_DB", f"{HOME}/block_db")))
+RPC           = env("RPC", "http://chi-001.devcore4.com:8545")
+MANIFEST      = os.path.abspath(os.path.expanduser(
+                    env("MANIFEST", os.path.join(os.path.dirname(WITNESS_DIR), "witness-manifest.csv"))))
+QUEUE_MODULUS = int(env("QUEUE_MODULUS", 1))     # 1 = every block (RTP). 100 = ethproofs sampling.
+INTERVAL      = float(env("INTERVAL", 6))        # half a slot: never more than one block behind
+# Retention policy (see the header): what makes a witness still worth its 7 MB.
+KEEP_RECENT   = int(env("KEEP_RECENT", 10))      # newest N always kept — nothing in flight is removed
+SKIP_AFTER    = int(env("SKIP_AFTER", 100))      # un-proved and this far behind -> abandoned, dropped
+KEEP_SAMPLE   = int(env("KEEP_SAMPLE", 1000))    # block % this == 0 -> kept forever (benchmark corpus)
+# Calibrated on 191 real mainnet witnesses (2026-07-29): median 7.2 MB, p90 10.9, p99 13.9, max 15.6.
+# A "keep forever" rule must stay near the p99 — at 12 MB it caught 7% of blocks, i.e. ~150 MB/h piling up.
+KEEP_BIG_MB   = float(env("KEEP_BIG_MB", 14))    # witness this large -> kept (outlier worth profiling)
+KEEP_SLOW_SECS = float(env("KEEP_SLOW_SECS", 45))  # proof took this long -> kept (outlier)
+ETHPROOFS_URL = env("ETHPROOFS_URL")
+CLUSTER       = env("CLUSTER")
+VM            = env("VM", "ZisK")
+GUEST         = env("GUEST", "monad-zisk")
+SOURCE        = env("SOURCE", socket.gethostname().split(".")[0])
+CHAIN_ID      = env("CHAIN_ID", "1")
+
+QUEUE     = os.path.join(REPO, "guests", GUEST, "fixtures")
+GEN_INPUT = os.path.join(REPO, "guests", GUEST, "gen-inputs")
+FIELDS    = ["block", "t_block", "t_avail", "t_witness", "t_queued", "bytes", "post_state_root", "promoted"]
+
+def log(msg):
+    print(f"{time.strftime('%H:%M:%S')} witness-tap: {msg}", flush=True)
+
+def rpc(method, params):
+    body = json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}).encode()
+    req = urllib.request.Request(RPC, body, {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r).get("result")
+
+def chain_tip():
+    """The REAL chain head (`latest`), not the finalized tag the producer follows — so the dashboard's
+    lag includes the finality delay instead of hiding it."""
+    try:
+        return int(rpc("eth_blockNumber", []), 16)
+    except Exception as e:                                    # noqa: BLE001 — never fatal
+        log(f"warn: chain tip unavailable ({e})")
+        return None
+
+def block_time(n):
+    try:
+        b = rpc("eth_getBlockByNumber", [hex(n), False])
+        return int(b["timestamp"], 16) if b else ""
+    except Exception:                                         # noqa: BLE001
+        return ""
+
+def block_db_mtime(n):
+    for p in (os.path.join(BLOCK_DB, str(n)), os.path.join(BLOCK_DB, f"{n // 1_000_000}M", str(n))):
+        try:
+            return round(os.path.getmtime(p), 3)
+        except OSError:
+            continue
+    return ""
+
+def read_root(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+def seen_blocks():
+    """The manifest IS the state: a block already recorded is never reprocessed (restart-safe)."""
+    out = set()
+    if os.path.exists(MANIFEST):
+        with open(MANIFEST, newline="") as f:
+            for row in csv.DictReader(f):
+                try:
+                    out.add(int(row["block"]))
+                except (KeyError, TypeError, ValueError):
+                    pass
+    return out
+
+def append_manifest(row):
+    new = not os.path.exists(MANIFEST)
+    with open(MANIFEST, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDS)
+        if new:
+            w.writeheader()
+        w.writerow(row)
+
+def safe_unlink(path, dry):
+    """Only ever remove a <digits>.<witness|post_state_root> file INSIDE WITNESS_DIR. This is the one
+    destructive operation in the pipeline; keep it boring and provable."""
+    d, name = os.path.dirname(os.path.abspath(path)), os.path.basename(path)
+    if d != WITNESS_DIR or not re.match(r"^\d+\.(witness|post_state_root)$", name):
+        log(f"refusing to delete {path} (outside {WITNESS_DIR} or unexpected name)")
+        return False
+    if dry:
+        log(f"[dry-run] would delete {name}")
+        return True
+    try:
+        os.unlink(path)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        log(f"warn: could not delete {name} ({e})")
+        return False
+
+def promote(block, wit, root_src, dry):
+    """Frame the witness into the prover queue, reading it where it already is (--src-dir): one
+    implementation of the ZisK input format (the guest's own gen-inputs), and no staging copy."""
+    if dry:
+        log(f"[dry-run] would queue {block} -> {QUEUE}/{CHAIN_ID}-{block}.bin")
+        return ""
+    r = subprocess.run([GEN_INPUT, "--src-dir", WITNESS_DIR, "--to", "fixtures", str(block)],
+                       capture_output=True, text=True, cwd=REPO)
+    if r.returncode != 0:
+        log(f"ERROR: gen-inputs failed for {block}: {(r.stderr or r.stdout).strip().splitlines()[-1:]}")
+        return ""
+    return round(time.time(), 3)
+
+def prove_status():
+    """block -> (status, prove_secs) for THIS guest, read from cli/prove-farm.csv — the same record its
+    own is_proven() consults, so the tap and the prover never disagree about what is done."""
+    out = {}
+    path = os.path.join(REPO, "prove-farm.csv")
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path, newline="") as f:
+            for row in csv.reader(f):
+                # ts,block,guest,mode,status,prove_secs,total_secs,proof_bytes,run_dir
+                if len(row) < 6 or row[2] != GUEST:
+                    continue
+                try:
+                    b = int(row[1])
+                except ValueError:
+                    continue
+                try:
+                    secs = float(row[5])
+                except ValueError:
+                    secs = None
+                prev = out.get(b)
+                if prev is None or row[4] == "ok":        # an ok anywhere in the log wins
+                    out[b] = (row[4], secs)
+    except OSError as e:
+        log(f"warn: cannot read prove-farm.csv ({e})")
+    return out
+
+def keep_reason(b, last, size_bytes, status):
+    """Why this block's witness is still worth keeping — or None if it can go. Order matters: the cheap,
+    absolute rules first."""
+    if b > last - KEEP_RECENT:
+        return "recent"                                   # possibly in flight, never touch
+    if KEEP_SAMPLE and b % KEEP_SAMPLE == 0:
+        return "sample"                                   # the reproducible benchmark corpus
+    st, secs = status.get(b, (None, None))
+    if st is not None and st != "ok":
+        return "proof-failed"                             # exactly what needs re-proving / debugging
+    if size_bytes and size_bytes >= KEEP_BIG_MB * 1024 * 1024:
+        return "big"                                      # heavy block: worth a deep profile
+    if secs is not None and secs >= KEEP_SLOW_SECS:
+        return "slow"                                     # slow proof: worth a deep profile
+    if st == "ok":
+        return None                                       # proved — the proof is the artefact now
+    if b <= last - SKIP_AFTER:
+        return None                                       # abandoned: --newest-first will never return
+    return "unproved"
+
+def queued_blocks():
+    """Blocks that have a framed input, whether or not their raw witness still exists."""
+    out = set()
+    if not os.path.isdir(QUEUE):
+        return out
+    for n in os.listdir(QUEUE):
+        m = re.match(rf"^{re.escape(CHAIN_ID)}-(\d+)\.bin$", n)
+        if m:
+            out.add(int(m.group(1)))
+    return out
+
+def prune(blocks, last, sizes, status, dry):
+    """Apply the retention policy to BOTH the raw dump dir and the framed queue. Returns
+    (dropped, abandoned, kept_by_reason).
+
+    The candidate set is the UNION of the two dirs, not just the dump dir: a framed input whose raw
+    witness is already gone (the tap restarted, the dump dir was cleaned by hand) would otherwise never be
+    re-examined, and cli/prove-farm would keep pulling ancient blocks out of the queue — the exact opposite
+    of the RTP policy. Seen for real in a rehearsal: stale inputs 100 blocks behind the tip got proved."""
+    dropped = abandoned = 0
+    kept = {}
+    for b in sorted(set(blocks) | queued_blocks()):
+        reason = keep_reason(b, last, sizes.get(b), status)
+        if reason:
+            kept[reason] = kept.get(reason, 0) + 1
+            continue
+        if status.get(b, (None, None))[0] != "ok":
+            abandoned += 1
+        # raw witness + root in the dump dir
+        safe_unlink(os.path.join(WITNESS_DIR, f"{b}.witness"), dry)
+        safe_unlink(os.path.join(WITNESS_DIR, f"{b}.post_state_root"), dry)
+        # framed input + root in the queue (never the .exec-report.json: it outlives the witness)
+        for suffix in (".bin", ".post_state_root"):
+            p = os.path.join(QUEUE, f"{CHAIN_ID}-{b}{suffix}")
+            if not os.path.exists(p):
+                continue
+            if dry:
+                log(f"[dry-run] would drop queue entry {os.path.basename(p)}")
+            else:
+                try:
+                    os.unlink(p)
+                except OSError as e:
+                    log(f"warn: could not drop {os.path.basename(p)} ({e})")
+        dropped += 1
+    return dropped, abandoned, kept
+
+def queue_files():
+    """How many framed inputs sit in the queue. NOT the un-proven backlog: cli/prove-farm leaves proven
+    inputs in place (it tracks progress by run record), so this only ever grows. The meaningful backlog
+    signal is the LAG between last_witness and the last proved block, which the mock derives itself."""
+    if not os.path.isdir(QUEUE):
+        return 0                                              # not created yet == nothing queued
+    try:
+        return len([f for f in os.listdir(QUEUE) if f.endswith(".bin")])
+    except OSError:
+        return None
+
+def heartbeat(tip, last_witness):
+    """Feed cli/ethproofs-mock's POST /status — the producer is the only party that knows the tip."""
+    if not ETHPROOFS_URL:
+        return
+    body = {"chain_tip": tip, "last_witness": last_witness, "queue_files": queue_files(),
+            "vm": VM, "guest": GUEST, "source": SOURCE}
+    if CLUSTER:
+        body["cluster_id"] = CLUSTER
+    try:
+        req = urllib.request.Request(ETHPROOFS_URL.rstrip("/") + "/status",
+                                     json.dumps(body).encode(), {"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as e:                                    # noqa: BLE001 — a dashboard, never fatal
+        log(f"warn: heartbeat failed ({e})")
+
+def cycle(seen, dry):
+    try:
+        names = os.listdir(WITNESS_DIR)
+    except OSError as e:
+        log(f"ERROR: cannot read {WITNESS_DIR} ({e})")
+        return
+    blocks = sorted(int(m.group(1)) for m in (WITNESS_RE.match(n) for n in names) if m)
+    if not blocks:
+        return
+    last = blocks[-1]
+    promoted = stale = 0
+    sizes = {}
+    # Retention needs to be decided BEFORE framing: on a cold start with a backlog (the replay catching up
+    # after a restart), framing every block and then deleting most of them would write over a gigabyte for
+    # nothing. So read the prover's record up front.
+    status = prove_status()
+
+    for b in blocks:
+        wit  = os.path.join(WITNESS_DIR, f"{b}.witness")
+        rootf = os.path.join(WITNESS_DIR, f"{b}.post_state_root")
+        is_cadence = (b % QUEUE_MODULUS == 0)
+        try:
+            sizes[b] = os.path.getsize(wit)
+        except OSError:
+            pass
+
+        if b not in seen:
+            t_queued = ""
+            if is_cadence and keep_reason(b, last, sizes.get(b), status) is None:
+                # Already droppable — too far behind to ever be proved. Record it (the coverage
+                # denominator must include it) but do not spend the framing on it.
+                stale += 1
+            elif is_cadence:
+                t_queued = promote(b, wit, rootf, dry)
+                # Count the would-be work in a dry run too, else it always reports queued=0 and the
+                # preview looks like it does nothing.
+                promoted += 1 if (t_queued != "" or dry) else 0
+            # A dry run must NOT record anything: a recorded block is never reprocessed, so writing the
+            # manifest here would make the following real run skip the promotion it just previewed.
+            if dry:
+                log(f"[dry-run] would record block {b} (promoted={1 if is_cadence else 0})")
+            else:
+                append_manifest({
+                    "block": b,
+                    "t_block": block_time(b) if is_cadence else "",  # 1 RPC call per queued block (~1/slot)
+                    "t_avail": block_db_mtime(b),
+                    "t_witness": round(os.path.getmtime(wit), 3) if os.path.exists(wit) else "",
+                    "t_queued": t_queued,
+                    "bytes": os.path.getsize(wit) if os.path.exists(wit) else "",
+                    "post_state_root": read_root(rootf),
+                    "promoted": 1 if t_queued != "" else 0,
+                })
+                seen.add(b)
+
+    # Retention runs over everything present, driven by what the prover has actually done.
+    dropped, abandoned, kept = prune(blocks, last, sizes, status, dry)
+
+    tip = chain_tip()
+    lag = (tip - last) if isinstance(tip, int) else "?"
+    kept_str = " ".join(f"{k}={v}" for k, v in sorted(kept.items())) or "-"
+    log(f"{'[dry-run] ' if dry else ''}last_witness={last} tip={tip} lag={lag} queued={promoted}"
+        f"{f' stale={stale}' if stale else ''} dropped={dropped}"
+        f"{f' (abandoned {abandoned})' if abandoned else ''} kept[{kept_str}] queue={queue_files()}")
+    # No heartbeat on a dry run: "dry" has to mean no side effects anywhere, including the dashboard.
+    if not dry:
+        heartbeat(tip, last)
+
+def main():
+    dry = "--dry-run" in sys.argv
+    once = "--once" in sys.argv
+    for a in sys.argv[1:]:
+        if a not in ("--dry-run", "--once"):
+            sys.exit(f"witness-tap: unknown argument {a}\n{__doc__}")
+    if not os.path.isdir(WITNESS_DIR):
+        sys.exit(f"witness-tap: no witness dir at {WITNESS_DIR} (set WITNESS_DIR=…)")
+    if not os.access(GEN_INPUT, os.X_OK):
+        sys.exit(f"witness-tap: {GEN_INPUT} not found/executable (is REPO={REPO} the zkvm-bench clone?)")
+    log(f"dir={WITNESS_DIR} repo={REPO} queue_modulus={QUEUE_MODULUS} keep_recent={KEEP_RECENT} "
+        f"manifest={MANIFEST}{' [DRY-RUN]' if dry else ''}{' [once]' if once else ''}"
+        f"{f' heartbeat={ETHPROOFS_URL}' if ETHPROOFS_URL else ''}")
+    seen = seen_blocks()
+    log(f"{len(seen)} block(s) already in the manifest")
+    while True:
+        cycle(seen, dry)
+        if once:
+            return
+        time.sleep(INTERVAL)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("stopped.")

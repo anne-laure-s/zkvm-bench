@@ -26,7 +26,7 @@ identify WHAT was proven and show on the leaderboard:
 
 Plus ONE endpoint the real ethproofs.org does not have, because only the producer knows it:
 
-  POST /status          {chain_tip, [last_witness, queue_depth, cluster_id, vm, guest, source]}
+  POST /status          {chain_tip, [last_witness, queue_files, cluster_id, vm, guest, source]}
 
 The three lifecycle POSTs above say what happened to ONE proof; they cannot say where the pipeline is as
 a whole, and above all nobody tells this server what the CHAIN's head is — so "how far behind are we?",
@@ -149,7 +149,9 @@ class Store:
             "source": body.get("source"),               # free-form: who is reporting (e.g. "nyc-003")
             "chain_tip": body.get("chain_tip"),         # the head the producer is following
             "last_witness": body.get("last_witness"),   # newest block a witness exists for
-            "queue_depth": body.get("queue_depth"),     # witnesses waiting to be proved
+            # framed inputs sitting in the queue — NOT an un-proven backlog (prove-farm leaves proven
+            # inputs in place); the backlog signal is the lag below. Legacy name accepted too.
+            "queue_files": body.get("queue_files", body.get("queue_depth")),
         }
         with self.lock:
             self.pipelines[key] = hb
@@ -195,7 +197,7 @@ class Store:
                 "cluster_id": cluster, "vm": hb.get("vm"), "guest": hb.get("guest"),
                 "source": hb.get("source"), "heartbeat_ts": hb.get("ts"),
                 "chain_tip": tip, "last_witness": hb.get("last_witness"),
-                "queue_depth": hb.get("queue_depth"),
+                "queue_files": hb.get("queue_files"),
                 **d,
                 "lag_blocks": {"witness": lag(hb.get("last_witness")), "proving": lag(d["proving"]),
                                "proved": lag(d["proved"]), "verified": lag(d["verified"])},
@@ -290,7 +292,7 @@ class Handler(BaseHTTPRequestHandler):
             hb = STORE.set_status(body)
             print(f"{now_iso()}  ← /status          {('[' + str(hb['source']) + '] ') if hb.get('source') else ''}"
                   f"cluster={hb.get('cluster_id')} tip={hb.get('chain_tip')} "
-                  f"witness={hb.get('last_witness')} queue={hb.get('queue_depth')}")
+                  f"witness={hb.get('last_witness')} queue={hb.get('queue_files')}")
             return self._reply(200, {"ok": True})
         if self.path.rstrip("/") == "/proofs/queued":
             STORE.record("queued", body); print(f"{now_iso()}  ← /proofs/queued   {mk}cluster={cluster} {who}block={block}")
@@ -336,8 +338,8 @@ class Handler(BaseHTTPRequestHandler):
                     f" · <span class=d>verified {n(p['verified'], -lb['verified'] if isinstance(lb['verified'], int) else None)}</span>")
             if p.get("rejected") is not None:
                 line += f" · <span class=r>rejected {p['rejected']}</span>"
-            if p.get("queue_depth") is not None:
-                line += f" · queue <b>{p['queue_depth']}</b>"
+            if p.get("queue_files") is not None:
+                line += f" · queue <b>{p['queue_files']}</b> file(s)"
             if p.get("lag_secs_est") is not None:
                 line += f" · <span class=s>≈{p['lag_secs_est']}s behind (12s/slot est.)</span>"
             if not p.get("heartbeat_ts"):
@@ -415,7 +417,7 @@ server DOES do on /proved is VERIFY the submitted proof (mock by default — see
 
   listening : http://127.0.0.1:{args.port}     ·  leaderboard: open it in a browser  ·  JSON: GET /proofs
   pipeline  : GET /status (where each pipeline is + lag vs the chain) — the producer feeds it the tip
-              with POST /status {{chain_tip, last_witness, queue_depth, cluster_id}}
+              with POST /status {{chain_tip, last_witness, queue_files, cluster_id}}
   store     : {args.store}   (submissions.jsonl + proofs/)
   auth      : {auth}     ·  {n} block(s) recorded so far
   verify    : {verify}

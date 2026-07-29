@@ -22,35 +22,43 @@
 # (No .hints: Monad has no reth-style hints-gen, and hints are an optional proving-time optimisation —
 #  the prover regenerates them. See infra/zisk-infra/scripts/core.sh prove_remote.)
 #
-#   ./gen-inputs [--from inputs|fixtures] [--to inputs|fixtures] [--limit N] [--force] [BLOCKS...]
+#   ./gen-inputs [--from inputs|fixtures] [--to inputs|fixtures] [--src-dir <dir>]
+#                [--limit N] [--force] [BLOCKS...]
 #
 #   ./gen-inputs                             # every curated witness -> inputs/
 #   ./gen-inputs --from fixtures --limit 3   # the 3 newest staged witnesses -> the prove-farm queue
 #   ./gen-inputs --from fixtures 25551992    # one block (a bare block or a 1-<block> tag both work)
+#   ./gen-inputs --src-dir ~/witnesses 25640700    # straight from the producer's dump dir, no staging
+#                                                  # copy (what infra/monad-witness/witness-tap uses)
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHAIN_ID="${CHAIN_ID:-1}"
 
-FROM=inputs; TO=""; LIMIT=0; FORCE=0; WANT=()
+FROM=inputs; TO=""; LIMIT=0; FORCE=0; SRC_DIR=""; WANT=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --from)  FROM="${2:?--from inputs|fixtures}"; shift 2 ;;
-    --to)    TO="${2:?--to inputs|fixtures}"; shift 2 ;;
-    --limit) LIMIT="${2:?--limit N}"; shift 2 ;;
-    --force) FORCE=1; shift ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
-    *)       WANT+=("$1"); shift ;;
+    --from)    FROM="${2:?--from inputs|fixtures}"; shift 2 ;;
+    --to)      TO="${2:?--to inputs|fixtures}"; shift 2 ;;
+    --src-dir) SRC_DIR="${2:?--src-dir <dir of bare <block>.witness>}"; shift 2 ;;
+    --limit)   LIMIT="${2:?--limit N}"; shift 2 ;;
+    --force)   FORCE=1; shift ;;
+    -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
+    *)         WANT+=("$1"); shift ;;
   esac
 done
 case "$FROM" in inputs|fixtures) ;; *) echo "gen-inputs: --from must be inputs|fixtures" >&2; exit 2 ;; esac
 TO="${TO:-$FROM}"
 case "$TO"   in inputs|fixtures) ;; *) echo "gen-inputs: --to must be inputs|fixtures" >&2; exit 2 ;; esac
 
-SRC="$HERE/../monad/$FROM"
+# --src-dir reads bare <block>.witness straight from wherever the producer dumps them, skipping the
+# in-repo staging copy entirely. At the RTP cadence (every block, ~7 MB, one per 12 s) staging would
+# double the I/O and the disk for nothing.
+if [ -n "$SRC_DIR" ]; then SRC="$SRC_DIR"; FROM=fixtures; TO="${TO:-fixtures}"; else SRC="$HERE/../monad/$FROM"; fi
 OUT="$HERE/$TO"; mkdir -p "$OUT"
 [ -d "$SRC" ] || { echo "gen-inputs: no Monad witnesses at $SRC" >&2; exit 1; }
 
-# Source naming differs per tier: inputs/ is already tagged 1-<block>, fixtures/ is a bare <block>.
+# Source naming differs per tier: inputs/ is already tagged 1-<block>, fixtures/ (and any --src-dir) is
+# a bare <block>.
 src_stem() { if [ "$FROM" = inputs ]; then echo "$CHAIN_ID-$1"; else echo "$1"; fi; }
 
 # list_blocks — the block numbers to convert: the explicit list, else everything in SRC. With --limit,

@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""witness-sim — replay the replay: feed an existing witness corpus into a dump dir, one block at a
+time, so the WHOLE pipeline can be rehearsed without a Monad node and without a GPU.
+
+`run_replay.py --zkvm-witness <dir>` drops `<block>.witness` (+ `.post_state_root`) as it executes. This
+does the same thing from witnesses we already have, on a compressed clock — which is enough to exercise
+everything downstream of the node: witness-tap's promote/prune/manifest/heartbeat, cli/prove-farm --watch
+draining the queue, cli/ethproofs-submit, and the mock's verification + status banner.
+
+It is a REHEARSAL, not a benchmark: block arrivals are synthetic, so the only meaningful latencies are
+the pipeline's own (t_witness -> t_queued -> submitted). Real numbers need the node at the tip.
+
+  ./witness-sim --corpus ../../guests/monad/fixtures --dest ~/witnesses [--interval 1.0]
+                [--start <block>] [--count N] [--stride 1] [--hardlink]
+
+Copies each witness into --dest in ascending block order. --stride thins the stream; --interval is the
+seconds between blocks (12.0 = real Ethereum cadence).
+
+It COPIES rather than hardlinks, deliberately: witness-tap stamps `t_witness` from the file's mtime, and
+a hardlink shares the corpus file's inode — hence its original mtime — so the whole latency chain would
+be measured against whenever those witnesses were first written. `--hardlink` is available for pure
+plumbing tests (instant, no disk), and prints that the timestamps are meaningless.
+"""
+import argparse, os, re, shutil, sys, time
+
+WITNESS_RE = re.compile(r"^(\d+)\.witness$")
+
+def place(src, dst, hardlink):
+    """Copy (fresh inode -> fresh mtime, which is what t_witness must be), or hardlink when the caller
+    only cares about plumbing. The tap only ever unlinks its own dir, so the corpus is never at risk
+    either way."""
+    tmp = dst + ".part"
+    if hardlink:
+        try:
+            os.link(src, tmp)
+        except OSError:
+            shutil.copyfile(src, tmp)
+    else:
+        shutil.copyfile(src, tmp)
+    os.replace(tmp, dst)          # atomic: a watcher never sees a partial witness
+
+def main():
+    ap = argparse.ArgumentParser(description="feed a witness corpus into a dump dir, block by block")
+    ap.add_argument("--corpus", required=True, help="dir holding <block>.witness (+ .post_state_root)")
+    ap.add_argument("--dest", required=True, help="the dump dir the tap watches (WITNESS_DIR)")
+    ap.add_argument("--interval", type=float, default=1.0, help="seconds between blocks (12 = mainnet)")
+    ap.add_argument("--start", type=int, default=None, help="first block to feed")
+    ap.add_argument("--count", type=int, default=None, help="how many blocks to feed")
+    ap.add_argument("--stride", type=int, default=1, help="feed every Nth block")
+    ap.add_argument("--hardlink", action="store_true",
+                    help="hardlink instead of copying: instant, but the witness keeps the corpus file's "
+                         "mtime, so every latency stamp downstream is meaningless (plumbing tests only)")
+    a = ap.parse_args()
+
+    corpus, dest = os.path.abspath(a.corpus), os.path.abspath(a.dest)
+    if not os.path.isdir(corpus):
+        sys.exit(f"witness-sim: no corpus at {corpus}")
+    os.makedirs(dest, exist_ok=True)
+    blocks = sorted(int(m.group(1)) for m in (WITNESS_RE.match(n) for n in os.listdir(corpus)) if m)
+    if a.start is not None:
+        blocks = [b for b in blocks if b >= a.start]
+    blocks = blocks[::a.stride]
+    if a.count is not None:
+        blocks = blocks[:a.count]
+    if not blocks:
+        sys.exit(f"witness-sim: no witnesses to feed from {corpus}")
+
+    print(f"witness-sim: feeding {len(blocks)} block(s) {blocks[0]}..{blocks[-1]} into {dest} "
+          f"every {a.interval}s ({'HARDLINK — timestamps meaningless' if a.hardlink else 'copy'})",
+          flush=True)
+    t0 = time.time()
+    for i, b in enumerate(blocks, 1):
+        for ext in ("witness", "post_state_root"):
+            src = os.path.join(corpus, f"{b}.{ext}")
+            if os.path.exists(src):
+                place(src, os.path.join(dest, f"{b}.{ext}"), a.hardlink)
+        if i % 25 == 0 or i == len(blocks):
+            print(f"witness-sim: {i}/{len(blocks)} fed (block {b}, {time.time() - t0:.0f}s)", flush=True)
+        if i < len(blocks):
+            time.sleep(a.interval)
+    print(f"witness-sim: done — {len(blocks)} block(s) in {time.time() - t0:.0f}s", flush=True)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nwitness-sim: stopped.")

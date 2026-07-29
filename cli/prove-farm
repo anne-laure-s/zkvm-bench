@@ -148,15 +148,19 @@ scan_unproven(){
 # external dep. The proof is FAKE (random bytes) — tests the pipeline plumbing, not the prover.
 mock_prove(){  # $1=block $2=plog → writes $INFRA/results/<tag>/mock-run/{proof.bin,report.json}
   local b="$1" plog="$2" tag rd pb
-  tag="$CHAIN_ID-$b"; rd="$INFRA/results/$tag/mock-run"; mkdir -p "$rd" || return 1
+  # Guest-scoped, like the real prove-cluster records (core.sh _artifact_rel): a bare results/<tag>/
+  # would be shared by every guest, and the identical mock-run subdir would overwrite the other's record.
+  tag="$CHAIN_ID-$b"; rd="$INFRA/results/$GUEST/$tag/mock-run"; mkdir -p "$rd" || return 1
   # Self-identifying: the proof bytes BEGIN with a MOCK-PROOF magic, so this fake is unmistakable anywhere
   # it travels (a real proof never starts with this). report.json also marks mode=mock/backend=mock-cluster.
   { printf 'MOCK-PROOF/mock-cluster NOT-A-REAL-PROOF '; head -c "$((300 + b % 700))" /dev/urandom; } \
     > "$rd/proof.bin" 2>/dev/null || return 1
   pb=$(wc -c < "$rd/proof.bin"); pb=${pb//[^0-9]/}
   # report.json in the shared prove contract (cli/report-schema.md); marked mock so it's never mistaken for real.
-  printf '{"mode":"mock","block":%s,"prove_secs":0,"total_secs":0,"proof_bytes":%s,"verified":null,"vkey_hash":"0xmock%s","backend":"mock-cluster"}\n' \
-    "$b" "$pb" "$b" > "$rd/report.json" || return 1
+  # zkvm/guest are "all"-tier fields in the contract: without them a run record can't say WHAT it proved,
+  # which any consumer joining records (e.g. profiling/rtp-latency.py) needs.
+  printf '{"mode":"mock","zkvm":"%s","guest":"%s","block":%s,"prove_secs":0,"total_secs":0,"proof_bytes":%s,"verified":null,"vkey_hash":"0xmock%s","backend":"mock-cluster"}\n' \
+    "${VM:-}" "$GUEST" "$b" "$pb" "$b" > "$rd/report.json" || return 1
   printf 'mock-cluster: fake run record for block %s (%s B proof) — pipeline plumbing test, NOT a real proof.\n' "$b" "$pb" > "$plog"
   return 0
 }

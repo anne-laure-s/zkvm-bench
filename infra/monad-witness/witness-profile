@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# witness-profile — while the GPU proves, use the box's idle CPU to EXECUTE the same block and record its
+# deterministic work-unit (ZisK steps). Free data on the way past: proving gives you wall-clock, execution
+# gives you the reproducible number this repo compares across zkVMs.
+#
+# It writes `<queue>/<chain>-<block>.exec-report.json`, which is exactly the path
+# infra/zisk-infra/scripts/core.sh already looks for — `prove_remote` copies it into the run record if it
+# is there (core.sh: exec_report), and profiling/rtp-latency.py reads it for the `work` column. So there is
+# nothing to wire: produce the file, and both consumers pick it up.
+#
+# Why here and not elsewhere: the work-unit is deterministic, so WHERE it runs doesn't change the number —
+# but the witness is 7 MB and lives on this box, and running it on the GPU box would steal CPU from the
+# very proof we are timing. So: this box, `nice`d, and skipped whenever we are falling behind. Profiling
+# must never cost the pipeline a block.
+#
+#   ./witness-profile [--once] [--dry-run]
+#
+# Config (env): REPO=~/zkvm-bench  GUEST=monad-zisk  CHAIN_ID=1  INTERVAL=20  NICE=15
+#               MAX_LAG=3        skip while (tip - newest queued) exceeds this — catch up first
+#               MAX_SECS=120     give up on one block after this long (a stuck emulator is not worth it)
+#               NEWEST_FIRST=1   profile the freshest block first, like the prover
+#
+# Requires the ZisK emulator on THIS box (`ziskemu`, via ziskup) — nyc-003 does not have it yet, and the
+# script says so rather than silently producing nothing.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="${REPO:-$HOME/zkvm-bench}"
+GUEST="${GUEST:-monad-zisk}"
+CHAIN_ID="${CHAIN_ID:-1}"
+INTERVAL="${INTERVAL:-20}"
+NICE="${NICE:-15}"
+MAX_LAG="${MAX_LAG:-3}"
+MAX_SECS="${MAX_SECS:-120}"
+NEWEST_FIRST="${NEWEST_FIRST:-1}"
+RPC="${RPC:-http://chi-001.devcore4.com:8545}"
+QUEUE="$REPO/guests/$GUEST/fixtures"
+ELF="$REPO/guests/$GUEST/$GUEST.elf"
+RUN="$REPO/infra/zisk-infra/run"
+
+ONCE=0; DRY=0
+for a in "$@"; do case "$a" in
+  --once) ONCE=1 ;; --dry-run) DRY=1 ;;
+  -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+  *) echo "witness-profile: unknown argument $a" >&2; exit 2 ;;
+esac; done
+
+log(){ printf '%s witness-profile: %s\n' "$(date +%H:%M:%S)" "$1"; }
+die(){ log "$1" >&2; exit 1; }
+
+[ -d "$QUEUE" ] || die "no queue at $QUEUE (is the tap running? is REPO=$REPO right?)"
+[ -f "$ELF" ]   || die "no ELF at $ELF"
+[ -x "$RUN" ]   || die "no dispatcher at $RUN"
+command -v ziskemu >/dev/null 2>&1 || [ -x "$HOME/.zisk/bin/ziskemu" ] \
+  || die "ziskemu not found — install the ZisK toolchain on this box (ziskup), or run the profiler where it exists"
+
+# tip_lag — how far the newest queued block is behind the chain head. Cheap (one RPC call) and the whole
+# point: if we are behind, the CPU belongs to the replay, not to profiling.
+tip_lag(){
+  local newest tip
+  newest="$(ls "$QUEUE" 2>/dev/null | sed -n "s/^$CHAIN_ID-\([0-9]*\)\.bin$/\1/p" | sort -n | tail -1)"
+  [ -n "$newest" ] || { echo ""; return; }
+  tip="$(curl -s --max-time 5 -X POST -H 'Content-Type: application/json' \
+        --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' "$RPC" \
+        | sed -n 's/.*"result":"0x\([0-9a-f]*\)".*/\1/p')"
+  [ -n "$tip" ] || { echo ""; return; }                    # RPC down: don't block profiling on it
+  echo $(( $((16#$tip)) - newest ))
+}
+
+# pending — queued inputs with no exec-report yet, prover order (newest first) by default.
+pending(){
+  local sort_flag="-n"; [ "$NEWEST_FIRST" = 1 ] && sort_flag="-rn"
+  ls "$QUEUE" 2>/dev/null | sed -n "s/^$CHAIN_ID-\([0-9]*\)\.bin$/\1/p" | sort $sort_flag | while read -r b; do
+    [ -f "$QUEUE/$CHAIN_ID-$b.exec-report.json" ] || echo "$b"
+  done
+}
+
+profile_one(){  # $1 = block
+  local b="$1" in="$QUEUE/$CHAIN_ID-$b.bin" rep="$QUEUE/$CHAIN_ID-$b.exec-report.json" t0 steps
+  [ -f "$in" ] || { log "skip $b (input gone — the tap dropped it)"; return 0; }
+  if [ "$DRY" = 1 ]; then log "[dry-run] would execute block $b -> $(basename "$rep")"; return 0; fi
+  t0=$SECONDS
+  # execute_local writes <input>.exec-report.json next to the input; nice'd so the replay always wins the
+  # CPU, and time-boxed so one pathological block can't stall the loop.
+  if ! nice -n "$NICE" "$RUN" execute ELF="$ELF" INPUT="$in" >"$QUEUE/$CHAIN_ID-$b.exec.log" 2>&1; then
+    log "execute FAILED for $b (see $CHAIN_ID-$b.exec.log)"
+    return 1
+  fi
+  steps="$(sed -n 's/.*"steps"[: ]*\([0-9]*\).*/\1/p' "$rep" 2>/dev/null | head -1)"
+  log "block $b: ${steps:-?} steps in $((SECONDS - t0))s"
+}
+
+log "queue=$QUEUE guest=$GUEST nice=$NICE max_lag=$MAX_LAG interval=${INTERVAL}s$([ "$DRY" = 1 ] && echo ' [DRY-RUN]')"
+while :; do
+  lag="$(tip_lag)"
+  if [ -n "$lag" ] && [ "$lag" -gt "$MAX_LAG" ] 2>/dev/null; then
+    log "behind by $lag block(s) — leaving the CPU to the replay"
+  else
+    n=0
+    while IFS= read -r b; do
+      [ -n "$b" ] || continue
+      profile_one "$b" || true
+      n=$((n + 1))
+      # Re-check the lag after each block: this loop must yield the moment the pipeline needs the CPU.
+      lag="$(tip_lag)"
+      if [ -n "$lag" ] && [ "$lag" -gt "$MAX_LAG" ] 2>/dev/null; then
+        log "fell behind ($lag) — pausing profiling"; break
+      fi
+    done < <(pending)
+    [ "$n" = 0 ] && log "nothing to profile (every queued input already has a report)"
+  fi
+  [ "$ONCE" = 1 ] && break
+  sleep "$INTERVAL"
+done
