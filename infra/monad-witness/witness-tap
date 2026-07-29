@@ -26,6 +26,11 @@ firehose into the three things the RTP pipeline actually needs, and nothing else
                                      >= KEEP_SLOW_SECS: the heavy blocks are the ones worth profiling
                  newest KEEP_RECENT -> always kept, so nothing in flight is pulled from under a prover
 
+               KEEPING a witness and QUEUEING it are different decisions. Only in-window, un-proved blocks
+               belong in the queue; a block kept for interest keeps its RAW witness (the framed input is
+               one gen-inputs call away) and is never re-offered to the prover. Otherwise an outlier from
+               280 blocks ago burns a proof slot — the opposite of --newest-first.
+
                `*.exec-report.json` files are NEVER deleted: a few hundred bytes each, and they carry the
                deterministic work-unit (ZisK steps) for a block whose 7 MB witness is long gone.
   3. RECORD  — one manifest row per block with the timestamps the latency report joins on, plus a
@@ -45,7 +50,7 @@ latency is measured on ONE clock and never mixes in the laptop's:
   t_queued         when the framed input landed in the prover queue
   bytes            witness size
   post_state_root  the expected root, the anchor for `run verify EXPECTED_ROOT=…`
-  promoted         1 if it went to the queue, 0 if it was ring-only
+  promoted         1 if it was framed into the queue, 0 if it was not (too far behind)
 
 Deliberately NOT here: proving and submission timings. Those come from prove-farm's report.json and the
 mock's submissions.jsonl; joining the three is the latency report, not this loop's job.
@@ -54,7 +59,8 @@ Config (env, all optional except the paths' defaults being sane on nyc-003):
   WITNESS_DIR=~/witnesses      REPO=~/zkvm-bench        BLOCK_DB=~/block_db
   RPC=http://chi-001.devcore4.com:8545                  MANIFEST=<WITNESS_DIR>/../witness-manifest.csv
   QUEUE_MODULUS=1 (RTP; 100 = ethproofs sampling)       INTERVAL=6
-  KEEP_RECENT=50 (raw ring)    QUEUE_KEEP=30 (framed inputs kept, newest first)
+  KEEP_RECENT=10 (never touched, may be in flight)      SKIP_AFTER=100 (un-proved -> abandoned)
+  KEEP_SAMPLE=1000 (benchmark corpus)   KEEP_BIG_MB=14   KEEP_SLOW_SECS=45  (outliers worth profiling)
   ETHPROOFS_URL=               CLUSTER=  VM=ZisK  GUEST=monad-zisk  SOURCE=<hostname>
 
   ./witness-tap [--once] [--dry-run]
@@ -218,6 +224,14 @@ def prove_status():
         log(f"warn: cannot read prove-farm.csv ({e})")
     return out
 
+def in_window(b, last):
+    """Is this block still worth PROVING? Two decisions must not be confused: `keep_reason` says whether a
+    file is worth its bytes (a huge block stays around for profiling long after the fact), while this says
+    whether the prover should still consider it. Queueing an outlier from 280 blocks ago burns a proof slot
+    on ancient history — the opposite of what --newest-first is for. Seen for real: blocks 25641069 and
+    25641121 were proved while the tip was at 25641348, purely because they were kept as `big`."""
+    return b > last - SKIP_AFTER
+
 def keep_reason(b, last, size_bytes, status):
     """Why this block's witness is still worth keeping — or None if it can go. Order matters: the cheap,
     absolute rules first."""
@@ -251,25 +265,18 @@ def queued_blocks():
 
 def prune(blocks, last, sizes, status, dry):
     """Apply the retention policy to BOTH the raw dump dir and the framed queue. Returns
-    (dropped, abandoned, kept_by_reason).
+    (dropped, abandoned, unqueued, kept_by_reason).
 
     The candidate set is the UNION of the two dirs, not just the dump dir: a framed input whose raw
     witness is already gone (the tap restarted, the dump dir was cleaned by hand) would otherwise never be
     re-examined, and cli/prove-farm would keep pulling ancient blocks out of the queue — the exact opposite
     of the RTP policy. Seen for real in a rehearsal: stale inputs 100 blocks behind the tip got proved."""
-    dropped = abandoned = 0
+    dropped = abandoned = unqueued = 0
     kept = {}
-    for b in sorted(set(blocks) | queued_blocks()):
-        reason = keep_reason(b, last, sizes.get(b), status)
-        if reason:
-            kept[reason] = kept.get(reason, 0) + 1
-            continue
-        if status.get(b, (None, None))[0] != "ok":
-            abandoned += 1
-        # raw witness + root in the dump dir
-        safe_unlink(os.path.join(WITNESS_DIR, f"{b}.witness"), dry)
-        safe_unlink(os.path.join(WITNESS_DIR, f"{b}.post_state_root"), dry)
-        # framed input + root in the queue (never the .exec-report.json: it outlives the witness)
+
+    def drop_queue_entry(b):
+        """Remove the framed input (never the .exec-report.json: it outlives the witness)."""
+        n = 0
         for suffix in (".bin", ".post_state_root"):
             p = os.path.join(QUEUE, f"{CHAIN_ID}-{b}{suffix}")
             if not os.path.exists(p):
@@ -281,8 +288,28 @@ def prune(blocks, last, sizes, status, dry):
                     os.unlink(p)
                 except OSError as e:
                     log(f"warn: could not drop {os.path.basename(p)} ({e})")
+                    continue
+            n += 1 if suffix == ".bin" else 0
+        return n
+
+    for b in sorted(set(blocks) | queued_blocks()):
+        reason = keep_reason(b, last, sizes.get(b), status)
+        if reason:
+            kept[reason] = kept.get(reason, 0) + 1
+            # The QUEUE only ever holds what the prover should still consider: in-window and un-proved.
+            # A block kept for interest (big / sample / proof-failed) keeps its RAW witness — the framed
+            # input is regenerable with one gen-inputs call, and at 14+ MB apiece keeping both doubles the
+            # cost of the interesting set for nothing.
+            if status.get(b, (None, None))[0] == "ok" or not in_window(b, last):
+                unqueued += drop_queue_entry(b)
+            continue
+        if status.get(b, (None, None))[0] != "ok":
+            abandoned += 1
+        safe_unlink(os.path.join(WITNESS_DIR, f"{b}.witness"), dry)
+        safe_unlink(os.path.join(WITNESS_DIR, f"{b}.post_state_root"), dry)
+        drop_queue_entry(b)
         dropped += 1
-    return dropped, abandoned, kept
+    return dropped, abandoned, unqueued, kept
 
 def queue_files():
     """How many framed inputs sit in the queue. NOT the un-proven backlog: cli/prove-farm leaves proven
@@ -338,9 +365,9 @@ def cycle(seen, dry):
 
         if b not in seen:
             t_queued = ""
-            if is_cadence and keep_reason(b, last, sizes.get(b), status) is None:
-                # Already droppable — too far behind to ever be proved. Record it (the coverage
-                # denominator must include it) but do not spend the framing on it.
+            if is_cadence and not in_window(b, last):
+                # Too far behind to ever be proved, whether or not we keep the witness. Record it (the
+                # coverage denominator must include it) but spend nothing on framing it.
                 stale += 1
             elif is_cadence:
                 t_queued = promote(b, wit, rootf, dry)
@@ -365,13 +392,14 @@ def cycle(seen, dry):
                 seen.add(b)
 
     # Retention runs over everything present, driven by what the prover has actually done.
-    dropped, abandoned, kept = prune(blocks, last, sizes, status, dry)
+    dropped, abandoned, unqueued, kept = prune(blocks, last, sizes, status, dry)
 
     tip = chain_tip()
     lag = (tip - last) if isinstance(tip, int) else "?"
     kept_str = " ".join(f"{k}={v}" for k, v in sorted(kept.items())) or "-"
     log(f"{'[dry-run] ' if dry else ''}last_witness={last} tip={tip} lag={lag} queued={promoted}"
         f"{f' stale={stale}' if stale else ''} dropped={dropped}"
+        f"{f' unqueued={unqueued}' if unqueued else ''}"
         f"{f' (abandoned {abandoned})' if abandoned else ''} kept[{kept_str}] queue={queue_files()}")
     # No heartbeat on a dry run: "dry" has to mean no side effects anywhere, including the dashboard.
     if not dry:

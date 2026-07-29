@@ -145,7 +145,11 @@ cmd_status() {
   echo "  dump : $(ls "$WITNESS_DIR" 2>/dev/null | grep -c '\.witness$') file(s), $(du -sh "$WITNESS_DIR" 2>/dev/null | cut -f1)"
   echo "  queue: $(ls "$REPO/guests/monad-zisk/fixtures" 2>/dev/null | grep -c '\.bin$') input(s), \
 $(ls "$REPO/guests/monad-zisk/fixtures" 2>/dev/null | grep -c '\.exec-report\.json$') profiled"
-  echo "  manif: $(( $(wc -l < "${MANIFEST:-$HOME/witness-manifest.csv}" 2>/dev/null || echo 1) - 1 )) row(s)"
+  # Guard the file test: a redirection from a missing file prints its own error before any 2>/dev/null
+  # inside the substitution can catch it — noisy on every status call before the tap has ever run.
+  local M="${MANIFEST:-$HOME/witness-manifest.csv}"
+  if [ -f "$M" ]; then echo "  manif: $(( $(wc -l < "$M") - 1 )) row(s)"
+  else echo "  manif: 0 row(s)  (no $M yet)"; fi
   echo "== disk =="; df -h / | tail -1 | sed 's/^/  /'; echo "  triedb: $(du -sh "$DB" 2>/dev/null | cut -f1)"
 }
 
