@@ -17,9 +17,11 @@ as the pipeline latency. submissions.jsonl comes from wherever the mock runs (ty
 reverse tunnel), so its timestamps are NOT comparable; they are used for the verdict only, and the
 submission delta is printed as indicative when --cross-clock is passed.
 
-MOCK RUNS ARE NOT LATENCY. A `mode=mock` record means cli/prove-farm --mock fabricated the proof in
-milliseconds. Those rows are shown (they prove the plumbing works) but excluded from every summary
-statistic, and the summary says so.
+MOCK RUNS ARE NOT LATENCY, AND THEY ARE MISSING A LEG. A `mode=mock` record means cli/prove-farm --mock
+fabricated the proof locally: it never called prove_remote, so the witness upload (~7 MB per block) and the
+proof download did not happen at all. They are absent, not simulated — the only thing a mock prover is
+allowed to invent is its own duration. Mock rows are therefore shown (the plumbing is real and worth
+proving) but excluded from every summary statistic, and the summary states both limits.
 
   profiling/rtp-latency.py --manifest ~/witness-manifest.csv --results infra/zisk-infra/results
   profiling/rtp-latency.py --manifest … --results … --submissions ethproofs-mock-data/submissions.jsonl
@@ -78,17 +80,28 @@ def read_runs(results_dir, chain_id, guest):
             except (IndexError, ValueError):
                 continue
         t = os.path.getmtime(rep)
+        # The work-unit lives with the RUN, not with the witness: a prove report carries prove_secs but no
+        # step count, and whatever emulated the block writes exec-report.json into the run record beside it.
+        work = r.get("steps", r.get("cycles"))
+        if work is None:
+            try:
+                with open(os.path.join(os.path.dirname(rep), "exec-report.json")) as g:
+                    x = json.load(g)
+                work = x.get("steps", x.get("cycles"))
+            except (OSError, ValueError):
+                pass
         if b not in out or t > out[b]["t_proved"]:
             out[b] = {"t_proved": t, "prove_secs": r.get("prove_secs"), "total_secs": r.get("total_secs"),
                       "proof_bytes": r.get("proof_bytes"), "mode": r.get("mode"),
-                      "work": r.get("steps", r.get("cycles")), "run_dir": os.path.dirname(rep)}
+                      "work": work, "backend": r.get("backend"),
+                      "run_dir": os.path.dirname(rep)}
     return out
 
 def read_exec_reports(queue_dir, chain_id):
-    """block -> the deterministic work-unit, from the exec-report the profiler leaves next to each queued
-    input (infra/monad-witness/witness-profile). A prove run record carries prove_secs but not the
-    work-unit, and these reports outlive the 7 MB witness they describe — so they are where `work` comes
-    from once the witness has been dropped."""
+    """block -> the deterministic work-unit, from exec-reports in a CURATED inputs dir (the convention
+    guests/*/inputs/*.exec-report.json). Only a secondary source: the primary one is the run record, read in
+    read_runs — derived artefacts belong to a run, not beside a witness. Pass --queue only if you keep
+    reports next to inputs yourself."""
     out = {}
     if not queue_dir:
         return out
@@ -140,6 +153,12 @@ def main():
                     help="also show witness→submitted, which mixes two machines' clocks")
     a = ap.parse_args()
 
+    if not os.path.isfile(a.manifest):
+        sys.exit(f"rtp-latency: no manifest at {a.manifest!r} — the producer writes it "
+                 f"(infra/monad-witness/witness-tap, MANIFEST=…); has it run yet?")
+    if not os.path.isdir(a.results):
+        sys.exit(f"rtp-latency: no results dir at {a.results!r} — point --results at a stack's results/ "
+                 f"(e.g. infra/zisk-infra/results)")
     man = read_manifest(a.manifest)
     runs = read_runs(a.results, a.chain_id, a.guest)
     subs = read_submissions(a.submissions) if a.submissions else {}
@@ -174,7 +193,8 @@ def main():
             "prove_secs": r["prove_secs"],
             "pipeline": delta(r["t_proved"], m["t_witness"]),     # THE number: witness -> proof in hand
             "submitted": s.get("ts"), "verified": s.get("verified"),
-            "mock": s.get("mock") or r["mode"] == "mock", "reason": s.get("reason"),
+            # mock-cluster (local) says mode=mock; the mock prover on a real remote says backend=mock-remote
+            "mock": s.get("mock") or r["mode"] == "mock" or "mock" in str(r.get("backend") or ""), "reason": s.get("reason"),
         })
 
     w = max(len("block"), 8)
@@ -219,8 +239,10 @@ def main():
     else:
         print("no real proof yet — nothing to summarise.")
     if mocks:
-        print(f"{mocks} mock row(s) shown but EXCLUDED from the summary: a mock-cluster proof is "
-              f"fabricated in milliseconds and measures nothing.")
+        print(f"{mocks} mock row(s) shown but EXCLUDED from the summary: a mock-cluster proof does not\n"
+              f"  measure a prover, AND cli/prove-farm --mock skips prove_remote entirely — so the witness\n"
+              f"  upload (~7 MB/block) and the proof download are ABSENT from these numbers, not modelled.\n"
+              f"  The pipeline latency above is optimistic by exactly those two transfers.")
     if incoherent:
         print(f"{len(incoherent)} row(s) dropped as incoherent (proof older than its witness — records "
               f"from a different run): {', '.join(str(b) for b in incoherent[:6])}"

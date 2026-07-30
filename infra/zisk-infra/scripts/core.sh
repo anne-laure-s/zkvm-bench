@@ -116,7 +116,22 @@ prove_remote() {
   local port="${PORT:-22}" mode="${MODE:-prove-compressed}" ws="${REMOTE_WS:-/workspace}"
   local remote_runner="${REMOTE_RUNNER:-zisk-runner}"
   local backend="${REMOTE_PROVE_BACKEND:-remote}"   # remote (coordinator) | local (cargo-zisk prove -g)
-  local ssh=(ssh -p "$port" "$REMOTE")
+
+  # ONE ssh connection for the whole block, compressed. Proving a block opens ~8 separate ssh/scp calls
+  # (mkdir, checksum, the input, the run, then proof/report/log/pv back). Without multiplexing each pays a
+  # full TCP + key exchange, and over a high-latency or tunnelled link that handshake cost dominated the
+  # transfer itself. ControlMaster makes the first call establish a shared channel the rest reuse, and -C
+  # compresses the 7 MB witness on the wire (trie nodes and RLP compress well).
+  # ZISK_SSH_MUX=0 disables it if a host ever misbehaves; ZISK_SSH_COMPRESS=0 drops the compression.
+  local mux=()
+  if [[ "${ZISK_SSH_MUX:-1}" != 0 ]]; then
+    local cpath="${TMPDIR:-/tmp}/zisk-mux-%C"
+    mux=(-o ControlMaster=auto -o "ControlPath=$cpath" -o ControlPersist=120)
+  fi
+  [[ "${ZISK_SSH_COMPRESS:-1}" != 0 ]] && mux+=(-C)
+  local ssh=(ssh "${mux[@]}" -p "$port" "$REMOTE")
+  # scp takes the same options but spells the port -P.
+  local scpo=("${mux[@]}" -P "$port")
 
   local elf_name; elf_name="$(basename "$ELF")"
   local in_name;  in_name="$(basename "$INPUT")"
@@ -142,20 +157,24 @@ prove_remote() {
   ws="$ws_abs"
 
   # Upload the ELF only when the remote copy differs (cheap to repeat per input).
+  # Portable on both ends: coreutils ships sha256sum, macOS ships shasum. And never let two EMPTY hashes
+  # compare equal — that would silently skip the upload and leave the remote to fail on a missing ELF.
   local lsum rsum
-  lsum="$(shasum -a 256 "$ELF" | awk '{print $1}')"
-  rsum="$("${ssh[@]}" "sha256sum $ws/elfs/$elf_name 2>/dev/null | awk '{print \$1}'" || true)"
-  if [[ "$lsum" != "$rsum" ]]; then
+  if   command -v sha256sum >/dev/null 2>&1; then lsum="$(sha256sum "$ELF" | awk '{print $1}')"
+  elif command -v shasum    >/dev/null 2>&1; then lsum="$(shasum -a 256 "$ELF" | awk '{print $1}')"
+  else lsum=""; echo "NOTE: no sha256sum/shasum here — uploading the ELF unconditionally." >&2; fi
+  rsum="$("${ssh[@]}" "(sha256sum $ws/elfs/$elf_name 2>/dev/null || shasum -a 256 $ws/elfs/$elf_name 2>/dev/null) | awk '{print \$1}'" || true)"
+  if [[ -z "$lsum" || "$lsum" != "$rsum" ]]; then
     echo "Uploading ELF (checksum changed/missing)..."
-    scp -P "$port" "$ELF" "$REMOTE:$ws/elfs/$elf_name"
+    scp "${scpo[@]}" "$ELF" "$REMOTE:$ws/elfs/$elf_name"
     echo "NOTE: ELF changed — re-run the per-ELF setup on the box: cluster/01-setup-elf.sh $ws/elfs/$elf_name" >&2
   else
     echo "ELF already present on remote, skipping upload."
   fi
 
   echo "Uploading input${have_hints:+ + hints}..."
-  scp -P "$port" "$INPUT" "$REMOTE:$ws/inputs/$in_name"
-  [[ $have_hints == 1 ]] && scp -rP "$port" "$hints" "$REMOTE:$ws/inputs/$hints_name"
+  scp "${scpo[@]}" "$INPUT" "$REMOTE:$ws/inputs/$in_name"
+  [[ $have_hints == 1 ]] && scp -r "${scpo[@]}" "$hints" "$REMOTE:$ws/inputs/$hints_name"
 
   # Record the run context (hardware, versions) — what the benchmark ran on.
   {
@@ -182,7 +201,20 @@ prove_remote() {
   # Run the proof, streaming output live AND capturing the full proving log to a
   # file. `pipefail` so a prover failure still propagates through the `tee`.
   local hints_arg=""; [[ $have_hints == 1 ]] && hints_arg="--hints $ws/inputs/$hints_name"
-  "${ssh[@]}" "set -o pipefail; ${logpref}ZISK_PROVE_BACKEND=$backend $remote_runner \
+  # Mock env, when the caller wants a MOCK prover on a REAL remote: everything on this side is unchanged
+  # (uploads, invocation, run-record fetch), only the far end sleeps instead of proving. That is the whole
+  # point — the transport legs stay real and measured; see zisk-runner's ZISK_MOCK_SECS branch.
+  # Only the MODEL crosses; the remote measures the work itself (it has the witness and the emulator) and
+  # derives its own duration. Nothing here decides how long the mock takes.
+  local mockenv=""
+  if [[ -n "${ZISK_MOCK_SECS:-}" || -n "${ZISK_MOCK_PER_MSTEP:-}" ]]; then
+    mockenv="${ZISK_MOCK_SECS:+ZISK_MOCK_SECS=$ZISK_MOCK_SECS }\
+${ZISK_MOCK_PER_MSTEP:+ZISK_MOCK_PER_MSTEP=$ZISK_MOCK_PER_MSTEP }\
+${ZISK_MOCK_SPEED:+ZISK_MOCK_SPEED=$ZISK_MOCK_SPEED }\
+${ZISK_MOCK_JITTER:+ZISK_MOCK_JITTER=$ZISK_MOCK_JITTER }\
+${ZISK_MOCK_DIST:+ZISK_MOCK_DIST=$ZISK_MOCK_DIST }"
+  fi
+  "${ssh[@]}" "set -o pipefail; ${logpref}${mockenv}ZISK_PROVE_BACKEND=$backend $remote_runner \
     --elf $ws/elfs/$elf_name \
     --input $ws/inputs/$in_name $hints_arg \
     --mode $mode \
@@ -191,16 +223,22 @@ prove_remote() {
     --report $ws/reports/$base.json 2>&1 | tee $ws/reports/$base.log"
 
   echo "Retrieving artifacts into $run_dir ..."
-  scp -P "$port" "$REMOTE:$ws/proofs/$base.proof.bin" "$run_dir/proof.bin"
-  scp -P "$port" "$REMOTE:$ws/reports/$base.json"     "$run_dir/report.json"
-  scp -P "$port" "$REMOTE:$ws/reports/$base.log"      "$run_dir/prove.log"
+  scp "${scpo[@]}" "$REMOTE:$ws/proofs/$base.proof.bin" "$run_dir/proof.bin"
+  scp "${scpo[@]}" "$REMOTE:$ws/reports/$base.json"     "$run_dir/report.json"
+  scp "${scpo[@]}" "$REMOTE:$ws/reports/$base.log"      "$run_dir/prove.log"
   # Public values are best-effort (ZisK may expose them differently per version).
-  scp -P "$port" "$REMOTE:$ws/proofs/$base.pv.bin"    "$run_dir/pv.bin" 2>/dev/null || true
+  scp "${scpo[@]}" "$REMOTE:$ws/proofs/$base.pv.bin"    "$run_dir/pv.bin" 2>/dev/null || true
 
   # Bundle the local emulation profile (steps) if it exists, so the run record is
   # self-contained.
   local exec_report="${INPUT%.bin}.exec-report.json"
   [[ -f "$exec_report" ]] && cp "$exec_report" "$run_dir/exec-report.json"
+  # A local emulation (execute_local) writes the guest's REAL public values next to the input, alongside the
+  # exec-report. They are not the prover's output, so they land as expected_pv.bin and never overwrite
+  # pv.bin — but they are genuine (the real guest, the real witness), which is what makes a root
+  # cross-check meaningful even when the proof beside them is a mock.
+  local local_pv="${INPUT%.bin}.pv.bin"
+  [[ -f "$local_pv" ]] && cp "$local_pv" "$run_dir/expected_pv.bin"
 
   echo "Done. Run record: $run_dir/"
   echo "  proof.bin"
@@ -238,16 +276,25 @@ verify_local() {
   [[ -f "$PROOF"  ]] || { echo "ERROR: proof not found: $PROOF (run: ./run prove ...)" >&2; return 1; }
 
   local pdir; pdir="$(dirname "$PROOF")"
-  local pv="${PV:-$pdir/pv.bin}"
+  # pv.bin is the PROVER's output; expected_pv.bin is what a local emulation of the guest committed. Prefer
+  # the prover's when it exists, fall back to the emulated one, and say which was used — they support
+  # different claims: "the proof is about the right state" vs "the guest computes the right state".
+  local pv="${PV:-$pdir/pv.bin}" pv_kind="prover"
   local expected_pv="$pdir/expected_pv.bin"
+  if [[ ! -f "$pv" && -f "$expected_pv" ]]; then pv="$expected_pv"; pv_kind="emulated"; fi
 
   echo "== verify =="
   echo "Proof     : $PROOF"
 
-  # 1. The verification itself — proof only.
-  echo "--- verifying proof ---"
-  "$RUNNER" --mode verify --proof "$PROOF" || {
-    echo "ERROR: proof verification FAILED" >&2; return 1; }
+  # 1. The verification itself — proof only. SKIP_PROOF_CHECK=1 runs ONLY the cross-checks below, which is
+  # how you interrogate a mock run: its proof is fake by construction, but its public values may be real.
+  if [[ -n "${SKIP_PROOF_CHECK:-}" ]]; then
+    echo "--- SKIPPING the cryptographic check (SKIP_PROOF_CHECK=1) — cross-checks only ---"
+  else
+    echo "--- verifying proof ---"
+    "$RUNNER" --mode verify --proof "$PROOF" || {
+      echo "ERROR: proof verification FAILED" >&2; return 1; }
+  fi
 
   # 2. Root cross-check (witness-free). A mismatch means the proof is valid but about
   #    the WRONG state — a correctness failure, so it fails the verb.
@@ -262,7 +309,7 @@ verify_local() {
       # ZisK writes the guest output padded (Monad guest: 256 B, root in the first 32).
       local got; got="$(xxd -p -l 32 "$pv" | tr -d '\n')"
       if [[ "$got" == "$want" ]]; then
-        echo "Root cross-check: OK (0x$got)"
+        echo "Root cross-check: OK (0x$got)  [$pv_kind public values]"
       else
         echo "ERROR: root MISMATCH — proof commits 0x$got, expected 0x$want" >&2
         return 1

@@ -20,11 +20,12 @@ guests/*/inputs/*.input.json
 guests/*/inputs/*.stdin
 guests/*/inputs/rpc-cache/
 
-# Collected witnesses (cli/witness-farm writes RSP/ZisK witnesses here) — large, regenerable.
-guests/*/fixtures/*.bin
-guests/*/fixtures/*.hints
-guests/*/fixtures/*.witness
-guests/*/fixtures/*.post_state_root
+# fixtures/ is entirely generated and never tracked: the witness staging area (pre-mined witnesses, dropped
+# in from a node) and the prover QUEUE that cli/witness-farm / infra/monad-witness/witness-tap fill. Only
+# witnesses live there — derived artefacts (exec-reports, public values) belong to a RUN, so they go in the
+# run record instead. Ignored wholesale rather than by extension, so a new witness format or a .part
+# temporary cannot slip into `git status`.
+guests/*/fixtures/
 
 # Execute reports — regenerable locally via `./run execute`. They feed profiling/results.html
 # (itself regenerated, not shipped), so they are NOT committed; re-run `./run execute` then results.py.

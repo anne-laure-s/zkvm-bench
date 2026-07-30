@@ -225,7 +225,16 @@ def mock_verify(proof_len, body, proof_path):
     """Stand-in for ethproofs.org's proof VERIFICATION — the SERVER's job (it's the trust anchor, not a
     dumb store). A stdlib server can't run the real SP1/ZisK verifier, so by default we MOCK-verify:
     check the submission is a real, non-empty, decodable proof carrying a verifier id + a block. Set
-    --verify-cmd to swap in a REAL verifier (this is the verification seam). Returns (ok, reason)."""
+    --verify-cmd to swap in a REAL verifier (this is the verification seam).
+
+    Returns (ok, reason) where ok is True (verified), False (REJECTED — a real proof that failed) or None
+    (not applicable). That third state exists because a DECLARED FAKE is not a verification failure: a
+    prove-farm --mock proof carries the MOCK-PROOF magic and arrives with mock:true, so the server knows
+    before it tries. Reporting ✗ on those cried wolf on every plumbing run, and a real rejection would have
+    been lost in the noise. It is deliberately NOT reported as accepted either — the whole point of the
+    magic is that a fake can never pass for real."""
+    if body.get("mock"):
+        return None, "mock proof — fake by construction, verification not applicable"
     if VERIFY_CMD:
         if not proof_path:
             return False, "no proof to verify"
@@ -310,7 +319,9 @@ class Handler(BaseHTTPRequestHandler):
             ok, reason = mock_verify(pb, body, proof_path)   # the SERVER verifies (mock/real via --verify-cmd)
             rec = STORE.record("proved", body, proof_bytes=pb, verified=ok, verify_reason=reason)
             pid = STORE.pid(cluster, block)
-            mark = "verified ✓" if ok else f"REJECTED ✗ ({reason})"
+            mark = ("verified ✓" if ok is True else
+                    f"not verified ⊘ ({reason})" if ok is None else
+                    f"REJECTED ✗ ({reason})")
             pi = f" pi={rec['public_inputs']}" if rec.get("public_inputs") else ""
             print(f"{now_iso()}  ← /proofs/proved   {mk}cluster={cluster} {who}block={block}{pi} "
                   f"time={rec['proving_time_ms']}ms work={rec['proving_cycles']} proof={pb}B  → stored proof_id={pid} · {mark}")
@@ -377,9 +388,12 @@ class Handler(BaseHTTPRequestHandler):
         for r in rows:
             ev = r.get("event", "")
             cls = {"queued": "q", "proving": "p", "proved": "d"}.get(ev, "")
+            # Three states, not two: ✓ verified · ✗ REJECTED (a real proof that failed — the alarming one)
+            # · ⊘ not applicable (a declared mock). A blank cell means nothing was submitted yet.
             v = r.get("verified")
-            vb = "✓" if v is True else ("✗" if v is False else "")
-            vc = "d" if v is True else ("r" if v is False else "")
+            ev_proved = r.get("event") == "proved"
+            vb = "✓" if v is True else ("✗" if v is False else ("⊘" if ev_proved else ""))
+            vc = "d" if v is True else ("r" if v is False else "q")
             blk = td(r.get("block_number")) or (f"pi:{str(r.get('public_inputs'))[:10]}" if r.get("public_inputs") else "")
             body.append(f"<tr><td>{td(r.get('cluster_id'))}</td><td class=l>{td(r.get('vm'))}</td>"
                         f"<td class=l>{td(r.get('guest'))}</td>"

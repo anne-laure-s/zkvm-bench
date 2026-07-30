@@ -14,7 +14,7 @@ reimplemented:
 | `fetch_blocks.py` | RPC → `block_db` (raw blocks, verified against the canonical hash), follows forever | monad tree |
 | `run_replay.py` | `block_db` → triedb, `--zkvm-witness <dir>` dumps a witness + post-state root per block | monad tree |
 | **`witness-tap`** | witnesses → **queue + manifest + heartbeat**, and prunes what is proved | here |
-| **`witness-profile`** | idle CPU → the block's deterministic work-unit, while the GPU proves (opt-in) | here |
+| `witness-profile` | benchmark-only: a block's deterministic work-unit (steps). **Not part of the RTP pipeline** — see below | here |
 | **`witness-follow`** | brings them up per phase, and reports where they are | here |
 | **`witness-sim`** | rehearse the whole pipeline from an existing witness corpus, no node, no GPU | here |
 | **`patch-fetch-blocks.py`** | teaches the fetcher `--head-tag latest --confirmations N` → block-by-block instead of epoch bursts | here |
@@ -28,7 +28,7 @@ chi-001 RPC ─► block_db ─► [monad replay + triedb] ─► ~/witnesses/<b
                                             ├─ manifest (timestamps)
                                             └─ heartbeat → POST /status
                                                                 ▼
-              guests/monad-zisk/fixtures/1-<block>.bin  (+ .exec-report.json from witness-profile)
+              guests/monad-zisk/fixtures/1-<block>.bin
                      = the queue cli/prove-farm drains
 ```
 
@@ -89,25 +89,40 @@ blindly; `witness-follow start` refuses to run while it exists.
 `QUEUE_MODULUS=1` by default — **every block, as it arrives**. That is what real-time proving means; the
 ÷100 sampling of an ethproofs benchmark cluster is a different, cheaper mode (`QUEUE_MODULUS=100`).
 
-The prover cannot keep up, and that is expected: ~20–70 s per proof against a 12 s slot. `cli/prove-farm
---newest-first` therefore always proves the freshest queued block and never returns for older ones, so
-the **fraction of blocks actually proved (coverage)** is a result in its own right — reported by
-[`profiling/rtp-latency.py`](../../profiling/rtp-latency.py) next to the per-block latency. A 2 s latency
-on 10 % of blocks is not real-time proving, and the report says both numbers.
+How close the prover can get is now measurable rather than guessed. Four real monad witnesses emulated to
+**182–311 Msteps**, and this repo's own 16×5090 numbers solve to `secs ≈ 3.8 + steps/28.3e6` (479 Msteps →
+20.7 s; ~14 Msteps/s at 74–105 M vs 22–24 at 410–479 M). That puts these blocks at **10–15 s**, and a p99
+witness (~13.9 MB, ~600 Msteps) at ~25 s — i.e. the prover **straddles the 12 s slot** rather than being
+hopelessly behind, as an earlier extrapolation from zisk-reth's largest block suggested.
+
+So `cli/prove-farm --newest-first` always proves the freshest queued block and never returns for older
+ones, and the **fraction actually proved (coverage)** is a result in its own right — reported by
+[`profiling/rtp-latency.py`](../../profiling/rtp-latency.py) next to the per-block latency. A 2 s latency on
+10 % of blocks is not real-time proving, and the report states both numbers. Expect the proved set to be
+non-contiguous: at the slot boundary the prover falls behind, then jumps to the newest and leaves a hole.
 
 The framed input is written straight from the dump dir (`gen-inputs --src-dir`) — no in-repo staging copy.
 At the RTP cadence, staging would double disk and I/O for nothing.
 
-## Retention: a witness exists to be proved
+## Retention: the raw witness dies at framing
 
-At one block per 12 s × ~7 MB the dump dir grows **~2 GB/h**, and the replay never cleans up. So the tap
-drops a witness once its proof is in hand — retention is driven by `cli/prove-farm.csv` (the same record
-`prove-farm`'s own `is_proven` reads), not by a blind ring, and a block is kept while it is still
+At one block per 12 s × ~7 MB the dump dir grows **~2 GB/h** and the replay never cleans up. The tap
+therefore deletes each raw witness **the moment it is framed**, because it is strictly redundant: the framed
+input is `LE64(len) + witness + pad`, so it *contains* the witness verbatim and the original is recoverable
+by dropping 8 bytes. Keeping both meant holding 14 MB per block across two directories for nothing.
+
+So the dump dir drains every cycle — watch `raw=` in the tap's log line, it should sit at **0–1**; anything
+piling up there means framing is failing or the replay is outrunning the tap. A witness younger than
+`SETTLE_SECS` (2 s) is left alone: framing a half-written one used to be recoverable from the raw copy, and
+no longer is.
+
+Everything below therefore acts on the **framed input**, driven by `cli/prove-farm.csv` (the same record
+`prove-farm`'s own `is_proven` reads) rather than by a blind ring. A block is kept while it is still
 *interesting*:
 
 | state | kept? | why |
 |---|---|---|
-| proved ok | **dropped** (raw + framed) | the proof is the artefact now |
+| proved ok | **dropped** | the proof is the artefact now |
 | proof FAILED | kept | exactly what needs re-proving or debugging |
 | never proved, < `SKIP_AFTER` behind | kept | still a candidate |
 | never proved, ≥ `SKIP_AFTER` behind | **dropped**, counted as *abandoned* | `--newest-first` will never come back for it; the abandoned count **is** the coverage gap, so it is logged |
@@ -115,62 +130,40 @@ drops a witness once its proof is in hand — retention is driven by `cli/prove-
 | witness ≥ `KEEP_BIG_MB`, or proof ≥ `KEEP_SLOW_SECS` | kept | the heavy blocks are the ones worth profiling |
 | newest `KEEP_RECENT` | always kept | nothing in flight is pulled from under a prover |
 
-`*.exec-report.json` is **never** deleted: a few hundred bytes carrying the block's deterministic
-work-unit, long after its 7 MB witness is gone.
+The `big` rule needs the witness size *after* the raw file is gone, so it falls back to the framed input's
+size minus its 8-byte prefix. Without that, an outlier would only be recognised on the cycle that framed it
+and would be dropped the moment it was proved.
 
 Each cycle logs the breakdown, e.g. `dropped=18 kept[big=1 proof-failed=1 recent=5 sample=1 slow=1
-unproved=3]` — so what the box is keeping, and why, is never a mystery.
+unproved=3] queue=12 raw=0` — so what the box is keeping, and why, is never a mystery.
 
 The tap is the **only** piece of the whole pipeline that removes files, so: it refuses to touch anything
 outside `WITNESS_DIR` or not named `<digits>.{witness,post_state_root}`, and `--dry-run` previews without
 deleting *or recording* (a recorded block is never reprocessed, so a dry run that wrote the manifest would
 silently skip the next real promotion).
 
-## Profiling for free, while the GPU proves
+## Work-units are a benchmark quantity, not an RTP one
 
-`./witness-profile` (opt-in: `PROFILE=1` for `witness-follow`) executes each queued block on this box's
-idle CPU and writes `<queue>/<chain>-<block>.exec-report.json`. Proving gives wall-clock; execution gives
-the **deterministic work-unit** (ZisK steps) — the number this repo actually compares across zkVMs, and
-one that no prove run record carries.
+`./witness-profile` executes a block on the CPU and writes `<queue>/<chain>-<block>.exec-report.json`
+carrying its **deterministic work-unit** (ZisK steps) — the number this repo compares across zkVMs.
 
-No wiring needed: that path is already what `prove_remote` copies into the run record
-([`core.sh`](../zisk-infra/scripts/core.sh) `exec_report`), and `rtp-latency.py --queue` reads it for the
-`work` column.
+It is deliberately **not** wired into `witness-follow start tip`. The real-time pipeline needs a witness,
+a proof and timestamps; it never reads a step count. Producing one live would mean a third long-running
+process, more failure surface, and 7 MB reads competing with the replay's triedb writes — for data nobody
+consumes there. Run it by hand, on a curated corpus, off the live path:
 
-It runs **nice'd** and skips itself whenever the newest queued block is more than `MAX_LAG` behind the
-chain head — profiling must never cost the pipeline a block. Doing it here rather than on the GPU box is
-deliberate: work-units are deterministic so the machine doesn't change the number, but stealing CPU on the
-prover would corrupt the very proving time we are measuring, and shipping 7 MB to the laptop defeats
-keeping witnesses on the box.
+```sh
+REPO=~/zkvm-bench ./witness-profile --once        # needs ziskemu on this box (ziskup)
+```
 
-⚠️ **Needs `ziskemu` on this box** (the ZisK toolchain, via `ziskup`). nyc-003 has only `libziskc.a` /
-`riscv2zisk` today, so the profiler exits with that message instead of silently producing nothing. The
-deep hotspot profile ([`profiling/hotspots.py`](../../profiling/README.md)) is far heavier and is not part
-of this loop — run it on the blocks retention deliberately kept (`big`, `slow`, `proof-failed`), which are
-exactly the interesting ones.
+The one place emulation legitimately belongs in a live run is inside the **mock** prover
+(`cli/prove-farm --mock-exec-fallback`): it needs a duration, deriving it from steps is the only defensible
+model, and the emulation happens exactly where a real prover would be working — inside the fiction, with
+its cost deducted from the simulated sleep. On a real cluster it disappears. There is always headroom for
+that deduction: the emulator runs ~150 Msteps/s against a modelled prover at ~28 Msteps/s.
 
-## The manifest — what latency is computed from
-
-`witness-manifest.csv`, one row per block. Every stamp except `t_block` is **this box's clock**, on
-purpose: pipeline latency must be measured on one clock, never mixed with the laptop's.
-
-| column | meaning |
-|---|---|
-| `t_block` | the block header's own timestamp (chain time) — cadence blocks only, 1 RPC call each |
-| `t_avail` | mtime of the `block_db` file — when the fetcher had the block locally |
-| `t_witness` | mtime of the witness — when the replay finished executing the block |
-| `t_queued` | when the framed input reached the prover queue |
-| `bytes`, `post_state_root`, `promoted` | witness size, the expected root (verification anchor), queued or ring-only |
-
-Proving and submission stamps deliberately live elsewhere (`report.json` from `cli/prove-farm`,
-`submissions.jsonl` from `cli/ethproofs-mock`); joining the three is the latency report's job. Reported
-as **two separate numbers, never one**: *pipeline latency* (`t_witness` → submitted) and the *finality
-delay* (`t_block` → `t_witness`), which is an artefact of following `finalized` and vanishes on `latest`.
-
-The tap also heartbeats `POST /status` to the mock with the **real** chain head (`eth_blockNumber`, i.e.
-`latest`) — not the finalized tag it follows — so the dashboard's lag shows the finality delay instead of
-hiding it. Point it at the mock with `ETHPROOFS_URL=` (through a reverse SSH tunnel if the mock runs on
-your laptop: `ssh -R 8547:localhost:8547 nyc-003`).
+Anything the mock leaves behind is a side effect, not a pipeline output. `rtp-latency.py --queue` will
+happily read those reports for its `work` column if they exist, and leave it blank if they don't.
 
 ## Known gaps
 

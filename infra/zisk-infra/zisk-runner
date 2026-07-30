@@ -11,6 +11,10 @@
 #   zisk-runner --elf E --input I --hints H --mode prove-compressed --output O [--public-values PV] [--report R] [--skip-verify]
 #   zisk-runner --mode verify --proof O                   [--report R]
 #
+# ZISK_MOCK_SECS (+ ZISK_MOCK_JITTER, ZISK_MOCK_DIST=uniform|normal): turn the prove modes into a MOCK
+# prover — sleep, emit a MOCK-PROOF-magic fake, skip cargo-zisk entirely. Lets a free machine stand in for
+# the cluster so the real transport path is exercised; no GPU, no toolchain required.
+#
 # Modes:
 #   execute           emulate (ziskemu -m) -> step count (≈ SP1 cycles) + public values
 #   prove-compressed  default recursive STARK proof (≈ SP1 prove-compressed)   [DEFAULT]
@@ -73,6 +77,17 @@ ensure_parent() { local d; d="$(dirname "$1")"; [[ -n "$d" ]] && mkdir -p "$d"; 
 jnum() { [[ -n "$1" ]] && printf '%s' "$1" || printf 'null'; }
 jbool() { [[ "$1" == 1 ]] && printf 'true' || printf 'false'; }
 
+# parse_steps <emulator-log> — the step count, ANCHORED on `steps=<n>` (what `ziskemu -m` prints) before
+# falling back to the loose "first number on a line mentioning step". The loose form alone would happily
+# return a timestamp or a version number if the output ever gains a prefix, and a wrong step count does not
+# fail loudly — it silently mis-scales the mock prover's model and every duration derived from it.
+parse_steps() {
+  local n
+  n="$(grep -oE 'steps?[=: ]+[0-9][0-9,]*' "$1" 2>/dev/null | grep -oE '[0-9][0-9,]*' | head -n1 | tr -d ',')"
+  [[ -n "$n" ]] || n="$(grep -iE 'steps?' "$1" 2>/dev/null | grep -oE '[0-9][0-9,]*' | head -n1 | tr -d ',')"
+  printf '%s' "$n"
+}
+
 write_report() { # $1 = json body
   [[ -z "$REPORT" ]] && return 0
   ensure_parent "$REPORT"
@@ -102,7 +117,7 @@ case "$MODE" in
     [[ "$rc" == 0 ]] || { echo "ERROR: ziskemu exited $rc" >&2; rm -f "$emu_log"; exit "$rc"; }
     # Best-effort: pull the step count out of the emulator metrics. ZisK calls
     # cycles "steps". Match the first integer on a line mentioning "steps".
-    steps="$(grep -iE 'steps?' "$emu_log" | grep -oE '[0-9][0-9,]*' | head -n1 | tr -d ',')"
+    steps="$(parse_steps "$emu_log")"
     pv_bytes=""; [[ -n "$PV" && -f "$PV" ]] && pv_bytes="$(wc -c < "$PV" | tr -d ' ')"
     rm -f "$emu_log"
     echo "Steps         : ${steps:-<unparsed>}"
@@ -170,6 +185,99 @@ JSON
     fi
     # shellcheck disable=SC2206
     [[ -n "$extra" ]] && set -- "$@" $extra
+
+    # MOCK PROVER: emit a fake proof after standing in for the proving time, instead of proving. This exists
+    # so the pipeline can be rehearsed against a REAL remote — every transfer, the workspace, the run-record
+    # fetch — with the prover as the only fiction, exactly where the real one would be. No GPU needed, and no
+    # ZisK toolchain unless you ask for the step-based model.
+    #   * the proof bytes start with MOCK-PROOF, so cli/verify-proof and cli/ethproofs-mock both refuse it
+    #   * public values, when the emulation runs, are the guest's REAL ones — the proof is fake, they are not
+    # Triggered on a NON-ZERO value, not merely a set one: the driver passes these unconditionally, so
+    # testing -n would make `--mock --remote` with no timing flags emulate for a model of zero.
+    _nz() { [[ -n "${1:-}" ]] && awk -v v="$1" 'BEGIN{exit !(v + 0 != 0)}'; }
+    if _nz "${ZISK_MOCK_SECS:-}" || _nz "${ZISK_MOCK_PER_MSTEP:-}"; then
+      # The witness is HERE — it was just uploaded — and so is the emulator. So the mock prover measures
+      # the work itself: emulate the block, read its step count, and derive how long the real prover would
+      # have taken. Nothing about the duration is decided elsewhere; the driver only passes the model.
+      #   ZISK_MOCK_SECS       fixed overhead (s)
+      #   ZISK_MOCK_PER_MSTEP  seconds per million steps — set it and the emulation runs
+      #   ZISK_MOCK_SPEED      divides the work term only (a faster/slower cluster)
+      #   ZISK_MOCK_JITTER / ZISK_MOCK_DIST   noise: ± bound (uniform) or std dev (normal)
+      mock_steps=""; mock_emul=0
+      if _nz "${ZISK_MOCK_PER_MSTEP:-}"; then
+        if command -v "$ZISK_EMU_BIN" >/dev/null 2>&1; then
+          echo "Cmd      : [MOCK PROVER] emulating to measure the work ($ZISK_EMU_BIN)"
+          emu_log="$(mktemp -t zisk-mock-emu)"
+          te0="$(now)"
+          # Same invocation as --mode execute: -m for the metrics, -o for the real public values.
+          if [[ -n "$PV" ]]; then ensure_parent "$PV"; fi
+          # shellcheck disable=SC2086
+          "$ZISK_EMU_BIN" -e "$ELF" -i "$INPUT" -m ${PV:+-o "$PV"} $ZISK_EMU_EXTRA_FLAGS >"$emu_log" 2>&1
+          emu_rc=$?
+          mock_emul="$(elapsed "$te0" "$(now)")"
+          mock_steps="$(parse_steps "$emu_log")"
+          if [[ "$emu_rc" != 0 || -z "$mock_steps" ]]; then
+            # Do NOT swallow this: without a step count the model silently collapses to the fixed term, so
+            # the duration would be wrong and the evidence gone. Keep the log and show why.
+            echo "WARN: emulation ${emu_rc:+exited $emu_rc }${mock_steps:+}${mock_steps:-produced no step count}" \
+                 "— the model falls back to the fixed term alone. Emulator output kept at $emu_log:" >&2
+            tail -5 "$emu_log" >&2
+          else
+            rm -f "$emu_log"
+          fi
+          echo "Steps    : ${mock_steps:-<unparsed>}  (measured in ${mock_emul}s)"
+        else
+          echo "WARN: $ZISK_EMU_BIN not found — cannot measure steps, falling back to the fixed term" >&2
+        fi
+      fi
+      # secs = overhead + per_mstep × Msteps / speed  ± noise
+      mock_dt="$(awk -v b="${ZISK_MOCK_SECS:-0}" -v p="${ZISK_MOCK_PER_MSTEP:-0}" -v s="${mock_steps:-0}" \
+                     -v sp="${ZISK_MOCK_SPEED:-1}" -v j="${ZISK_MOCK_JITTER:-0}" \
+                     -v d="${ZISK_MOCK_DIST:-uniform}" -v seed="$RANDOM$$" 'BEGIN{
+        srand(seed); if (sp <= 0) sp = 1
+        v = b + (p > 0 && s > 0 ? p * (s / 1000000) / sp : 0)
+        if (j > 0) { if (d == "normal") { u1 = rand(); if (u1 < 1e-12) u1 = 1e-12
+                       v += j * sqrt(-2 * log(u1)) * cos(6.283185307179586 * rand()) }
+                     else v += (rand() * 2 - 1) * j }
+        if (v < 0.1) v = 0.1; printf "%.2f", v }')"
+      # The emulation was real time spent standing in for proving, so it is DEDUCTED: the mock's total
+      # occupancy equals the modelled proving time. If it overran the model, say so — silence there would
+      # make every latency number downstream optimistic by an unknown amount.
+      mock_nap="$(awk -v t="$mock_dt" -v e="$mock_emul" 'BEGIN{ d = t - e; if (d < 0) d = 0; printf "%.2f", d }')"
+      if awk -v e="$mock_emul" -v t="$mock_dt" 'BEGIN{exit !(e > t)}'; then
+        echo "WARN: OVERSHOT — emulation took ${mock_emul}s but the model says ${mock_dt}s; this box emulates" \
+             "slower than the modelled prover. Raise ZISK_MOCK_PER_MSTEP or drop it." >&2
+      fi
+      echo "Cmd      : [MOCK PROVER] model=${mock_dt}s − emulation=${mock_emul}s → sleep ${mock_nap}s — no proving"
+      ensure_parent "$OUTPUT"
+      sleep "$mock_nap"
+      { printf 'MOCK-PROOF/mock-remote NOT-A-REAL-PROOF elf=%s input=%s ' \
+          "$(basename "$ELF")" "$(basename "$INPUT")"
+        head -c 400 /dev/urandom; } > "$OUTPUT"
+      proof_bytes="$(wc -c < "$OUTPUT" | tr -d ' ')"
+      pv_bytes=""; [[ -n "$PV" && -f "$PV" ]] && pv_bytes="$(wc -c < "$PV" | tr -d ' ')"
+      echo "Proof saved   : $OUTPUT ($proof_bytes bytes) — FAKE"
+      # `steps` in the report is the real, deterministic work-unit the emulation measured — so
+      # cli/ethproofs-submit fills proving_cycles and rtp-latency fills its work column with no extra hop.
+      write_report "$(cat <<JSON
+{
+  "mode": "mock",
+  "zkvm": "ZisK",
+  "steps": $(jnum "$mock_steps"),
+  "prove_secs": $mock_dt,
+  "mock_speed": ${ZISK_MOCK_SPEED:-1},
+  "emulate_secs": $(jnum "$mock_emul"),
+  "verify_secs": null,
+  "total_secs": $mock_dt,
+  "proof_bytes": $proof_bytes,
+  "public_values_bytes": $(jnum "$pv_bytes"),
+  "verified": null,
+  "backend": "mock-remote"
+}
+JSON
+)"
+      exit 0
+    fi
 
     echo "Cmd      : $*"
     t0="$(now)"

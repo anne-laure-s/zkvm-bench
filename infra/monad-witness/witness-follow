@@ -7,8 +7,13 @@
 #   fetch     fetch_blocks.py   raw blocks from an RPC -> block_db          (follows the chain, forever)
 #   replay    run_replay.py     block_db -> triedb, dumping zkVM witnesses  (follows block_db, forever)
 #   tap       ./witness-tap     witnesses -> queue + manifest + heartbeat, and PRUNES what is done
-#   profile   ./witness-profile idle CPU -> the block's deterministic work-unit, while the GPU proves
-#             (opt-in with PROFILE=1; needs ziskemu on this box)
+#
+# ./witness-profile is deliberately NOT one of them. A work-unit (steps) is a BENCHMARK quantity, not an
+# RTP one: the real-time pipeline never needs it, and producing it live would add a third process, more
+# failure surface and disk I/O on the producer's path for data nobody reads there. Run it by hand on a
+# curated corpus instead. The one place emulation legitimately belongs in a live run is inside the MOCK
+# prover (cli/prove-farm --mock-exec-fallback), where it stands in for proving and its cost is deducted
+# from the simulated sleep — i.e. inside the fiction, not in the producer.
 #
 # Two phases, because they have opposite needs:
 #
@@ -57,9 +62,6 @@ replay_cmd() {  # $1 = catchup|tip
 --block-db $BLOCK_DB --db $DB --rpc $RPC --logs-dir ./logs --status-file status.json \
 --nthreads $NTHREADS $extra 2>&1 | tee -a ~/replay-$1.log"
 }
-profile_cmd() {
-  echo "cd $HERE && REPO=$REPO GUEST=${GUEST:-monad-zisk} RPC=$RPC ./witness-profile 2>&1 | tee -a ~/witness-profile.log"
-}
 tap_cmd() {
   echo "cd $HERE && WITNESS_DIR=$WITNESS_DIR REPO=$REPO BLOCK_DB=$BLOCK_DB RPC=$RPC \
 ${ETHPROOFS_URL:+ETHPROOFS_URL=$ETHPROOFS_URL }${CLUSTER:+CLUSTER=$CLUSTER }\
@@ -67,14 +69,7 @@ ${QUEUE_MODULUS:+QUEUE_MODULUS=$QUEUE_MODULUS }${KEEP_RECENT:+KEEP_RECENT=$KEEP_
 ./witness-tap 2>&1 | tee -a ~/witness-tap.log"
 }
 
-# PROFILE=1 adds the opt-in profiler (idle CPU -> work-units); it needs ziskemu on this box.
-phase_sessions() {
-  if [ "$1" = tip ]; then
-    printf 'fetch replay-tip tap%s\n' "$([ "${PROFILE:-0}" = 1 ] && echo ' profile')"
-  else
-    echo "fetch replay-catchup"
-  fi
-}
+phase_sessions() { [ "$1" = tip ] && echo "fetch replay-tip tap" || echo "fetch replay-catchup"; }
 
 cmd_plan() {
   local phase="${1:-catchup}"
@@ -89,9 +84,6 @@ cmd_plan() {
     echo "$(tap_cmd | sed 's/\.\/witness-tap/.\/witness-tap --once --dry-run/')"
     echo
     echo "tmux new-session -d -s tap \"$(tap_cmd)\""
-    echo
-    echo "# optional (PROFILE=1): execute each block on the idle CPU for its deterministic work-unit"
-    echo "tmux new-session -d -s profile \"$(profile_cmd)\""
   fi
 }
 
@@ -109,7 +101,6 @@ fix the cause, then rm it. Never clear it blindly."
       fetch)        tmux new-session -d -s "$s" "$(fetch_cmd)" ;;
       replay-*)     tmux new-session -d -s "$s" "$(replay_cmd "$phase")" ;;
       tap)          tmux new-session -d -s "$s" "$(tap_cmd)" ;;
-      profile)      tmux new-session -d -s "$s" "$(profile_cmd)" ;;
     esac
     echo "· started $s"
   done
@@ -143,8 +134,8 @@ cmd_status() {
   fi
   echo "== witnesses =="
   echo "  dump : $(ls "$WITNESS_DIR" 2>/dev/null | grep -c '\.witness$') file(s), $(du -sh "$WITNESS_DIR" 2>/dev/null | cut -f1)"
-  echo "  queue: $(ls "$REPO/guests/monad-zisk/fixtures" 2>/dev/null | grep -c '\.bin$') input(s), \
-$(ls "$REPO/guests/monad-zisk/fixtures" 2>/dev/null | grep -c '\.exec-report\.json$') profiled"
+  # Strict tag form: the queue also holds <tag>.pv.bin public values, which are not queue entries.
+  echo "  queue: $(ls "$REPO/guests/monad-zisk/fixtures" 2>/dev/null | grep -cE '^[0-9]+-[0-9]+\.bin$') input(s)"
   # Guard the file test: a redirection from a missing file prints its own error before any 2>/dev/null
   # inside the substitution can catch it — noisy on every status call before the tap has ever run.
   local M="${MANIFEST:-$HOME/witness-manifest.csv}"

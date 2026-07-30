@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# archive-logs — keep every log the RTP pipeline produces, without keeping 14 000 files a day.
+#
+# The producer writes two shapes of log, and they need opposite treatments:
+#
+#   MANY SMALL FILES, one per block — `~/monad/logs/monad_<b>_<b>.log` (with --min-follow-batch 1 the
+#     replay restarts monad per block, so each block gets its own file, startup banner included) and
+#     `prove-farm-logs/{prove,submit}-<guest>-<block>.log`. At ~300 blocks/h that is ~14 000 files a day
+#     for ~30 MB. The cost is INODES, not bytes: directory listings slow down, `ls -t` crawls.
+#     -> rolled up into ONE archive per run. These files are near-identical to each other (the same monad
+#        banner over and over), so a single compressed stream shares its dictionary across all of them and
+#        squashes far better than compressing each on its own.
+#
+#   FEW APPEND-ONLY FILES — ~/fetch.log, ~/replay-*.log, ~/witness-tap.log, ~/prove-mock.log. One file
+#     each, so no inode problem, but they grow forever (~2-3 MB/day combined).
+#     -> rotated: COPIED then truncated in place, never moved. A move would leave the running process
+#        writing into an unlinked file, and the log would silently vanish.
+#
+# What it never touches: `~/witness-manifest.csv`, `prove-farm.csv`, the run records under
+# `infra/*/results/`, and `~/monad/logs/ALERT`. That is the DATA (and, for ALERT, a failure marker) — it is
+# compact, it is what the latency report reads, and it is not log noise.
+#
+# Safety: a source file is deleted only after the archive has been written AND listed back with the
+# expected number of entries. Files younger than --min-age minutes are left alone, so nothing still being
+# written is ever swept up. --dry-run prints everything and changes nothing.
+#
+#   ./archive-logs [--dry-run] [--min-age 60] [--out ~/log-archive]
+#
+# Config (env): MONAD_DIR REPO OUT MIN_AGE
+# Daily from cron, e.g.:  17 4 * * *  $HOME/zkvm-bench/infra/monad-witness/archive-logs >> $HOME/archive-logs.log 2>&1
+#
+# Targets the Linux box: it uses GNU `find -printf` and `xargs -a`. Not portable to macOS as written.
+set -uo pipefail
+
+MONAD_DIR="${MONAD_DIR:-$HOME/monad}"
+REPO="${REPO:-$HOME/zkvm-bench}"
+OUT="${OUT:-$HOME/log-archive}"
+MIN_AGE="${MIN_AGE:-60}"          # minutes; never archive anything younger
+DRY=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run)  DRY=1; shift ;;
+    --min-age)  MIN_AGE="${2:?--min-age <minutes>}"; shift 2 ;;
+    --out)      OUT="${2:?--out <dir>}"; shift 2 ;;
+    -h|--help)  sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
+    *)          echo "archive-logs: unknown argument '$1' (see --help)" >&2; exit 2 ;;
+  esac
+done
+
+log(){ printf '%s archive-logs: %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+# Prefer zstd (better and faster at these sizes), fall back to gzip. Both are handled by the repo's own
+# cluster/fetch-runs.sh, so the choice is already familiar.
+if command -v zstd >/dev/null 2>&1; then
+  COMP="zstd -12 -q"; DECOMP="zstd -dc"; EXT="tar.zst"
+else
+  COMP="gzip -9"; DECOMP="gzip -dc"; EXT="tar.gz"
+fi
+
+STAMP="$(date +%F-%H%M)"
+mkdir -p "$OUT" || { echo "archive-logs: cannot create $OUT" >&2; exit 1; }
+
+human(){ awk -v b="${1:-0}" 'BEGIN{ u="B"; s=b
+  if (s>=1073741824){s/=1073741824;u="G"} else if (s>=1048576){s/=1048576;u="M"} else if (s>=1024){s/=1024;u="K"}
+  printf (u=="B" ? "%d%s" : "%.1f%s"), s, u }'; }
+
+# rollup <label> <dir> <find-name-pattern> — collapse many small logs into one archive, then delete the
+# originals, but only once the archive lists back intact.
+rollup(){
+  local label="$1" dir="$2" pat="$3" list n raw arch listed
+  [ -d "$dir" ] || { log "skip $label: no $dir"; return 0; }
+  list="$(mktemp)"; trap 'rm -f "$list"' RETURN
+  find "$dir" -maxdepth 1 -type f -name "$pat" -mmin "+$MIN_AGE" -print > "$list" 2>/dev/null
+  n=$(wc -l < "$list" | tr -d ' ')
+  [ "$n" -gt 0 ] || { log "skip $label: nothing older than ${MIN_AGE}min"; return 0; }
+  # Sizes come straight from find (GNU -printf). Do NOT loop a `stat` per file: awk keeps one command pipe
+  # per distinct command string and never closes them, so at thousands of files it runs out of descriptors —
+  # precisely the regime this script exists for.
+  raw=$(find "$dir" -maxdepth 1 -type f -name "$pat" -mmin "+$MIN_AGE" -printf '%s\n' 2>/dev/null \
+        | awk '{t+=$1} END{print t+0}')
+  arch="$OUT/$label-$STAMP.$EXT"
+
+  if [ "$DRY" = 1 ]; then
+    log "[dry-run] $label: would archive $n file(s) ($(human "$raw")) from $dir -> $arch, then delete them"
+    return 0
+  fi
+
+  # tar reads the file list from stdin; -C keeps the archive paths relative to the log dir.
+  if ! tar -C "$dir" -cf - -T <(sed "s|^$dir/||" "$list") 2>/dev/null | $COMP > "$arch"; then
+    log "ERROR $label: archiving failed, sources left untouched ($arch removed)"
+    rm -f "$arch"; return 1
+  fi
+  # Integrity gate before any deletion: the archive must list back exactly what went in.
+  listed=$($DECOMP < "$arch" | tar -tf - 2>/dev/null | grep -c . || true)
+  if [ "$listed" != "$n" ]; then
+    log "ERROR $label: archive lists $listed entries, expected $n — sources left untouched ($arch kept for inspection)"
+    return 1
+  fi
+  xargs -r -a "$list" rm -f
+  log "$label: $n file(s) $(human "$raw") -> $(basename "$arch") $(human "$(wc -c < "$arch" | tr -d ' ')")"
+}
+
+# rotate <file> — copy then TRUNCATE IN PLACE, so the writing process keeps its file descriptor valid.
+rotate(){
+  local f="$1" base dst raw
+  [ -s "$f" ] || return 0
+  base="$(basename "$f" .log)"; dst="$OUT/$base-$STAMP.log"
+  raw=$(wc -c < "$f" | tr -d ' ')
+  if [ "$DRY" = 1 ]; then
+    log "[dry-run] rotate $f ($(human "$raw")) -> $dst.${EXT#tar.}, then truncate in place"
+    return 0
+  fi
+  cp "$f" "$dst" || { log "ERROR: cannot copy $f — left as is"; return 1; }
+  : > "$f" || log "WARN: copied $f but could not truncate it (still growing)"
+  $COMP < "$dst" > "$dst.${EXT#tar.}" && rm -f "$dst"
+  log "rotated $(basename "$f") $(human "$raw") -> $(basename "$dst").${EXT#tar.}"
+}
+
+log "out=$OUT min-age=${MIN_AGE}min compressor=${COMP%% *}$([ "$DRY" = 1 ] && echo ' [DRY-RUN]')"
+
+# Many-small-files: the per-block logs. ALERT is deliberately excluded by the name patterns.
+rollup monad "$MONAD_DIR/logs"       'monad_*.log'
+rollup prove "$REPO/prove-farm-logs" '*.log'
+
+# Append-only: one file per long-running component.
+for f in "$HOME/fetch.log" "$HOME/replay-tip.log" "$HOME/replay-catchup.log" \
+         "$HOME/witness-tap.log" "$HOME/prove-mock.log" "$HOME/witness-profile.log"; do
+  rotate "$f"
+done
+
+log "archive dir now $(human "$( (du -sk "$OUT" 2>/dev/null || echo 0) | awk '{print $1*1024}')") in $(ls -1 "$OUT" 2>/dev/null | wc -l | tr -d ' ') file(s)"

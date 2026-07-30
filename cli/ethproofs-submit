@@ -20,6 +20,7 @@ ZisK api.rs send, so swapping to the real ethproofs.org is config-only:
   proof.bin (bytes) -> proof (base64)          |  --block / report.block  -> block_number
   report.prove_secs x 1000 -> proving_time(ms) |  --cluster               -> cluster_id
   report.vkey_hash -> verifier_id              |  report.cycles OR .steps -> proving_cycles
+                                              |    (else the run's exec-report.json — same number)
       (BOTH SP1 cycles and ZisK steps go in `proving_cycles` — there is NO `proving_steps` in the API)
 EXTRA fields (mock leaderboard only; NOT sent by the real clients — dropped by --minimal):
   --vm / report.zkvm -> vm  ·  --guest / report.guest -> guest  ·  --public-inputs / <run>/*.pv.bin
@@ -31,13 +32,42 @@ MOCK_MAGIC = b"MOCK-PROOF"   # prove-farm --mock writes proof bytes starting wit
 
 
 def pv_digest(run_dir):
-    """A short, stable digest of the committed public values (the proof's public inputs/outputs) — from
-    the run record's *.pv.bin. Identifies non-block proofs (e.g. fibonacci) and pins what was proven."""
-    for p in sorted(glob.glob(os.path.join(run_dir, "*.pv.bin"))):
+    """A short, stable digest of the committed public values (the proof's public inputs/outputs).
+    Identifies non-block proofs (e.g. fibonacci) and pins what was proven.
+
+    Order matters and is explicit rather than glob-alphabetical: the PROVER's own public values (*.pv.bin)
+    win, and `expected_pv.bin` — what a local emulation of the guest committed — is only a fallback, used
+    when there is no prover output (a mock run). Sending the emulated digest while a real one exists would
+    quietly attribute the guest's claim to the proof."""
+    for p in sorted(glob.glob(os.path.join(run_dir, "*.pv.bin"))) + [
+            os.path.join(run_dir, "expected_pv.bin")]:
+        if not os.path.isfile(p):
+            continue
         try:
             return "sha256:" + hashlib.sha256(open(p, "rb").read()).hexdigest()[:16]
         except OSError:
             pass
+    return None
+
+
+def exec_work(run_dir):
+    """The work-unit from the run record's bundled exec-report.json, if any.
+
+    Legitimate as a fallback for `proving_cycles`: a ZisK step count (like an SP1 cycle count) is the
+    DETERMINISTIC trace length for a given ELF + input — the same number whichever machine measured it, so
+    an emulator's count is the prover's count. It is only a fallback because a prover that reports its own
+    work-unit should be believed first. Costs one small file read, once per submission, after proving."""
+    p = os.path.join(run_dir, "exec-report.json")
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    for k in ("steps", "cycles"):
+        if d.get(k) is not None:
+            return d[k]
     return None
 
 
@@ -155,7 +185,11 @@ def main():
 
     # work-unit → ALWAYS `proving_cycles`, matching BOTH real clients: RSP cycles and ZisK *steps* both go
     # in that field (there is no `proving_steps` in the ethproofs API). Explicit override wins, else report.
-    work = next((v for v in (args.steps, args.cycles, rep.get("steps"), rep.get("cycles")) if v is not None), None)
+    # explicit override > the prove report's own field > the bundled exec-report (deterministic, see above).
+    # Without the last one every ZisK submission goes out with an empty work-unit: zisk-runner's PROVE report
+    # carries prove_secs/proof_bytes/backend but never the step count.
+    work = next((v for v in (args.steps, args.cycles, rep.get("steps"), rep.get("cycles"),
+                             exec_work(args.run_dir)) if v is not None), None)
     proved = {"block_number": block, "cluster_id": cluster, "proof": proof_b64, **ident}
     if work is not None:
         proved["proving_cycles"] = work

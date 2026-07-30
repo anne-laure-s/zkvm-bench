@@ -16,6 +16,8 @@
 #   ./witness-profile [--once] [--dry-run]
 #
 # Config (env): REPO=~/zkvm-bench  GUEST=monad-zisk  CHAIN_ID=1  INTERVAL=20  NICE=15
+#               SRC=<dir of <chain>-<block>.bin>   default guests/<guest>/inputs (the CURATED set, where
+#                    exec-reports belong) — not the live prover queue
 #               MAX_LAG=3        skip while (tip - newest queued) exceeds this — catch up first
 #               MAX_SECS=120     give up on one block after this long (a stuck emulator is not worth it)
 #               NEWEST_FIRST=1   profile the freshest block first, like the prover
@@ -33,7 +35,14 @@ MAX_LAG="${MAX_LAG:-3}"
 MAX_SECS="${MAX_SECS:-120}"
 NEWEST_FIRST="${NEWEST_FIRST:-1}"
 RPC="${RPC:-http://chi-001.devcore4.com:8545}"
-QUEUE="$REPO/guests/$GUEST/fixtures"
+# Idle I/O class (Linux only) — the replay's disk writes must always win over profiling reads.
+IONICE=""; command -v ionice >/dev/null 2>&1 && IONICE="ionice -c3"
+# Curated set by default, NOT the live queue: fixtures/ holds witnesses (pre-mined or framed for the
+# prover) and derived artefacts have no business there. inputs/ is where an exec-report belongs — that is
+# already the convention (`guests/*/inputs/*.exec-report.json` is git-ignored as such). Point SRC at the
+# queue only for a one-off, knowing you will leave reports beside its entries.
+SRC="${SRC:-$REPO/guests/$GUEST/inputs}"
+QUEUE="$SRC"
 ELF="$REPO/guests/$GUEST/$GUEST.elf"
 RUN="$REPO/infra/zisk-infra/run"
 
@@ -47,7 +56,7 @@ esac; done
 log(){ printf '%s witness-profile: %s\n' "$(date +%H:%M:%S)" "$1"; }
 die(){ log "$1" >&2; exit 1; }
 
-[ -d "$QUEUE" ] || die "no queue at $QUEUE (is the tap running? is REPO=$REPO right?)"
+[ -d "$QUEUE" ] || die "no inputs dir at $QUEUE (curate a working set there, or set SRC=<dir>)"
 [ -f "$ELF" ]   || die "no ELF at $ELF"
 [ -x "$RUN" ]   || die "no dispatcher at $RUN"
 command -v ziskemu >/dev/null 2>&1 || [ -x "$HOME/.zisk/bin/ziskemu" ] \
@@ -79,9 +88,10 @@ profile_one(){  # $1 = block
   [ -f "$in" ] || { log "skip $b (input gone — the tap dropped it)"; return 0; }
   if [ "$DRY" = 1 ]; then log "[dry-run] would execute block $b -> $(basename "$rep")"; return 0; fi
   t0=$SECONDS
-  # execute_local writes <input>.exec-report.json next to the input; nice'd so the replay always wins the
-  # CPU, and time-boxed so one pathological block can't stall the loop.
-  if ! nice -n "$NICE" "$RUN" execute ELF="$ELF" INPUT="$in" >"$QUEUE/$CHAIN_ID-$b.exec.log" 2>&1; then
+  # execute_local writes <input>.exec-report.json next to the input. nice'd so the replay always wins the
+  # CPU — and ionice'd into the idle class where available, because reading a 7 MB witness competes with the
+  # replay's triedb writes, and CPU priority alone does nothing for that.
+  if ! $IONICE nice -n "$NICE" "$RUN" execute ELF="$ELF" INPUT="$in" >"$QUEUE/$CHAIN_ID-$b.exec.log" 2>&1; then
     log "execute FAILED for $b (see $CHAIN_ID-$b.exec.log)"
     return 1
   fi
