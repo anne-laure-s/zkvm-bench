@@ -20,7 +20,8 @@ identify WHAT was proven and show on the leaderboard:
   POST /proofs/queued   {block_number, cluster_id, [vm, guest]}
   POST /proofs/proving  {block_number, cluster_id, [vm, guest]}
   POST /proofs/proved   {proof (base64), block_number, proving_cycles|proving_steps, proving_time (ms),
-                         verifier_id, cluster_id, [vm, guest, public_inputs]}  -> verified, returns {proof_id, verified}
+                         verifier_id, cluster_id, [vm, guest, public_inputs, t_block, e2e_secs]}
+                         -> verified, returns {proof_id, verified}
   GET  /                 leaderboard (HTML: pipeline banner + cluster·vm·guest·block·verified)
   GET  /proofs           JSON records   ·   GET /status   JSON pipeline state
 
@@ -110,6 +111,9 @@ class Store:
             # work-unit is cycles (SP1/OpenVM) or steps (ZisK) — record whichever is present
             "proving_cycles": body.get("proving_cycles", body.get("proving_steps")),
             "proving_time_ms": body.get("proving_time"),
+            # chain time of the block, and chain-time -> our ack: the whole pipeline, node to ethproofs
+            "t_block": body.get("t_block"),
+            "e2e_secs": body.get("e2e_secs"),
             "verifier_id": body.get("verifier_id"),
             "proof_bytes": proof_bytes,
             # server-side verdict (the SERVER verifies — see mock_verify). None until /proved.
@@ -204,6 +208,22 @@ class Store:
             }
             lv = entry["lag_blocks"]["verified"]
             entry["lag_secs_est"] = lv * 12 if isinstance(lv, int) else None
+            # Coverage over the span actually attempted: proofs submitted vs blocks between the first and the
+            # last. With a prover slower than the chain most blocks are skipped by design, and that ratio is
+            # the honest RTP result — not something to leave implicit in the gaps.
+            # Only blocks that reached `proved` count as covered: one stuck at queued/proving is exactly the
+            # kind of thing this figure must not flatter.
+            blocks = sorted(b for (c, b), r in self.state.items()
+                            if b is not None and r.get("event") == "proved"
+                            and (cluster is None or str(c) == str(cluster)))
+            if len(blocks) >= 2:
+                entry.update(cov_proved=len(blocks), cov_span=blocks[-1] - blocks[0] + 1,
+                             cov_from=blocks[0], cov_to=blocks[-1])
+            e2es = sorted(r["e2e_secs"] for r in self.state.values()
+                          if r.get("e2e_secs") is not None
+                          and (cluster is None or str(r.get("cluster_id")) == str(cluster)))
+            if e2es:
+                entry.update(e2e_median=e2es[len(e2es) // 2], e2e_min=e2es[0], e2e_max=e2es[-1])
             out.append(entry)
         return out
 
@@ -353,6 +373,14 @@ class Handler(BaseHTTPRequestHandler):
                 line += f" · queue <b>{p['queue_files']}</b> file(s)"
             if p.get("lag_secs_est") is not None:
                 line += f" · <span class=s>≈{p['lag_secs_est']}s behind (12s/slot est.)</span>"
+            # Coverage, spelled out. The table only lists blocks that were submitted, so the ones the prover
+            # skipped are invisible gaps in the numbering — this turns them into a figure.
+            if p.get("cov_span"):
+                line += (f"<br>coverage <b>{p['cov_proved']}/{p['cov_span']}</b> blocks"
+                         f" ({100.0 * p['cov_proved'] / p['cov_span']:.0f}%) over {p['cov_from']}..{p['cov_to']}")
+                if p.get("e2e_median") is not None:
+                    line += (f" · end-to-end median <b>{p['e2e_median']:.1f}s</b>"
+                             f" (min {p['e2e_min']:.1f} / max {p['e2e_max']:.1f})")
             if not p.get("heartbeat_ts"):
                 line += ("<br><span class=w>no producer heartbeat — POST /status {chain_tip,…} to show "
                          "the chain tip and the real lag</span>")
@@ -372,6 +400,7 @@ class Handler(BaseHTTPRequestHandler):
                       key=lambda r: (r.get("cluster_id") or 0, str(r.get("vm") or ""),
                                      str(r.get("guest") or ""), r.get("block_number") or 0), reverse=True)
         def td(v): return "" if v is None else v
+        def secs(ms): return "" if ms is None else f"{ms / 1000:.1f}"
         body = ["<!doctype html><meta charset=utf-8><title>ethproofs-mock</title>",
                 "<style>body{font:14px system-ui;margin:2rem}h1{font-size:1.2rem}"
                 "table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 8px;text-align:right}"
@@ -383,7 +412,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._banner()]
         body += [
                 "<table><tr><th>cluster</th><th class=l>vm</th><th class=l>guest</th><th>mock</th><th>block</th><th class=l>state</th>"
-                "<th>work-unit</th><th>prove (ms)</th><th>proof (B)</th><th>verified</th>"
+                "<th>work-unit</th><th>prove (s)</th><th>e2e (s)</th><th>proof (B)</th><th>verified</th>"
                 "<th class=l>verifier_id</th><th class=l>updated</th></tr>"]
         for r in rows:
             ev = r.get("event", "")
@@ -399,7 +428,9 @@ class Handler(BaseHTTPRequestHandler):
                         f"<td class=l>{td(r.get('guest'))}</td>"
                         f"<td class='r'>{'⚠️MOCK' if r.get('mock') else ''}</td><td>{blk}</td>"
                         f"<td class='l {cls}'>{ev}</td><td>{td(r.get('proving_cycles'))}</td>"
-                        f"<td>{td(r.get('proving_time_ms'))}</td><td>{td(r.get('proof_bytes'))}</td>"
+                        # ms is the API's unit; seconds is what a human compares to a 12 s slot.
+                        f"<td>{secs(r.get('proving_time_ms'))}</td><td>{td(r.get('e2e_secs'))}</td>"
+                        f"<td>{td(r.get('proof_bytes'))}</td>"
                         f"<td class='{vc}' title='{td(r.get('verify_reason'))}'>{vb}</td>"
                         f"<td class=l>{str(td(r.get('verifier_id')))[:18]}</td><td class=l>{td(r.get('ts'))}</td></tr>")
         body.append("</table>")

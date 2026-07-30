@@ -264,7 +264,7 @@ step "Starting the producer (fetch · replay+witnesses · tap)"
 onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS ETHPROOFS_URL=http://localhost:$MOCK_PORT CLUSTER=local-ZisK-monad ./witness-follow start tip"
 
 step "Starting the prover (mock on this Mac, transfers real)"
-onbox "tmux has-session -t prove 2>/dev/null && echo '   · prove already running' || tmux new-session -d -s prove \"cd $BOX_REPO && REMOTE_WS=$MOCK_WS REMOTE_RUNNER=$MOCK_RUNNER_DIR/zisk-runner cli/prove-farm --guest monad-zisk --mock --remote $MAC_USER@localhost --port $TUN_SSH_PORT --mock-secs $MOCK_SECS --mock-per-mstep $MOCK_PER_MSTEP --mock-speed $MOCK_SPEED --mock-jitter $MOCK_JITTER --interval 2 --watch --newest-first --ethproofs-url http://localhost:$MOCK_PORT --ethproofs-cluster local-ZisK-monad 2>&1 | tee -a ~/prove-mock.log\""
+onbox "tmux has-session -t prove 2>/dev/null && echo '   · prove already running' || tmux new-session -d -s prove \"cd $BOX_REPO && REMOTE_WS=$MOCK_WS REMOTE_RUNNER=$MOCK_RUNNER_DIR/zisk-runner WITNESS_MANIFEST=\$HOME/witness-manifest.csv cli/prove-farm --guest monad-zisk --mock --remote $MAC_USER@localhost --port $TUN_SSH_PORT --mock-secs $MOCK_SECS --mock-per-mstep $MOCK_PER_MSTEP --mock-speed $MOCK_SPEED --mock-jitter $MOCK_JITTER --interval 2 --watch --newest-first --ethproofs-url http://localhost:$MOCK_PORT --ethproofs-cluster local-ZisK-monad 2>&1 | tee -a ~/prove-mock.log\""
 
 [ "$CRON" = 1 ] && { step "Installing the daily log archiver on the box"
   onbox "(crontab -l 2>/dev/null | grep -v archive-logs; echo '17 4 * * * \$HOME/zkvm-bench/infra/monad-witness/archive-logs >> \$HOME/archive-logs.log 2>&1') | crontab - && crontab -l | tail -1"; }

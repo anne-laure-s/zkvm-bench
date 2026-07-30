@@ -24,9 +24,10 @@ ZisK api.rs send, so swapping to the real ethproofs.org is config-only:
       (BOTH SP1 cycles and ZisK steps go in `proving_cycles` — there is NO `proving_steps` in the API)
 EXTRA fields (mock leaderboard only; NOT sent by the real clients — dropped by --minimal):
   --vm / report.zkvm -> vm  ·  --guest / report.guest -> guest  ·  --public-inputs / <run>/*.pv.bin
+  t_block + e2e_secs  (chain time of the block, and chain-time -> ack: the WHOLE pipeline in one number)
   mock:true  (from report mode=mock / backend=mock-cluster / MOCK-PROOF magic; warns if sent non-local)
 """
-import argparse, base64, glob, hashlib, io, json, os, sys, tarfile, urllib.error, urllib.parse, urllib.request
+import argparse, base64, csv, glob, hashlib, io, json, os, sys, tarfile, time, urllib.error, urllib.parse, urllib.request
 
 MOCK_MAGIC = b"MOCK-PROOF"   # prove-farm --mock writes proof bytes starting with this (see mock_prove)
 
@@ -47,6 +48,26 @@ def pv_digest(run_dir):
             return "sha256:" + hashlib.sha256(open(p, "rb").read()).hexdigest()[:16]
         except OSError:
             pass
+    return None
+
+
+def block_chain_time(manifest, block):
+    """The block's OWN header timestamp (chain time) from the producer's manifest, or None.
+
+    This is what makes an END-TO-END latency possible. Every other stamp belongs to one machine's clock, but
+    a block header's timestamp is chain time: comparing it with the moment this submitter gets its 200 OK
+    measures the whole pipeline — node reception, execution, witness, framing, transfer, proving, submission
+    — in one number, and both ends are NTP-synced rather than the same clock."""
+    if not manifest or not os.path.isfile(manifest):
+        return None
+    try:
+        with open(manifest, newline="") as f:
+            for row in csv.DictReader(f):
+                if (row.get("block") or "").strip() == str(block):
+                    v = (row.get("t_block") or "").strip()
+                    return float(v) if v else None
+    except (OSError, ValueError):
+        pass
     return None
 
 
@@ -141,6 +162,9 @@ def main():
                          "proving_cycles, proving_time, verifier_id) — drop vm/guest/mock/public_inputs. "
                          "Use for the real ethproofs.org if it rejects unknown fields.")
     ap.add_argument("--proved-only", action="store_true", help="skip queued/proving, POST only /proved")
+    ap.add_argument("--manifest", default=os.environ.get("WITNESS_MANIFEST",
+                                                        os.path.expanduser("~/witness-manifest.csv")),
+                    help="producer manifest, for the block's chain timestamp -> end-to-end latency")
     ap.add_argument("--dry-run", action="store_true", help="print the requests, don't send")
     args = ap.parse_args()
 
@@ -205,12 +229,19 @@ def main():
         proved["verifier_id"] = vid
 
     pi = None if args.minimal else (args.public_inputs if args.public_inputs is not None else pv_digest(args.run_dir))
+    # End-to-end: chain time of the block -> now, measured the instant before we hand the proof over.
+    tb = None if args.minimal else block_chain_time(args.manifest, block)
+    e2e = round(time.time() - tb, 1) if tb else None
+    if tb:
+        proved["t_block"] = int(tb)
+        proved["e2e_secs"] = e2e
     if pi is not None:
         proved["public_inputs"] = pi
 
     lifecycle = {"block_number": block, "cluster_id": cluster, **ident}
     print(f"ethproofs-submit: {'[MOCK] ' if is_mock else ''}{'[minimal] ' if args.minimal else ''}vm={vm} guest={guest} block={block} cluster={cluster} -> {url}  "
-          f"(proof={len(proof_bytes)}B from {kind}, time={ptime}ms, work={proved.get('proving_cycles')}, vk={str(vid)[:14]}, pi={pi})")
+          f"(proof={len(proof_bytes)}B from {kind}, time={ptime}ms, work={proved.get('proving_cycles')}, "
+          f"vk={str(vid)[:14]}, pi={pi}{f', e2e={e2e}s' if e2e else ''})")
 
     if not args.proved_only:
         post(url, args.token, "/proofs/queued", lifecycle, args.dry_run)
