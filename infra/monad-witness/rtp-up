@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# rtp-up — bring the whole RTP mock pipeline up, end to end, from the Mac.
+#
+# Topology it wires (the one we settled on):
+#
+#   nyc-003                                    this Mac
+#   ───────                                    ────────
+#   fetch_blocks.py  (latest-N, block by block)
+#   run_replay.py    (--zkvm-witness)
+#   witness-tap      (queue · manifest · heartbeat · purge)
+#   cli/prove-farm   ──7 MB witness──►         zisk-runner in MOCK mode: emulates the block to
+#                    ◄──380 KB proof──          measure its steps, derives the proving time, sleeps
+#                    ──submission────►         cli/ethproofs-mock  (verifies, leaderboard, /status)
+#
+# The Mac reaches the box directly; the box reaches the Mac through a reverse tunnel this script
+# supervises (2222 -> the Mac's sshd, 8547 -> the mock). Only the prover's SLEEP is fiction: the block
+# fetch, the execution, the witness, both transfers, the submission and the verification are all real.
+#
+# WHAT IT WILL NOT DO, on purpose:
+#   * enable Remote Login (a security setting — turn it on yourself in System Settings > Sharing)
+#   * commit or push your code (it checks and refuses instead: publishing is your call)
+#   * install a toolchain
+#
+#   ./rtp-up [--dry-run] [--purge] [--keep-mock] [--cron] [--stop]
+#
+#     --dry-run    print every command, run none of them
+#     --purge      empty the prover queue and the witness dump first, for a clean coverage measurement
+#     --keep-mock  do not restart ethproofs-mock (default: restart it, so it can never run stale code —
+#                  its store persists, nothing is lost)
+#     --cron       also install the daily archive-logs cron on the box
+#     --stop       tear the whole thing down instead (box sessions, tunnel, mock)
+#
+# It also CATCHES UP first: the replay has to reach the head before it starts dumping witnesses, and it must
+# do that with --zkvm-witness OFF (the flag forces the interpreter and writes ~7 MB per block — replaying a
+# backlog with it on costs hours and tens of GB for blocks that have no real-time value). The script starts
+# the witness-less replay, polls the gap until it closes, then switches to the tip phase.
+#
+# Config (env): BOX=nyc-003  MAC_USER=$USER  TUN_SSH_PORT=2222  MOCK_PORT=8547
+#               MOCK_STORE=/tmp/ethproofs-rtp  MOCK_SECS=2.12  MOCK_PER_MSTEP=0.0364  MOCK_SPEED=2.5  MOCK_JITTER=0.5
+#               HEAD_TAG=latest  CONFIRMATIONS=2  MOCK_RUNNER_DIR=$HOME/zisk-mock
+#               CATCHUP_TARGET=10 (blocks)  CATCHUP_POLL=30 (s)  CATCHUP_MAX_MIN=240
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MAC_REPO="$(cd "$HERE/../.." && pwd)"
+
+BOX="${BOX:-nyc-003}"
+MAC_USER="${MAC_USER:-$USER}"
+TUN_SSH_PORT="${TUN_SSH_PORT:-2222}"
+MOCK_PORT="${MOCK_PORT:-8547}"
+MOCK_STORE="${MOCK_STORE:-/tmp/ethproofs-rtp}"
+MOCK_SECS="${MOCK_SECS:-2.12}"        # least-squares fit on the 11 measured 16x5090 blocks:
+MOCK_PER_MSTEP="${MOCK_PER_MSTEP:-0.0364}"  #   secs = 2.12 + 0.0364 x Msteps  (+-0.2 s)
+# Real blocks are 330-600 Msteps = 14-24 s, above the 12 s slot, so the queue could never drain. 2.5 is the
+# smallest factor putting even the heaviest observed block under the slot. Recorded in every report.json.
+MOCK_SPEED="${MOCK_SPEED:-2.5}"
+MOCK_JITTER="${MOCK_JITTER:-0.5}"
+HEAD_TAG="${HEAD_TAG:-latest}"
+CONFIRMATIONS="${CONFIRMATIONS:-2}"
+# The runner must live OUTSIDE ~/Documents: macOS TCC protects it, and a process started by sshd cannot
+# execute anything there ("Operation not permitted"). This is why the script copies it at all.
+MOCK_RUNNER_DIR="${MOCK_RUNNER_DIR:-$HOME/zisk-mock}"
+MOCK_WS="${MOCK_WS:-$HOME/zisk-mock-ws}"
+BOX_REPO="${BOX_REPO:-\$HOME/zkvm-bench}"
+
+DRY=0 PURGE=0 KEEP_MOCK=0 CRON=0 STOP=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run)   DRY=1; shift ;;
+    --purge)     PURGE=1; shift ;;
+    --keep-mock) KEEP_MOCK=1; shift ;;
+    --cron)      CRON=1; shift ;;
+    --stop)      STOP=1; shift ;;
+    -h|--help)   sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
+    *)           echo "rtp-up: unknown argument '$1' (see --help)" >&2; exit 2 ;;
+  esac
+done
+
+step(){ printf '\n\033[1m== %s\033[0m\n' "$*"; }
+say(){  printf '   %s\n' "$*"; }
+die(){  printf '\n\033[1mrtp-up: %s\033[0m\n' "$*" >&2; exit 1; }
+# run — every mutating action goes through here, so --dry-run is honest by construction.
+run(){ if [ "$DRY" = 1 ]; then printf '   $ %s\n' "$*"; else eval "$@"; fi; }
+onbox(){ if [ "$DRY" = 1 ]; then printf '   [%s] $ %s\n' "$BOX" "$*"; else ssh "$BOX" "$*"; fi; }
+# onbox_q — read-only query, always executed even in dry-run (it changes nothing and the checks are the
+# point of a dry run).
+onbox_q(){ ssh -o BatchMode=yes "$BOX" "$*" 2>/dev/null; }
+
+# ── teardown ────────────────────────────────────────────────────────────────────────────────────────
+if [ "$STOP" = 1 ]; then
+  step "Stopping the box's sessions"
+  onbox "cd $BOX_REPO/infra/monad-witness && ./witness-follow stop; tmux kill-session -t prove 2>/dev/null; tmux ls 2>&1 | sed 's/^/   /'"
+  step "Stopping the tunnel and the mock on this Mac"
+  # The supervisor FIRST, or it would immediately redial the ssh we are about to kill. And match the actual
+  # command line: the forward spec, not "ssh -N -R" — the -o options sit between those tokens.
+  run "pkill -f 'rtp-up-tunnel' || true"
+  run "pkill -f 'R $TUN_SSH_PORT:127.0.0.1:22' || true"
+  run "pkill -f ethproofs-mock || true"
+  say "the fetcher on the box is left running (the block_db is cheap and reusable)"
+  exit 0
+fi
+
+# ── 0. this Mac's repo must be pushed, or the box cannot have the code ──────────────────────────────
+step "Checking this repo is published"
+cd "$MAC_REPO" || die "cannot cd to $MAC_REPO"
+dirty="$(git status --porcelain 2>/dev/null | head -5)"
+[ -z "$dirty" ] || { echo "$dirty" | sed 's/^/   /'; die "uncommitted changes above. Commit them yourself — publishing is your call, not this script's."; }
+ahead="$(git rev-list '@{u}..HEAD' --count 2>/dev/null || echo '?')"
+[ "$ahead" = "0" ] || die "HEAD is $ahead commit(s) ahead of the remote. Push first: the box pulls from there."
+say "clean and pushed ($(git log --oneline -1))"
+
+# ── 1. the mock prover's runner, outside the TCC-protected tree ─────────────────────────────────────
+step "Staging the mock prover's runner in $MOCK_RUNNER_DIR"
+run "mkdir -p '$MOCK_RUNNER_DIR'"
+run "cp '$MAC_REPO/infra/zisk-infra/zisk-runner' '$MOCK_RUNNER_DIR/'"
+run "chmod +x '$MOCK_RUNNER_DIR/zisk-runner'"
+if [ "$DRY" != 1 ]; then
+  grep -q 'MOCK PROVER] emulating' "$MOCK_RUNNER_DIR/zisk-runner" \
+    || die "the staged runner has no emulating mock branch — is $MAC_REPO up to date?"
+  say "staged, and it carries the emulating mock branch"
+fi
+command -v ziskemu >/dev/null 2>&1 \
+  && say "ziskemu found: the prover will measure real step counts" \
+  || say "WARNING: no ziskemu on this Mac — the model will fall back to its fixed term only"
+
+# ── 2. the box must be able to ssh back here, without a password ────────────────────────────────────
+step "Key auth from $BOX back to this Mac"
+pub="$(onbox_q 'cat ~/.ssh/id_ed25519.pub 2>/dev/null')"
+if [ -z "$pub" ]; then
+  say "no key on the box — generating one there"
+  onbox "ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519 -q"
+  pub="$(onbox_q 'cat ~/.ssh/id_ed25519.pub 2>/dev/null')"
+fi
+[ -n "$pub" ] || [ "$DRY" = 1 ] || die "still no public key on $BOX"
+if [ "$DRY" != 1 ]; then
+  mkdir -p ~/.ssh && chmod 700 ~/.ssh
+  if grep -qxF "$pub" ~/.ssh/authorized_keys 2>/dev/null; then
+    say "already authorised here"
+  else
+    printf '%s\n' "$pub" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+    say "added to ~/.ssh/authorized_keys"
+  fi
+  # sshd refuses a key SILENTLY if the home dir is group/other-writable — the failure looks like a bad key.
+  # Only touched if it actually is, and said out loud: it is your home directory's permissions.
+  case "$(ls -ld ~ | cut -c1-10)" in
+    *w*w*|*w??w*) say "NOTE: ~ is group/other-writable, which makes sshd ignore the key — fixing with chmod go-w ~"
+                  chmod go-w ~ ;;
+  esac
+fi
+
+# ── 3. ethproofs-mock ──────────────────────────────────────────────────────────────────────────────
+step "ethproofs-mock on :$MOCK_PORT (store $MOCK_STORE)"
+if [ "$KEEP_MOCK" = 1 ]; then
+  say "--keep-mock: leaving whatever is running alone"
+else
+  run "pkill -f ethproofs-mock || true"
+  run "sleep 1"
+  run "nohup '$MAC_REPO/cli/ethproofs-mock' --port $MOCK_PORT --store '$MOCK_STORE' --verify-cmd '$MAC_REPO/cli/verify-proof' >> ~/ethproofs-mock.log 2>&1 &"
+  run "sleep 2"
+fi
+if [ "$DRY" != 1 ]; then
+  curl -sf "http://127.0.0.1:$MOCK_PORT/status" >/dev/null \
+    && say "answering on 127.0.0.1:$MOCK_PORT (log: ~/ethproofs-mock.log)" \
+    || die "not answering on :$MOCK_PORT — see ~/ethproofs-mock.log"
+fi
+
+# ── 4. the reverse tunnel, supervised ──────────────────────────────────────────────────────────────
+# 127.0.0.1 rather than localhost: the mock binds IPv4 only, and `localhost` can resolve to ::1 first.
+# The retry loop matters over a multi-hour run on a home link — a dropped tunnel would otherwise stay
+# dropped, and every submission would fail silently until someone noticed.
+step "Reverse tunnel ($TUN_SSH_PORT -> this Mac's sshd, $MOCK_PORT -> the mock)"
+tun_alive(){ [ -n "$(onbox_q "ss -ltn 2>/dev/null | grep -c ':$TUN_SSH_PORT '")" ] \
+             && [ "$(onbox_q "ss -ltn 2>/dev/null | grep -c ':$TUN_SSH_PORT '")" != "0" ]; }
+if [ "$DRY" != 1 ] && tun_alive; then
+  say "already listening on $BOX:$TUN_SSH_PORT"
+else
+  run "nohup bash -c 'while true; do ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o BatchMode=yes -R $TUN_SSH_PORT:127.0.0.1:22 -R $MOCK_PORT:127.0.0.1:$MOCK_PORT $BOX; echo \"rtp-up-tunnel: link down, retrying in 5s\"; sleep 5; done' >> ~/tunnel.log 2>&1 &"
+  run "sleep 3"
+fi
+
+# ── 5. both directions must actually work, before anything is started ──────────────────────────────
+step "End-to-end reachability"
+if [ "$DRY" != 1 ]; then
+  onbox_q "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p $TUN_SSH_PORT $MAC_USER@localhost true" \
+    && say "$BOX can ssh into this Mac without a password" \
+    || die "$BOX still cannot ssh in. Check: Remote Login enabled? ~/.ssh permissions? See ~/tunnel.log"
+  onbox_q "curl -sf http://localhost:$MOCK_PORT/status >/dev/null" \
+    && say "$BOX can reach the mock through the tunnel" \
+    || die "$BOX cannot reach the mock on :$MOCK_PORT — the tunnel's forward is not up (see ~/tunnel.log)"
+  bashv="$(onbox_q "ssh -o BatchMode=yes -p $TUN_SSH_PORT $MAC_USER@localhost 'bash --version | head -1'")"
+  say "prover's shell: ${bashv:-unknown}"
+  case "$bashv" in *"version 3."*) say "  (bash 3.2: emulation time is measured to the second — ±1s of noise)";; esac
+fi
+
+# ── 6. the box: code, producer, prover ─────────────────────────────────────────────────────────────
+step "Updating the box's clone"
+onbox "cd $BOX_REPO && git pull --ff-only 2>&1 | tail -2"
+if [ "$DRY" != 1 ]; then
+  # Two plain greps rather than arithmetic over `grep -c`: summing with cut/paste/bc needs bc on the box and,
+  # worse, an empty result from a failed pipeline would compare unequal to "0" and PASS the check.
+  onbox_q "grep -q 'MOCK PROVER] emulating' $BOX_REPO/infra/zisk-infra/zisk-runner" \
+    || die "the box's runner has no emulating mock branch — did the pull work?"
+  onbox_q "grep -q ZISK_MOCK_PER_MSTEP $BOX_REPO/cli/prove-farm" \
+    || die "the box's prove-farm cannot drive a remote mock prover — did the pull work?"
+  say "the box's clone has the mock prover"
+fi
+
+# ── 7. catch up to the tip WITHOUT witnesses, before the tip phase ─────────────────────────────────
+# The replay must reach the head before it starts dumping witnesses. With --zkvm-witness it runs the
+# interpreter (~4.6 vs ~8 blocks/s) AND writes ~7 MB per block, so replaying a backlog with the flag on
+# costs hours and tens of GB of witnesses that have no real-time value whatsoever. So: catch up with the
+# flag OFF, then switch. Starting `catchup` is idempotent — if we are already at the tip the loop exits on
+# its first poll, having cost a few seconds of witness-less replay.
+step "Catching up to the tip (no witnesses while there is a backlog)"
+# gap — "<block_db head> <last_executed> <gap>". The block_db listing is authoritative: status.json's
+# `available` is only as fresh as the last replay cycle, and the replay may be stopped right now.
+box_gap(){ onbox_q "H=\$(ls ~/block_db 2>/dev/null | grep -E '^[0-9]+\$' | sort -n | tail -1); L=\$(grep -o '\"last_executed\": [0-9]*' ~/monad/status.json 2>/dev/null | grep -o '[0-9]*'); echo \"\${H:-0} \${L:-0} \$(( \${H:-0} - \${L:-0} ))\""; }
+
+if [ "$DRY" = 1 ]; then
+  say "[dry-run] would start the catch-up replay and poll until the gap is <= ${CATCHUP_TARGET:-10} blocks"
+else
+  onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS ./witness-follow start catchup 2>&1 | sed 's/^/   /'"
+  target="${CATCHUP_TARGET:-10}"; poll="${CATCHUP_POLL:-30}"; maxmin="${CATCHUP_MAX_MIN:-240}"
+  deadline=$(( $(date +%s) + maxmin * 60 )); stall=0; prev=""
+  while :; do
+    read -r head last gap <<<"$(box_gap)"
+    [ -n "${gap:-}" ] || die "cannot read the box's progress (is ~/monad/status.json there?)"
+    if [ "$gap" -le "$target" ]; then
+      say "at the tip: block_db=$head last_executed=$last gap=$gap"
+      break
+    fi
+    if [ -n "$prev" ]; then
+      done_blocks=$(( last - prev ))
+      if [ "$done_blocks" -le 0 ]; then
+        stall=$((stall + 1))
+        # Three idle polls means the replay is not advancing: an ALERT, a dead session, or an empty
+        # block_db. Stopping here beats waiting hours for a loop that will never finish.
+        [ "$stall" -lt 3 ] || die "the replay has not advanced in $((3 * poll))s (gap=$gap). Check: \
+ssh $BOX 'tail -5 ~/replay-catchup.log; ls ~/monad/logs/ALERT'"
+        say "gap=$gap — no progress ($stall/3)"
+      else
+        stall=0
+        rate=$(awk -v d="$done_blocks" -v p="$poll" 'BEGIN{printf "%.1f", d/p}')
+        eta=$(awk -v g="$gap" -v d="$done_blocks" -v p="$poll" 'BEGIN{printf "%d", (d>0 ? g*p/d/60 : 0)}')
+        say "gap=$gap  ($rate blocks/s, ~${eta} min left)"
+      fi
+    else
+      say "gap=$gap — catching up"
+    fi
+    prev="$last"
+    [ "$(date +%s)" -lt "$deadline" ] || die "still $gap blocks behind after ${maxmin} min — giving up"
+    sleep "$poll"
+  done
+  onbox "cd $BOX_REPO/infra/monad-witness && ./witness-follow stop >/dev/null 2>&1; echo '   catch-up replay stopped'"
+fi
+
+if [ "$PURGE" = 1 ]; then
+  step "Purging the queue and the witness dump (clean coverage)"
+  onbox "cd $BOX_REPO/infra/monad-witness && ./witness-follow stop"
+  onbox "find $BOX_REPO/guests/monad-zisk/fixtures -maxdepth 1 -type f -delete; rm -f ~/witnesses/*.witness ~/witnesses/*.post_state_root; echo purged"
+fi
+
+step "Starting the producer (fetch · replay+witnesses · tap)"
+onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS ETHPROOFS_URL=http://localhost:$MOCK_PORT CLUSTER=local-ZisK-monad ./witness-follow start tip"
+
+step "Starting the prover (mock on this Mac, transfers real)"
+onbox "tmux has-session -t prove 2>/dev/null && echo '   · prove already running' || tmux new-session -d -s prove \"cd $BOX_REPO && REMOTE_WS=$MOCK_WS REMOTE_RUNNER=$MOCK_RUNNER_DIR/zisk-runner cli/prove-farm --guest monad-zisk --mock --remote $MAC_USER@localhost --port $TUN_SSH_PORT --mock-secs $MOCK_SECS --mock-per-mstep $MOCK_PER_MSTEP --mock-speed $MOCK_SPEED --mock-jitter $MOCK_JITTER --interval 2 --watch --newest-first --ethproofs-url http://localhost:$MOCK_PORT --ethproofs-cluster local-ZisK-monad 2>&1 | tee -a ~/prove-mock.log\""
+
+[ "$CRON" = 1 ] && { step "Installing the daily log archiver on the box"
+  onbox "(crontab -l 2>/dev/null | grep -v archive-logs; echo '17 4 * * * \$HOME/zkvm-bench/infra/monad-witness/archive-logs >> \$HOME/archive-logs.log 2>&1') | crontab - && crontab -l | tail -1"; }
+
+# ── 7. where to look ───────────────────────────────────────────────────────────────────────────────
+step "Up. What to watch"
+cat <<EOF
+   on $BOX:
+     tail -2 ~/witness-tap.log            lag (2-3 blocks) · raw (0-1) · unproved (must not climb)
+     tail -6 ~/prove-mock.log             per block: prove=X wall=Z  ->  Z-X IS the transport
+     cd \$HOME/zkvm-bench && profiling/rtp-latency.py --manifest ~/witness-manifest.csv \\
+        --results infra/zisk-infra/results --guest monad-zisk | tail -15
+   on this Mac:
+     cat $MOCK_WS/reports/\$(ls -t $MOCK_WS/reports | grep '\.log\$' | head -1)
+                                          Steps: <9 digits> · model - emulation -> sleep
+     open http://127.0.0.1:$MOCK_PORT     leaderboard; a mock proof must read ⊘, never ✗
+     tail -f ~/tunnel.log                 link drops and retries
+   tear down:  $0 --stop
+EOF
