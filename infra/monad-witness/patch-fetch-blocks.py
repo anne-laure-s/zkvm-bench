@@ -45,6 +45,9 @@ EDITS = [
         blk = self.one("eth_getBlockByNumber", [tag, False])
         return int(blk["number"], 16)'''),
 
+    # 2b. threading, for the watcher thread.
+    ("import concurrent.futures", "import concurrent.futures\nimport threading"),
+
     # 2. The two knobs.
     ('''    ap.add_argument("--poll-interval", type=float, default=6.0)''',
      '''    ap.add_argument("--poll-interval", type=float, default=6.0)
@@ -66,6 +69,88 @@ EDITS = [
                     end, target, target - end, rate,''',
      '''                    "fetched up to %d (%s-%d %d, gap %d, %.0f blocks/s)",
                     end, args.head_tag, args.confirmations, target, target - end, rate,'''),
+    # 5. A newHeads watcher, so the fetcher is NOTIFIED instead of polling.
+    ('''class Rpc:''',
+     '''def _head_watcher(ws_url, poll_interval):
+    """Subscribe to newHeads and return a threading.Event set on every new head, or None.
+
+    This is what the ethproofs reference clients do (chain-follow over WS), and it removes the polling
+    latency entirely: the loop below waits on the event instead of sleeping a fixed interval.
+
+    Deliberately best-effort. The watcher runs in a daemon thread, reconnects on failure, and the main loop
+    passes `poll_interval` as its wait timeout — so if the library is missing, the endpoint refuses, or the
+    link drops, the fetcher degrades EXACTLY to its previous polling behaviour instead of stalling.
+    Needs a WebSocket client: `pip install websocket-client`.
+    """
+    try:
+        import websocket  # websocket-client, sync API
+    except ImportError:
+        log.warning("websocket-client not installed — falling back to polling every %ss "
+                    "(pip install websocket-client to get newHeads notifications)", poll_interval)
+        return None
+
+    event = threading.Event()
+
+    def run():
+        sub = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_subscribe",
+                          "params": ["newHeads"]})
+        while True:
+            try:
+                ws = websocket.create_connection(ws_url, timeout=30)
+                ws.send(sub)
+                log.info("subscribed to newHeads at %s", ws_url)
+                while True:
+                    ws.recv()          # any frame means the head moved (or the subscription ack)
+                    event.set()
+            except Exception as e:     # noqa: BLE001 — never take the fetcher down with it
+                log.warning("newHeads subscription dropped (%s) — retrying in 5s, polling meanwhile", e)
+                event.set()            # do not leave the loop waiting on a dead subscription
+                time.sleep(5)
+
+    threading.Thread(target=run, daemon=True).start()
+    return event
+
+
+class Rpc:'''),
+
+    # 6. The knob, and the derived default.
+    ('''    ap.add_argument(
+        "--confirmations", type=int, default=0,
+        help="stay this many blocks behind --head-tag; 2 avoids single-slot reorgs at a 24s cost",
+    )''',
+     '''    ap.add_argument(
+        "--confirmations", type=int, default=0,
+        help="stay this many blocks behind --head-tag; 2 avoids single-slot reorgs at a 24s cost",
+    )
+    ap.add_argument(
+        "--ws-url", default=None,
+        help="newHeads WebSocket endpoint; default = --rpc with http -> ws (the same port serves both on "
+             "geth/reth when --ws is enabled). Set --ws-url '' to force plain polling.",
+    )'''),
+
+    # 7. Wait for a notification instead of sleeping a fixed interval.
+    ('''            if target < next_block:
+                time.sleep(args.poll_interval)
+                continue''',
+     '''            if target < next_block:
+                # Notified, not polled: wait for the next head, with poll_interval as the timeout so a
+                # missing/dead subscription degrades to exactly the old behaviour.
+                if head_event is not None:
+                    head_event.wait(args.poll_interval)
+                    head_event.clear()
+                else:
+                    time.sleep(args.poll_interval)
+                continue'''),
+
+    # 8. Start the watcher once, next to the Rpc client.
+    ('''    rpc = Rpc(args.rpc)
+    next_block = args.start''',
+     '''    rpc = Rpc(args.rpc)
+    ws_url = args.ws_url
+    if ws_url is None:
+        ws_url = re.sub(r"^http", "ws", args.rpc)
+    head_event = _head_watcher(ws_url, args.poll_interval) if ws_url else None
+    next_block = args.start'''),
 ]
 
 def main():
@@ -82,12 +167,29 @@ def main():
     # One unambiguous marker decides the state. Comparing old/new text cannot: edit 2 is additive, so the
     # "old" string survives inside the "new" one and both directions look half-applied.
     patched = MARKER in src
-    pairs = [(new, old) for old, new in EDITS] if a.revert else EDITS
-    missing = [i for i, (old, _) in enumerate(pairs, 1) if old not in src]
-
-    if patched != a.revert:      # apply on a patched file, or revert on a clean one
-        print(f"patch-fetch-blocks: already {'applied' if patched else 'reverted'} in {a.file}")
-        return
+    if a.revert:
+        pairs = [(new, old) for old, new in EDITS]
+        if not patched:
+            print(f"patch-fetch-blocks: already reverted in {a.file}")
+            return
+        missing = [i for i, (old, _) in enumerate(pairs, 1) if old not in src]
+    else:
+        # Per-edit, not all-or-nothing: this patch set GREW (the newHeads subscription came later), so a file
+        # patched by an older version of this script is partially applied. A single global marker would call
+        # it done and silently skip the new edits.
+        pairs = [(old, new) for old, new in EDITS if new not in src]
+        if not pairs:
+            print(f"patch-fetch-blocks: already applied in {a.file}")
+            return
+        # Check each edit against the text AS IT WILL BE when its turn comes, not against the original:
+        # some edits extend what an earlier one inserted (the --ws-url knob grows the --confirmations
+        # block), so their source text does not exist in a fresh file yet.
+        probe, missing = src, []
+        for i, (o, n) in enumerate(pairs, 1):
+            if o in probe:
+                probe = probe.replace(o, n, 1)
+            else:
+                missing.append(i)
     if missing:
         print(f"patch-fetch-blocks: cannot {'revert' if a.revert else 'apply'} — edit(s) "
               f"{', '.join(map(str, missing))} of {len(pairs)} do not match this file. The upstream "

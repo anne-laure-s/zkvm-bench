@@ -30,6 +30,9 @@
 #     --cron       also install the daily archive-logs cron on the box
 #     --stop       tear the whole thing down instead (box sessions, tunnel, mock)
 #
+# It also patches the fetcher for `newHeads` notifications (and installs websocket-client on the box for
+# them), so a block is picked up on arrival rather than on the next poll.
+#
 # It also CATCHES UP first: the replay has to reach the head before it starts dumping witnesses, and it must
 # do that with --zkvm-witness OFF (the flag forces the interpreter and writes ~7 MB per block — replaying a
 # backlog with it on costs hours and tens of GB for blocks that have no real-time value). The script starts
@@ -37,8 +40,9 @@
 #
 # Config (env): BOX=nyc-003  MAC_USER=$USER  TUN_SSH_PORT=2222  MOCK_PORT=8547
 #               MOCK_STORE=/tmp/ethproofs-rtp  MOCK_SECS=2.12  MOCK_PER_MSTEP=0.0364  MOCK_SPEED=2.5  MOCK_JITTER=0.5
-#               HEAD_TAG=latest  CONFIRMATIONS=2  MOCK_RUNNER_DIR=$HOME/zisk-mock
+#               HEAD_TAG=latest  CONFIRMATIONS=0 (the head — real time)  MOCK_RUNNER_DIR=$HOME/zisk-mock
 #               CATCHUP_TARGET=10 (blocks)  CATCHUP_POLL=30 (s)  CATCHUP_MAX_MIN=240
+#               FETCH_POLL=1  TAP_INTERVAL=1   (polling latency, 6 s each by default)
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,7 +60,15 @@ MOCK_PER_MSTEP="${MOCK_PER_MSTEP:-0.0364}"  #   secs = 2.12 + 0.0364 x Msteps  (
 MOCK_SPEED="${MOCK_SPEED:-2.5}"
 MOCK_JITTER="${MOCK_JITTER:-0.5}"
 HEAD_TAG="${HEAD_TAG:-latest}"
-CONFIRMATIONS="${CONFIRMATIONS:-2}"
+# 0 = prove the HEAD, the block as it comes out. That is what real-time proving means, and confirmations
+# are its direct opposite: each one is 12 s of deliberate waiting on a 12 s slot budget. The cost is reorg
+# exposure — a replaced block leaves the replay unable to apply the next one, which stops the producer with
+# an ALERT until the triedb is rewound. That is a recovery problem to solve, not a reason to wait.
+CONFIRMATIONS="${CONFIRMATIONS:-0}"
+# Polling intervals. Both the fetcher and the tap default to 6 s, i.e. up to 12 s of PURE WAITING in the
+# end-to-end latency for nothing at all. One RPC call and one directory scan per second cost nothing.
+FETCH_POLL="${FETCH_POLL:-1}"
+TAP_INTERVAL="${TAP_INTERVAL:-1}"
 # The runner must live OUTSIDE ~/Documents: macOS TCC protects it, and a process started by sshd cannot
 # execute anything there ("Operation not permitted"). This is why the script copies it at all.
 MOCK_RUNNER_DIR="${MOCK_RUNNER_DIR:-$HOME/zisk-mock}"
@@ -205,6 +217,36 @@ if [ "$DRY" != 1 ]; then
   say "the box's clone has the mock prover"
 fi
 
+# ── 6b. the fetcher: newHeads subscription instead of polling ──────────────────────────────────────
+# Must happen BEFORE the catch-up, which is what starts the fetcher. And if either the patch or the library
+# is newly in place, the RUNNING fetcher is still the old code — so the session is killed to force a restart.
+# Continuing with a silently unpatched fetcher would mean none of this has any effect and nothing says so.
+step "Fetcher: newHeads over WebSocket"
+if [ "$DRY" = 1 ]; then
+  say "[dry-run] would install websocket-client if missing and apply patch-fetch-blocks.py"
+else
+  changed=0
+  PYBOX="\$HOME/.pyenv/versions/3.12.13/bin/python3"
+  # -m pip against THAT interpreter: witness-follow runs the fetcher with it, and a plain `pip` would
+  # happily install into a different Python where the import then fails.
+  if onbox_q "$PYBOX -c 'import websocket' 2>/dev/null"; then
+    say "websocket-client already present"
+  else
+    say "installing websocket-client into the box's pyenv"
+    onbox "$PYBOX -m pip install --quiet websocket-client && echo '   installed'" && changed=1 \
+      || say "install failed — the fetcher will fall back to polling (harmless, just slower)"
+  fi
+  if onbox_q "grep -q '_head_watcher' ~/monad/fetch_blocks.py"; then
+    say "fetch_blocks.py already patched"
+  else
+    onbox "cd $BOX_REPO/infra/monad-witness && ./patch-fetch-blocks.py 2>&1 | sed 's/^/   /'" && changed=1
+  fi
+  if [ "$changed" = 1 ]; then
+    say "restarting the fetcher so it picks this up"
+    onbox "tmux kill-session -t fetch 2>/dev/null; echo '   fetch session cleared'"
+  fi
+fi
+
 # ── 7. catch up to the tip WITHOUT witnesses, before the tip phase ─────────────────────────────────
 # The replay must reach the head before it starts dumping witnesses. With --zkvm-witness it runs the
 # interpreter (~4.6 vs ~8 blocks/s) AND writes ~7 MB per block, so replaying a backlog with the flag on
@@ -219,7 +261,7 @@ box_gap(){ onbox_q "H=\$(ls ~/block_db 2>/dev/null | grep -E '^[0-9]+\$' | sort 
 if [ "$DRY" = 1 ]; then
   say "[dry-run] would start the catch-up replay and poll until the gap is <= ${CATCHUP_TARGET:-10} blocks"
 else
-  onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS ./witness-follow start catchup 2>&1 | sed 's/^/   /'"
+  onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL ./witness-follow start catchup 2>&1 | sed 's/^/   /'"
   target="${CATCHUP_TARGET:-10}"; poll="${CATCHUP_POLL:-30}"; maxmin="${CATCHUP_MAX_MIN:-240}"
   deadline=$(( $(date +%s) + maxmin * 60 )); stall=0; prev=""
   while :; do
@@ -261,10 +303,20 @@ if [ "$PURGE" = 1 ]; then
 fi
 
 step "Starting the producer (fetch · replay+witnesses · tap)"
-onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS ETHPROOFS_URL=http://localhost:$MOCK_PORT CLUSTER=local-ZisK-monad ./witness-follow start tip"
+if [ "$DRY" != 1 ] && [ -n "$(onbox_q "ls ~/monad/logs/ALERT 2>/dev/null")" ]; then
+  # At CONFIRMATIONS=0 this is what a reorg looks like: the replay could not apply the next block on top of
+  # one that left the canonical chain. Recovery is a rewind + re-fetch, and it must be deliberate.
+  say "⚠️  logs/ALERT is present — the replay stopped on a failed batch (a reorg, at CONFIRMATIONS=0)."
+  say "    Recover with, on $BOX:"
+  say "      L=\$(grep -o '"last_executed": [0-9]*' ~/monad/status.json | grep -o '[0-9]*')"
+  say "      ~/monad/build/category/mpt/monad-mpt --storage ~/triedb.db --rewind-to \$((L - 3)) --yes"
+  say "      rm -f ~/block_db/\$((L - 2)) ~/block_db/\$((L - 1)) ~/block_db/\$L ~/monad/logs/ALERT"
+  die "not starting the producer on top of an ALERT — rewind first, then re-run."
+fi
+onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL TAP_INTERVAL=$TAP_INTERVAL ETHPROOFS_URL=http://localhost:$MOCK_PORT CLUSTER=local-ZisK-monad ./witness-follow start tip"
 
 step "Starting the prover (mock on this Mac, transfers real)"
-onbox "tmux has-session -t prove 2>/dev/null && echo '   · prove already running' || tmux new-session -d -s prove \"cd $BOX_REPO && REMOTE_WS=$MOCK_WS REMOTE_RUNNER=$MOCK_RUNNER_DIR/zisk-runner WITNESS_MANIFEST=\$HOME/witness-manifest.csv cli/prove-farm --guest monad-zisk --mock --remote $MAC_USER@localhost --port $TUN_SSH_PORT --mock-secs $MOCK_SECS --mock-per-mstep $MOCK_PER_MSTEP --mock-speed $MOCK_SPEED --mock-jitter $MOCK_JITTER --interval 2 --watch --newest-first --ethproofs-url http://localhost:$MOCK_PORT --ethproofs-cluster local-ZisK-monad 2>&1 | tee -a ~/prove-mock.log\""
+onbox "tmux has-session -t prove 2>/dev/null && echo '   · prove already running' || tmux new-session -d -s prove \"cd $BOX_REPO && REMOTE_WS=$MOCK_WS REMOTE_RUNNER=$MOCK_RUNNER_DIR/zisk-runner WITNESS_MANIFEST=\$HOME/witness-manifest.csv cli/prove-farm --guest monad-zisk --mock --remote $MAC_USER@localhost --port $TUN_SSH_PORT --mock-secs $MOCK_SECS --mock-per-mstep $MOCK_PER_MSTEP --mock-speed $MOCK_SPEED --mock-jitter $MOCK_JITTER --interval 1 --watch --newest-first --ethproofs-url http://localhost:$MOCK_PORT --ethproofs-cluster local-ZisK-monad 2>&1 | tee -a ~/prove-mock.log\""
 
 [ "$CRON" = 1 ] && { step "Installing the daily log archiver on the box"
   onbox "(crontab -l 2>/dev/null | grep -v archive-logs; echo '17 4 * * * \$HOME/zkvm-bench/infra/monad-witness/archive-logs >> \$HOME/archive-logs.log 2>&1') | crontab - && crontab -l | tail -1"; }

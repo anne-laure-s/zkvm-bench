@@ -30,6 +30,8 @@
 # Config (env): MONAD_DIR REPO WITNESS_DIR BLOCK_DB DB RPC NTHREADS MAX_BATCH MIN_FOLLOW_BATCH
 #               PY ETHPROOFS_URL CLUSTER QUEUE_MODULUS KEEP_RECENT
 #               HEAD_TAG CONFIRMATIONS   (block-by-block; needs ./patch-fetch-blocks.py — see README)
+#               FETCH_POLL TAP_INTERVAL   (polling latency: both default to 6 s, which is 12 s of pure
+#                                          waiting in the end-to-end budget for no benefit)
 set -uo pipefail
 
 MONAD_DIR="${MONAD_DIR:-$HOME/monad}"
@@ -53,6 +55,9 @@ fetch_cmd() {
   local extra=""
   [ -n "${HEAD_TAG:-}" ]      && extra="$extra --head-tag $HEAD_TAG"
   [ -n "${CONFIRMATIONS:-}" ] && extra="$extra --confirmations $CONFIRMATIONS"
+  # The fetcher sleeps --poll-interval when caught up (6 s by default), so up to 6 s of pure latency sits
+  # between a block appearing and the fetcher noticing. One RPC call per second to a local node is nothing.
+  [ -n "${FETCH_POLL:-}" ]    && extra="$extra --poll-interval $FETCH_POLL"
   echo "cd $MONAD_DIR && $PY fetch_blocks.py --rpc $RPC --block-db $BLOCK_DB$extra 2>&1 | tee -a ~/fetch.log"
 }
 replay_cmd() {  # $1 = catchup|tip
@@ -66,6 +71,7 @@ tap_cmd() {
   echo "cd $HERE && WITNESS_DIR=$WITNESS_DIR REPO=$REPO BLOCK_DB=$BLOCK_DB RPC=$RPC \
 ${ETHPROOFS_URL:+ETHPROOFS_URL=$ETHPROOFS_URL }${CLUSTER:+CLUSTER=$CLUSTER }\
 ${QUEUE_MODULUS:+QUEUE_MODULUS=$QUEUE_MODULUS }${KEEP_RECENT:+KEEP_RECENT=$KEEP_RECENT }\
+${TAP_INTERVAL:+INTERVAL=$TAP_INTERVAL }\
 ./witness-tap 2>&1 | tee -a ~/witness-tap.log"
 }
 
