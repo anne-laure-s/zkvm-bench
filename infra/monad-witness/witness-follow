@@ -30,7 +30,7 @@
 # Config (env): MONAD_DIR REPO WITNESS_DIR BLOCK_DB DB RPC NTHREADS MAX_BATCH MIN_FOLLOW_BATCH
 #               PY ETHPROOFS_URL CLUSTER QUEUE_MODULUS KEEP_RECENT
 #               HEAD_TAG CONFIRMATIONS   (block-by-block; needs ./patch-fetch-blocks.py — see README)
-#               FETCH_POLL TAP_INTERVAL   (polling latency: both default to 6 s, which is 12 s of pure
+#               FETCH_POLL TAP_INTERVAL REPLAY_POLL   (polling latency: 6 s, 6 s and 12 s by default,
 #                                          waiting in the end-to-end budget for no benefit)
 set -uo pipefail
 
@@ -63,6 +63,10 @@ fetch_cmd() {
 replay_cmd() {  # $1 = catchup|tip
   local extra="--max-batch $MAX_BATCH"
   [ "$1" = tip ] && extra="--min-follow-batch $MIN_FOLLOW_BATCH --zkvm-witness $WITNESS_DIR"
+  # run_replay.py idles on its OWN poll interval (12 s by default) once it has consumed the block_db — the
+  # single largest polling delay in the whole pipeline, and measured at 6-18 s inside chain->witness.
+  # Passed only when set, because an unknown flag would stop the replay from starting at all.
+  [ -n "${REPLAY_POLL:-}" ] && extra="$extra --poll-interval $REPLAY_POLL"
   echo "cd $MONAD_DIR && $PY run_replay.py --monad-bin build/cmd/monad --monad-cli-bin build/cmd/monad-cli \
 --block-db $BLOCK_DB --db $DB --rpc $RPC --logs-dir ./logs --status-file status.json \
 --nthreads $NTHREADS $extra 2>&1 | tee -a ~/replay-$1.log"
@@ -71,7 +75,7 @@ tap_cmd() {
   echo "cd $HERE && WITNESS_DIR=$WITNESS_DIR REPO=$REPO BLOCK_DB=$BLOCK_DB RPC=$RPC \
 ${ETHPROOFS_URL:+ETHPROOFS_URL=$ETHPROOFS_URL }${CLUSTER:+CLUSTER=$CLUSTER }\
 ${QUEUE_MODULUS:+QUEUE_MODULUS=$QUEUE_MODULUS }${KEEP_RECENT:+KEEP_RECENT=$KEEP_RECENT }\
-${TAP_INTERVAL:+INTERVAL=$TAP_INTERVAL }\
+${TAP_INTERVAL:+INTERVAL=$TAP_INTERVAL }${SETTLE_SECS:+SETTLE_SECS=$SETTLE_SECS }\
 ./witness-tap 2>&1 | tee -a ~/witness-tap.log"
 }
 

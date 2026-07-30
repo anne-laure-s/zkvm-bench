@@ -18,7 +18,7 @@
 #
 # WHAT IT WILL NOT DO, on purpose:
 #   * enable Remote Login (a security setting — turn it on yourself in System Settings > Sharing)
-#   * commit or push your code (it checks and refuses instead: publishing is your call)
+#   * commit or push your code (it warns; the box's own clone is verified at step 6 instead)
 #   * install a toolchain
 #
 #   ./rtp-up [--dry-run] [--purge] [--keep-mock] [--cron] [--stop]
@@ -42,7 +42,11 @@
 #               MOCK_STORE=/tmp/ethproofs-rtp  MOCK_SECS=2.12  MOCK_PER_MSTEP=0.0364  MOCK_SPEED=2.5  MOCK_JITTER=0.5
 #               HEAD_TAG=latest  CONFIRMATIONS=0 (the head — real time)  MOCK_RUNNER_DIR=$HOME/zisk-mock
 #               CATCHUP_TARGET=10 (blocks)  CATCHUP_POLL=30 (s)  CATCHUP_MAX_MIN=240
-#               FETCH_POLL=1  TAP_INTERVAL=1   (polling latency, 6 s each by default)
+#               FETCH_POLL=1  TAP_INTERVAL=1  REPLAY_POLL=1  SETTLE_SECS=0.5   (polling latency)
+#               PROVER=<ssh target the BOX can reach>  PROVER_PORT=22
+#                   unset = the mock prover runs on this Mac through the tunnel: 20-34 s per block of pure
+#                   transport, the largest term left in the end-to-end. Set it to a datacenter host and the
+#                   witness never touches the home link. See the block above PROVER= for the details.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,10 +73,39 @@ CONFIRMATIONS="${CONFIRMATIONS:-0}"
 # end-to-end latency for nothing at all. One RPC call and one directory scan per second cost nothing.
 FETCH_POLL="${FETCH_POLL:-1}"
 TAP_INTERVAL="${TAP_INTERVAL:-1}"
+# run_replay.py's own idle poll: 12 s by default, the biggest single polling delay in the pipeline (measured
+# inside chain->witness at 6-18 s). Verify the flag name once with `run_replay.py --help | grep poll`.
+REPLAY_POLL="${REPLAY_POLL:-1}"
+# The tap skips a witness younger than this so it never frames a half-written one. 2 s was cautious and
+# showed up whole in wit->queue; monad writes a witness in one pass, so 0.5 s is enough margin.
+SETTLE_SECS="${SETTLE_SECS:-0.5}"
 # The runner must live OUTSIDE ~/Documents: macOS TCC protects it, and a process started by sshd cannot
 # execute anything there ("Operation not permitted"). This is why the script copies it at all.
 MOCK_RUNNER_DIR="${MOCK_RUNNER_DIR:-$HOME/zisk-mock}"
 MOCK_WS="${MOCK_WS:-$HOME/zisk-mock-ws}"
+
+# WHERE THE PROVER RUNS — the single largest remaining term in the end-to-end latency.
+#
+# Every block sends a 7-15 MB framed witness from the box to the prover. Default (PROVER unset) that prover
+# is this Mac, reached through the reverse tunnel: measured at 20-34 s per block, ~2 Mbit/s effective, and
+# multiplexing every ssh call onto one connection already took what there was to take. It is not the link,
+# it is the topology — a home uplink with TCP inside TCP. No interval, buffer or compression flag fixes it.
+#
+# Set PROVER to an ssh target the BOX can reach on a datacenter link (chi-001, or the GPU box where real
+# proving would happen) and that term collapses to a fraction of a second. Only the 381 KB proof and its
+# report then cross the home link, to the ethproofs mock — 20-40x less data on the slow hop.
+#
+#   PROVER=chi-001 ./rtp-up
+#
+# The runner is staged there FROM THE BOX, not from here: the box is what has to reach it, so staging over
+# the same path proves the path. ziskemu must exist on it, or the mock loses the step measurement and falls
+# back to its fixed term — which would quietly turn every simulated duration into the same number.
+PROVER="${PROVER:-}"
+if [ -n "$PROVER" ]; then
+  PROVER_TARGET="$PROVER";               PROVER_PORT="${PROVER_PORT:-22}";      PROVER_WHERE="$PROVER"
+else
+  PROVER_TARGET="$MAC_USER@localhost";   PROVER_PORT="$TUN_SSH_PORT";           PROVER_WHERE="this Mac"
+fi
 BOX_REPO="${BOX_REPO:-\$HOME/zkvm-bench}"
 
 DRY=0 PURGE=0 KEEP_MOCK=0 CRON=0 STOP=0
@@ -113,35 +146,62 @@ if [ "$STOP" = 1 ]; then
 fi
 
 # ── 0. this Mac's repo must be pushed, or the box cannot have the code ──────────────────────────────
-step "Checking this repo is published"
+# Warnings, not gates. What actually has to be true is that the BOX has the code it needs, and that is
+# verified for real at step 6 by grepping its clone — not inferrable from this repo's git state. Blocking on
+# an uncommitted notes file was pure friction.
+# The one asymmetry worth naming: the box runs the PUSHED version, while the runner staged on this Mac at
+# step 1 is copied from the WORKING TREE. So uncommitted changes can make the two ends disagree.
+step "This repo's state"
 cd "$MAC_REPO" || die "cannot cd to $MAC_REPO"
-dirty="$(git status --porcelain 2>/dev/null | head -5)"
-[ -z "$dirty" ] || { echo "$dirty" | sed 's/^/   /'; die "uncommitted changes above. Commit them yourself — publishing is your call, not this script's."; }
+say "$(git log --oneline -1)"
+dirty="$(git status --porcelain 2>/dev/null)"
+if [ -n "$dirty" ]; then
+  say "uncommitted (fine — but the box pulls the pushed version, this Mac stages from the working tree):"
+  printf '%s\n' "$dirty" | head -8 | sed 's/^/     /'
+fi
 ahead="$(git rev-list '@{u}..HEAD' --count 2>/dev/null || echo '?')"
-[ "$ahead" = "0" ] || die "HEAD is $ahead commit(s) ahead of the remote. Push first: the box pulls from there."
-say "clean and pushed ($(git log --oneline -1))"
+case "$ahead" in
+  0) ;;
+  '?') say "no upstream configured — cannot tell whether the box can pull this" ;;
+  *) say "NOTE: $ahead commit(s) not pushed. The box will pull what IS on the remote; step 6 checks it has \
+what the run needs." ;;
+esac
 
 # ── 1. the mock prover's runner, outside the TCC-protected tree ─────────────────────────────────────
-step "Staging the mock prover's runner in $MOCK_RUNNER_DIR"
-run "mkdir -p '$MOCK_RUNNER_DIR'"
-run "cp '$MAC_REPO/infra/zisk-infra/zisk-runner' '$MOCK_RUNNER_DIR/'"
-run "chmod +x '$MOCK_RUNNER_DIR/zisk-runner'"
-if [ "$DRY" != 1 ]; then
-  grep -q 'MOCK PROVER] emulating' "$MOCK_RUNNER_DIR/zisk-runner" \
-    || die "the staged runner has no emulating mock branch — is $MAC_REPO up to date?"
-  say "staged, and it carries the emulating mock branch"
+# Only when the prover IS this Mac. For a remote prover the staging needs the box's clone, which is not
+# updated until step 7 — so it happens there instead (7c), over the same box->prover path the run will use.
+if [ -z "$PROVER" ]; then
+  step "Staging the mock prover's runner in $MOCK_RUNNER_DIR"
+  run "mkdir -p '$MOCK_RUNNER_DIR'"
+  run "cp '$MAC_REPO/infra/zisk-infra/zisk-runner' '$MOCK_RUNNER_DIR/'"
+  run "chmod +x '$MOCK_RUNNER_DIR/zisk-runner'"
+  if [ "$DRY" != 1 ]; then
+    grep -q 'MOCK PROVER] emulating' "$MOCK_RUNNER_DIR/zisk-runner" \
+      || die "the staged runner has no emulating mock branch — is $MAC_REPO up to date?"
+    say "staged, and it carries the emulating mock branch"
+  fi
+  command -v ziskemu >/dev/null 2>&1 \
+    && say "ziskemu found: the prover will measure real step counts" \
+    || say "WARNING: no ziskemu on this Mac — the model will fall back to its fixed term only"
+else
+  step "Mock prover on $PROVER (not this Mac) — staging deferred to after the box's clone is updated"
 fi
-command -v ziskemu >/dev/null 2>&1 \
-  && say "ziskemu found: the prover will measure real step counts" \
-  || say "WARNING: no ziskemu on this Mac — the model will fall back to its fixed term only"
 
 # ── 2. the box must be able to ssh back here, without a password ────────────────────────────────────
 step "Key auth from $BOX back to this Mac"
+# Test the PRIVATE half. Checking only `.pub` was a real bug: a leftover public key (or a wiped ~/.ssh that
+# kept nothing at all) let this step report success while the box had nothing to authenticate with, and the
+# run then survived purely on a forwarded agent — until the agent went away and every transfer stopped.
+have_key="$(onbox_q 'test -f ~/.ssh/id_ed25519 && echo yes')"
 pub="$(onbox_q 'cat ~/.ssh/id_ed25519.pub 2>/dev/null')"
-if [ -z "$pub" ]; then
-  say "no key on the box — generating one there"
-  onbox "ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519 -q"
+if [ "$have_key" != yes ] || [ -z "$pub" ]; then
+  say "no usable key pair on the box — generating one there"
+  onbox "mkdir -p ~/.ssh && chmod 700 ~/.ssh && rm -f ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub && ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519 -q -C $BOX-rtp"
+  have_key="$(onbox_q 'test -f ~/.ssh/id_ed25519 && echo yes')"
   pub="$(onbox_q 'cat ~/.ssh/id_ed25519.pub 2>/dev/null')"
+  [ "$have_key" = yes ] || [ "$DRY" = 1 ] || die "ssh-keygen did not leave a private key on $BOX. If ~/.ssh \
+keeps being emptied there, something on that host manages it (config management, a home reset) — find that \
+before going further, or the pipeline will keep dying whenever your agent is not around."
 fi
 [ -n "$pub" ] || [ "$DRY" = 1 ] || die "still no public key on $BOX"
 if [ "$DRY" != 1 ]; then
@@ -193,13 +253,27 @@ fi
 # ── 5. both directions must actually work, before anything is started ──────────────────────────────
 step "End-to-end reachability"
 if [ "$DRY" != 1 ]; then
-  onbox_q "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p $TUN_SSH_PORT $MAC_USER@localhost true" \
-    && say "$BOX can ssh into this Mac without a password" \
-    || die "$BOX still cannot ssh in. Check: Remote Login enabled? ~/.ssh permissions? See ~/tunnel.log"
+  # IdentityAgent=none + IdentitiesOnly=yes: BatchMode does NOT rule out agent authentication, so without
+  # these a forwarded agent answers for the box and this check passes with no key on it at all. That is
+  # exactly how the pipeline came to depend on an agent that later disappeared. Test what the tmux sessions
+  # will actually have — their own key, nothing else.
+  onbox_q "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o IdentityAgent=none -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 -p $TUN_SSH_PORT $MAC_USER@localhost true" \
+    && say "$BOX can ssh into this Mac with its OWN key (no agent involved)" \
+    || die "$BOX cannot ssh in using its own key. An agent may still make it look fine interactively, but the \
+tmux sessions have no agent. Check: Remote Login enabled on this Mac? ~/.ssh/authorized_keys contains the \
+key printed above? ~ not group-writable? See ~/tunnel.log"
   onbox_q "curl -sf http://localhost:$MOCK_PORT/status >/dev/null" \
     && say "$BOX can reach the mock through the tunnel" \
     || die "$BOX cannot reach the mock on :$MOCK_PORT — the tunnel's forward is not up (see ~/tunnel.log)"
-  bashv="$(onbox_q "ssh -o BatchMode=yes -p $TUN_SSH_PORT $MAC_USER@localhost 'bash --version | head -1'")"
+  # The prover hop, whichever it is. For a remote prover this is the check that matters most: the box must
+  # reach it with a key, unattended, or every block fails at upload and the queue silently drains to nothing.
+  if [ -n "$PROVER" ]; then
+    onbox_q "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p $PROVER_PORT $PROVER_TARGET true" \
+      && say "$BOX can ssh into the prover $PROVER_TARGET without a password" \
+      || die "$BOX cannot ssh into $PROVER_TARGET (port $PROVER_PORT). Add $BOX's ~/.ssh/id_ed25519.pub to \
+that host's authorized_keys — the same way step 2 does it for this Mac."
+  fi
+  bashv="$(onbox_q "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET 'bash --version | head -1'")"
   say "prover's shell: ${bashv:-unknown}"
   case "$bashv" in *"version 3."*) say "  (bash 3.2: emulation time is measured to the second — ±1s of noise)";; esac
 fi
@@ -215,6 +289,25 @@ if [ "$DRY" != 1 ]; then
   onbox_q "grep -q ZISK_MOCK_PER_MSTEP $BOX_REPO/cli/prove-farm" \
     || die "the box's prove-farm cannot drive a remote mock prover — did the pull work?"
   say "the box's clone has the mock prover"
+fi
+
+# ── 6c. a remote prover's runner, pushed from the box's freshly-pulled clone ────────────────────────
+if [ -n "$PROVER" ]; then
+  step "Staging the runner on $PROVER_TARGET:$MOCK_RUNNER_DIR (from the box)"
+  onbox "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET 'mkdir -p $MOCK_RUNNER_DIR $MOCK_WS'"
+  onbox "scp -q -o BatchMode=yes -P $PROVER_PORT $BOX_REPO/infra/zisk-infra/zisk-runner $PROVER_TARGET:$MOCK_RUNNER_DIR/"
+  onbox "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET 'chmod +x $MOCK_RUNNER_DIR/zisk-runner'"
+  if [ "$DRY" != 1 ]; then
+    onbox_q "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET \"grep -q 'MOCK PROVER] emulating' $MOCK_RUNNER_DIR/zisk-runner\"" \
+      && say "staged, and it carries the emulating mock branch" \
+      || die "the runner on $PROVER_TARGET has no emulating mock branch — the copy did not land"
+    # Without ziskemu the model loses its only per-block input and every simulated duration becomes the same
+    # fixed term. That is not a degraded measurement, it is a constant pretending to be one — so say it loudly.
+    onbox_q "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET 'command -v ziskemu >/dev/null 2>&1'" \
+      && say "ziskemu found on the prover: it will measure real step counts" \
+      || say "WARNING: no ziskemu on $PROVER_TARGET — every mock duration will be the SAME fixed term, \
+unrelated to the block. Install ZisK there, or keep the prover on the Mac."
+  fi
 fi
 
 # ── 6b. the fetcher: newHeads subscription instead of polling ──────────────────────────────────────
@@ -261,7 +354,7 @@ box_gap(){ onbox_q "H=\$(ls ~/block_db 2>/dev/null | grep -E '^[0-9]+\$' | sort 
 if [ "$DRY" = 1 ]; then
   say "[dry-run] would start the catch-up replay and poll until the gap is <= ${CATCHUP_TARGET:-10} blocks"
 else
-  onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL ./witness-follow start catchup 2>&1 | sed 's/^/   /'"
+  onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL REPLAY_POLL=$REPLAY_POLL ./witness-follow start catchup 2>&1 | sed 's/^/   /'"
   target="${CATCHUP_TARGET:-10}"; poll="${CATCHUP_POLL:-30}"; maxmin="${CATCHUP_MAX_MIN:-240}"
   deadline=$(( $(date +%s) + maxmin * 60 )); stall=0; prev=""
   while :; do
@@ -313,10 +406,10 @@ if [ "$DRY" != 1 ] && [ -n "$(onbox_q "ls ~/monad/logs/ALERT 2>/dev/null")" ]; t
   say "      rm -f ~/block_db/\$((L - 2)) ~/block_db/\$((L - 1)) ~/block_db/\$L ~/monad/logs/ALERT"
   die "not starting the producer on top of an ALERT — rewind first, then re-run."
 fi
-onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL TAP_INTERVAL=$TAP_INTERVAL ETHPROOFS_URL=http://localhost:$MOCK_PORT CLUSTER=local-ZisK-monad ./witness-follow start tip"
+onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL TAP_INTERVAL=$TAP_INTERVAL REPLAY_POLL=$REPLAY_POLL SETTLE_SECS=$SETTLE_SECS ETHPROOFS_URL=http://localhost:$MOCK_PORT CLUSTER=local-ZisK-monad ./witness-follow start tip"
 
-step "Starting the prover (mock on this Mac, transfers real)"
-onbox "tmux has-session -t prove 2>/dev/null && echo '   · prove already running' || tmux new-session -d -s prove \"cd $BOX_REPO && REMOTE_WS=$MOCK_WS REMOTE_RUNNER=$MOCK_RUNNER_DIR/zisk-runner WITNESS_MANIFEST=\$HOME/witness-manifest.csv cli/prove-farm --guest monad-zisk --mock --remote $MAC_USER@localhost --port $TUN_SSH_PORT --mock-secs $MOCK_SECS --mock-per-mstep $MOCK_PER_MSTEP --mock-speed $MOCK_SPEED --mock-jitter $MOCK_JITTER --interval 1 --watch --newest-first --ethproofs-url http://localhost:$MOCK_PORT --ethproofs-cluster local-ZisK-monad 2>&1 | tee -a ~/prove-mock.log\""
+step "Starting the prover (mock on $PROVER_WHERE, transfers real)"
+onbox "tmux has-session -t prove 2>/dev/null && echo '   · prove already running' || tmux new-session -d -s prove \"cd $BOX_REPO && REMOTE_WS=$MOCK_WS REMOTE_RUNNER=$MOCK_RUNNER_DIR/zisk-runner WITNESS_MANIFEST=\$HOME/witness-manifest.csv cli/prove-farm --guest monad-zisk --mock --remote $PROVER_TARGET --port $PROVER_PORT --mock-secs $MOCK_SECS --mock-per-mstep $MOCK_PER_MSTEP --mock-speed $MOCK_SPEED --mock-jitter $MOCK_JITTER --interval 1 --watch --newest-first --ethproofs-url http://localhost:$MOCK_PORT --ethproofs-cluster local-ZisK-monad 2>&1 | tee -a ~/prove-mock.log\""
 
 [ "$CRON" = 1 ] && { step "Installing the daily log archiver on the box"
   onbox "(crontab -l 2>/dev/null | grep -v archive-logs; echo '17 4 * * * \$HOME/zkvm-bench/infra/monad-witness/archive-logs >> \$HOME/archive-logs.log 2>&1') | crontab - && crontab -l | tail -1"; }
