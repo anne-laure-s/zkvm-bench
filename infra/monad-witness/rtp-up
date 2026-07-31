@@ -207,7 +207,11 @@ step "Key auth from $BOX back to this Mac"
 have_key="$(onbox_q 'test -f ~/.ssh/id_ed25519 && echo yes')"
 pub="$(onbox_q 'cat ~/.ssh/id_ed25519.pub 2>/dev/null')"
 if [ "$have_key" != yes ] || [ -z "$pub" ]; then
+  # Say WHICH half is missing, and what the directory looks like. This has fired twice on a box where the key
+  # was verified present hours earlier, and "no usable key pair" alone gives nothing to reason from.
   say "no usable key pair on the box — generating one there"
+  say "  private: ${have_key:-MISSING}   public: $([ -n "$pub" ] && echo present || echo MISSING)"
+  onbox_q 'ls -la ~/.ssh/ 2>&1 | head -8' | sed 's/^/     /'
   onbox "mkdir -p ~/.ssh && chmod 700 ~/.ssh && rm -f ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub && ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519 -q -C $BOX-rtp"
   have_key="$(onbox_q 'test -f ~/.ssh/id_ed25519 && echo yes')"
   pub="$(onbox_q 'cat ~/.ssh/id_ed25519.pub 2>/dev/null')"
@@ -358,10 +362,61 @@ fi
 # costs hours and tens of GB of witnesses that have no real-time value whatsoever. So: catch up with the
 # flag OFF, then switch. Starting `catchup` is idempotent — if we are already at the tip the loop exits on
 # its first poll, having cost a few seconds of witness-less replay.
+# An ALERT means a previous batch FAILED and the replay will not start. Checked HERE, before the catch-up
+# loop, because that loop can only observe the symptom: the gap growing at chain speed while nothing runs.
+# Its "no progress in 90s" verdict is true but buries the cause under a minute and a half of polling.
+if [ "$DRY" != 1 ] && onbox_q "test -f ~/monad/logs/ALERT && echo yes" | grep -q yes; then
+  printf '\n'
+  onbox_q "cat ~/monad/logs/ALERT" | sed 's/^/   | /'
+  die "the replay is stopped on the ALERT above and will not restart while it exists.
+
+Read it first — never clear it blindly.
+
+'bad nonce' (or a state-root / parent-hash mismatch) means a REORG replaced a block the triedb ALREADY
+APPLIED — the expected failure mode at CONFIRMATIONS=0. Two things we know the hard way:
+
+  * Deleting the divergent blocks from block_db and re-fetching the canonical ones DOES NOT FIX IT. Verified:
+    the re-fetched block failed with the identical error. The bad state is in the triedb, not in block_db.
+Recovery is to UN-APPLY the diverged blocks. The triedb still holds the earlier state (history_length runs to
+~3900 blocks, far above the 300 minimum), so this is just a pointer move — with the replay stopped, which it
+already is:
+
+  last=\$(~/monad/build/cmd/monad-cli --db ~/triedb.db | grep -o 'latest_finalized_block_id=[0-9]*' | cut -d= -f2)
+  ~/monad/build/category/mpt/monad-mpt --storage ~/triedb.db --rewind-to \$((last - 10)) --yes
+  rm ~/monad/logs/ALERT
+
+Note the two traps: monad-mpt is at build/category/mpt/, NOT in build/cmd/ beside monad and monad-cli, and it
+takes --storage, NOT --db. Add --allow-dirty if it refuses because the crash left the dirty flag set. The
+block_db needs no purge as long as its blocks above the rewind point were fetched AFTER the reorg settled —
+if they predate it, delete them too and let the fetcher re-download.
+
+Anything else (disk full, a crash, a missing block) is a different problem entirely."
+fi
+
 step "Catching up to the tip (no witnesses while there is a backlog)"
 # gap — "<block_db head> <last_executed> <gap>". The block_db listing is authoritative: status.json's
 # `available` is only as fresh as the last replay cycle, and the replay may be stopped right now.
-box_gap(){ onbox_q "H=\$(ls ~/block_db 2>/dev/null | grep -E '^[0-9]+\$' | sort -n | tail -1); L=\$(grep -o '\"last_executed\": [0-9]*' ~/monad/status.json 2>/dev/null | grep -o '[0-9]*'); echo \"\${H:-0} \${L:-0} \$(( \${H:-0} - \${L:-0} ))\""; }
+# Progress comes from monad-cli, NOT from status.json. run_replay.py writes status.json BEFORE starting a
+# batch and then blocks in child.wait() until it finishes — with MAX_BATCH=2000 at 7-9 blocks/s that is 4-5
+# minutes during which last_executed cannot change in the file. Polling it every 30 s and concluding "no
+# progress" after 90 s declares a healthy replay dead every single time, on its first batch.
+# monad-cli reads the triedb's own committed head, live, in ~0.14 s. status.json stays as the fallback in case
+# a concurrent read-only open ever fails while monad holds the database.
+# Three numbers, because the catch-up has three distinct states and one number cannot tell them apart:
+#   AVAIL  status.json's `available` — the CONTIGUOUS head of block_db, which is all the replay can consume.
+#          NOT max(block_db): a hole leaves thousands of blocks on disk that are unreachable, and reporting
+#          the max once claimed "8097 blocks ready" while the true answer was zero.
+#   LAST   the triedb's committed head, from monad-cli, live. status.json's copy is written BEFORE a batch and
+#          then frozen for the 4-5 minutes the batch runs, so it cannot be used to detect progress.
+#   TIP    the chain head. Distance to it is the only correct "are we caught up" test — AVAIL-LAST reaching
+#          zero means the fetcher has stopped supplying, which is the opposite of being caught up.
+box_gap(){ onbox_q "
+A=\$(grep -o '\"available\": [0-9]*' ~/monad/status.json 2>/dev/null | grep -o '[0-9]*')
+T=\$(grep -o '\"finalized_head\": [0-9]*' ~/monad/status.json 2>/dev/null | grep -o '[0-9]*')
+L=\$(~/monad/build/cmd/monad-cli --db ~/triedb.db 2>/dev/null | grep -o 'latest_finalized_block_id=[0-9]*' | cut -d= -f2)
+[ -n \"\$L\" ] || L=\$(grep -o '\"last_executed\": [0-9]*' ~/monad/status.json 2>/dev/null | grep -o '[0-9]*')
+echo \"\${A:-0} \${L:-0} \${T:-0}\"
+"; }
 
 if [ "$DRY" = 1 ]; then
   say "[dry-run] would start the catch-up replay and poll until the gap is <= ${CATCHUP_TARGET:-10} blocks"
@@ -370,26 +425,51 @@ else
   target="${CATCHUP_TARGET:-10}"; poll="${CATCHUP_POLL:-30}"; maxmin="${CATCHUP_MAX_MIN:-240}"
   deadline=$(( $(date +%s) + maxmin * 60 )); stall=0; prev=""
   while :; do
-    read -r head last gap <<<"$(box_gap)"
-    [ -n "${gap:-}" ] || die "cannot read the box's progress (is ~/monad/status.json there?)"
+    read -r avail last tip <<<"$(box_gap)"
+    [ -n "${tip:-}" ] || die "cannot read the box's progress (is ~/monad/status.json there?)"
+    gap=$(( tip - last )); ready=$(( avail - last ))
     if [ "$gap" -le "$target" ]; then
-      say "at the tip: block_db=$head last_executed=$last gap=$gap"
+      say "at the tip: available=$avail last_executed=$last gap-to-chain=$gap"
       break
     fi
-    if [ -n "$prev" ]; then
+    if [ "$ready" -le 0 ]; then
+      # Nothing to execute: block_db has no block $((last+1)). This is a FETCHER problem, never a replay one,
+      # and it is what a block_db purge leaves behind when the fetcher was not stopped first — it keeps writing
+      # at the tip from its in-memory position and never comes back to fill the hole, and existing_max_block()
+      # takes the MAX, so restarting it does not help either. Only deleting everything above the gap does.
+      stall=$((stall + 1))
+      [ "$stall" -lt 4 ] || die "the replay has nothing to execute: block_db is missing block $((last + 1)) \
+while the chain is $gap blocks ahead. There is a HOLE in block_db — almost certainly a purge done with the \
+fetcher still running. Fix it by removing everything above the triedb head so the fetch resumes contiguously:
+
+  pkill -f fetch_blocks.py; tmux kill-session -t fetch
+  ls ~/block_db | awk '\$1+0 > $last' > /tmp/drop.txt; wc -l < /tmp/drop.txt
+  (cd ~/block_db && xargs -a /tmp/drop.txt rm -f)
+
+then re-run rtp-up, which restarts the fetcher from $((last + 1))."
+      say "gap-to-chain=$gap — nothing to execute, block_db is missing $((last + 1)) ($stall/4)"
+    elif [ -n "$prev" ]; then
       done_blocks=$(( last - prev ))
       if [ "$done_blocks" -le 0 ]; then
         stall=$((stall + 1))
-        # Three idle polls means the replay is not advancing: an ALERT, a dead session, or an empty
-        # block_db. Stopping here beats waiting hours for a loop that will never finish.
-        [ "$stall" -lt 3 ] || die "the replay has not advanced in $((3 * poll))s (gap=$gap). Check: \
-ssh $BOX 'tail -5 ~/replay-catchup.log; ls ~/monad/logs/ALERT'"
-        say "gap=$gap — no progress ($stall/3)"
+        # Idle with $ready blocks in hand is a genuine failure. Name the cause here rather than sending the
+        # operator to look for it — an ALERT is by far the most common, and hunting for it once cost a morning.
+        if [ "$stall" -ge 3 ]; then
+          if onbox_q "test -f ~/monad/logs/ALERT && echo yes" | grep -q yes; then
+            printf '\n'; onbox_q "head -3 ~/monad/logs/ALERT" | sed 's/^/   | /'
+            die "the replay stopped on a NEW ALERT (above) after $((3 * poll))s with $ready blocks ready to \
+execute. If it is the same block as before, the triedb state is diverged and must be rewound — see the recovery \
+block printed when rtp-up refuses to start on an ALERT."
+          fi
+          die "the replay has not advanced in $((3 * poll))s and there is no ALERT, though $ready blocks are \
+ready. The session probably died another way. Check: ssh $BOX 'tmux ls; tail -20 ~/replay-catchup.log'"
+        fi
+        say "gap-to-chain=$gap — no progress ($stall/3)"
       else
         stall=0
         rate=$(awk -v d="$done_blocks" -v p="$poll" 'BEGIN{printf "%.1f", d/p}')
         eta=$(awk -v g="$gap" -v d="$done_blocks" -v p="$poll" 'BEGIN{printf "%d", (d>0 ? g*p/d/60 : 0)}')
-        say "gap=$gap  ($rate blocks/s, ~${eta} min left)"
+        say "gap-to-chain=$gap  ($rate blocks/s, $ready ready, ~${eta} min left)"
       fi
     else
       say "gap=$gap — catching up"
