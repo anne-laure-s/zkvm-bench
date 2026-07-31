@@ -32,6 +32,10 @@
 #               HEAD_TAG CONFIRMATIONS   (block-by-block; needs ./patch-fetch-blocks.py — see README)
 #               FETCH_POLL TAP_INTERVAL REPLAY_POLL   (polling latency: 6 s, 6 s and 12 s by default,
 #                                          waiting in the end-to-end budget for no benefit)
+#               TIP_DIRECT=1 BLOCK_DB_TIMEOUT=30s   at the tip, run ONE long-lived monad that waits for blocks
+#                                          instead of run_replay.py starting a fresh one per batch. Removes a
+#                                          full db-open per block from chain->witness. TIP_DIRECT=0 restores
+#                                          the old path for comparison.
 set -uo pipefail
 
 MONAD_DIR="${MONAD_DIR:-$HOME/monad}"
@@ -71,6 +75,27 @@ replay_cmd() {  # $1 = catchup|tip
 --block-db $BLOCK_DB --db $DB --rpc $RPC --logs-dir ./logs --status-file status.json \
 --nthreads $NTHREADS $extra 2>&1 | tee -a ~/replay-$1.log"
 }
+# tip_direct_cmd — ONE long-lived monad process that WAITS for blocks, instead of a fresh one per batch.
+#
+# `monad --help` gives two options run_replay.py never uses together:
+#   --nblocks           default 18446744073709551615, i.e. "until stopped"
+#   --block-db-timeout  seconds to wait for a block to appear in block_db (0 = no retry, the default)
+#
+# With both, monad follows block_db as it grows. That removes the single remaining floor under chain->witness:
+# run_replay.py starts a NEW monad per batch, and --min-follow-batch 1 (required for block-by-block) pays that
+# full startup — db open, ring config, ~0.4 s of initialisation — for EVERY block. It also makes
+# run_replay.py's own --poll-interval irrelevant, since monad itself is now the thing that waits.
+#
+# monad resumes from the triedb's own head (observed: "Finished initializing db at block = N, start block
+# number = N+1"), so no start block is needed and restarts stay safe.
+#
+# MAX_BATCH and MIN_FOLLOW_BATCH have no meaning on this path — there are no batches.
+tip_direct_cmd() {
+  local extra=""
+  [ -n "${BLOCK_DB_TIMEOUT:-}" ] && extra="--block-db-timeout $BLOCK_DB_TIMEOUT"
+  echo "$MONAD_DIR/build/cmd/monad --chain ethereum_mainnet --block-db $BLOCK_DB --db $DB \
+--nthreads $NTHREADS --zkvm-witness $WITNESS_DIR $extra"
+}
 tap_cmd() {
   echo "cd $HERE && WITNESS_DIR=$WITNESS_DIR REPO=$REPO BLOCK_DB=$BLOCK_DB RPC=$RPC \
 ${ETHPROOFS_URL:+ETHPROOFS_URL=$ETHPROOFS_URL }${CLUSTER:+CLUSTER=$CLUSTER }\
@@ -90,6 +115,34 @@ phase_sessions() { [ "$1" = tip ] && echo "fetch replay-tip tap" || echo "fetch 
 # Deliberately NOT a blind retry loop. ./reorg-recover refuses anything that is not reorg-shaped and gives up
 # once its margin is exhausted, so a genuine fault (disk full, corruption) stops the loop instead of grinding
 # the database. And an exit WITHOUT an ALERT is a clean stop — `witness-follow stop` must not be fought.
+# run_tip_once — one run of the tip producer, on whichever path TIP_DIRECT selects.
+#
+# TIP_DIRECT=1 (default): monad directly, long-lived. TIP_DIRECT=0: the old run_replay.py path, kept so the two
+# can be MEASURED against each other rather than one replacing the other on an argument.
+#
+# The direct path has to write logs/ALERT itself, because that marker is run_replay.py's job and ./reorg-recover
+# parses it for the failing block number. Same shape, same first lines, so nothing downstream changes.
+run_tip_once() {
+  if [ "${TIP_DIRECT:-1}" = 0 ]; then
+    echo "supervise: tip replay via run_replay.py (TIP_DIRECT=0 — one monad process per batch)"
+    eval "$(replay_cmd tip)"; return $?
+  fi
+  local log rc; log="$MONAD_DIR/logs/monad-tip-$(date +%Y%m%d-%H%M%SZ).log"
+  mkdir -p "$MONAD_DIR/logs" "$WITNESS_DIR"
+  echo "supervise: tip producer direct, one long-lived process -> $log"
+  echo "supervise:   $(tip_direct_cmd)"
+  eval "$(tip_direct_cmd)" > "$log" 2>&1; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # Same format run_replay.py writes, so ./reorg-recover finds "block N failed with: <reason>" in the tail.
+    { echo "monad exited $rc (direct tip mode)"
+      echo "log: $log"
+      echo "last lines:"
+      tail -40 "$log"
+    } > "$MONAD_DIR/logs/ALERT"
+  fi
+  return "$rc"
+}
+
 cmd_supervise() {
   local rc
   while :; do
@@ -98,8 +151,7 @@ cmd_supervise() {
       tmux new-session -d -s fetch "$(fetch_cmd)"
       sleep 3
     fi
-    echo "supervise: starting the tip replay"
-    eval "$(replay_cmd tip)"; rc=$?
+    run_tip_once; rc=$?
     if [ ! -f "$MONAD_DIR/logs/ALERT" ]; then
       echo "supervise: replay exited rc=$rc with no ALERT — a clean stop or a crash to look at. Not restarting."
       return "$rc"
@@ -143,7 +195,16 @@ fix the cause, then rm it. Never clear it blindly."
       fetch)        tmux new-session -d -s "$s" "$(fetch_cmd)" ;;
       # The TIP replay runs under the supervisor, so a reorg is repaired and the replay restarted without
       # anyone watching. Catch-up does not need it: it replays already-finalized history, which cannot reorg.
-      replay-tip)   tmux new-session -d -s "$s" "cd $HERE && ./witness-follow supervise >> ~/replay-supervise.log 2>&1" ;;
+      # Every variable is passed EXPLICITLY: a tmux session inherits the tmux SERVER's environment, not that of
+      # the shell that created it, so exported values silently vanish. The other commands escape this because
+      # they interpolate their values into the command text; `supervise` reads them at runtime, so they have to
+      # be spelled out here or it would quietly run on defaults.
+      replay-tip)   tmux new-session -d -s "$s" "cd $HERE && MONAD_DIR=$MONAD_DIR REPO=$REPO \
+WITNESS_DIR=$WITNESS_DIR BLOCK_DB=$BLOCK_DB DB=$DB RPC=$RPC NTHREADS=$NTHREADS PY=$PY \
+MAX_BATCH=$MAX_BATCH MIN_FOLLOW_BATCH=$MIN_FOLLOW_BATCH TIP_DIRECT=${TIP_DIRECT:-1} \
+BLOCK_DB_TIMEOUT=${BLOCK_DB_TIMEOUT:-30s} ${REPLAY_POLL:+REPLAY_POLL=$REPLAY_POLL }\
+${HEAD_TAG:+HEAD_TAG=$HEAD_TAG }${CONFIRMATIONS:+CONFIRMATIONS=$CONFIRMATIONS }\
+${FETCH_POLL:+FETCH_POLL=$FETCH_POLL }./witness-follow supervise >> ~/replay-supervise.log 2>&1" ;;
       replay-*)     tmux new-session -d -s "$s" "$(replay_cmd "$phase")" ;;
       tap)          tmux new-session -d -s "$s" "$(tap_cmd)" ;;
     esac

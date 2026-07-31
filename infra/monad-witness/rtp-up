@@ -118,6 +118,21 @@ fi
 # already uses for every `ssh "$BOX"` call, so it is working by construction. Meaningless for a datacenter
 # prover (it would not resolve there, and it has no tunnel to avoid), hence only when the prover is the Mac.
 if [ -z "$PROVER" ]; then PULL_VIA="${PULL_VIA:-$BOX}"; else PULL_VIA="${PULL_VIA:-}"; fi
+
+# TIP_DIRECT — at the tip, ONE long-lived monad that waits for blocks (--block-db-timeout) instead of
+# run_replay.py starting a fresh process per batch. With MIN_FOLLOW_BATCH=1, that per-batch startup is paid for
+# every single block: a full db open on a 440 GB triedb before any work happens. It is the last floor under
+# chain->witness, and no polling interval reaches it.
+# TIP_DIRECT=0 restores the run_replay.py path so the two can be measured rather than argued about.
+#
+# OFF BY DEFAULT, and not for lack of trying: monad rejects it with
+#     --block-db-timeout requires --as-eth-blocks
+# and --as-eth-blocks means "ingest monad blocks in evm format" — the Monad-chain ingestion path, not the
+# Ethereum-mainnet block_db we fetch from an RPC. So the wait-for-blocks capability exists but is unreachable
+# for an ethereum chain in this build, and the ~3 s per-block startup (measured: 1 block per 3 s at the tip,
+# almost entirely db open) is a floor no setting removes. The code stays for the day that restriction lifts.
+TIP_DIRECT="${TIP_DIRECT:-0}"
+BLOCK_DB_TIMEOUT="${BLOCK_DB_TIMEOUT:-30s}"
 BOX_REPO="${BOX_REPO:-\$HOME/zkvm-bench}"
 
 DRY=0 PURGE=0 KEEP_MOCK=0 CRON=0 STOP=0
@@ -368,6 +383,12 @@ fi
 if [ "$DRY" != 1 ] && onbox_q "test -f ~/monad/logs/ALERT && echo yes" | grep -q yes; then
   printf '\n'
   onbox_q "cat ~/monad/logs/ALERT" | sed 's/^/   | /'
+  # Only advise a rewind for a reorg-shaped failure. Printing the recovery recipe under an ALERT that says
+  # "--block-db-timeout requires --as-eth-blocks" invites rewinding a 440 GB database to fix a typo in a flag.
+  if ! onbox_q "grep -qE 'bad nonce|state root|parent|mismatch' ~/monad/logs/ALERT && echo yes" | grep -q yes; then
+    die "the replay is stopped on the ALERT above, which is NOT a reorg — no rewind, and ./reorg-recover would
+refuse it. Fix the cause it names, then: ssh $BOX 'rm ~/monad/logs/ALERT'"
+  fi
   die "the replay is stopped on the ALERT above and will not restart while it exists.
 
 Read it first — never clear it blindly.
@@ -498,7 +519,12 @@ if [ "$DRY" != 1 ] && [ -n "$(onbox_q "ls ~/monad/logs/ALERT 2>/dev/null")" ]; t
   say "      rm -f ~/block_db/\$((L - 2)) ~/block_db/\$((L - 1)) ~/block_db/\$L ~/monad/logs/ALERT"
   die "not starting the producer on top of an ALERT — rewind first, then re-run."
 fi
-onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL TAP_INTERVAL=$TAP_INTERVAL REPLAY_POLL=$REPLAY_POLL SETTLE_SECS=$SETTLE_SECS ETHPROOFS_URL=http://localhost:$MOCK_PORT CLUSTER=local-ZisK-monad ./witness-follow start tip"
+# Kill the tip sessions first, for the same reason the prover is always restarted: a live tmux session carries
+# the code and environment it was created with, and witness-follow skips sessions that already exist. That is
+# how the long-lived-monad path stayed undeployed while the logs showed a perfectly healthy producer — twice in
+# one day, on two different components. Restarting costs one block; not restarting costs the whole change.
+onbox "tmux kill-session -t replay-tip 2>/dev/null; tmux kill-session -t tap 2>/dev/null; pkill -f '[r]un_replay.py' 2>/dev/null; pkill -f '[w]itness-tap' 2>/dev/null; sleep 2; echo '   · tip sessions cleared (they would keep the old code and env)'"
+onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL TAP_INTERVAL=$TAP_INTERVAL REPLAY_POLL=$REPLAY_POLL SETTLE_SECS=$SETTLE_SECS TIP_DIRECT=$TIP_DIRECT BLOCK_DB_TIMEOUT=$BLOCK_DB_TIMEOUT ETHPROOFS_URL=http://localhost:$MOCK_PORT CLUSTER=local-ZisK-monad ./witness-follow start tip"
 
 step "Starting the prover (mock on $PROVER_WHERE, transfers real)"
 # ALWAYS restarted, never "already running". A live session carries the environment and the code it was
