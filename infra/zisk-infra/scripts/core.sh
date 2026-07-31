@@ -172,8 +172,36 @@ prove_remote() {
     echo "ELF already present on remote, skipping upload."
   fi
 
-  echo "Uploading input${have_hints:+ + hints}..."
-  scp "${scpo[@]}" "$INPUT" "$REMOTE:$ws/inputs/$in_name"
+  # PULL_VIA — send the bytes the OTHER WAY ROUND, over a connection the remote opens itself.
+  #
+  # Measured on the RTP prototype: pushing through a reverse ssh tunnel to a home Mac gave 3.8 Mbit/s, while
+  # a direct connection between the SAME two machines gave 25 Mbit/s or better. The link was never the
+  # limit — TCP inside TCP was. The asymmetry is only about who can be reached: a datacenter box is publicly
+  # addressable, a laptop behind NAT is not, which is why the tunnel exists at all.
+  #
+  # So keep the tunnel for the control channel (a few hundred bytes of ssh command) and let the remote pull
+  # the payload over a direct, un-nested connection: PULL_VIA is this machine's ssh target AS SEEN FROM THE
+  # REMOTE. On the witness box, PULL_VIA=aschmitt@nyc-003 turns 7-15 MB from ~15 s into ~3 s.
+  #
+  # The remote runs this non-interactively, so it needs its own key for us — no agent will be present. On
+  # failure we say so loudly and fall back to pushing: a slow pipeline beats a stopped one, but a silent
+  # fallback would let a broken config masquerade as a working optimisation.
+  local pulled=0
+  if [[ -n "${PULL_VIA:-}" ]]; then
+    local abs_input; abs_input="$(cd "$(dirname "$INPUT")" && pwd)/$(basename "$INPUT")"
+    local pull_opts="${PULL_SSH_OPTS:--o BatchMode=yes -o StrictHostKeyChecking=accept-new}"
+    echo "Pulling input from $PULL_VIA (direct, bypassing the tunnel for the payload)..."
+    if "${ssh[@]}" "scp -q $pull_opts '$PULL_VIA:$abs_input' '$ws/inputs/$in_name'"; then
+      pulled=1
+    else
+      echo "WARNING: $REMOTE could not pull from $PULL_VIA — falling back to pushing through the tunnel." >&2
+      echo "         Check from the remote: ssh $pull_opts $PULL_VIA true" >&2
+    fi
+  fi
+  if [[ $pulled == 0 ]]; then
+    echo "Uploading input${have_hints:+ + hints}..."
+    scp "${scpo[@]}" "$INPUT" "$REMOTE:$ws/inputs/$in_name"
+  fi
   [[ $have_hints == 1 ]] && scp -r "${scpo[@]}" "$hints" "$REMOTE:$ws/inputs/$hints_name"
 
   # Record the run context (hardware, versions) — what the benchmark ran on.

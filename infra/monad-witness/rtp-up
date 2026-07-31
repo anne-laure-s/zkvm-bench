@@ -106,6 +106,18 @@ if [ -n "$PROVER" ]; then
 else
   PROVER_TARGET="$MAC_USER@localhost";   PROVER_PORT="$TUN_SSH_PORT";           PROVER_WHERE="this Mac"
 fi
+
+# PULL_VIA — the witness travels on a connection the PROVER opens, not through the tunnel.
+#
+# Measured: pushing 10 MB box->Mac through the reverse tunnel ran at 3.8 Mbit/s; the same 10 MB over a direct
+# connection between the same two machines ran at 25 Mbit/s (and that was the Mac's slower direction). The
+# link was never the limit, TCP-in-TCP was. The tunnel exists only because a laptop behind NAT cannot be
+# reached — but the laptop can always reach the box, so the payload should go that way round.
+#
+# The value is the box as the PROVER sees it, which for a Mac prover is exactly $BOX: the alias this script
+# already uses for every `ssh "$BOX"` call, so it is working by construction. Meaningless for a datacenter
+# prover (it would not resolve there, and it has no tunnel to avoid), hence only when the prover is the Mac.
+if [ -z "$PROVER" ]; then PULL_VIA="${PULL_VIA:-$BOX}"; else PULL_VIA="${PULL_VIA:-}"; fi
 BOX_REPO="${BOX_REPO:-\$HOME/zkvm-bench}"
 
 DRY=0 PURGE=0 KEEP_MOCK=0 CRON=0 STOP=0
@@ -409,7 +421,7 @@ fi
 onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL TAP_INTERVAL=$TAP_INTERVAL REPLAY_POLL=$REPLAY_POLL SETTLE_SECS=$SETTLE_SECS ETHPROOFS_URL=http://localhost:$MOCK_PORT CLUSTER=local-ZisK-monad ./witness-follow start tip"
 
 step "Starting the prover (mock on $PROVER_WHERE, transfers real)"
-onbox "tmux has-session -t prove 2>/dev/null && echo '   · prove already running' || tmux new-session -d -s prove \"cd $BOX_REPO && REMOTE_WS=$MOCK_WS REMOTE_RUNNER=$MOCK_RUNNER_DIR/zisk-runner WITNESS_MANIFEST=\$HOME/witness-manifest.csv cli/prove-farm --guest monad-zisk --mock --remote $PROVER_TARGET --port $PROVER_PORT --mock-secs $MOCK_SECS --mock-per-mstep $MOCK_PER_MSTEP --mock-speed $MOCK_SPEED --mock-jitter $MOCK_JITTER --interval 1 --watch --newest-first --ethproofs-url http://localhost:$MOCK_PORT --ethproofs-cluster local-ZisK-monad 2>&1 | tee -a ~/prove-mock.log\""
+onbox "tmux has-session -t prove 2>/dev/null && echo '   · prove already running' || tmux new-session -d -s prove \"cd $BOX_REPO && REMOTE_WS=$MOCK_WS REMOTE_RUNNER=$MOCK_RUNNER_DIR/zisk-runner ${PULL_VIA:+PULL_VIA=$PULL_VIA }WITNESS_MANIFEST=\$HOME/witness-manifest.csv cli/prove-farm --guest monad-zisk --mock --remote $PROVER_TARGET --port $PROVER_PORT --mock-secs $MOCK_SECS --mock-per-mstep $MOCK_PER_MSTEP --mock-speed $MOCK_SPEED --mock-jitter $MOCK_JITTER --interval 1 --watch --newest-first --ethproofs-url http://localhost:$MOCK_PORT --ethproofs-cluster local-ZisK-monad 2>&1 | tee -a ~/prove-mock.log\""
 
 [ "$CRON" = 1 ] && { step "Installing the daily log archiver on the box"
   onbox "(crontab -l 2>/dev/null | grep -v archive-logs; echo '17 4 * * * \$HOME/zkvm-bench/infra/monad-witness/archive-logs >> \$HOME/archive-logs.log 2>&1') | crontab - && crontab -l | tail -1"; }
