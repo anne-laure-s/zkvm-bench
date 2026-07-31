@@ -160,7 +160,9 @@ prove_remote() {
   # Portable on both ends: coreutils ships sha256sum, macOS ships shasum. And never let two EMPTY hashes
   # compare equal — that would silently skip the upload and leave the remote to fail on a missing ELF.
   local lsum rsum
-  local t_start; t_start="$(date +%s)"
+  # %N (Linux, and core.sh runs on the producer box) — whole seconds are coarser than the effects we are now
+  # chasing: a phase going 3.4s -> 1.9s reads as "3" then "2", or worse "3" then "3".
+  local t_start; t_start="$(date +%s.%N)"
   if   command -v sha256sum >/dev/null 2>&1; then lsum="$(sha256sum "$ELF" | awk '{print $1}')"
   elif command -v shasum    >/dev/null 2>&1; then lsum="$(shasum -a 256 "$ELF" | awk '{print $1}')"
   else lsum=""; echo "NOTE: no sha256sum/shasum here — uploading the ELF unconditionally." >&2; fi
@@ -190,7 +192,14 @@ prove_remote() {
   local pulled=0
   if [[ -n "${PULL_VIA:-}" ]]; then
     local abs_input; abs_input="$(cd "$(dirname "$INPUT")" && pwd)/$(basename "$INPUT")"
-    local pull_opts="${PULL_SSH_OPTS:--o BatchMode=yes -o StrictHostKeyChecking=accept-new}"
+    # Compression and connection reuse, both of which the PUSH path had and this one silently did not:
+    #   -C            witnesses are trie nodes and RLP, i.e. highly compressible. Omitting it shipped 2-3x the
+    #                 bytes over the one hop that actually carries them.
+    #   ControlMaster the box->prover channel is multiplexed, but the prover->box connection this scp opens is a
+    #                 NEW one per block, paying a full key exchange every time. ControlPersist keeps it warm
+    #                 between blocks, which at one block per 12 s means it is never cold.
+    local pull_opts="${PULL_SSH_OPTS:--C -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+-o ControlMaster=auto -o ControlPath=/tmp/zisk-pull-%C -o ControlPersist=120}"
     echo "Pulling input from $PULL_VIA (direct, bypassing the tunnel for the payload)..."
     if "${ssh[@]}" "scp -q $pull_opts '$PULL_VIA:$abs_input' '$ws/inputs/$in_name'"; then
       pulled=1
@@ -204,7 +213,7 @@ prove_remote() {
     scp "${scpo[@]}" "$INPUT" "$REMOTE:$ws/inputs/$in_name"
   fi
   [[ $have_hints == 1 ]] && scp -r "${scpo[@]}" "$hints" "$REMOTE:$ws/inputs/$hints_name"
-  local t_in; t_in="$(date +%s)"
+  local t_in; t_in="$(date +%s.%N)"
 
   # Record the run context (hardware, versions) — what the benchmark ran on.
   {
@@ -252,7 +261,7 @@ ${ZISK_MOCK_DIST:+ZISK_MOCK_DIST=$ZISK_MOCK_DIST }"
     --public-values $ws/proofs/$base.pv.bin \
     --report $ws/reports/$base.json 2>&1 | tee $ws/reports/$base.log"
 
-  local t_run; t_run="$(date +%s)"
+  local t_run; t_run="$(date +%s.%N)"
 
   # ONE round trip instead of four. The four artifacts are tiny — a 480 B proof, three small text files — so
   # what those scp calls cost was not bandwidth but latency: a full request/response each, over a tunnel where
@@ -274,19 +283,23 @@ proofs/$base.pv.bin 2>/dev/null" | tar xf - -C "$getdir" 2>/dev/null
   # failed on its own line, and a single stream must not turn that into a silent empty run record.
   [[ -s "$run_dir/proof.bin" ]] || { echo "ERROR: no proof came back from $REMOTE — see $run_dir/prove.log" >&2; return 1; }
 
-  local t_get; t_get="$(date +%s)"
+  local t_get; t_get="$(date +%s.%N)"
   # Per-phase timing, because attributing this by subtracting `prove` from the wall clock is how the transport
   # got blamed for 20-34 s that turned out to be a mixture of throughput and round trips. Whole seconds are
-  # enough: the phases are seconds-scale, and the prover may be a macOS bash 3.2 with no sub-second clock.
-  printf 'Timing    : input %ds · remote %ds · retrieve %ds · total %ds\n' \
-    "$(( t_in - t_start ))" "$(( t_run - t_in ))" "$(( t_get - t_run ))" "$(( t_get - t_start ))"
+  # Tenths, not whole seconds: once transport is down to a couple of seconds, integer granularity is coarser
+  # than the changes being made and a real improvement can read as no change at all. The clock is read on the
+  # PRODUCER (Linux), so date +%N is available — the prover's macOS bash never sees these.
+  # bash has no float arithmetic, so every subtraction goes through awk. One call, not four.
+  local ph; ph="$(awk -v a="$t_start" -v b="$t_in" -v c="$t_run" -v d="$t_get" \
+    'BEGIN{printf "%.1f %.1f %.1f %.1f %.1f", b-a, c-b, d-c, (b-a)+(d-c), d-a}')"
+  local p_in p_rem p_get p_tr p_tot; read -r p_in p_rem p_get p_tr p_tot <<<"$ph"
+  printf 'Timing    : input %ss · remote %ss · retrieve %ss · total %ss\n' "$p_in" "$p_rem" "$p_get" "$p_tot"
   # Also as data, not just as a log line: these are the numbers that told us the transport was TWO problems,
   # and they belong in the run record so ethproofs-submit can carry them to the leaderboard. A phase timing
   # buried in prose gets re-derived by subtraction, which is exactly how it went wrong three times.
   # `transport` is the operator-facing figure: everything that is not the prover's own work.
-  printf '{"input_secs":%d,"remote_secs":%d,"retrieve_secs":%d,"transport_secs":%d,"total_secs":%d,"pulled_direct":%s}\n' \
-    "$(( t_in - t_start ))" "$(( t_run - t_in ))" "$(( t_get - t_run ))" \
-    "$(( (t_in - t_start) + (t_get - t_run) ))" "$(( t_get - t_start ))" \
+  printf '{"input_secs":%s,"remote_secs":%s,"retrieve_secs":%s,"transport_secs":%s,"total_secs":%s,"pulled_direct":%s}\n' \
+    "$p_in" "$p_rem" "$p_get" "$p_tr" "$p_tot" \
     "$( [[ $pulled == 1 ]] && echo true || echo false )" > "$run_dir/timing.json"
 
   # Bundle the local emulation profile (steps) if it exists, so the run record is
