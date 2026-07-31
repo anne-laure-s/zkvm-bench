@@ -71,27 +71,35 @@ def block_chain_time(manifest, block):
     return None
 
 
-def witness_secs(manifest, block):
-    """How long the PRODUCER took: the block's chain time -> the witness existing on disk.
+def producer_secs(manifest, block):
+    """(node_secs, witness_secs) — the two halves of getting a witness, which have NOTHING in common.
 
-    Without this the leaderboard leaves e2e - prove - transport as a remainder for the reader to compute, and a
-    remainder silently absorbs whatever else is happening. Same clock at both ends is not required: t_block is
-    chain time and t_witness is the box's, both NTP-synced, which is the same basis e2e already uses.
+    node    t_block -> t_avail: the block's own timestamp until the RPC will serve it. Measured at 4.6-6.1 s on
+            chi-001, i.e. half the slot, and none of it is ours — the fetcher, the newHeads subscription and the
+            block_db write together add nothing measurable on top of it.
+    witness t_avail -> t_witness: replaying the block and dumping the witness. This one IS ours.
+
+    Reported separately because a single `witness` column charged the producer for the node's lag, which makes
+    the pipeline look three times worse than it is and points optimisation at the wrong component.
     """
     if not manifest or not os.path.isfile(manifest):
-        return None
+        return (None, None)
     try:
         with open(manifest, newline="") as f:
             for row in csv.DictReader(f):
                 if (row.get("block") or "").strip() == str(block):
                     tb = (row.get("t_block") or "").strip()
+                    ta = (row.get("t_avail") or "").strip()
                     tw = (row.get("t_witness") or "").strip()
-                    if tb and tw:
-                        return round(float(tw) - float(tb), 1)
-                    return None
+                    node = round(float(ta) - float(tb), 1) if tb and ta else None
+                    # Fall back to t_block when t_avail is missing (older manifest rows): the sum still
+                    # reconciles with e2e, it just lands entirely in the witness column as it used to.
+                    base = ta or tb
+                    wit = round(float(tw) - float(base), 1) if tw and base else None
+                    return (node, wit)
     except (OSError, ValueError):
         pass
-    return None
+    return (None, None)
 
 
 def exec_work(run_dir):
@@ -184,7 +192,14 @@ def main():
                     help="send ONLY the canonical ethproofs fields (block_number, cluster_id, proof, "
                          "proving_cycles, proving_time, verifier_id) — drop vm/guest/mock/public_inputs. "
                          "Use for the real ethproofs.org if it rejects unknown fields.")
-    ap.add_argument("--proved-only", action="store_true", help="skip queued/proving, POST only /proved")
+    # Default ON. The queued/proving posts happen HERE, at submission time, i.e. after the block is already
+    # proved — so they stamp "queued" and "proving" with a timestamp that is neither. They are two extra TCP
+    # connections through the tunnel per block, carrying information that is wrong by construction. Honest
+    # lifecycle reporting would have to be posted by the producer and the prover as those states are entered,
+    # which is a different change; until then, not sending them beats sending fiction.
+    ap.add_argument("--proved-only", action=argparse.BooleanOptionalAction, default=True,
+                    help="POST only /proved (default). --no-proved-only also posts queued/proving, whose "
+                         "timestamps are meaningless from here.")
     ap.add_argument("--manifest", default=os.environ.get("WITNESS_MANIFEST",
                                                         os.path.expanduser("~/witness-manifest.csv")),
                     help="producer manifest, for the block's chain timestamp -> end-to-end latency")
@@ -264,7 +279,9 @@ def main():
     # artifacts. Written by prove_remote; absent for local runs, and absent is not zero — omit rather than
     # invent, or a local run would read as a suspiciously perfect transport.
     if not args.minimal:
-        ws = witness_secs(args.manifest, block)
+        ns, ws = producer_secs(args.manifest, block)
+        if ns is not None:
+            proved["node_secs"] = ns
         if ws is not None:
             proved["witness_secs"] = ws
         try:

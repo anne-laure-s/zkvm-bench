@@ -150,23 +150,31 @@ prove_remote() {
   echo "Remote    : $REMOTE:$port (mode=$mode, backend=$backend)"
   echo "Run dir   : $run_dir"
 
-  # Create the workspace AND resolve it to an absolute path in one round trip.
-  local ws_abs
-  ws_abs="$("${ssh[@]}" "mkdir -p \"$ws\"/elfs \"$ws\"/inputs \"$ws\"/proofs \"$ws\"/reports && cd \"$ws\" && pwd")" \
+  # Create the workspace, resolve it to an absolute path, AND read the remote ELF's hash — all in ONE round
+  # trip. The hash used to be its own ssh call, paid on every block to learn something that changes almost
+  # never. Folding it in here beats caching it locally: one fewer exchange and no stale-cache failure mode.
+  # Line 1 is the path, line 2 the hash (empty if the ELF is not there yet, which correctly forces an upload).
+  # Timed from HERE, before the first exchange with the prover: the workspace call is part of what `input`
+  # costs, and starting the clock after it would flatter the very change being measured.
+  # %N (Linux — core.sh runs on the producer box): tenths, because at ~2 s whole seconds hide real gains.
+  local t_start; t_start="$(date +%s.%N)"
+  local ws_meta ws_abs rsum
+  ws_meta="$("${ssh[@]}" "mkdir -p \"$ws\"/elfs \"$ws\"/inputs \"$ws\"/proofs \"$ws\"/reports && cd \"$ws\" && pwd \
+&& { sha256sum elfs/$elf_name 2>/dev/null || shasum -a 256 elfs/$elf_name 2>/dev/null; } | awk '{print \$1}'")" \
     || { echo "ERROR: cannot prepare remote workspace '$ws'" >&2; return 1; }
+  ws_abs="$(printf '%s\n' "$ws_meta" | sed -n 1p)"
+  rsum="$(printf '%s\n' "$ws_meta" | sed -n 2p)"
+  [[ -n "$ws_abs" ]] || { echo "ERROR: remote workspace '$ws' did not resolve" >&2; return 1; }
   ws="$ws_abs"
 
   # Upload the ELF only when the remote copy differs (cheap to repeat per input).
   # Portable on both ends: coreutils ships sha256sum, macOS ships shasum. And never let two EMPTY hashes
   # compare equal — that would silently skip the upload and leave the remote to fail on a missing ELF.
-  local lsum rsum
-  # %N (Linux, and core.sh runs on the producer box) — whole seconds are coarser than the effects we are now
-  # chasing: a phase going 3.4s -> 1.9s reads as "3" then "2", or worse "3" then "3".
-  local t_start; t_start="$(date +%s.%N)"
+  # rsum already came back with the workspace setup above — no second round trip for it.
+  local lsum
   if   command -v sha256sum >/dev/null 2>&1; then lsum="$(sha256sum "$ELF" | awk '{print $1}')"
   elif command -v shasum    >/dev/null 2>&1; then lsum="$(shasum -a 256 "$ELF" | awk '{print $1}')"
   else lsum=""; echo "NOTE: no sha256sum/shasum here — uploading the ELF unconditionally." >&2; fi
-  rsum="$("${ssh[@]}" "(sha256sum $ws/elfs/$elf_name 2>/dev/null || shasum -a 256 $ws/elfs/$elf_name 2>/dev/null) | awk '{print \$1}'" || true)"
   if [[ -z "$lsum" || "$lsum" != "$rsum" ]]; then
     echo "Uploading ELF (checksum changed/missing)..."
     scp "${scpo[@]}" "$ELF" "$REMOTE:$ws/elfs/$elf_name"
@@ -192,14 +200,13 @@ prove_remote() {
   local pulled=0
   if [[ -n "${PULL_VIA:-}" ]]; then
     local abs_input; abs_input="$(cd "$(dirname "$INPUT")" && pwd)/$(basename "$INPUT")"
-    # Compression and connection reuse, both of which the PUSH path had and this one silently did not:
-    #   -C            witnesses are trie nodes and RLP, i.e. highly compressible. Omitting it shipped 2-3x the
-    #                 bytes over the one hop that actually carries them.
-    #   ControlMaster the box->prover channel is multiplexed, but the prover->box connection this scp opens is a
-    #                 NEW one per block, paying a full key exchange every time. ControlPersist keeps it warm
-    #                 between blocks, which at one block per 12 s means it is never cold.
-    local pull_opts="${PULL_SSH_OPTS:--C -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
--o ControlMaster=auto -o ControlPath=/tmp/zisk-pull-%C -o ControlPersist=120}"
+    # -C only. Multiplexing was tried here and made things WORSE: input went from 3-4 s to 2.5-23 s, wildly
+    # variable, while `retrieve` (small, same options) stayed at 0.5 s. Sharing one ControlMaster channel means
+    # sharing one TCP connection and one ssh channel window, and a single 10 MB stream does not want either —
+    # it wants its own connection, which is what it had. Multiplexing pays off for MANY SMALL round trips (the
+    # box->prover control calls, where it belongs and stays); it is the wrong tool for one bulk transfer.
+    # The handshake it would have saved is ~0.3 s. The contention it caused was measured in seconds.
+    local pull_opts="${PULL_SSH_OPTS:--C -o BatchMode=yes -o StrictHostKeyChecking=accept-new}"
     echo "Pulling input from $PULL_VIA (direct, bypassing the tunnel for the payload)..."
     if "${ssh[@]}" "scp -q $pull_opts '$PULL_VIA:$abs_input' '$ws/inputs/$in_name'"; then
       pulled=1
@@ -272,8 +279,23 @@ ${ZISK_MOCK_DIST:+ZISK_MOCK_DIST=$ZISK_MOCK_DIST }"
   # a missing member on stderr and still write the rest — hence 2>/dev/null on both ends rather than a check.
   echo "Retrieving artifacts into $run_dir ..."
   local getdir; getdir="$(mktemp -d)"
-  "${ssh[@]}" "cd $ws && tar cf - proofs/$base.proof.bin reports/$base.json reports/$base.log \
-proofs/$base.pv.bin 2>/dev/null" | tar xf - -C "$getdir" 2>/dev/null
+  local members="proofs/$base.proof.bin reports/$base.json reports/$base.log proofs/$base.pv.bin"
+  if [[ -n "${PULL_VIA:-}" ]]; then
+    # Same inversion as the witness, in the other direction: the tar stream rides a connection the PROVER opens
+    # to us, not the tunnel. The payload is small, so what this buys is the round trip, not bandwidth — but at
+    # this point the round trip IS the cost. The ssh command itself still goes through the tunnel; it is a few
+    # hundred bytes.
+    local tarball="$getdir/artifacts.tar"
+    if "${ssh[@]}" "cd $ws && tar cf - $members 2>/dev/null | ssh $pull_opts '$PULL_VIA' \"cat > '$tarball'\"" \
+       && [[ -s "$tarball" ]]; then
+      tar xf "$tarball" -C "$getdir" 2>/dev/null; rm -f "$tarball"
+    else
+      echo "WARNING: direct push-back from $REMOTE failed — falling back to the tunnel." >&2
+      "${ssh[@]}" "cd $ws && tar cf - $members 2>/dev/null" | tar xf - -C "$getdir" 2>/dev/null
+    fi
+  else
+    "${ssh[@]}" "cd $ws && tar cf - $members 2>/dev/null" | tar xf - -C "$getdir" 2>/dev/null
+  fi
   mv "$getdir/proofs/$base.proof.bin" "$run_dir/proof.bin"   2>/dev/null
   mv "$getdir/reports/$base.json"     "$run_dir/report.json" 2>/dev/null
   mv "$getdir/reports/$base.log"      "$run_dir/prove.log"   2>/dev/null
@@ -293,13 +315,19 @@ proofs/$base.pv.bin 2>/dev/null" | tar xf - -C "$getdir" 2>/dev/null
   local ph; ph="$(awk -v a="$t_start" -v b="$t_in" -v c="$t_run" -v d="$t_get" \
     'BEGIN{printf "%.1f %.1f %.1f %.1f %.1f", b-a, c-b, d-c, (b-a)+(d-c), d-a}')"
   local p_in p_rem p_get p_tr p_tot; read -r p_in p_rem p_get p_tr p_tot <<<"$ph"
-  printf 'Timing    : input %ss · remote %ss · retrieve %ss · total %ss\n' "$p_in" "$p_rem" "$p_get" "$p_tot"
+  local in_bytes; in_bytes="$(stat -c %s "$INPUT" 2>/dev/null || stat -f %z "$INPUT" 2>/dev/null || echo 0)"
+  local in_mbits; in_mbits="$(awk -v b="$in_bytes" -v s="$p_in" 'BEGIN{printf "%.1f", (s>0? b*8/s/1000000 : 0)}')"
+  printf 'Timing    : input %ss (%s MB @ %s Mbit/s) · remote %ss · retrieve %ss · total %ss\n' \
+    "$p_in" "$(awk -v b="$in_bytes" 'BEGIN{printf "%.1f", b/1048576}')" "$in_mbits" "$p_rem" "$p_get" "$p_tot"
   # Also as data, not just as a log line: these are the numbers that told us the transport was TWO problems,
   # and they belong in the run record so ethproofs-submit can carry them to the leaderboard. A phase timing
   # buried in prose gets re-derived by subtraction, which is exactly how it went wrong three times.
   # `transport` is the operator-facing figure: everything that is not the prover's own work.
-  printf '{"input_secs":%s,"remote_secs":%s,"retrieve_secs":%s,"transport_secs":%s,"total_secs":%s,"pulled_direct":%s}\n' \
-    "$p_in" "$p_rem" "$p_get" "$p_tr" "$p_tot" \
+  # Bytes too, so a slow `input` can be told apart from a big one. Without it a 35 s outlier is unattributable:
+  # 15 MB in 35 s is a collapsed link, 150 MB in 35 s would be a normal one — and guessing between them is how
+  # the transport got misdiagnosed twice. mbits is the number to look at; it should sit near the link rate.
+  printf '{"input_secs":%s,"input_bytes":%s,"input_mbits":%s,"remote_secs":%s,"retrieve_secs":%s,"transport_secs":%s,"total_secs":%s,"pulled_direct":%s}\n' \
+    "$p_in" "$in_bytes" "$in_mbits" "$p_rem" "$p_get" "$p_tr" "$p_tot" \
     "$( [[ $pulled == 1 ]] && echo true || echo false )" > "$run_dir/timing.json"
 
   # Bundle the local emulation profile (steps) if it exists, so the run record is

@@ -81,9 +81,15 @@ while IFS= read -r blk; do
   tag="$CHAIN_ID-$blk"; bin="$OUT/$tag.bin"
   if [ "$FORCE" != 1 ] && [ -f "$bin" ] && [ "$bin" -nt "$w" ]; then continue; fi
   python3 - "$w" "$bin" <<'PY'
-import sys, struct
-d = open(sys.argv[1], "rb").read(); n = len(d); pad = (-(8 + n)) % 8
-open(sys.argv[2], "wb").write(struct.pack("<Q", n) + d + b"\x00" * pad)
+import sys, struct, os, shutil
+# Streamed, not concatenated. `header + d + pad` built a SECOND full copy of a 7-15 MB witness in memory
+# before writing a byte — on the producer box, which is the machine already dominating the latency budget.
+# The read and the write are inherent (monad writes the raw witness, this frames it); the extra copy was not.
+n = os.path.getsize(sys.argv[1]); pad = (-(8 + n)) % 8
+with open(sys.argv[1], "rb") as src, open(sys.argv[2], "wb") as dst:
+    dst.write(struct.pack("<Q", n))
+    shutil.copyfileobj(src, dst, 1 << 20)
+    dst.write(b"\x00" * pad)
 PY
   # Carry the expected post-state root alongside the input — the cross-check anchor for verification.
   root="${w%.witness}.post_state_root"

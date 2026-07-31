@@ -119,6 +119,9 @@ class Store:
             "transport_secs": body.get("transport_secs"),
             "pulled_direct": body.get("pulled_direct"),
             "witness_secs": body.get("witness_secs"),
+            # The RPC's own lag, kept apart from the producer's work: charging one to the other made the
+            # pipeline look three times worse than it is, and pointed effort at the wrong component.
+            "node_secs": body.get("node_secs"),
             "verifier_id": body.get("verifier_id"),
             "proof_bytes": proof_bytes,
             # server-side verdict (the SERVER verifies — see mock_verify). None until /proved.
@@ -420,10 +423,10 @@ class Handler(BaseHTTPRequestHandler):
             past it, and silently showing 0.0 would hide the rounding rather than admit it.
             """
             e2e, w, t = r.get("e2e_secs"), r.get("witness_secs"), r.get("transport_secs")
-            p = r.get("proving_time_ms")
-            if None in (e2e, w, t, p):
+            p, n = r.get("proving_time_ms"), r.get("node_secs")
+            if None in (e2e, w, t, p, n):
                 return ""
-            q = e2e - w - t - p / 1000
+            q = e2e - n - w - t - p / 1000
             return f"{q:.1f}" if q >= 0 else "~0"
         body = ["<!doctype html><meta charset=utf-8><title>ethproofs-mock</title>",
                 "<style>body{font:14px system-ui;margin:2rem}h1{font-size:1.2rem}"
@@ -439,7 +442,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Ordered as the block travels: produced, shipped, proved, waited. Every second of e2e lands in
                 # one of them, so nothing is left as a remainder for the reader to work out.
                 "<th>work-unit</th>"
-                "<th>witness (s)</th><th>transport (s)</th><th>prove (s)</th><th>queue (s)</th>"
+                "<th>node (s)</th><th>witness (s)</th><th>transport (s)</th><th>prove (s)</th><th>queue (s)</th>"
                 "<th>e2e (s)</th><th>proof (B)</th><th>verified</th>"
                 "<th class=l>verifier_id</th><th class=l>updated</th></tr>"]
         for r in rows:
@@ -457,6 +460,7 @@ class Handler(BaseHTTPRequestHandler):
                         f"<td class='r'>{'⚠️MOCK' if r.get('mock') else ''}</td><td>{blk}</td>"
                         f"<td class='l {cls}'>{ev}</td><td>{td(r.get('proving_cycles'))}</td>"
                         # ms is the API's unit; seconds is what a human compares to a 12 s slot.
+                        f"<td>{td(r.get('node_secs'))}</td>"
                         f"<td>{td(r.get('witness_secs'))}</td>"
                         # A dot marks the witness pulled over the direct link rather than pushed through the
                         # tunnel — the difference between ~4 s and ~25 s, and worth seeing per block.
