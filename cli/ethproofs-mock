@@ -114,6 +114,11 @@ class Store:
             # chain time of the block, and chain-time -> our ack: the whole pipeline, node to ethproofs
             "t_block": body.get("t_block"),
             "e2e_secs": body.get("e2e_secs"),
+            # Where the non-prover time goes. Kept alongside e2e because e2e alone cannot distinguish a slow
+            # pipeline from a slow prover, and that ambiguity cost a day of optimising the wrong term.
+            "transport_secs": body.get("transport_secs"),
+            "pulled_direct": body.get("pulled_direct"),
+            "witness_secs": body.get("witness_secs"),
             "verifier_id": body.get("verifier_id"),
             "proof_bytes": proof_bytes,
             # server-side verdict (the SERVER verifies — see mock_verify). None until /proved.
@@ -401,6 +406,25 @@ class Handler(BaseHTTPRequestHandler):
                                      str(r.get("guest") or ""), r.get("block_number") or 0), reverse=True)
         def td(v): return "" if v is None else v
         def secs(ms): return "" if ms is None else f"{ms / 1000:.1f}"
+
+        def queue_wait(r):
+            """Whatever e2e is not witness + transport + prove: the block sat waiting to be picked up.
+
+            Derived rather than measured, and deliberately the LAST column to be derived — the other three are
+            each timed at their own source. With --newest-first this is the interesting number: a block the
+            prover skipped while newer ones arrived shows a large queue and a normal everything-else, which is
+            what separates "the pipeline is slow" from "the prover is saturated".
+
+            Blank unless all three parts are known: a partial sum would attribute the missing part to waiting.
+            Negative values are clamped and marked — whole-second phase timings against a 0.1 s e2e can round
+            past it, and silently showing 0.0 would hide the rounding rather than admit it.
+            """
+            e2e, w, t = r.get("e2e_secs"), r.get("witness_secs"), r.get("transport_secs")
+            p = r.get("proving_time_ms")
+            if None in (e2e, w, t, p):
+                return ""
+            q = e2e - w - t - p / 1000
+            return f"{q:.1f}" if q >= 0 else "~0"
         body = ["<!doctype html><meta charset=utf-8><title>ethproofs-mock</title>",
                 "<style>body{font:14px system-ui;margin:2rem}h1{font-size:1.2rem}"
                 "table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 8px;text-align:right}"
@@ -412,7 +436,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._banner()]
         body += [
                 "<table><tr><th>cluster</th><th class=l>vm</th><th class=l>guest</th><th>mock</th><th>block</th><th class=l>state</th>"
-                "<th>work-unit</th><th>prove (s)</th><th>e2e (s)</th><th>proof (B)</th><th>verified</th>"
+                # Ordered as the block travels: produced, shipped, proved, waited. Every second of e2e lands in
+                # one of them, so nothing is left as a remainder for the reader to work out.
+                "<th>work-unit</th>"
+                "<th>witness (s)</th><th>transport (s)</th><th>prove (s)</th><th>queue (s)</th>"
+                "<th>e2e (s)</th><th>proof (B)</th><th>verified</th>"
                 "<th class=l>verifier_id</th><th class=l>updated</th></tr>"]
         for r in rows:
             ev = r.get("event", "")
@@ -429,7 +457,13 @@ class Handler(BaseHTTPRequestHandler):
                         f"<td class='r'>{'⚠️MOCK' if r.get('mock') else ''}</td><td>{blk}</td>"
                         f"<td class='l {cls}'>{ev}</td><td>{td(r.get('proving_cycles'))}</td>"
                         # ms is the API's unit; seconds is what a human compares to a 12 s slot.
-                        f"<td>{secs(r.get('proving_time_ms'))}</td><td>{td(r.get('e2e_secs'))}</td>"
+                        f"<td>{td(r.get('witness_secs'))}</td>"
+                        # A dot marks the witness pulled over the direct link rather than pushed through the
+                        # tunnel — the difference between ~4 s and ~25 s, and worth seeing per block.
+                        f"<td>{td(r.get('transport_secs'))}{'·' if r.get('pulled_direct') else ''}</td>"
+                        f"<td>{secs(r.get('proving_time_ms'))}</td>"
+                        f"<td>{queue_wait(r)}</td>"
+                        f"<td>{td(r.get('e2e_secs'))}</td>"
                         f"<td>{td(r.get('proof_bytes'))}</td>"
                         f"<td class='{vc}' title='{td(r.get('verify_reason'))}'>{vb}</td>"
                         f"<td class=l>{str(td(r.get('verifier_id')))[:18]}</td><td class=l>{td(r.get('ts'))}</td></tr>")

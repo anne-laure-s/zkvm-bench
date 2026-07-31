@@ -280,6 +280,14 @@ proofs/$base.pv.bin 2>/dev/null" | tar xf - -C "$getdir" 2>/dev/null
   # enough: the phases are seconds-scale, and the prover may be a macOS bash 3.2 with no sub-second clock.
   printf 'Timing    : input %ds · remote %ds · retrieve %ds · total %ds\n' \
     "$(( t_in - t_start ))" "$(( t_run - t_in ))" "$(( t_get - t_run ))" "$(( t_get - t_start ))"
+  # Also as data, not just as a log line: these are the numbers that told us the transport was TWO problems,
+  # and they belong in the run record so ethproofs-submit can carry them to the leaderboard. A phase timing
+  # buried in prose gets re-derived by subtraction, which is exactly how it went wrong three times.
+  # `transport` is the operator-facing figure: everything that is not the prover's own work.
+  printf '{"input_secs":%d,"remote_secs":%d,"retrieve_secs":%d,"transport_secs":%d,"total_secs":%d,"pulled_direct":%s}\n' \
+    "$(( t_in - t_start ))" "$(( t_run - t_in ))" "$(( t_get - t_run ))" \
+    "$(( (t_in - t_start) + (t_get - t_run) ))" "$(( t_get - t_start ))" \
+    "$( [[ $pulled == 1 ]] && echo true || echo false )" > "$run_dir/timing.json"
 
   # Bundle the local emulation profile (steps) if it exists, so the run record is
   # self-contained.

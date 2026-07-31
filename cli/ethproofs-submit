@@ -71,6 +71,29 @@ def block_chain_time(manifest, block):
     return None
 
 
+def witness_secs(manifest, block):
+    """How long the PRODUCER took: the block's chain time -> the witness existing on disk.
+
+    Without this the leaderboard leaves e2e - prove - transport as a remainder for the reader to compute, and a
+    remainder silently absorbs whatever else is happening. Same clock at both ends is not required: t_block is
+    chain time and t_witness is the box's, both NTP-synced, which is the same basis e2e already uses.
+    """
+    if not manifest or not os.path.isfile(manifest):
+        return None
+    try:
+        with open(manifest, newline="") as f:
+            for row in csv.DictReader(f):
+                if (row.get("block") or "").strip() == str(block):
+                    tb = (row.get("t_block") or "").strip()
+                    tw = (row.get("t_witness") or "").strip()
+                    if tb and tw:
+                        return round(float(tw) - float(tb), 1)
+                    return None
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def exec_work(run_dir):
     """The work-unit from the run record's bundled exec-report.json, if any.
 
@@ -235,6 +258,23 @@ def main():
     if tb:
         proved["t_block"] = int(tb)
         proved["e2e_secs"] = e2e
+
+    # Phase timings from the run record, so the leaderboard shows WHERE the time went rather than only how much.
+    # `transport_secs` is what the pipeline costs around the prover: shipping the witness plus fetching the
+    # artifacts. Written by prove_remote; absent for local runs, and absent is not zero — omit rather than
+    # invent, or a local run would read as a suspiciously perfect transport.
+    if not args.minimal:
+        ws = witness_secs(args.manifest, block)
+        if ws is not None:
+            proved["witness_secs"] = ws
+        try:
+            with open(os.path.join(args.run_dir, "timing.json")) as f:
+                t = json.load(f)
+            for k in ("transport_secs", "input_secs", "retrieve_secs", "pulled_direct"):
+                if t.get(k) is not None:
+                    proved[k] = t[k]
+        except (OSError, ValueError):
+            pass
     if pi is not None:
         proved["public_inputs"] = pi
 
