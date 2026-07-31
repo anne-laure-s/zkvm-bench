@@ -160,6 +160,7 @@ prove_remote() {
   # Portable on both ends: coreutils ships sha256sum, macOS ships shasum. And never let two EMPTY hashes
   # compare equal — that would silently skip the upload and leave the remote to fail on a missing ELF.
   local lsum rsum
+  local t_start; t_start="$(date +%s)"
   if   command -v sha256sum >/dev/null 2>&1; then lsum="$(sha256sum "$ELF" | awk '{print $1}')"
   elif command -v shasum    >/dev/null 2>&1; then lsum="$(shasum -a 256 "$ELF" | awk '{print $1}')"
   else lsum=""; echo "NOTE: no sha256sum/shasum here — uploading the ELF unconditionally." >&2; fi
@@ -203,6 +204,7 @@ prove_remote() {
     scp "${scpo[@]}" "$INPUT" "$REMOTE:$ws/inputs/$in_name"
   fi
   [[ $have_hints == 1 ]] && scp -r "${scpo[@]}" "$hints" "$REMOTE:$ws/inputs/$hints_name"
+  local t_in; t_in="$(date +%s)"
 
   # Record the run context (hardware, versions) — what the benchmark ran on.
   {
@@ -250,12 +252,34 @@ ${ZISK_MOCK_DIST:+ZISK_MOCK_DIST=$ZISK_MOCK_DIST }"
     --public-values $ws/proofs/$base.pv.bin \
     --report $ws/reports/$base.json 2>&1 | tee $ws/reports/$base.log"
 
+  local t_run; t_run="$(date +%s)"
+
+  # ONE round trip instead of four. The four artifacts are tiny — a 480 B proof, three small text files — so
+  # what those scp calls cost was not bandwidth but latency: a full request/response each, over a tunnel where
+  # a round trip is expensive. Multiplexing removed the handshakes, not the round trips. tar streams all four
+  # in a single exchange on the connection that is already open.
+  #
+  # Public values are best-effort (ZisK exposes them differently across versions), so tar is allowed to report
+  # a missing member on stderr and still write the rest — hence 2>/dev/null on both ends rather than a check.
   echo "Retrieving artifacts into $run_dir ..."
-  scp "${scpo[@]}" "$REMOTE:$ws/proofs/$base.proof.bin" "$run_dir/proof.bin"
-  scp "${scpo[@]}" "$REMOTE:$ws/reports/$base.json"     "$run_dir/report.json"
-  scp "${scpo[@]}" "$REMOTE:$ws/reports/$base.log"      "$run_dir/prove.log"
-  # Public values are best-effort (ZisK may expose them differently per version).
-  scp "${scpo[@]}" "$REMOTE:$ws/proofs/$base.pv.bin"    "$run_dir/pv.bin" 2>/dev/null || true
+  local getdir; getdir="$(mktemp -d)"
+  "${ssh[@]}" "cd $ws && tar cf - proofs/$base.proof.bin reports/$base.json reports/$base.log \
+proofs/$base.pv.bin 2>/dev/null" | tar xf - -C "$getdir" 2>/dev/null
+  mv "$getdir/proofs/$base.proof.bin" "$run_dir/proof.bin"   2>/dev/null
+  mv "$getdir/reports/$base.json"     "$run_dir/report.json" 2>/dev/null
+  mv "$getdir/reports/$base.log"      "$run_dir/prove.log"   2>/dev/null
+  mv "$getdir/proofs/$base.pv.bin"    "$run_dir/pv.bin"      2>/dev/null
+  rm -rf "$getdir"
+  # The proof is the one artifact whose absence must fail loudly: with four separate scp calls a missing proof
+  # failed on its own line, and a single stream must not turn that into a silent empty run record.
+  [[ -s "$run_dir/proof.bin" ]] || { echo "ERROR: no proof came back from $REMOTE — see $run_dir/prove.log" >&2; return 1; }
+
+  local t_get; t_get="$(date +%s)"
+  # Per-phase timing, because attributing this by subtracting `prove` from the wall clock is how the transport
+  # got blamed for 20-34 s that turned out to be a mixture of throughput and round trips. Whole seconds are
+  # enough: the phases are seconds-scale, and the prover may be a macOS bash 3.2 with no sub-second clock.
+  printf 'Timing    : input %ds · remote %ds · retrieve %ds · total %ds\n' \
+    "$(( t_in - t_start ))" "$(( t_run - t_in ))" "$(( t_get - t_run ))" "$(( t_get - t_start ))"
 
   # Bundle the local emulation profile (steps) if it exists, so the run record is
   # self-contained.
