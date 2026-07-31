@@ -81,6 +81,38 @@ ${TAP_INTERVAL:+INTERVAL=$TAP_INTERVAL }${SETTLE_SECS:+SETTLE_SECS=$SETTLE_SECS 
 
 phase_sessions() { [ "$1" = tip ] && echo "fetch replay-tip tap" || echo "fetch replay-catchup"; }
 
+# cmd_supervise — run the tip replay FOREVER, recovering from reorgs on its own.
+#
+# At CONFIRMATIONS=0 a reorg stops run_replay.py with an ALERT and nothing restarts it: two reorgs in four
+# hours took the producer down twice, each needing a manual rewind. Real-time proving cannot depend on someone
+# watching. So: run the replay, and when it dies with an ALERT, repair the state and run it again.
+#
+# Deliberately NOT a blind retry loop. ./reorg-recover refuses anything that is not reorg-shaped and gives up
+# once its margin is exhausted, so a genuine fault (disk full, corruption) stops the loop instead of grinding
+# the database. And an exit WITHOUT an ALERT is a clean stop — `witness-follow stop` must not be fought.
+cmd_supervise() {
+  local rc
+  while :; do
+    if ! tmux has-session -t fetch 2>/dev/null; then
+      echo "supervise: fetcher not running (reorg-recover stops it by design) — starting it"
+      tmux new-session -d -s fetch "$(fetch_cmd)"
+      sleep 3
+    fi
+    echo "supervise: starting the tip replay"
+    eval "$(replay_cmd tip)"; rc=$?
+    if [ ! -f "$MONAD_DIR/logs/ALERT" ]; then
+      echo "supervise: replay exited rc=$rc with no ALERT — a clean stop or a crash to look at. Not restarting."
+      return "$rc"
+    fi
+    echo "supervise: ALERT present — attempting reorg recovery"
+    if ! MONAD_DIR="$MONAD_DIR" BLOCK_DB="$BLOCK_DB" DB="$DB" "$HERE/reorg-recover"; then
+      echo "supervise: recovery refused (reason above). The ALERT is left in place; stopping." >&2
+      return 1
+    fi
+    echo "supervise: recovered — restarting"
+  done
+}
+
 cmd_plan() {
   local phase="${1:-catchup}"
   echo "# phase: $phase   (nothing has been started — this only prints)"
@@ -109,6 +141,9 @@ fix the cause, then rm it. Never clear it blindly."
     if tmux has-session -t "$s" 2>/dev/null; then echo "· $s already running"; continue; fi
     case "$s" in
       fetch)        tmux new-session -d -s "$s" "$(fetch_cmd)" ;;
+      # The TIP replay runs under the supervisor, so a reorg is repaired and the replay restarted without
+      # anyone watching. Catch-up does not need it: it replays already-finalized history, which cannot reorg.
+      replay-tip)   tmux new-session -d -s "$s" "cd $HERE && ./witness-follow supervise >> ~/replay-supervise.log 2>&1" ;;
       replay-*)     tmux new-session -d -s "$s" "$(replay_cmd "$phase")" ;;
       tap)          tmux new-session -d -s "$s" "$(tap_cmd)" ;;
     esac
@@ -157,6 +192,7 @@ cmd_status() {
 case "${1:-plan}" in
   plan)   shift || true; cmd_plan "${1:-catchup}" ;;
   start)  shift || true; cmd_start "${1:-catchup}" ;;
+  supervise) cmd_supervise ;;
   stop)   cmd_stop ;;
   status) cmd_status ;;
   -h|--help) sed -n '2,30p' "$0" ;;

@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# reorg-recover — undo a reorg that stopped the replay, so real-time proving can resume unattended.
+#
+# WHY THIS EXISTS. At CONFIRMATIONS=0 the fetcher writes blocks that are still reorg-able. When one is
+# replaced, the triedb has already applied it: the next canonical block then fails validation (observed twice
+# in four hours, both times `block N failed with: bad nonce` — the replaced block had included a transaction,
+# so the sender's nonce is one ahead of what the canonical chain expects). run_replay.py writes logs/ALERT and
+# exits, and NOTHING restarts it. That is availability near zero, not a latency problem.
+#
+# Confirmations are the opposite of real-time proving — each one is 12 s of deliberate waiting against a 12 s
+# slot. So the fix is recovery, not delay. This script is that recovery.
+#
+# WHAT IT DOES, and why in this order — every step was learned the hard way:
+#   1. STOP THE FETCHER FIRST. It holds its next block in memory; if it keeps running while block_db is
+#      trimmed it carries on writing at the tip and never fills the gap, and `existing_max_block()` takes the
+#      MAX, so restarting it later does not fill it either. That mistake cost an hour: the replay sat with
+#      `available == last_executed` and thousands of unreachable blocks above a hole.
+#   2. REWIND THE TRIEDB. This is what un-applies the bad state; re-fetching alone does NOT work (verified —
+#      the re-fetched canonical block failed with the identical error). The tool is
+#      $MONAD_DIR/build/category/mpt/monad-mpt, NOT in build/cmd/ beside monad and monad-cli, and it takes
+#      --storage, NOT --db.
+#   3. TRIM block_db ABOVE THE REWIND POINT. Those blocks were fetched at CONFIRMATIONS=0 before the reorg
+#      settled, so some of them ARE the non-canonical ones. Rewinding without trimming just re-applies them.
+#   4. Remove the ALERT last, so a crash midway leaves the marker in place rather than a half-repaired db that
+#      looks healthy.
+#
+# ESCALATING MARGIN. A single-slot reorg needs a handful of blocks; but the divergence can predate the block
+# that reports it (the failure surfaces where a nonce first conflicts, not where the chain forked). Measured
+# once: 10 blocks was not enough, 1000 was. So the margin starts at MARGIN and DOUBLES each time recovery is
+# attempted for the same failing block, up to MAX_MARGIN. The attempt count lives in a state file next to the
+# ALERT so it survives restarts.
+#
+#   ./reorg-recover [--dry-run]
+#
+# Exit 0 = repaired (caller should restart the fetcher and the replay). Exit 1 = refused, and it says why:
+# no ALERT, an ALERT that is not a reorg, or the margin exhausted. It never guesses past MAX_MARGIN — beyond
+# that the history window itself is the limit and a snapshot rebuild is the honest answer.
+set -uo pipefail
+
+MONAD_DIR="${MONAD_DIR:-$HOME/monad}"
+BLOCK_DB="${BLOCK_DB:-$HOME/block_db}"
+DB="${DB:-$HOME/triedb.db}"
+MPT="${MPT:-$MONAD_DIR/build/category/mpt/monad-mpt}"
+CLI="${CLI:-$MONAD_DIR/build/cmd/monad-cli}"
+MARGIN="${MARGIN:-64}"
+MAX_MARGIN="${MAX_MARGIN:-4096}"
+ALERT="$MONAD_DIR/logs/ALERT"
+STATE="$MONAD_DIR/logs/.reorg-recover-state"
+DRY=0
+[ "${1:-}" = "--dry-run" ] && DRY=1
+
+log(){ printf '%s reorg-recover: %s\n' "$(date +%H:%M:%S)" "$*"; }
+die(){ printf '%s reorg-recover: %s\n' "$(date +%H:%M:%S)" "$*" >&2; exit 1; }
+run(){ if [ "$DRY" = 1 ]; then printf '   $ %s\n' "$*"; else eval "$@"; fi; }
+
+[ -f "$ALERT" ] || die "no $ALERT — nothing to recover (the replay stopped for another reason, or is running)"
+[ -x "$MPT" ]   || die "no monad-mpt at $MPT (look for it: find $MONAD_DIR -name '*mpt*' -type f -perm -u+x)"
+[ -x "$CLI" ]   || die "no monad-cli at $CLI"
+
+# Only reorg-shaped failures. Disk full, a crash or a missing block are different problems and a rewind makes
+# them worse, not better — it would throw away good state to work around an unrelated fault.
+failing="$(grep -oE 'block [0-9]+ failed with: [a-z ]+' "$ALERT" | tail -1)"
+[ -n "$failing" ] || die "the ALERT does not name a failing block — read it yourself, this is not a reorg:
+$(head -3 "$ALERT")"
+fblock="$(printf '%s' "$failing" | grep -oE '[0-9]+' | head -1)"
+case "$failing" in
+  *"bad nonce"*|*"root"*|*"parent"*|*"mismatch"*) log "reorg-shaped failure: $failing" ;;
+  *) die "'$failing' is not a reorg signature. A rewind will not fix it, and would discard good state." ;;
+esac
+
+# Escalate only for the SAME block: a new failing block is a new reorg and deserves a fresh, small margin.
+prev_block=""; prev_margin=""
+[ -f "$STATE" ] && read -r prev_block prev_margin < "$STATE"
+margin="$MARGIN"
+if [ "$prev_block" = "$fblock" ] && [ -n "$prev_margin" ]; then
+  margin=$(( prev_margin * 2 ))
+  log "same failing block as last attempt ($fblock) — the fork predates it, doubling the margin to $margin"
+fi
+[ "$margin" -le "$MAX_MARGIN" ] || die "margin $margin exceeds MAX_MARGIN=$MAX_MARGIN for block $fblock. The \
+divergence is deeper than the history window can undo — rebuild the triedb from a snapshot. Not guessing further."
+
+last="$("$CLI" --db "$DB" 2>/dev/null | grep -o 'latest_finalized_block_id=[0-9]*' | cut -d= -f2)"
+[ -n "$last" ] || die "cannot read the triedb head from monad-cli"
+earliest="$("$CLI" --db "$DB" 2>/dev/null | grep -o 'earliest_block_id=[0-9]*' | cut -d= -f2)"
+target=$(( last - margin ))
+# The rewind can only reach what the history window still holds. Below `earliest` the versions are gone and
+# monad-mpt would fail (or worse, succeed into an unusable state).
+if [ -n "$earliest" ] && [ "$target" -le "$earliest" ]; then
+  die "rewinding $margin blocks would land at $target, at or below the earliest retained version $earliest. \
+The history window cannot undo this — rebuild from a snapshot."
+fi
+
+log "failing block $fblock · triedb head $last · rewinding to $target (margin $margin, history from $earliest)"
+printf '%s %s\n' "$fblock" "$margin" > "${STATE}.tmp" && mv "${STATE}.tmp" "$STATE"
+
+log "1/4 stopping the fetcher (it must not write while block_db is trimmed)"
+run "pkill -f '[f]etch_blocks.py' 2>/dev/null; tmux kill-session -t fetch 2>/dev/null; true"
+run "sleep 2"
+
+log "2/4 rewinding the triedb"
+# --allow-dirty because the replay died mid-batch, which is exactly when the dirty flag is set; without it the
+# rewind refuses on the one occasion it is always needed.
+run "'$MPT' --storage '$DB' --rewind-to $target --yes --allow-dirty" \
+  || die "the rewind FAILED — the ALERT is untouched and the db is as it was. Read the output above."
+if [ "$DRY" != 1 ]; then
+  now="$("$CLI" --db "$DB" 2>/dev/null | grep -o 'latest_finalized_block_id=[0-9]*' | cut -d= -f2)"
+  [ "$now" = "$target" ] || die "rewind reported success but the head is $now, not $target — stopping here"
+  log "    head is now $now"
+fi
+
+log "3/4 trimming block_db above $target (they may be the non-canonical ones)"
+if [ "$DRY" = 1 ]; then
+  printf '   $ %s\n' "ls $BLOCK_DB | awk '\$1+0 > $target' | xargs rm -f   ($(ls "$BLOCK_DB" 2>/dev/null | awk -v t="$target" '$1+0 > t' | wc -l | tr -d ' ') file(s))"
+else
+  drop="$(mktemp)"; trap 'rm -f "$drop"' EXIT
+  ls "$BLOCK_DB" 2>/dev/null | awk -v t="$target" '$1+0 > t' > "$drop"
+  log "    $(wc -l < "$drop" | tr -d ' ') block(s) to re-fetch"
+  [ -s "$drop" ] && ( cd "$BLOCK_DB" && xargs -a "$drop" rm -f )
+fi
+
+log "4/4 removing the ALERT"
+run "rm -f '$ALERT'"
+
+log "repaired. The caller must now restart the fetcher (it was stopped in step 1) and the replay."
