@@ -410,6 +410,22 @@ class Handler(BaseHTTPRequestHandler):
         def td(v): return "" if v is None else v
         def secs(ms): return "" if ms is None else f"{ms / 1000:.1f}"
 
+        def service_secs(r):
+            """witness + transport + prove: the cost of processing ONE block, with no waiting in it.
+
+            This is the number that decides everything, because it is the one compared to the 12 s slot. Under
+            12 s the prover finishes before the next block lands, idles, and picks each witness within a poll —
+            `queue` collapses to ~1 s. Over 12 s it is never idle, so it inherits a witness of arbitrary age
+            (0-12 s, ~6 s mean) and `queue` appears all at once. Near the threshold a second cut here is worth
+            two: one off service, and a share of the queue it stops creating.
+
+            Kept SEPARATE from `pipeline`, which deliberately still includes the queue — hiding saturation
+            would make a pipeline that cannot keep up look perfectly healthy.
+            """
+            w, t = r.get("witness_secs"), r.get("transport_secs")
+            p = r.get("proving_time_ms")
+            return "" if None in (w, t, p) else f"{w + t + p / 1000:.1f}"
+
         def pipeline_secs(r):
             """e2e minus the RPC node's lag: what this pipeline is actually accountable for.
 
@@ -455,7 +471,9 @@ class Handler(BaseHTTPRequestHandler):
                 # Ordered as the block travels: produced, shipped, proved, waited. Every second of e2e lands in
                 # one of them, so nothing is left as a remainder for the reader to work out.
                 "<th>work-unit</th>"
-                "<th>node (s)</th><th>witness (s)</th><th>transport (s)</th><th>prove (s)</th><th>queue (s)</th>"
+                "<th>node (s)</th><th>witness (s)</th><th>transport (s)</th><th>prove (s)</th>"
+                # service = the three above. The one number to compare against the 12 s slot.
+                "<th>service (s)</th><th>queue (s)</th>"
                 "<th>pipeline (s)</th><th>e2e (s)</th><th>proof (B)</th><th>verified</th>"
                 "<th class=l>verifier_id</th><th class=l>updated</th></tr>"]
         for r in rows:
@@ -479,6 +497,7 @@ class Handler(BaseHTTPRequestHandler):
                         # tunnel — the difference between ~4 s and ~25 s, and worth seeing per block.
                         f"<td>{td(r.get('transport_secs'))}{'·' if r.get('pulled_direct') else ''}</td>"
                         f"<td>{secs(r.get('proving_time_ms'))}</td>"
+                        f"<td>{service_secs(r)}</td>"
                         f"<td>{queue_wait(r)}</td>"
                         f"<td>{pipeline_secs(r)}</td>"
                         f"<td>{td(r.get('e2e_secs'))}</td>"
