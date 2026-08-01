@@ -389,30 +389,20 @@ if [ "$DRY" != 1 ] && onbox_q "test -f ~/monad/logs/ALERT && echo yes" | grep -q
     die "the replay is stopped on the ALERT above, which is NOT a reorg — no rewind, and ./reorg-recover would
 refuse it. Fix the cause it names, then: ssh $BOX 'rm ~/monad/logs/ALERT'"
   fi
-  die "the replay is stopped on the ALERT above and will not restart while it exists.
-
-Read it first — never clear it blindly.
-
-'bad nonce' (or a state-root / parent-hash mismatch) means a REORG replaced a block the triedb ALREADY
-APPLIED — the expected failure mode at CONFIRMATIONS=0. Two things we know the hard way:
-
-  * Deleting the divergent blocks from block_db and re-fetching the canonical ones DOES NOT FIX IT. Verified:
-    the re-fetched block failed with the identical error. The bad state is in the triedb, not in block_db.
-Recovery is to UN-APPLY the diverged blocks. The triedb still holds the earlier state (history_length runs to
-~3900 blocks, far above the 300 minimum), so this is just a pointer move — with the replay stopped, which it
-already is:
-
-  last=\$(~/monad/build/cmd/monad-cli --db ~/triedb.db | grep -o 'latest_finalized_block_id=[0-9]*' | cut -d= -f2)
-  ~/monad/build/category/mpt/monad-mpt --storage ~/triedb.db --rewind-to \$((last - 10)) --yes
-  rm ~/monad/logs/ALERT
-
-Note the two traps: monad-mpt is at build/category/mpt/, NOT in build/cmd/ beside monad and monad-cli, and it
-takes --storage, NOT --db. Add --allow-dirty if it refuses because the crash left the dirty flag set. The
-block_db needs no purge as long as its blocks above the rewind point were fetched AFTER the reorg settled —
-if they predate it, delete them too and let the fetcher re-download.
-
-Anything else (disk full, a crash, a missing block) is a different problem entirely."
+  # Reorg-shaped: repair it here rather than printing a recipe. witness-follow's supervisor only covers reorgs
+  # that happen WHILE it runs; one that lands after a stop (overnight, say) left rtp-up refusing to start with
+  # a tool sitting right there that handles exactly this case. reorg-recover refuses anything it should not
+  # touch and escalates its own margin, so calling it is not a blind retry.
+  say "reorg-shaped ALERT — running reorg-recover on $BOX"
+  if onbox "cd $BOX_REPO/infra/monad-witness && ./reorg-recover 2>&1 | sed 's/^/   | /'"; then
+    say "recovered — continuing (the fetcher was stopped by the recovery and is restarted below)"
+  else
+    die "reorg-recover could not repair it (reason above). Do NOT clear the ALERT by hand: the replay would \
+fail on the same block. If the margin is exhausted, the divergence is deeper than the history window and the \
+triedb has to be rebuilt from a snapshot."
+  fi
 fi
+
 
 step "Catching up to the tip (no witnesses while there is a backlog)"
 # gap — "<block_db head> <last_executed> <gap>". The block_db listing is authoritative: status.json's
