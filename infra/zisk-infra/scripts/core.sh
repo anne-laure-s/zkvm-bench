@@ -158,12 +158,16 @@ prove_remote() {
   # costs, and starting the clock after it would flatter the very change being measured.
   # %N (Linux — core.sh runs on the producer box): tenths, because at ~2 s whole seconds hide real gains.
   local t_start; t_start="$(date +%s.%N)"
-  local ws_meta ws_abs rsum
+  local ws_meta ws_abs rsum rinsize
   ws_meta="$("${ssh[@]}" "mkdir -p \"$ws\"/elfs \"$ws\"/inputs \"$ws\"/proofs \"$ws\"/reports && cd \"$ws\" && pwd \
-&& { sha256sum elfs/$elf_name 2>/dev/null || shasum -a 256 elfs/$elf_name 2>/dev/null; } | awk '{print \$1}'")" \
+&& { sha256sum elfs/$elf_name 2>/dev/null || shasum -a 256 elfs/$elf_name 2>/dev/null; } | awk '{print \$1}' \
+&& { stat -c %s inputs/$in_name 2>/dev/null || stat -f %z inputs/$in_name 2>/dev/null || echo 0; }")" \
     || { echo "ERROR: cannot prepare remote workspace '$ws'" >&2; return 1; }
   ws_abs="$(printf '%s\n' "$ws_meta" | sed -n 1p)"
   rsum="$(printf '%s\n' "$ws_meta" | sed -n 2p)"
+  # Line 3: the size the prover ALREADY has for this input, 0 if absent. This is what makes overlap possible —
+  # a witness shipped ahead of time by prove-farm's prefetcher costs nothing here.
+  rinsize="$(printf '%s\n' "$ws_meta" | sed -n 3p)"
   [[ -n "$ws_abs" ]] || { echo "ERROR: remote workspace '$ws' did not resolve" >&2; return 1; }
   ws="$ws_abs"
 
@@ -197,8 +201,16 @@ prove_remote() {
   # The remote runs this non-interactively, so it needs its own key for us — no agent will be present. On
   # failure we say so loudly and fall back to pushing: a slow pipeline beats a stopped one, but a silent
   # fallback would let a broken config masquerade as a working optimisation.
-  local pulled=0
-  if [[ -n "${PULL_VIA:-}" ]]; then
+  local pulled=0 prefetched=0
+  # Already there, byte-for-byte the same size? Then a prefetcher shipped it while the previous block was being
+  # proved, and the transfer has already happened off the critical path. Size, not hash: a hash would cost the
+  # very round trip this is avoiding, and these names are content-addressed by block — a same-named input of
+  # the same length is the same witness.
+  local lin_size; lin_size="$(stat -c %s "$INPUT" 2>/dev/null || stat -f %z "$INPUT" 2>/dev/null || echo 0)"
+  if [[ "$lin_size" != 0 && "$rinsize" == "$lin_size" ]]; then
+    echo "Input already on the prover (prefetched, $lin_size B) — no transfer on the critical path."
+    prefetched=1; pulled=1
+  elif [[ -n "${PULL_VIA:-}" ]]; then
     local abs_input; abs_input="$(cd "$(dirname "$INPUT")" && pwd)/$(basename "$INPUT")"
     # -C only. Multiplexing was tried here and made things WORSE: input went from 3-4 s to 2.5-23 s, wildly
     # variable, while `retrieve` (small, same options) stayed at 0.5 s. Sharing one ControlMaster channel means
@@ -326,9 +338,10 @@ ${ZISK_MOCK_DIST:+ZISK_MOCK_DIST=$ZISK_MOCK_DIST }"
   # Bytes too, so a slow `input` can be told apart from a big one. Without it a 35 s outlier is unattributable:
   # 15 MB in 35 s is a collapsed link, 150 MB in 35 s would be a normal one — and guessing between them is how
   # the transport got misdiagnosed twice. mbits is the number to look at; it should sit near the link rate.
-  printf '{"input_secs":%s,"input_bytes":%s,"input_mbits":%s,"remote_secs":%s,"retrieve_secs":%s,"transport_secs":%s,"total_secs":%s,"pulled_direct":%s}\n' \
+  printf '{"input_secs":%s,"input_bytes":%s,"input_mbits":%s,"remote_secs":%s,"retrieve_secs":%s,"transport_secs":%s,"total_secs":%s,"pulled_direct":%s,"prefetched":%s}\n' \
     "$p_in" "$in_bytes" "$in_mbits" "$p_rem" "$p_get" "$p_tr" "$p_tot" \
-    "$( [[ $pulled == 1 ]] && echo true || echo false )" > "$run_dir/timing.json"
+    "$( [[ $pulled == 1 ]] && echo true || echo false )" \
+    "$( [[ $prefetched == 1 ]] && echo true || echo false )" > "$run_dir/timing.json"
 
   # Bundle the local emulation profile (steps) if it exists, so the run record is
   # self-contained.

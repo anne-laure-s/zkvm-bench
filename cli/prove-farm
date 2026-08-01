@@ -94,7 +94,7 @@ die(){ echo "prove-farm: $*" >&2; exit 2; }
 log(){ printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
 usage(){ sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit "${1:-0}"; }
 
-GUEST="rsp"; REMOTE=""; PORT=""; MODE=""; NUM_GPUS=""; WITNESS_DIR=""; CHAIN_ID="1"; MAX_BLOCKS=0
+GUEST="rsp"; PREFETCH=1; REMOTE=""; PORT=""; MODE=""; NUM_GPUS=""; WITNESS_DIR=""; CHAIN_ID="1"; MAX_BLOCKS=0
 WATCH=0; INTERVAL=2; NEWEST_FIRST=0; MOCK=0   # INTERVAL: idle re-scan. 2s, not 30 — at the tip the
 # queue is empty right after each proof, so a long idle sleep meant sleeping THROUGH the next blocks.
 # Re-scanning costs a directory listing and a CSV scan; there was never a reason for it to be slow.
@@ -123,6 +123,8 @@ while [ $# -gt 0 ]; do
     --max-blocks)        MAX_BLOCKS="${2:?}"; shift 2 ;;
     --watch)             WATCH=1; shift ;;                 # continuous: keep draining the witness queue
     --interval)          INTERVAL="${2:?}"; shift 2 ;;     # watch: idle re-scan (s); default 2
+    --prefetch)          PREFETCH=1; shift ;;              # overlap the next transfer with this proof
+    --no-prefetch)       PREFETCH=0; shift ;;
     --newest-first)      NEWEST_FIRST=1; shift ;;          # prove nearest the tip first (RTP policy)
     --mock)              MOCK=1; shift ;;                   # mock-cluster: fake the prover (no box) — plumbing test
     --mock-secs)         MOCK_SECS="${2:?}"; shift 2 ;;     # simulated proving time (0 = instant)
@@ -347,9 +349,52 @@ a faster box: the deduction only works while emulation is faster than the modell
 # prove_one — one uniform call to the stack's prove-cluster (resolves its own artifacts + drives ITS
 # cluster), then locate the fetched run record, require the PROOF (not just the report), and record it.
 # With --mock the prove step is the mock-cluster stand-in (local, no box); everything downstream is identical.
+# prefetch_next — ship the NEXT block's witness to the prover WHILE the current one is being proved.
+#
+# Service time = witness + transport + prove. At ~15.5 s against a 12 s slot the prover is never idle, so it
+# always inherits a witness of arbitrary age and `queue` appears (0-12 s, ~6 s mean). Overlapping the transport
+# with the proving takes ~5 s out of the service time, which is what puts it back UNDER the slot — and the
+# queue then collapses on its own. That is the compounding win: the transport is not merely faster, it stops
+# being on the critical path at all.
+#
+# Not a departure from the ethproofs model: no queueing policy changes, nothing is reordered, the prover still
+# takes the newest block when it frees up. This only moves bytes to the machine that is about to want them.
+#
+# Runs in the background, deliberately best-effort: it holds no lock, and if it ships the wrong block (the tip
+# moved) or fails outright, prove_remote simply transfers normally. The only state it leaves is a file in the
+# prover's inputs/ — which prove_remote accepts by name and size, and which the next block would overwrite.
+prefetch_next(){
+  local after="$1" nxt src
+  [ "$PREFETCH" = 1 ] && [ -n "$REMOTE" ] || return 0
+  # Wait for the next witness to exist. A block lands every ~12 s and a prove takes ~7 s, so a few seconds in
+  # there is usually one. Give up rather than linger: a stale prefetch is worthless and holds a connection.
+  local waited=0
+  while [ "$waited" -lt "${PREFETCH_WAIT:-8}" ]; do
+    nxt="$(scan_unproven | awk -v a="$after" '$1+0 > a {print; exit}')"
+    [ -n "$nxt" ] && break
+    sleep 1; waited=$((waited + 1))
+  done
+  [ -n "$nxt" ] || return 0
+  src="$WDIR/$CHAIN_ID-$nxt.bin"
+  [ -f "$src" ] || return 0
+  local ws="${REMOTE_WS:-/workspace}" dst="$CHAIN_ID-$nxt.bin"
+  if [ -n "${PULL_VIA:-}" ]; then
+    ssh -o BatchMode=yes -p "${PORT:-22}" "$REMOTE" \
+      "mkdir -p '$ws/inputs' && scp -q -C -o BatchMode=yes '$PULL_VIA:$src' '$ws/inputs/$dst'" 2>/dev/null \
+      && log "   (prefetched $nxt to the prover while $after was proving)"
+  else
+    ssh -o BatchMode=yes -p "${PORT:-22}" "$REMOTE" "mkdir -p '$ws/inputs'" 2>/dev/null \
+      && scp -q -C -o BatchMode=yes -P "${PORT:-22}" "$src" "$REMOTE:$ws/inputs/$dst" 2>/dev/null \
+      && log "   (prefetched $nxt to the prover while $after was proving)"
+  fi
+}
+
 prove_one(){
   local b="$1" tag plog ref t0 rc rep run_dir proof ps ts pb reason p
   LAST_OK=0; LAST_RUN_DIR=""            # globals: signal success + run record to the submit step
+  # Overlap the next block's transfer with this proof. Left unwaited on purpose: it must not delay this
+  # block, and it bounds itself (PREFETCH_WAIT then the transfer), so at most one or two are ever alive.
+  prefetch_next "$b" &
   tag="$CHAIN_ID-$b"; plog="$LOGDIR/prove-$GUEST-$b.log"; ref="$LOGDIR/.ref-$b"; : > "$ref"; t0=$SECONDS
   if [ "$MOCK" = 1 ] && [ -z "$REMOTE" ]; then
     log ">> prove $b ($GUEST) → mock-cluster (no box)"
