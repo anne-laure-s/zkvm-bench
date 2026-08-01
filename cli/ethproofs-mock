@@ -410,6 +410,19 @@ class Handler(BaseHTTPRequestHandler):
         def td(v): return "" if v is None else v
         def secs(ms): return "" if ms is None else f"{ms / 1000:.1f}"
 
+        def pipeline_secs(r):
+            """e2e minus the RPC node's lag: what this pipeline is actually accountable for.
+
+            Reads with the `node` column beside it: node + pipeline = e2e.
+
+            e2e is measured from the BLOCK'S OWN TIMESTAMP, which is right — it is the only cross-machine
+            valid origin, and it is the number a 12 s slot is judged against. But ~5.9 s of it elapse before
+            the block is even served to us, so e2e alone answers "did we make the slot?" and never "how are
+            we doing?". This column answers the second question; e2e stays for the first.
+            """
+            e2e, n = r.get("e2e_secs"), r.get("node_secs")
+            return "" if None in (e2e, n) else f"{e2e - n:.1f}"
+
         def queue_wait(r):
             """Whatever e2e is not witness + transport + prove: the block sat waiting to be picked up.
 
@@ -443,7 +456,7 @@ class Handler(BaseHTTPRequestHandler):
                 # one of them, so nothing is left as a remainder for the reader to work out.
                 "<th>work-unit</th>"
                 "<th>node (s)</th><th>witness (s)</th><th>transport (s)</th><th>prove (s)</th><th>queue (s)</th>"
-                "<th>e2e (s)</th><th>proof (B)</th><th>verified</th>"
+                "<th>pipeline (s)</th><th>e2e (s)</th><th>proof (B)</th><th>verified</th>"
                 "<th class=l>verifier_id</th><th class=l>updated</th></tr>"]
         for r in rows:
             ev = r.get("event", "")
@@ -467,6 +480,7 @@ class Handler(BaseHTTPRequestHandler):
                         f"<td>{td(r.get('transport_secs'))}{'·' if r.get('pulled_direct') else ''}</td>"
                         f"<td>{secs(r.get('proving_time_ms'))}</td>"
                         f"<td>{queue_wait(r)}</td>"
+                        f"<td>{pipeline_secs(r)}</td>"
                         f"<td>{td(r.get('e2e_secs'))}</td>"
                         f"<td>{td(r.get('proof_bytes'))}</td>"
                         f"<td class='{vc}' title='{td(r.get('verify_reason'))}'>{vb}</td>"
