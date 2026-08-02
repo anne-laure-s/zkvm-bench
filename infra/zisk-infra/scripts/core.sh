@@ -202,6 +202,15 @@ prove_remote() {
   # failure we say so loudly and fall back to pushing: a slow pipeline beats a stopped one, but a silent
   # fallback would let a broken config masquerade as a working optimisation.
   local pulled=0 prefetched=0
+  # BOTH directions need these options — the input pull below AND the artifact push-back in `retrieve`. Declare
+  # them here, at function scope, never inside a branch. They used to be declared inside the `elif` that pulls
+  # the input, so a PREFETCHED input took the first branch, left pull_opts unset, and `set -u` killed the
+  # retrieve step at the tar: "line 301: pull_opts: unbound variable". Every block the prefetcher successfully
+  # shipped therefore FAILED — and failed again on every retry, because the input was still sitting on the
+  # prover and matched on size again. 31 blocks poisoned, 0 recovered, while the feature looked like it was
+  # working: `(prefetched N …)` in the farm log, `<< N FAIL (rc=1 no-report no-proof)` eight seconds later.
+  # The prefetch measured as 0 % effective for exactly as long as it was 100 % fatal.
+  local pull_opts="${PULL_SSH_OPTS:--C -o BatchMode=yes -o StrictHostKeyChecking=accept-new}"
   # Already there, byte-for-byte the same size? Then a prefetcher shipped it while the previous block was being
   # proved, and the transfer has already happened off the critical path. Size, not hash: a hash would cost the
   # very round trip this is avoiding, and these names are content-addressed by block — a same-named input of
@@ -218,7 +227,6 @@ prove_remote() {
     # it wants its own connection, which is what it had. Multiplexing pays off for MANY SMALL round trips (the
     # box->prover control calls, where it belongs and stays); it is the wrong tool for one bulk transfer.
     # The handshake it would have saved is ~0.3 s. The contention it caused was measured in seconds.
-    local pull_opts="${PULL_SSH_OPTS:--C -o BatchMode=yes -o StrictHostKeyChecking=accept-new}"
     echo "Pulling input from $PULL_VIA (direct, bypassing the tunnel for the payload)..."
     if "${ssh[@]}" "scp -q $pull_opts '$PULL_VIA:$abs_input' '$ws/inputs/$in_name'"; then
       pulled=1
@@ -297,8 +305,20 @@ ${ZISK_MOCK_DIST:+ZISK_MOCK_DIST=$ZISK_MOCK_DIST }"
     # to us, not the tunnel. The payload is small, so what this buys is the round trip, not bandwidth — but at
     # this point the round trip IS the cost. The ssh command itself still goes through the tunnel; it is a few
     # hundred bytes.
+    #
+    # And since the round trip IS the cost, multiplex THIS connection — the opposite call from the input pull,
+    # and not a contradiction of it. The rule the pull comment states is the one being applied: mux is for many
+    # small round trips, not for one bulk stream. This is the small-round-trip case. Measured prover->box:
+    # a fresh handshake is 1.09-1.22 s, a reused channel 0.19-0.20 s, and `retrieve` currently sits at a 1.6 s
+    # median for ~1 KB of artifacts — i.e. it is almost entirely handshake. One control socket per PULL_VIA,
+    # persisted across blocks, so only the first block of a run pays it.
+    #
+    # The socket lives on the PROVER (this ssh runs there), so the path must be short and prover-side: a unix
+    # socket path is capped at 104 bytes on macOS and %C alone is 64 hex chars, which $ws/... would overflow.
+    # PULL_BACK_SSH_OPTS overrides; set it to "$pull_opts" to go back to a fresh connection per block.
+    local back_opts="${PULL_BACK_SSH_OPTS:-$pull_opts -o ControlMaster=auto -o ControlPath=/tmp/zisk-pb-%C -o ControlPersist=120}"
     local tarball="$getdir/artifacts.tar"
-    if "${ssh[@]}" "cd $ws && tar cf - $members 2>/dev/null | ssh $pull_opts '$PULL_VIA' \"cat > '$tarball'\"" \
+    if "${ssh[@]}" "cd $ws && tar cf - $members 2>/dev/null | ssh $back_opts '$PULL_VIA' \"cat > '$tarball'\"" \
        && [[ -s "$tarball" ]]; then
       tar xf "$tarball" -C "$getdir" 2>/dev/null; rm -f "$tarball"
     else
