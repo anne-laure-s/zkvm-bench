@@ -391,7 +391,10 @@ if [ "$DRY" != 1 ] && onbox_q "test -f ~/monad/logs/ALERT && echo yes" | grep -q
   onbox_q "cat ~/monad/logs/ALERT" | sed 's/^/   | /'
   # Only advise a rewind for a reorg-shaped failure. Printing the recovery recipe under an ALERT that says
   # "--block-db-timeout requires --as-eth-blocks" invites rewinding a 440 GB database to fix a typo in a flag.
-  if ! onbox_q "grep -qE 'bad nonce|state root|parent|mismatch' ~/monad/logs/ALERT && echo yes" | grep -q yes; then
+  # Anchored on the FAILURE line, as ./reorg-recover is. A bare grep over the whole file matches monad's
+  # routine "state root = 0x..." info line, which the ALERT embeds in its 40-line tail — so a timeout or a
+  # bad flag was classified as a reorg, and recovery was attempted on a database that was perfectly fine.
+  if ! onbox_q "grep -oE 'block [0-9]+ failed with: [a-z ]+' ~/monad/logs/ALERT | grep -qE 'bad nonce|state root|parent|mismatch' && echo yes" | grep -q yes; then
     die "the replay is stopped on the ALERT above, which is NOT a reorg — no rewind, and ./reorg-recover would
 refuse it. Fix the cause it names, then: ssh $BOX 'rm ~/monad/logs/ALERT'"
   fi

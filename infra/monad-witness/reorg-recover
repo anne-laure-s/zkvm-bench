@@ -21,7 +21,11 @@
 #      --storage, NOT --db.
 #   3. TRIM block_db ABOVE THE REWIND POINT. Those blocks were fetched at CONFIRMATIONS=0 before the reorg
 #      settled, so some of them ARE the non-canonical ones. Rewinding without trimming just re-applies them.
-#   4. Remove the ALERT last, so a crash midway leaves the marker in place rather than a half-repaired db that
+#   4. DROP THOSE BLOCKS FROM prove-farm.csv. A reorged block may already have been proved — the failure only
+#      surfaces at a LATER block — so its proof describes an orphan, and prove-farm's is_proven() keys on the
+#      block number alone: it would skip the canonical witness and leave the orphan's proof at that height.
+#      Invalidating the prover's ledger over the same range is the other half of trimming block_db.
+#   5. Remove the ALERT last, so a crash midway leaves the marker in place rather than a half-repaired db that
 #      looks healthy.
 #
 # ESCALATING MARGIN. A single-slot reorg needs a handful of blocks; but the divergence can predate the block
@@ -42,6 +46,7 @@ BLOCK_DB="${BLOCK_DB:-$HOME/block_db}"
 DB="${DB:-$HOME/triedb.db}"
 MPT="${MPT:-$MONAD_DIR/build/category/mpt/monad-mpt}"
 CLI="${CLI:-$MONAD_DIR/build/cmd/monad-cli}"
+FARM_CSV="${FARM_CSV:-$HOME/zkvm-bench/prove-farm.csv}"
 MARGIN="${MARGIN:-64}"
 MAX_MARGIN="${MAX_MARGIN:-4096}"
 ALERT="$MONAD_DIR/logs/ALERT"
@@ -93,11 +98,11 @@ fi
 log "failing block $fblock · triedb head $last · rewinding to $target (margin $margin, history from $earliest)"
 printf '%s %s\n' "$fblock" "$margin" > "${STATE}.tmp" && mv "${STATE}.tmp" "$STATE"
 
-log "1/4 stopping the fetcher (it must not write while block_db is trimmed)"
+log "1/5 stopping the fetcher (it must not write while block_db is trimmed)"
 run "pkill -f '[f]etch_blocks.py' 2>/dev/null; tmux kill-session -t fetch 2>/dev/null; true"
 run "sleep 2"
 
-log "2/4 rewinding the triedb"
+log "2/5 rewinding the triedb"
 # --allow-dirty because the replay died mid-batch, which is exactly when the dirty flag is set; without it the
 # rewind refuses on the one occasion it is always needed.
 run "'$MPT' --storage '$DB' --rewind-to $target --yes --allow-dirty" \
@@ -108,7 +113,7 @@ if [ "$DRY" != 1 ]; then
   log "    head is now $now"
 fi
 
-log "3/4 trimming block_db above $target (they may be the non-canonical ones)"
+log "3/5 trimming block_db above $target (they may be the non-canonical ones)"
 if [ "$DRY" = 1 ]; then
   printf '   $ %s\n' "ls $BLOCK_DB | awk '\$1+0 > $target' | xargs rm -f   ($(ls "$BLOCK_DB" 2>/dev/null | awk -v t="$target" '$1+0 > t' | wc -l | tr -d ' ') file(s))"
 else
@@ -118,7 +123,32 @@ else
   [ -s "$drop" ] && ( cd "$BLOCK_DB" && xargs -a "$drop" rm -f )
 fi
 
-log "4/4 removing the ALERT"
+# A reorged block may ALREADY have been proved: the failure only surfaces at a later block, so the divergent
+# one can be through the prover and on the leaderboard before anything looks wrong. Its proof describes an
+# orphan. After the rewind, re-execution produces a NEW witness for the SAME block number — and prove-farm's
+# is_proven() keys on the number alone, so it would skip the canonical version and leave the orphan's proof
+# standing at that height. Against the real ethproofs, where a proof's identity is (cluster, block_number),
+# that is a wrong proof at a given height, not merely untidy.
+#
+# So invalidate the same range in the prover's ledger that we just invalidated on disk. Those blocks become
+# un-proved, the tap re-offers them, and the canonical witness is proved. The run records are left alone: they
+# are an audit trail of what actually ran, and rewriting history there would hide the reorg rather than record
+# it.
+log "4/5 dropping blocks > $target from $FARM_CSV (their proofs describe orphaned blocks)"
+if [ ! -f "$FARM_CSV" ]; then
+  log "    no $FARM_CSV — nothing to invalidate"
+elif [ "$DRY" = 1 ]; then
+  printf '   $ %s\n' "awk -F, 'NR==1 || \$2+0 <= $target' $FARM_CSV   ($(awk -F, -v t="$target" 'NR>1 && $2+0 > t' "$FARM_CSV" 2>/dev/null | wc -l | tr -d ' ') row(s) would go)"
+else
+  dropped="$(awk -F, -v t="$target" 'NR>1 && $2+0 > t' "$FARM_CSV" | wc -l | tr -d ' ')"
+  # Header always kept, and written via a temp file + mv so an interrupted run cannot leave a truncated ledger
+  # — losing it would make every block look un-proved and re-prove thousands.
+  awk -F, -v t="$target" 'NR==1 || $2+0 <= t' "$FARM_CSV" > "${FARM_CSV}.tmp" \
+    && mv "${FARM_CSV}.tmp" "$FARM_CSV" \
+    && log "    $dropped row(s) dropped — those blocks will be proved again from their canonical witness"
+fi
+
+log "5/5 removing the ALERT"
 run "rm -f '$ALERT'"
 
 log "repaired. The caller must now restart the fetcher (it was stopped in step 1) and the replay."
