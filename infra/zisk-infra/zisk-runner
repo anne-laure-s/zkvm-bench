@@ -263,7 +263,10 @@ JSON
       #
       # Padded from /dev/urandom, never zeros. A real proof is cryptographic and incompressible; zero padding
       # would vanish under `ssh -C` and leave the return leg exactly as unmeasured as 480 bytes did.
-      local mock_pb="${ZISK_MOCK_PROOF_BYTES:-390144}"      # 381 KiB — a ZisK compressed proof
+      # NOT `local` — this branch is top-level script, not a function body. `local` there fails, leaves the name
+      # unbound, and `set -u` then kills the runner at the next reference: the report is never written and the
+      # block comes back as "no-report no-proof" with an 80-byte truncated proof. Cost one full restart to find.
+      mock_pb="${ZISK_MOCK_PROOF_BYTES:-390144}"            # 381 KiB — a ZisK compressed proof
       { printf 'MOCK-PROOF/mock-remote NOT-A-REAL-PROOF elf=%s input=%s ' \
           "$(basename "$ELF")" "$(basename "$INPUT")"
         head -c "$mock_pb" /dev/urandom; } > "$OUTPUT"

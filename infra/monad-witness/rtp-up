@@ -220,6 +220,11 @@ if [ -z "$PROVER" ]; then
   # connection (the box is reachable, a laptop behind NAT is not), and it saves the ~2 s of ssh setup that every
   # per-block scp repays: measured 4.05 -> 2.66 s per witness, +34 %, byte-verified over 10 interleaved rounds.
   run "cp '$MAC_REPO/infra/zisk-infra/witness-pump' '$MOCK_RUNNER_DIR/'"
+  # ethproofs-submit too, so the POST can happen HERE, where the proof already is. Posting it from the box means
+  # sending a 508 KB base64 body back through the tunnel at 3.8 Mbit/s — ~1.10 s per block for bytes that never
+  # left this machine. The box still decides: it invokes, reads the status, logs the verdict, writes the CSV.
+  run "cp '$MAC_REPO/cli/ethproofs-submit' '$MOCK_RUNNER_DIR/'"
+  run "chmod +x '$MOCK_RUNNER_DIR/ethproofs-submit'"
   run "chmod +x '$MOCK_RUNNER_DIR/witness-pump'"
   # Restart it, never reuse: like the prover session, a live pump holds the code and env it started with.
   # PUMP_SOCK stays SHORT — a unix socket path is capped at ~104 bytes on macOS, the same limit that bit the
@@ -587,7 +592,7 @@ step "Starting the prover (mock on $PROVER_WHERE, transfers real)"
 # in the tap — two different implementations hitting the same arithmetic ceiling, because the ceiling is not
 # in either of them. The lever that works is making the transfer itself cheaper (scp -O in prove_remote),
 # which helps every block instead of a third of them.
-onbox "tmux kill-session -t prove 2>/dev/null && echo '   · restarting prove (a live session would keep the old code and env)'; tmux new-session -d -s prove \"cd $BOX_REPO && REMOTE_WS=$MOCK_WS REMOTE_RUNNER=$MOCK_RUNNER_DIR/zisk-runner ${PULL_VIA:+PULL_VIA=$PULL_VIA }WITNESS_PUMP=$MOCK_RUNNER_DIR/witness-pump PUMP_SOCK=$PUMP_SOCK WITNESS_MANIFEST=\$HOME/witness-manifest.csv cli/prove-farm --guest monad-zisk --mock --remote $PROVER_TARGET --port $PROVER_PORT --mock-secs $MOCK_SECS --mock-per-mstep $MOCK_PER_MSTEP --mock-speed $MOCK_SPEED --mock-jitter $MOCK_JITTER --interval 1 --watch --newest-first --no-prefetch --ethproofs-url http://localhost:$MOCK_PORT --ethproofs-cluster local-ZisK-monad 2>&1 | tee -a ~/prove-mock.log\""
+onbox "tmux kill-session -t prove 2>/dev/null && echo '   · restarting prove (a live session would keep the old code and env)'; tmux new-session -d -s prove \"cd $BOX_REPO && REMOTE_WS=$MOCK_WS REMOTE_RUNNER=$MOCK_RUNNER_DIR/zisk-runner ${PULL_VIA:+PULL_VIA=$PULL_VIA }WITNESS_PUMP=$MOCK_RUNNER_DIR/witness-pump PUMP_SOCK=$PUMP_SOCK REMOTE_SUBMIT=$MOCK_RUNNER_DIR/ethproofs-submit WITNESS_MANIFEST=\$HOME/witness-manifest.csv cli/prove-farm --guest monad-zisk --mock --remote $PROVER_TARGET --port $PROVER_PORT --mock-secs $MOCK_SECS --mock-per-mstep $MOCK_PER_MSTEP --mock-speed $MOCK_SPEED --mock-jitter $MOCK_JITTER --interval 1 --watch --newest-first --no-prefetch --ethproofs-url http://localhost:$MOCK_PORT --ethproofs-cluster local-ZisK-monad 2>&1 | tee -a ~/prove-mock.log\""
 
 [ "$CRON" = 1 ] && { step "Installing the daily log archiver on the box"
   onbox "(crontab -l 2>/dev/null | grep -v archive-logs; echo '17 4 * * * \$HOME/zkvm-bench/infra/monad-witness/archive-logs >> \$HOME/archive-logs.log 2>&1') | crontab - && crontab -l | tail -1"; }

@@ -438,10 +438,15 @@ PY
   # Bytes too, so a slow `input` can be told apart from a big one. Without it a 35 s outlier is unattributable:
   # 15 MB in 35 s is a collapsed link, 150 MB in 35 s would be a normal one — and guessing between them is how
   # the transport got misdiagnosed twice. mbits is the number to look at; it should sit near the link rate.
-  printf '{"input_secs":%s,"input_bytes":%s,"input_mbits":%s,"remote_secs":%s,"retrieve_secs":%s,"transport_secs":%s,"total_secs":%s,"pulled_direct":%s,"prefetched":%s}\n' \
+  # remote_ws / remote_base: WHERE the prover's own copies of these artifacts live. Recorded because the
+  # submission can be made to happen ON the prover (see cli/prove-farm's submit_one) so the 508 KB base64 proof
+  # never crosses the tunnel — and the naming convention that produces `$base` belongs here, in the one place
+  # that already owns it. Without this, prove-farm would have to re-derive it and the convention would live twice.
+  printf '{"input_secs":%s,"input_bytes":%s,"input_mbits":%s,"remote_secs":%s,"retrieve_secs":%s,"transport_secs":%s,"total_secs":%s,"pulled_direct":%s,"prefetched":%s,"remote_ws":"%s","remote_base":"%s"}\n' \
     "$p_in" "$in_bytes" "$in_mbits" "$p_rem" "$p_get" "$p_tr" "$p_tot" \
     "$( [[ $pulled == 1 ]] && echo true || echo false )" \
-    "$( [[ $prefetched == 1 ]] && echo true || echo false )" > "$run_dir/timing.json"
+    "$( [[ $prefetched == 1 ]] && echo true || echo false )" \
+    "$ws" "$base" > "$run_dir/timing.json"
 
   # Bundle the local emulation profile (steps) if it exists, so the run record is
   # self-contained.

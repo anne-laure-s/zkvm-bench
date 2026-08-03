@@ -95,6 +95,9 @@ log(){ printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
 usage(){ sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit "${1:-0}"; }
 
 GUEST="rsp"; PREFETCH=1; REMOTE=""; PORT=""; MODE=""; NUM_GPUS=""; WITNESS_DIR=""; CHAIN_ID="1"; MAX_BLOCKS=0
+# Where cli/ethproofs-submit lives ON THE PROVER, for the prover-side POST (see submit_one). Staged there by
+# rtp-up alongside zisk-runner and witness-pump. Empty or absent -> submit_one posts from here instead.
+REMOTE_SUBMIT="${REMOTE_SUBMIT:-}"
 WATCH=0; INTERVAL=2; NEWEST_FIRST=0; MOCK=0   # INTERVAL: idle re-scan. 2s, not 30 — at the tip the
 # queue is empty right after each proof, so a long idle sleep meant sleeping THROUGH the next blocks.
 # Re-scanning costs a directory listing and a CSV scan; there was never a reason for it to be slow.
@@ -458,15 +461,70 @@ prove_one(){
 
 # submit_one — hand a finished proof to the ethproofs seam (cli/ethproofs-submit → mock/ethproofs.org).
 # No-op unless --ethproofs-url was given. Never fatal: a submit failure is logged, proving continues.
+# submit_one — hand a finished proof to the ethproofs seam. THE BOX DECIDES; the POST may happen elsewhere.
+#
+# WHY THE POST CAN MOVE. The proof is produced on the prover, and in the RTP topology the ethproofs endpoint is
+# the mock running ON THAT SAME PROVER, reached from here through the reverse tunnel. So posting from the box
+# sends the proof back across the tunnel it was just pulled off: base64 inflates 381 KB to 508 KB, and the
+# tunnel does 3.8 Mbit/s — about 1.10 s per block for bytes that were already on the destination machine.
+# Invisible until the mock stopped faking a 480-byte proof; ~1 ms before that.
+#
+# What does NOT move: the box invokes, reads the exit status and the output, logs the verdict and writes the CSV.
+# Only the HTTP call relocates, so the single-clock discipline is untouched — t_proved is still the run record's
+# mtime on this machine (see profiling/rtp-latency.py).
+#
+# The prover assembles a run-record-shaped directory from the artifacts IT wrote (it has proof.bin, report.json
+# and the public values under its own workspace names), plus timing.json passed inline from here — ~180 bytes,
+# and the only piece the prover cannot know because this side measured it.
+#
+# SUBMIT_VIA_PROVER=0 forces the old local POST. It is also the automatic fallback: no remote info in
+# timing.json, no REMOTE, or a failed remote invocation all fall back here rather than dropping a submission.
 submit_one(){  # $1=block  $2=run_dir
-  local b="$1" rd="$2" slog
+  local b="$1" rd="$2" slog rws rbase
   [ -n "$ETHPROOFS_URL" ] || return 0
   slog="$LOGDIR/submit-$GUEST-$b.log"
   [ -n "$rd" ] || { log "submit $b: no run record — skip"; return 1; }
+  # Where the prover keeps its own copies — recorded by prove_remote, which owns the naming convention.
+  if [ "${SUBMIT_VIA_PROVER:-1}" = 1 ] && [ -n "$REMOTE" ] && [ -n "$REMOTE_SUBMIT" ] && [ -r "$rd/timing.json" ]; then
+    rws="$(sed -n 's/.*"remote_ws":"\([^"]*\)".*/\1/p' "$rd/timing.json")"
+    rbase="$(sed -n 's/.*"remote_base":"\([^"]*\)".*/\1/p' "$rd/timing.json")"
+  fi
+  if [ -n "$rws" ] && [ -n "$rbase" ]; then
+    log ">> submit $b → $ETHPROOFS_URL (posted BY the prover — the proof never crosses the tunnel)"
+    # TWO inputs travel, not one. ethproofs-submit derives node_secs / witness_secs / e2e_secs / queued from the
+    # PRODUCER'S MANIFEST, which it finds via $WITNESS_MANIFEST — an environment variable it inherited for free
+    # while it ran here, and that the prover has neither the variable nor the file for. Missing it does not fail
+    # the submission: those fields are simply dropped, and the leaderboard shows a row with only transport and
+    # prove filled. That is exactly how this broke, and it broke silently.
+    #
+    # So both small inputs are shipped explicitly: timing.json (~250 B, measured on this side) and the ONE
+    # manifest row for this block plus its header (~300 B). base64 so no quoting or newline survives to bite —
+    # the alphabet is shell-safe, which a CSV row with a 0x-prefixed state root is not.
+    local mf="${WITNESS_MANIFEST:-$HOME/witness-manifest.csv}" p_tim p_man
+    p_tim="$(base64 < "$rd/timing.json" 2>/dev/null | tr -d '\n')"
+    p_man=""
+    [ -r "$mf" ] && p_man="$({ head -1 "$mf"; grep -m1 "^$b," "$mf"; } 2>/dev/null | base64 | tr -d '\n')"
+    # One exchange: build the shaped dir, drop the two inputs in, submit, clean up. `cp` not `ln`, because
+    # ethproofs-submit may read a file the workspace could prune under it mid-submission.
+    if ssh -o BatchMode=yes -p "${PORT:-22}" "$REMOTE" \
+        "d=\$(mktemp -d) && cp '$rws/proofs/$rbase.proof.bin' \"\$d/proof.bin\" \
+         && cp '$rws/reports/$rbase.json' \"\$d/report.json\" \
+         && { cp '$rws/proofs/$rbase.pv.bin' \"\$d/$rbase.pv.bin\" 2>/dev/null || true; } \
+         && printf %s '$p_tim' | { base64 -d 2>/dev/null || base64 -D; } > \"\$d/timing.json\" \
+         && { [ -n '$p_man' ] && printf %s '$p_man' | { base64 -d 2>/dev/null || base64 -D; } > \"\$d/manifest.csv\" || true; } \
+         && '$REMOTE_SUBMIT' --run-dir \"\$d\" --block '$b' ${VM:+--vm '$VM'} --guest '$GUEST' \
+              --manifest \"\$d/manifest.csv\" \
+              --ethproofs-url '$ETHPROOFS_URL' --token '$ETHPROOFS_TOKEN' --cluster '$ETHPROOFS_CLUSTER'; \
+         rc=\$?; rm -rf \"\$d\"; exit \$rc" > "$slog" 2>&1; then
+      log "<< submit $b ok  ($(tail -n1 "$slog"))"
+      return 0
+    fi
+    log "   (prover-side submit failed — falling back to posting from here; see $slog)"
+  fi
   log ">> submit $b → $ETHPROOFS_URL"
   if "$HERE/ethproofs-submit" --run-dir "$rd" --block "$b" ${VM:+--vm "$VM"} --guest "$GUEST" \
         --ethproofs-url "$ETHPROOFS_URL" --token "$ETHPROOFS_TOKEN" --cluster "$ETHPROOFS_CLUSTER" \
-        > "$slog" 2>&1; then
+        >> "$slog" 2>&1; then
     log "<< submit $b ok  ($(tail -n1 "$slog"))"
   else
     log "<< submit $b FAILED — see $slog"
