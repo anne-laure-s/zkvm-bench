@@ -315,7 +315,12 @@ mock_prove(){  # $1=block $2=plog → writes $INFRA/results/<guest>/<tag>/mock-r
   tag="$CHAIN_ID-$b"; rd="$INFRA/results/$GUEST/$tag/mock-run"; mkdir -p "$rd" || return 1
   # Self-identifying: the proof bytes BEGIN with a MOCK-PROOF magic, so this fake is unmistakable anywhere
   # it travels (a real proof never starts with this). report.json also marks mode=mock/backend=mock-cluster.
-  { printf 'MOCK-PROOF/mock-cluster NOT-A-REAL-PROOF '; head -c "$((300 + b % 700))" /dev/urandom; } \
+  # Realistic SIZE, from /dev/urandom, constant across blocks — see the same reasoning in zisk-runner's mock
+  # branch. The old `300 + b % 700` was doubly wrong: three orders too small, and varying with the block when a
+  # real proof does not vary at all (SP1 in this repo: 1.273 MB across 5 blocks, 126 bytes of spread).
+  # The size is what everything downstream is sized by, so it is not the mock's to invent.
+  { printf 'MOCK-PROOF/mock-cluster NOT-A-REAL-PROOF '
+    head -c "${ZISK_MOCK_PROOF_BYTES:-390144}" /dev/urandom; } \
     > "$rd/proof.bin" 2>/dev/null || return 1
   pb=$(wc -c < "$rd/proof.bin"); pb=${pb//[^0-9]/}
   # Burn the simulated proving time BEFORE writing the record, so the record's mtime (what
