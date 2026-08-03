@@ -543,7 +543,10 @@ fi
 # how the long-lived-monad path stayed undeployed while the logs showed a perfectly healthy producer — twice in
 # one day, on two different components. Restarting costs one block; not restarting costs the whole change.
 onbox "tmux kill-session -t replay-tip 2>/dev/null; tmux kill-session -t tap 2>/dev/null; pkill -f '[r]un_replay.py' 2>/dev/null; pkill -f '[w]itness-tap' 2>/dev/null; sleep 2; echo '   · tip sessions cleared (they would keep the old code and env)'"
-onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL TAP_INTERVAL=$TAP_INTERVAL REPLAY_POLL=$REPLAY_POLL SETTLE_SECS=$SETTLE_SECS TIP_DIRECT=$TIP_DIRECT BLOCK_DB_TIMEOUT=$BLOCK_DB_TIMEOUT ETHPROOFS_URL=http://localhost:$MOCK_PORT CLUSTER=local-ZisK-monad ./witness-follow start tip"
+# The tap SHIPS each framed input to the prover as soon as it exists, which is what makes the transfer
+# unconditional instead of a 35 %-of-the-time race — see witness-tap's SHIP block. PROVER_WS/SHIP_VIA mirror
+# what prove_remote uses, so the prover pulls over its own direct connection rather than the tunnel.
+onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL TAP_INTERVAL=$TAP_INTERVAL REPLAY_POLL=$REPLAY_POLL SETTLE_SECS=$SETTLE_SECS TIP_DIRECT=$TIP_DIRECT BLOCK_DB_TIMEOUT=$BLOCK_DB_TIMEOUT ETHPROOFS_URL=http://localhost:$MOCK_PORT CLUSTER=local-ZisK-monad PROVER=$PROVER_TARGET PROVER_PORT=$PROVER_PORT PROVER_WS=$MOCK_WS ${PULL_VIA:+SHIP_VIA=$PULL_VIA }./witness-follow start tip"
 
 step "Starting the prover (mock on $PROVER_WHERE, transfers real)"
 # ALWAYS restarted, never "already running". A live session carries the environment and the code it was
@@ -551,7 +554,13 @@ step "Starting the prover (mock on $PROVER_WHERE, transfers real)"
 # not running — which is exactly how PULL_VIA sat unused for a full session while the logs looked healthy.
 # prove-farm holds no state (it re-reads the queue every interval), so a restart costs at most one in-flight
 # block. Silently keeping a stale process costs a whole measurement run.
-onbox "tmux kill-session -t prove 2>/dev/null && echo '   · restarting prove (a live session would keep the old code and env)'; tmux new-session -d -s prove \"cd $BOX_REPO && REMOTE_WS=$MOCK_WS REMOTE_RUNNER=$MOCK_RUNNER_DIR/zisk-runner ${PULL_VIA:+PULL_VIA=$PULL_VIA }WITNESS_MANIFEST=\$HOME/witness-manifest.csv cli/prove-farm --guest monad-zisk --mock --remote $PROVER_TARGET --port $PROVER_PORT --mock-secs $MOCK_SECS --mock-per-mstep $MOCK_PER_MSTEP --mock-speed $MOCK_SPEED --mock-jitter $MOCK_JITTER --interval 1 --watch --newest-first --ethproofs-url http://localhost:$MOCK_PORT --ethproofs-cluster local-ZisK-monad 2>&1 | tee -a ~/prove-mock.log\""
+#
+# --no-prefetch: the TAP now ships each input at framing time, so the farm's own prefetcher is not merely
+# redundant, it is the failure mode. Two bulk streams on one 25 Mbit/s link is what took inputs to 24-34 s
+# (size-independent) while `backlog` climbed 14 -> 31; and the farm's prefetcher has to *guess* which block it
+# will take next, which at the tip it gets wrong ~65 % of the time. The tap never guesses — it ships what it
+# has just framed. Exactly one shipper on the link, by design.
+onbox "tmux kill-session -t prove 2>/dev/null && echo '   · restarting prove (a live session would keep the old code and env)'; tmux new-session -d -s prove \"cd $BOX_REPO && REMOTE_WS=$MOCK_WS REMOTE_RUNNER=$MOCK_RUNNER_DIR/zisk-runner ${PULL_VIA:+PULL_VIA=$PULL_VIA }WITNESS_MANIFEST=\$HOME/witness-manifest.csv cli/prove-farm --guest monad-zisk --mock --remote $PROVER_TARGET --port $PROVER_PORT --mock-secs $MOCK_SECS --mock-per-mstep $MOCK_PER_MSTEP --mock-speed $MOCK_SPEED --mock-jitter $MOCK_JITTER --interval 1 --watch --newest-first --no-prefetch --ethproofs-url http://localhost:$MOCK_PORT --ethproofs-cluster local-ZisK-monad 2>&1 | tee -a ~/prove-mock.log\""
 
 [ "$CRON" = 1 ] && { step "Installing the daily log archiver on the box"
   onbox "(crontab -l 2>/dev/null | grep -v archive-logs; echo '17 4 * * * \$HOME/zkvm-bench/infra/monad-witness/archive-logs >> \$HOME/archive-logs.log 2>&1') | crontab - && crontab -l | tail -1"; }
