@@ -377,15 +377,28 @@ prefetch_next(){
   [ -n "$nxt" ] || return 0
   src="$WDIR/$CHAIN_ID-$nxt.bin"
   [ -f "$src" ] || return 0
-  local ws="${REMOTE_WS:-/workspace}" dst="$CHAIN_ID-$nxt.bin"
-  if [ -n "${PULL_VIA:-}" ]; then
-    ssh -o BatchMode=yes -p "${PORT:-22}" "$REMOTE" \
-      "mkdir -p '$ws/inputs' && scp -q -C -o BatchMode=yes '$PULL_VIA:$src' '$ws/inputs/$dst'" 2>/dev/null \
-      && log "   (prefetched $nxt to the prover while $after was proving)"
+  local ws="${REMOTE_WS:-/workspace}" dst="$CHAIN_ID-$nxt.bin" err rc
+  # SAY SO WHEN IT FAILS. This used to log only on success — `… 2>/dev/null && log "(prefetched …)"` — so a
+  # prefetch that could not even connect produced NO line at all, and the farm log looked exactly like a farm
+  # with nothing to prefetch. It stayed broken for 12 minutes in plain sight, reading as "transport is slow"
+  # while the real cause was that the box had lost its key and every fresh ssh was refused. The proving path
+  # never noticed because it rides a multiplexed master authenticated once at startup; the prefetcher is the
+  # only component that opens a NEW connection per block, which makes it the canary — but only if it speaks.
+  # Best-effort still means best-effort: this never fails the block, it just stops being silent about it.
+  err="$(
+    if [ -n "${PULL_VIA:-}" ]; then
+      ssh -o BatchMode=yes -p "${PORT:-22}" "$REMOTE" \
+        "mkdir -p '$ws/inputs' && scp -q -C -o BatchMode=yes '$PULL_VIA:$src' '$ws/inputs/$dst'" 2>&1 >/dev/null
+    else
+      ssh -o BatchMode=yes -p "${PORT:-22}" "$REMOTE" "mkdir -p '$ws/inputs'" 2>&1 >/dev/null \
+        && scp -q -C -o BatchMode=yes -P "${PORT:-22}" "$src" "$REMOTE:$ws/inputs/$dst" 2>&1 >/dev/null
+    fi
+  )"; rc=$?
+  if [ "$rc" = 0 ]; then
+    log "   (prefetched $nxt to the prover while $after was proving)"
   else
-    ssh -o BatchMode=yes -p "${PORT:-22}" "$REMOTE" "mkdir -p '$ws/inputs'" 2>/dev/null \
-      && scp -q -C -o BatchMode=yes -P "${PORT:-22}" "$src" "$REMOTE:$ws/inputs/$dst" 2>/dev/null \
-      && log "   (prefetched $nxt to the prover while $after was proving)"
+    # One line, not a stack: this fires once per block and a wall of text would train the reader to skip it.
+    log "   (prefetch of $nxt FAILED rc=$rc — transport stays on the critical path: ${err%%$'\n'*})"
   fi
 }
 
