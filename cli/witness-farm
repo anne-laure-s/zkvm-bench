@@ -1,29 +1,47 @@
 #!/usr/bin/env bash
-# cli/witness-farm — set up and run continuous RSP + ZisK witness generation.
+# cli/witness-farm — set up and run continuous RSP + ZisK + OpenVM witness generation.
 #
 #   Samples every STRIDE (default 50) blocks starting from `latest` (or a given block),
 #   going forward, and NEVER waits: if the next stride block isn't mined yet, it proves
 #   the current `latest` (minus a reorg margin) and re-anchors forward from there.
 #
-#   Per block: ZisK first (it always needs the proxy's debug_executionWitness; this also warms
-#   the shared witness cache), then RSP with a per-block fallback — proxy/EW first (cache hit),
-#   and if that doesn't produce a clean witness, retry the same block via getProof. Keep
-#   whichever validates. Covers both failure modes: issue #181 gas-mismatch (getProof fails →
-#   EW saves it) AND proxy under-collection (EW fails → getProof saves it).
+#   Per block, for each arm named in GUESTS:
+#     zisk   — needs the proxy's debug_executionWitness; run first, since it also warms the
+#              shared witness cache that RSP's EW attempt then hits.
+#     rsp    — per-block fallback: proxy/EW first (cache hit), and if that doesn't produce a
+#              clean witness, retry the same block via getProof. Keep whichever validates.
+#              Covers both failure modes: issue #181 gas-mismatch (getProof fails → EW saves
+#              it) AND proxy under-collection (EW fails → getProof saves it).
+#     openvm — `--mode make-input`, DIRECT to Alchemy: openvm-reth-benchmark synthesizes the
+#              execution witness in-process (it owns --preimage-cache-nibbles), so it needs a
+#              plain archive RPC and no proxy hop. Same posture as RSP's getProof fallback.
+#
+#   With STRIDE=1 and MAX_BLOCKS set this is also the BACKFILL tool: the blocks are long since
+#   mined, so the `kind=stride` branch walks the range without ever waiting.
 #
 # Usage:
 #   ALCHEMY_URL=https://eth-mainnet.g.alchemy.com/v2/<key> ./cli/witness-farm            # from latest
 #   ALCHEMY_URL=... ./cli/witness-farm 22500000                                          # from a block
 #   ALCHEMY_URL=... STRIDE=100 MARGIN=12 MAX_BLOCKS=200 ./cli/witness-farm               # tuned
+#   # backfill OpenVM only over the corpus every other backend already has (503 blocks):
+#   ALCHEMY_URL=... GUESTS=openvm STRIDE=1 MAX_BLOCKS=503 ./cli/witness-farm 25551992
 #
-# Env knobs: STRIDE MARGIN PROXY_PORT NIBBLES RETRY_CU PROXY_CONCURRENCY RSP_RPC_CU MAX_BLOCKS MAX_FAILS
-#            RETRY_RPC RETRY_PAUSE PROXY_START_TRIES RSP_SKIP_EXEC
+# Env knobs: GUESTS STRIDE MARGIN PROXY_PORT NIBBLES RETRY_CU PROXY_CONCURRENCY RSP_RPC_CU
+#            MAX_BLOCKS MAX_FAILS RETRY_RPC RETRY_PAUSE PROXY_START_TRIES RSP_SKIP_EXEC
 # Lives in cli/ but writes its outputs (witness-farm.csv, wcache/, witness-farm-logs/) to the repo
 # root; run it from the repo root: ./cli/witness-farm
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # repo root (this script lives in cli/)
 : "${ALCHEMY_URL:?export ALCHEMY_URL=https://eth-mainnet.g.alchemy.com/v2/<key>}"
+# Which arms to run. Default is the historical pair, so an existing invocation behaves exactly as
+# before; naming `openvm` is opt-in. An arm not listed is neither built nor run, which is what
+# makes `GUESTS=openvm` cheap: no proxy, hence no 16^NIBBLES preimage precompute at startup.
+GUESTS="${GUESTS:-zisk rsp}"
+wants(){ case " $GUESTS " in *" $1 "*) return 0 ;; esac; return 1; }
+for _g in $GUESTS; do
+  case "$_g" in zisk|rsp|openvm) ;; *) echo "witness-farm: unknown guest '$_g' in GUESTS (want: zisk rsp openvm)" >&2; exit 2 ;; esac
+done
 STRIDE="${STRIDE:-50}"
 MARGIN="${MARGIN:-12}"                       # reorg safety when proving `latest`
 PROXY_PORT="${PROXY_PORT:-8545}"
@@ -54,15 +72,31 @@ OUT="${OUT:-$ROOT/witness-farm.csv}"          # CSV ledger (env-overridable → 
 LOGDIR="${LOGDIR:-$ROOT/witness-farm-logs}"   # logs (env-overridable → per-worker; a shared proxy is reused, not restarted)
 RSP_FIX="$ROOT/guests/rsp/fixtures"           # collected RSP witnesses
 ZISK_FIX="$ROOT/guests/zisk-reth/fixtures"    # collected ZisK witnesses (+ hints)
-mkdir -p "$LOGDIR" "$WCACHE" "$RSP_FIX" "$ZISK_FIX"
+OPENVM_BIN="$OPENVM_DIR/target/release/openvm-reth-benchmark"
+OPENVM_CACHE="$ROOT/guests/openvm-reth/inputs/rpc-cache"   # the layout `./run prove … RSYNC_CACHE=1` ships to the box
+OPENVM_FIX="$ROOT/guests/openvm-reth/fixtures"             # collected OpenVM witnesses (queue for cli/prove-farm)
+mkdir -p "$LOGDIR" "$WCACHE" "$RSP_FIX" "$ZISK_FIX" "$OPENVM_FIX"
 
 log(){ echo "$(date +%H:%M:%S)  $*" >&2; }   # stderr: never pollutes $(tip) capture
 rpc(){ curl -s "$1" -X POST -H 'content-type: application/json' \
          -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":$3}"; }
 tip(){  # current mainnet tip as decimal (retries on RPC hiccup — not a block-wait)
-  local r
+  local r raw
   while :; do
-    r=$(rpc "$ALCHEMY_URL" eth_blockNumber '[]' | python3 -c 'import sys,json;print(int(json.load(sys.stdin)["result"],16))' 2>/dev/null)
+    raw=$(rpc "$ALCHEMY_URL" eth_blockNumber '[]')
+    # A quota/capacity 429 answers every call identically, so the retry below would spin forever
+    # printing "bad/empty" and never name the cause. Same fail-fast as the proxy startup path.
+    # `tip` is always called inside a command substitution, so this `exit` only ends the SUBSHELL.
+    # That is why every call site is `x=$(tip) || exit 1`: the assignment carries the substitution's
+    # status out. Without that, an empty tip would flow into the arithmetic below and the farm would
+    # happily target block `0 - MARGIN`.
+    if printf '%s' "$raw" | grep -qiE 'capacity limit|monthly capacity|scaling policy|compute units'; then
+      echo "tip: Alchemy CAPACITY/QUOTA exceeded (429) — NOT a transient blip. The monthly CU cap is" >&2
+      echo "     used up. Upgrade the plan, use another RPC key/provider, or a reth archive node." >&2
+      printf '     %s\n' "$(printf '%s' "$raw" | head -c 300)" >&2
+      exit 1
+    fi
+    r=$(printf '%s' "$raw" | python3 -c 'import sys,json;print(int(json.load(sys.stdin)["result"],16))' 2>/dev/null)
     # Must be a plausible mainnet height. A blank/0/garbage value (e.g. an RPC error or
     # an interrupted curl) would otherwise poison `next` and stride over junk blocks.
     case "$r" in ''|*[!0-9]*) r= ;; esac
@@ -70,11 +104,11 @@ tip(){  # current mainnet tip as decimal (retries on RPC hiccup — not a block-
     log "tip query bad/empty ('$r'), retrying in 5s…"; sleep 5
   done
 }
-# A block counts as done (skip it) when RSP is ok AND ZisK is either ok, or a deterministic
+# The ZisK+RSP pair counts as done when RSP is ok AND ZisK is either ok, or a deterministic
 # preimage/nibbles failure recorded at a depth >= the CURRENT NIBBLES (re-running at the
 # same-or-shallower depth fails identically). Bumping NIBBLES for a second pass makes those
 # NIB<M> rows fail the "M >= NIBBLES" test → the block is re-attempted at the deeper depth.
-is_done(){
+pair_done(){
   awk -F, -v b="$1" -v nib="${NIBBLES:-7}" '
     $2==b {
       if ($4=="ok" && $6=="ok") f=1                                # full ZisK+RSP pair collected
@@ -82,26 +116,93 @@ is_done(){
     }
     END{ exit !f }' "$OUT" 2>/dev/null
 }
+# OpenVM's "done" is the FILESYSTEM, not the ledger: the witness either sits in fixtures/ or it
+# does not. That keeps an openvm-only pass resumable across a lost/rotated CSV, and it is why the
+# ledger's openvm column is informational — nothing reads it back to decide what to re-run.
+openvm_done(){ [ -s "$OPENVM_FIX/1-$1.bin" ]; }
+# A block is done when every ENABLED arm has what it needs. Enabling a new arm therefore re-visits
+# blocks whose other arms are already collected, and only the missing arm runs (see gen_block).
+is_done(){
+  local b="$1"
+  if wants zisk || wants rsp; then pair_done "$b" || return 1; fi
+  if wants openvm; then openvm_done "$b" || return 1; fi
+  return 0
+}
 
 # ---------- setup ----------
-command -v cargo >/dev/null   || { echo "cargo not found"; exit 1; }
 command -v python3 >/dev/null || { echo "python3 not found"; exit 1; }
 
-log "building proxy (witness cache)…"
-( cd "$OPENVM_DIR" && cargo build -p openvm-rpc-proxy --release ) || { echo "proxy build failed"; exit 1; }
-log "building RSP (execution-witness / proxy path)…"
-( cd "$RSP_DIR" && cargo build --release --bin rsp --features execution-witness --target-dir target-ew ) \
-  || { echo "rsp (ew) build failed"; exit 1; }
-log "building RSP (getProof fallback)…"
-( cd "$RSP_DIR" && cargo build --release --bin rsp ) \
-  || { echo "rsp (basic) build failed"; exit 1; }
-[ -x "$RSP_EW_BIN" ]    || { echo "rsp ew binary missing: $RSP_EW_BIN"; exit 1; }
-[ -x "$RSP_BASIC_BIN" ] || { echo "rsp basic binary missing: $RSP_BASIC_BIN"; exit 1; }
-[ -x "$PROXY_BIN" ]     || { echo "proxy binary missing: $PROXY_BIN"; exit 1; }
+# The proxy exists for the two arms that consume debug_executionWitness. OpenVM synthesizes its own
+# in-process, so an openvm-only run needs neither the build nor the startup preimage precompute.
+need_proxy=0; { wants zisk || wants rsp; } && need_proxy=1
+
+# Which binaries THIS run actually needs — so a build-less run can be validated up front rather
+# than dying on the first block.
+need_bins=""
+[ "$need_proxy" = 1 ] && need_bins="$need_bins $PROXY_BIN"
+if wants rsp;    then need_bins="$need_bins $RSP_EW_BIN $RSP_BASIC_BIN"; fi
+if wants openvm; then need_bins="$need_bins $OPENVM_BIN"; fi
+
+# Building is a convenience here, not the point of a collection run. SKIP_BUILD=1 skips it; so does
+# a missing cargo, PROVIDED every binary this run needs is already built. A missing binary is the
+# one case a build would genuinely have fixed, so that still fails — with the paths named.
+if [ "${SKIP_BUILD:-0}" != 1 ] && ! command -v cargo >/dev/null; then
+  missing=""
+  for _b in $need_bins; do [ -x "$_b" ] || missing="$missing
+    $_b"; done
+  if [ -n "$missing" ]; then
+    echo "cargo not found, and this run needs binaries that are not built:$missing" >&2
+    echo "  Install Rust (https://rustup.rs, then . \"\$HOME/.cargo/env\") and re-run, or build them" >&2
+    echo "  on a host that has cargo and copy them in." >&2
+    exit 1
+  fi
+  log "cargo not found — proceeding with the already-built binaries (implies SKIP_BUILD=1)"
+  SKIP_BUILD=1
+fi
+
+if [ "$need_proxy" = 1 ]; then
+  if [ "${SKIP_BUILD:-0}" != 1 ]; then
+    log "building proxy (witness cache)…"
+    ( cd "$OPENVM_DIR" && cargo build -p openvm-rpc-proxy --release ) || { echo "proxy build failed"; exit 1; }
+  fi
+  [ -x "$PROXY_BIN" ] || { echo "proxy binary missing: $PROXY_BIN"; exit 1; }
+fi
+if wants rsp; then
+  if [ "${SKIP_BUILD:-0}" != 1 ]; then
+    log "building RSP (execution-witness / proxy path)…"
+    ( cd "$RSP_DIR" && cargo build --release --bin rsp --features execution-witness --target-dir target-ew ) \
+      || { echo "rsp (ew) build failed"; exit 1; }
+    log "building RSP (getProof fallback)…"
+    ( cd "$RSP_DIR" && cargo build --release --bin rsp ) \
+      || { echo "rsp (basic) build failed"; exit 1; }
+  fi
+  [ -x "$RSP_EW_BIN" ]    || { echo "rsp ew binary missing: $RSP_EW_BIN"; exit 1; }
+  [ -x "$RSP_BASIC_BIN" ] || { echo "rsp basic binary missing: $RSP_BASIC_BIN"; exit 1; }
+fi
+if wants openvm; then
+  if [ "${SKIP_BUILD:-0}" != 1 ]; then
+    log "building openvm-reth-benchmark (make-input host)…"
+    ( cd "$OPENVM_DIR" && cargo build --release --bin openvm-reth-benchmark ) \
+      || { echo "openvm-reth-benchmark build failed"; exit 1; }
+  fi
+  [ -x "$OPENVM_BIN" ] || { echo "openvm binary missing: $OPENVM_BIN"; exit 1; }
+  # Same-commit rule (guests/README.md): a witness only matches an ELF built from the same
+  # openvm-eth commit. Worth checking loudest exactly when the build was skipped, since then the
+  # binary is whatever an earlier session left behind.
+  _head="$(git -C "$OPENVM_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+  _pin="$(cat "$ROOT/guests/openvm-reth/openvm-reth.commit" 2>/dev/null || echo unknown)"
+  log "openvm-eth commit: ${_head:0:9} (binary built from ${_pin:0:9})"
+  if [ "$_head" != "$_pin" ]; then
+    log "⚠️  openvm-eth HEAD != the commit the binary was built from — the witness layout may not"
+    log "    match the guest ELF (guests/README.md same-commit rule). Rebuild both, or check out $_pin."
+  fi
+fi
 
 # ---------- start proxy if not already up ----------
 started_proxy=0; PROXY_PID=""
-if rpc "$PROXY_URL" eth_chainId '[]' | grep -q '"result"'; then
+if [ "$need_proxy" = 0 ]; then
+  log "no proxy needed (GUESTS=$GUESTS)"
+elif rpc "$PROXY_URL" eth_chainId '[]' | grep -q '"result"'; then
   log "proxy already up on :$PROXY_PORT — reusing"
 else
   log "starting proxy (nibbles=$NIBBLES — preimage precompute can take minutes)…"
@@ -144,7 +245,17 @@ trap cleanup EXIT
 # why Ctrl-C didn't stop it). exit 130 → fires the EXIT trap → cleanup runs once.
 trap 'echo >&2; log "interrupted — stopping…"; exit 130' INT TERM
 
-[ -f "$OUT" ] || echo "ts,block,kind,rsp,rsp_src,zisk,secs" > "$OUT"
+# Ledger schema. `openvm` is APPENDED, never inserted: pair_done() reads $4 and $6 by position, so
+# an insertion would silently reinterpret every existing row. A file still carrying the old header
+# gets that one line rewritten; its rows keep 7 fields and awk then reads $8 as empty, which is
+# exactly what "arm not run" should look like.
+HEADER="ts,block,kind,rsp,rsp_src,zisk,secs,openvm"
+if [ ! -f "$OUT" ]; then
+  echo "$HEADER" > "$OUT"
+elif [ "$(head -1 "$OUT")" = "ts,block,kind,rsp,rsp_src,zisk,secs" ]; then
+  { echo "$HEADER"; tail -n +2 "$OUT"; } > "$OUT.tmp" && mv "$OUT.tmp" "$OUT" \
+    && log "ledger header upgraded (+openvm column): $OUT"
+fi
 
 # Run RSP once with a given binary/rpc/cache. Prints ok|DIVERGED|FAIL; RSP output → logfile.
 #   ok       = exit 0 and no host mismatch warning (clean, valid witness)
@@ -170,6 +281,35 @@ run_rsp(){  # $1=block $2=binary $3=rpc $4=cachedir $5=logfile
   fi
 }
 
+# Mint the OpenVM witness for a block and land it in fixtures/. Prints ok|FAIL|QUOTA|NOFILE.
+#
+# Goes through infra/openvm-infra/run gen-input (not the binary directly) for the same reason the
+# ZisK arm does: guest.sh owns the flag set, and openvm-eth's flags drift. RPC is Alchemy DIRECT —
+# make-input wants a plain archive endpoint, and routing it through the EW-synthesizing proxy would
+# be a second proxy in front of a host that already is one.
+run_openvm(){  # $1=block $2=logfile
+  # Separate statements on purpose: `local x="$1" y="…$x…"` would expand $x from the CALLER's scope,
+  # since local's arguments are all word-expanded before the builtin assigns any of them.
+  local b="$1" lg="$2"
+  local cbin="$OPENVM_CACHE/input/1/$b.bin" fbin="$OPENVM_FIX/1-$b.bin"
+  if [ ! -s "$cbin" ]; then
+    ( cd "$ROOT" && RPC_URL="$ALCHEMY_URL" OPENVM_CACHE_DIR="$OPENVM_CACHE" CHAIN_ID=1 \
+        infra/openvm-infra/run gen-input GUEST=openvm-reth BLOCK="$b" ) > "$lg" 2>&1
+  fi
+  if [ ! -s "$cbin" ]; then
+    # A monthly-capacity 429 is NOT transient (it 429s on every retry, even though 429 ∈ NET_RE);
+    # report it apart so the caller can stop instead of grinding through the whole range.
+    grep -qiE 'capacity limit|monthly capacity|scaling policy|compute units' "$lg" 2>/dev/null \
+      && { echo QUOTA; return; }
+    echo FAIL; return
+  fi
+  # Hard link: one copy of a 5–22 MB witness under two names, so the cache keeps the layout the box
+  # expects while fixtures/ carries the `1-<block>.bin` name cli/prove-farm scans for. Copy only if
+  # the two ever land on different volumes.
+  ln -f "$cbin" "$fbin" 2>/dev/null || cp -f "$cbin" "$fbin" 2>/dev/null || { echo NOFILE; return; }
+  echo ok
+}
+
 # True if any of the given log files shows a transient network/proxy error.
 net_fail(){ grep -qiE "$NET_RE" "$@" 2>/dev/null; }
 
@@ -191,12 +331,15 @@ fail_reason(){  # $1=block
   fi
 }
 
-# ---------- generate one block: ZisK (proxy, warms cache) then RSP (EW → getProof fallback) ----------
+# ---------- generate one block: ZisK (proxy, warms cache), RSP (EW → getProof), OpenVM (direct) ----------
+# An arm not in GUESTS is not run and records `-`. Arms are independent, so a run that enables only
+# `openvm` over blocks whose pair is already collected does exactly the missing work.
 gen_block(){
-  local b="$1" kind="$2" t0 rsp zisk src cache try
-  if is_done "$b"; then log "skip $b (already done)"; LAST_RSP=ok; return; fi
+  local b="$1" kind="$2" t0 rsp="-" zisk="-" src="-" ovm="-" cache try
+  if is_done "$b"; then log "skip $b (already done)"; LAST_STATUS=ok; return; fi
   t0=$SECONDS
 
+  if wants zisk; then
   # 1) ZisK first: it always needs the proxy's debug_executionWitness, and building it here warms
   #    the shared witness cache so RSP's EW attempt below is a cache hit (not a ~10-min cold build).
   #    Retries on a transient network failure (a blip mid-build aborts the whole ~30-min build).
@@ -238,7 +381,9 @@ gen_block(){
     fi
     break
   done
+  fi   # wants zisk
 
+  if wants rsp; then
   # 2) RSP — but ONLY if ZisK could build a witness. A NIB* block (proxy preimage miss at this
   #    nibble depth) can never be built by ZisK, so a comparable ZisK+RSP benchmark pair is
   #    impossible. Don't spend RSP's time on it (EW fails identically; getProof can be a ~20-min
@@ -274,14 +419,47 @@ gen_block(){
       break
     done
   fi
+  fi   # wants rsp
 
-  echo "$(date +%FT%T),$b,$kind,$rsp,$src,$zisk,$((SECONDS-t0))" >> "$OUT"
-  log "<< $b — zisk=$zisk rsp=$rsp($src)  ($((SECONDS-t0))s)"
-  LAST_RSP="$rsp"            # signal to the loop's consecutive-fail guard
+  # 3) OpenVM — independent of the two above: no proxy, no shared cache, Alchemy direct. Retries a
+  #    transient network failure like the others; a quota 429 stops the whole run (see below).
+  if wants openvm; then
+    if openvm_done "$b"; then
+      ovm=ok; log ">> $b ($kind) — OpenVM already in fixtures — skip"
+    else
+      try=0
+      while :; do
+        log ">> $b ($kind) — OpenVM (make-input, direct)…"
+        ovm=$(run_openvm "$b" "$LOGDIR/openvm-$b.log")
+        [ "$ovm" = ok ] && break
+        if [ "$ovm" != QUOTA ] && [ "$try" -lt "$RETRY_RPC" ] && net_fail "$LOGDIR/openvm-$b.log"; then
+          try=$((try+1)); log "OpenVM $b: transient network failure — retry $try/$RETRY_RPC in ${RETRY_PAUSE}s…"
+          sleep "$RETRY_PAUSE"; continue
+        fi
+        break
+      done
+    fi
+  fi
+
+  echo "$(date +%FT%T),$b,$kind,$rsp,$src,$zisk,$((SECONDS-t0)),$ovm" >> "$OUT"
+  log "<< $b — zisk=$zisk rsp=$rsp($src) openvm=$ovm  ($((SECONDS-t0))s)"
+  # Signal to the loop's consecutive-fail guard: the decisive arm. RSP when it runs (a FAIL there
+  # means BOTH its backends failed), else OpenVM, else ZisK.
+  if   wants rsp;    then LAST_STATUS="$rsp"
+  elif wants openvm; then LAST_STATUS="$ovm"
+  else                    LAST_STATUS="$zisk"
+  fi
+  # A quota wall is systemic and immediate — every remaining block would 429 identically. Stop here
+  # rather than let MAX_FAILS burn several blocks' worth of retries first.
+  if [ "$ovm" = QUOTA ]; then
+    echo "openvm: Alchemy CAPACITY/QUOTA exceeded (429) — NOT a transient blip. The monthly CU cap is" >&2
+    echo "        used up. Upgrade the plan, use another RPC key/provider, or a reth archive node." >&2
+    tail -4 "$LOGDIR/openvm-$b.log" >&2; exit 1
+  fi
 }
 
 # ---------- never-wait loop ----------
-if [ -n "$START_BLOCK" ]; then next="$START_BLOCK"; else next="$(tip)"; fi
+if [ -n "$START_BLOCK" ]; then next="$START_BLOCK"; else next="$(tip)" || exit 1; fi
 log "farm: next=$next stride=$STRIDE margin=$MARGIN  (out=$OUT)"
 # Pre-Merge guard: PoW blocks (< 15,537,394 = the Merge, 2022-09-15) have UNCLES that the stateless
 # witness omits → rsp=FAIL(premerge). Also catches a dropped digit in START_BLOCK (2556230 vs 25562300).
@@ -290,24 +468,26 @@ if [ -n "$START_BLOCK" ] && [ "$START_BLOCK" -lt 15537394 ]; then
   log "    RSP can't validate → rsp=FAIL(premerge). Dropped a digit? (recent ≈ ${START_BLOCK}0). Ctrl-C to abort; continuing in 8s…"
   sleep 8
 fi
-count=0; fails=0; LAST_RSP=ok
+count=0; fails=0; LAST_STATUS=ok
 while :; do
-  safe=$(( $(tip) - MARGIN ))
+  cur=$(tip) || exit 1          # see tip(): a quota 429 must end the RUN, not just its subshell
+  safe=$(( cur - MARGIN ))
   if [ "$next" -le "$safe" ]; then
     target="$next"; kind=stride; next=$(( next + STRIDE ))          # historical / caught up: stride
   else
     target="$safe"; kind=latest; next=$(( safe + STRIDE ))          # future not mined: prove latest, re-anchor
   fi
   gen_block "$target" "$kind"
-  # Consecutive-fail guard: a FAIL here means BOTH backends (EW and getProof) failed on the
-  # block. If that happens N times in a row it's systemic (real fork/version wall, dead proxy,
-  # network down) — bail rather than grind for minutes/block forever.
+  # Consecutive-fail guard: on the RSP arm a FAIL means BOTH backends (EW and getProof) failed on
+  # the block; on the OpenVM arm it means make-input produced no witness. If that happens N times in
+  # a row it's systemic (real fork/version wall, dead proxy, network down) — bail rather than grind
+  # for minutes/block forever.
   # A NIB skip (rsp=skip) is a deterministic classification, not a systemic failure — it proves the
   # pipeline works (the proxy re-executed far enough to hit the preimage). Don't let it trip the
-  # wall. Only real RSP failures (FAIL/DIVERGED/NOFILE) count toward the consecutive-fail streak.
-  case "$LAST_RSP" in ok|skip) fails=0 ;; *) fails=$(( fails + 1 )) ;; esac
+  # wall. Only real failures (FAIL/DIVERGED/NOFILE) count toward the consecutive-fail streak.
+  case "$LAST_STATUS" in ok|skip) fails=0 ;; *) fails=$(( fails + 1 )) ;; esac
   if [ "$MAX_FAILS" -gt 0 ] && [ "$fails" -ge "$MAX_FAILS" ]; then
-    log "STOP: $fails consecutive RSP failures — likely a fork/version wall near block $target. Stopping."
+    log "STOP: $fails consecutive failures — likely a fork/version wall near block $target. Stopping."
     break
   fi
   count=$((count+1))

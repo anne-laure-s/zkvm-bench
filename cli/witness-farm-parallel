@@ -19,9 +19,17 @@
 # (workers reuse the shared proxy and never see its log) — fine for NIB-free ranges; if a range is
 # NIB-heavy, generate it single-threaded (cli/witness-farm) so NIB blocks are marked, not just FAIL'd.
 #
-# Env passthrough to workers: RETRY_CU PROXY_CONCURRENCY NIBBLES RSP_SKIP_EXEC RSP_RPC_CU MARGIN.
+# Env passthrough to workers: GUESTS SKIP_BUILD RETRY_CU PROXY_CONCURRENCY NIBBLES RSP_SKIP_EXEC
+#                             RSP_RPC_CU MARGIN.
+# SKIP_BUILD=1 skips the cargo builds and just asserts the binaries exist; a missing cargo implies it.
 # Outputs: witness-farm-parallel-logs/{proxy.log, worker-<i>/…, worker-<i>.csv}; merged → witness-farm.csv.
-# Witnesses land in the usual guests/{rsp,zisk-reth}/fixtures/ — feed cli/prove-farm as always.
+# Witnesses land in the usual guests/{rsp,zisk-reth,openvm-reth}/fixtures/ — feed cli/prove-farm as always.
+#
+# GUESTS selects the arms (default `zisk rsp`; see cli/witness-farm). With `GUESTS=openvm` there is no
+# shared proxy to own — each worker's make-input talks to Alchemy directly — so the CU reasoning above
+# still holds but the ~2 GB preimage table and its startup cost do not apply. Backfill a contiguous
+# range by giving --stride 1:
+#   ALCHEMY_URL=… GUESTS=openvm ./cli/witness-farm-parallel --jobs 8 --stride 1 --per-job 63 25551992
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -38,6 +46,13 @@ esac; done
 [ -n "$START" ] || { echo "usage: ALCHEMY_URL=… $0 [--jobs N] [--stride S] [--per-job M] <start-block>" >&2; exit 2; }
 [ "$DRY" = 1 ] || : "${ALCHEMY_URL:?export ALCHEMY_URL=https://eth-mainnet.g.alchemy.com/v2/<key>}"
 
+# Which arms the workers run (see cli/witness-farm). Validated here too, so a typo fails before N
+# workers are spawned and each rejects it separately.
+GUESTS="${GUESTS:-zisk rsp}"
+wants(){ case " $GUESTS " in *" $1 "*) return 0 ;; esac; return 1; }
+for _g in $GUESTS; do
+  case "$_g" in zisk|rsp|openvm) ;; *) echo "witness-farm-parallel: unknown guest '$_g' in GUESTS (want: zisk rsp openvm)" >&2; exit 2 ;; esac
+done
 RETRY_CU="${RETRY_CU:-9000}"; PROXY_CONCURRENCY="${PROXY_CONCURRENCY:-64}"; NIBBLES="${NIBBLES:-7}"
 PROXY_PORT="${PROXY_PORT:-8545}"; PROXY_URL="http://127.0.0.1:$PROXY_PORT"
 OPENVM_DIR="$ROOT/vendor/openvm-eth"; PROXY_BIN="$OPENVM_DIR/target/release/openvm-rpc-proxy"
@@ -48,8 +63,13 @@ log(){ echo "$(date +%H:%M:%S)  [parallel] $*" >&2; }
 rpc(){ curl -s "$1" -X POST -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":[]}"; }
 
 if [ "$DRY" = 1 ]; then
-  echo "# proxy (shared): $PROXY_BIN --rpc-url <ALCHEMY> --bind-address 127.0.0.1:$PROXY_PORT \\"
-  echo "#   --rpc-retry-cu $RETRY_CU --rpc-concurrency $PROXY_CONCURRENCY --preimage-cache-nibbles $NIBBLES --witness-cache-dir $WCACHE"
+  echo "# arms (GUESTS): $GUESTS"
+  if wants zisk || wants rsp; then
+    echo "# proxy (shared): $PROXY_BIN --rpc-url <ALCHEMY> --bind-address 127.0.0.1:$PROXY_PORT \\"
+    echo "#   --rpc-retry-cu $RETRY_CU --rpc-concurrency $PROXY_CONCURRENCY --preimage-cache-nibbles $NIBBLES --witness-cache-dir $WCACHE"
+  else
+    echo "# proxy (shared): none — no arm needs debug_executionWitness; workers go direct to Alchemy"
+  fi
   echo "# $JOBS workers, per-worker step=$WSTRIDE, per-job=${PER_JOB} (0=∞):"
   for i in $(seq 0 $((JOBS-1))); do
     echo "#   worker $i: STRIDE=$WSTRIDE MAX_BLOCKS=$PER_JOB OUT=worker-$i.csv  witness-farm $((START + i*STRIDE))"
@@ -60,14 +80,56 @@ fi
 mkdir -p "$LOGROOT" "$WCACHE"
 
 # ---- build once (workers would each rebuild, serializing on cargo's lock; do it up front) ----
-log "building proxy + RSP once…"
-( cd "$OPENVM_DIR" && cargo build -p openvm-rpc-proxy --release ) || { echo "proxy build failed"; exit 1; }
-( cd "$RSP_DIR" && cargo build --release --bin rsp --features execution-witness --target-dir target-ew ) || { echo "rsp (ew) build failed"; exit 1; }
-( cd "$RSP_DIR" && cargo build --release --bin rsp ) || { echo "rsp build failed"; exit 1; }
+# Same GUESTS contract as cli/witness-farm: build only the arms that will run. An openvm-only run
+# needs no proxy and no RSP, which also means no shared preimage table to precompute below.
+need_proxy=0; { wants zisk || wants rsp; } && need_proxy=1
+
+# Same build-less posture as cli/witness-farm, and checked HERE rather than in the workers: the
+# whole point of building up front is that N workers would otherwise serialize on cargo's lock, so
+# a missing toolchain must be diagnosed before any worker is spawned. SKIP_BUILD passes through, so
+# the workers do not re-derive it.
+need_bins=""
+[ "$need_proxy" = 1 ] && need_bins="$need_bins $PROXY_BIN"
+if wants rsp;    then need_bins="$need_bins $RSP_DIR/target-ew/release/rsp $RSP_DIR/target/release/rsp"; fi
+if wants openvm; then need_bins="$need_bins $OPENVM_DIR/target/release/openvm-reth-benchmark"; fi
+if [ "${SKIP_BUILD:-0}" != 1 ] && ! command -v cargo >/dev/null; then
+  missing=""
+  for _b in $need_bins; do [ -x "$_b" ] || missing="$missing
+    $_b"; done
+  if [ -n "$missing" ]; then
+    echo "cargo not found, and this run needs binaries that are not built:$missing" >&2
+    echo "  Install Rust (https://rustup.rs, then . \"\$HOME/.cargo/env\") and re-run, or build them" >&2
+    echo "  on a host that has cargo and copy them in." >&2
+    exit 1
+  fi
+  log "cargo not found — proceeding with the already-built binaries (implies SKIP_BUILD=1)"
+  SKIP_BUILD=1
+fi
+export SKIP_BUILD="${SKIP_BUILD:-0}"
+
+if [ "$SKIP_BUILD" != 1 ]; then
+  if [ "$need_proxy" = 1 ]; then
+    log "building proxy once…"
+    ( cd "$OPENVM_DIR" && cargo build -p openvm-rpc-proxy --release ) || { echo "proxy build failed"; exit 1; }
+  fi
+  if wants rsp; then
+    log "building RSP once…"
+    ( cd "$RSP_DIR" && cargo build --release --bin rsp --features execution-witness --target-dir target-ew ) || { echo "rsp (ew) build failed"; exit 1; }
+    ( cd "$RSP_DIR" && cargo build --release --bin rsp ) || { echo "rsp build failed"; exit 1; }
+  fi
+  if wants openvm; then
+    log "building openvm-reth-benchmark once…"
+    ( cd "$OPENVM_DIR" && cargo build --release --bin openvm-reth-benchmark ) || { echo "openvm-reth-benchmark build failed"; exit 1; }
+  fi
+fi
 
 PROXY_PID=""; WORKERS=()
 merge_csvs(){   # rebuild witness-farm.csv = existing rows + all worker rows, deduped by block (col 2)
-  [ -f "$OUT_MAIN" ] || echo "ts,block,kind,rsp,rsp_src,zisk,secs" > "$OUT_MAIN"
+  # First row per block wins, and pre-existing rows come first. So a block already recorded by an
+  # earlier pass keeps that row: an openvm-only pass over the same block does the work and lands the
+  # witness, but its `openvm` column can be dropped here. Harmless by design — witness-farm resolves
+  # "openvm already done" from guests/openvm-reth/fixtures/, never from this ledger.
+  [ -f "$OUT_MAIN" ] || echo "ts,block,kind,rsp,rsp_src,zisk,secs,openvm" > "$OUT_MAIN"
   local tmp="$OUT_MAIN.tmp"
   { head -1 "$OUT_MAIN"
     { tail -n +2 "$OUT_MAIN" 2>/dev/null; cat "$LOGROOT"/worker-*.csv 2>/dev/null | grep -v '^ts,block'; } \
@@ -83,7 +145,9 @@ trap cleanup EXIT
 trap 'echo >&2; log "interrupted — stopping all…"; exit 130' INT TERM
 
 # ---- one shared proxy, owned by this launcher (reused, not restarted, by every worker) ----
-if rpc "$PROXY_URL" eth_chainId | grep -q '"result"'; then
+if [ "$need_proxy" = 0 ]; then
+  log "no shared proxy needed (GUESTS=$GUESTS) — workers go direct to Alchemy"
+elif rpc "$PROXY_URL" eth_chainId | grep -q '"result"'; then
   log "proxy already up on :$PROXY_PORT — reusing (leave it as-is)"
 else
   log "starting shared proxy (nibbles=$NIBBLES, retry-cu=$RETRY_CU, concurrency=$PROXY_CONCURRENCY) — preimage precompute can take minutes…"
@@ -106,7 +170,8 @@ for i in $(seq 0 $((JOBS-1))); do
   wstart=$(( START + i * STRIDE )); wdir="$LOGROOT/worker-$i"; mkdir -p "$wdir"
   # `env` (not a bare NAME=val prefix) so the CONDITIONAL vars work: ${VAR:+NAME=val} expands after the
   # shell has already decided assignment-vs-command, so as a bare prefix it'd be run as a command.
-  env OUT="$LOGROOT/worker-$i.csv" LOGDIR="$wdir" STRIDE="$WSTRIDE" MAX_BLOCKS="$PER_JOB" \
+  env OUT="$LOGROOT/worker-$i.csv" LOGDIR="$wdir" STRIDE="$WSTRIDE" MAX_BLOCKS="$PER_JOB" GUESTS="$GUESTS" \
+    SKIP_BUILD="$SKIP_BUILD" \
     ALCHEMY_URL="$ALCHEMY_URL" RETRY_CU="$RETRY_CU" PROXY_CONCURRENCY="$PROXY_CONCURRENCY" NIBBLES="$NIBBLES" \
     ${RSP_SKIP_EXEC:+RSP_SKIP_EXEC="$RSP_SKIP_EXEC"} ${RSP_RPC_CU:+RSP_RPC_CU="$RSP_RPC_CU"} ${MARGIN:+MARGIN="$MARGIN"} \
     "$ROOT/cli/witness-farm" "$wstart" > "$wdir/worker.log" 2>&1 &
