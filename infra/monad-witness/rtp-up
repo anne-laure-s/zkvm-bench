@@ -225,6 +225,26 @@ step "Key auth from $BOX back to this Mac"
 # Test the PRIVATE half. Checking only `.pub` was a real bug: a leftover public key (or a wiped ~/.ssh that
 # kept nothing at all) let this step report success while the box had nothing to authenticate with, and the
 # run then survived purely on a forwarded agent — until the agent went away and every transfer stopped.
+# Before generating anything: is something on that host scheduled to DELETE it again? On nyc-003 the answer
+# is yes — an Ansible-managed crontab entry, `0 * * * * find ~/.ssh -type f -name 'id_*' -delete`, wipes the
+# private key at the top of every hour. That is why this step has "fired twice on a box where the key was
+# verified present hours earlier", and why ~/.ssh keeps coming back with only authorized_keys + known_hosts:
+# the glob matches id_* and nothing else. Generating a fresh key here still "succeeds", so no existing check
+# catches it — the pipeline just quietly loses every fresh ssh connection at the next :00, keeps proving on
+# a multiplexed master authenticated before the wipe, and dies for good whenever that socket drops.
+# Detect it and say so, with the deadline. Do not work around it silently: the entry is a deliberate control
+# owned by whoever runs the Ansible, and renaming the key to dodge the glob is their decision, not this
+# script's. Repeated re-runs are also why the Mac's authorized_keys accumulates one dead key per run.
+wipe_cron="$(onbox_q "crontab -l 2>/dev/null | grep -E '^[^#].*\.ssh.*(id_\*|id_ed25519|id_rsa).*-delete'")"
+if [ -n "$wipe_cron" ]; then
+  say "WARNING: a cron entry on $BOX deletes the private key on a schedule:"
+  printf '   %s\n' "     $wipe_cron"
+  say "  a key generated now survives until that job next runs. The prefetcher (the only component that"
+  say "  opens a FRESH connection per block) stops at that moment; proving limps on through the existing"
+  say "  multiplexed master and stops for good when it drops. Re-running rtp-up is a reset, not a fix."
+  say "  Durable options: get the entry scoped/exempted by whoever owns the Ansible, or remove the need for"
+  say "  a box->Mac private key at all (the prover can already reach the box — that is what PULL_VIA uses)."
+fi
 have_key="$(onbox_q 'test -f ~/.ssh/id_ed25519 && echo yes')"
 pub="$(onbox_q 'cat ~/.ssh/id_ed25519.pub 2>/dev/null')"
 if [ "$have_key" != yes ] || [ -z "$pub" ]; then
