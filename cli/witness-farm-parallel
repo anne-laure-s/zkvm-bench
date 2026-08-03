@@ -57,7 +57,10 @@ RETRY_CU="${RETRY_CU:-9000}"; PROXY_CONCURRENCY="${PROXY_CONCURRENCY:-64}"; NIBB
 PROXY_PORT="${PROXY_PORT:-8545}"; PROXY_URL="http://127.0.0.1:$PROXY_PORT"
 OPENVM_DIR="$ROOT/vendor/openvm-eth"; PROXY_BIN="$OPENVM_DIR/target/release/openvm-rpc-proxy"
 RSP_DIR="$ROOT/vendor/rsp"; WCACHE="$ROOT/wcache"
-LOGROOT="$ROOT/witness-farm-parallel-logs"; OUT_MAIN="$ROOT/witness-farm.csv"
+# Overridable so a trial run can be pointed at a throwaway directory. Without that, any test writes
+# into the real log tree and OVERWRITES worker-<i>/worker.log from previous runs — cli/witness-farm
+# has honoured OUT/LOGDIR for exactly this reason and this launcher did not.
+LOGROOT="${LOGROOT:-$ROOT/witness-farm-parallel-logs}"; OUT_MAIN="${OUT_MAIN:-$ROOT/witness-farm.csv}"
 WSTRIDE=$(( JOBS * STRIDE ))
 log(){ echo "$(date +%H:%M:%S)  [parallel] $*" >&2; }
 rpc(){ curl -s "$1" -X POST -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":[]}"; }
@@ -147,6 +150,21 @@ trap 'echo >&2; log "interrupted — stopping all…"; exit 130' INT TERM
 # ---- one shared proxy, owned by this launcher (reused, not restarted, by every worker) ----
 if [ "$need_proxy" = 0 ]; then
   log "no shared proxy needed (GUESTS=$GUESTS) — workers go direct to Alchemy"
+  # The proxy is normally what fails loudly on a bad/exhausted key before any block is attempted.
+  # With no proxy, nothing validates the endpoint up front, and a quota 429 would surface only as N
+  # workers dying into N separate logs. One cheap call turns that into one message.
+  _probe="$(rpc "$ALCHEMY_URL" eth_blockNumber)"
+  if printf '%s' "$_probe" | grep -qiE 'capacity limit|monthly capacity|scaling policy|compute units'; then
+    echo "witness-farm-parallel: Alchemy CAPACITY/QUOTA exceeded (429) — NOT transient, every worker" >&2
+    echo "  would die on its first block. Upgrade the plan, use another key/provider, or a reth node." >&2
+    printf '  %s\n' "$(printf '%s' "$_probe" | head -c 300)" >&2
+    exit 1
+  fi
+  printf '%s' "$_probe" | grep -q '"result"' || {
+    echo "witness-farm-parallel: the RPC did not answer eth_blockNumber — check ALCHEMY_URL." >&2
+    printf '  %s\n' "$(printf '%s' "$_probe" | head -c 300)" >&2
+    exit 1; }
+  log "RPC ok (tip $(printf '%s' "$_probe" | python3 -c 'import sys,json;print(int(json.load(sys.stdin)["result"],16))' 2>/dev/null || echo '?'))"
 elif rpc "$PROXY_URL" eth_chainId | grep -q '"result"'; then
   log "proxy already up on :$PROXY_PORT — reusing (leave it as-is)"
 else
@@ -181,4 +199,22 @@ for i in $(seq 0 $((JOBS-1))); do
 done
 
 log "$JOBS workers running. Watch: tail -f $LOGROOT/worker-*/worker.log  ·  CU/s: your Alchemy dashboard. Ctrl-C to stop all."
-wait
+
+# A bare `wait` hides a worker that dies on its first block: the launcher would fall straight through
+# to its cleanup line and look like a clean stop, with the reason visible only to whoever thinks to
+# open worker-<i>/worker.log. Wait per PID, keep each status, and surface the tail of any log whose
+# worker ended non-zero — that log is the only place the reason exists.
+worker_fails=0
+for i in $(seq 0 $((JOBS-1))); do
+  wait "${WORKERS[$i]}"; st=$?
+  [ "$st" -eq 0 ] && continue
+  # 130/143 = the INT/TERM this launcher sent on Ctrl-C, not a worker fault.
+  case "$st" in 130|143) continue ;; esac
+  worker_fails=$((worker_fails+1))
+  log "⚠️  worker $i exited $st — last lines of worker-$i/worker.log:"
+  tail -6 "$LOGROOT/worker-$i/worker.log" >&2
+done
+if [ "$worker_fails" -gt 0 ]; then
+  log "$worker_fails of $JOBS workers FAILED (see the tails above)."
+  exit 1        # so a nohup/CI wrapper sees the failure instead of a silent success
+fi
