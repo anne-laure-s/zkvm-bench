@@ -251,9 +251,22 @@ JSON
       echo "Cmd      : [MOCK PROVER] model=${mock_dt}s − emulation=${mock_emul}s → sleep ${mock_nap}s — no proving"
       ensure_parent "$OUTPUT"
       sleep "$mock_nap"
+      # SIZE IS NOT PART OF THE FICTION. The mock's sleep is allowed to be invented; its proof SIZE is not,
+      # because everything downstream of the prover is sized by it — the tar back to the box, the base64 in
+      # ethproofs-submit, and the POST that (in this topology) crosses the reverse tunnel at 3.8 Mbit/s.
+      # At 480 bytes that whole return leg measures ~3 ms and is therefore never exercised: the first real
+      # prover would discover ~0.8 s of it at once. Measured references: a real SP1 proof in this repo is
+      # 1.273 MB (n=5, spread 126 bytes — essentially constant), and a ZisK compressed proof is ~381 KB.
+      #
+      # Constant, not block-varying: real proof size does not track the block, so making it do so would be a
+      # second fiction dressed as realism.
+      #
+      # Padded from /dev/urandom, never zeros. A real proof is cryptographic and incompressible; zero padding
+      # would vanish under `ssh -C` and leave the return leg exactly as unmeasured as 480 bytes did.
+      local mock_pb="${ZISK_MOCK_PROOF_BYTES:-390144}"      # 381 KiB — a ZisK compressed proof
       { printf 'MOCK-PROOF/mock-remote NOT-A-REAL-PROOF elf=%s input=%s ' \
           "$(basename "$ELF")" "$(basename "$INPUT")"
-        head -c 400 /dev/urandom; } > "$OUTPUT"
+        head -c "$mock_pb" /dev/urandom; } > "$OUTPUT"
       proof_bytes="$(wc -c < "$OUTPUT" | tr -d ' ')"
       pv_bytes=""; [[ -n "$PV" && -f "$PV" ]] && pv_bytes="$(wc -c < "$PV" | tr -d ' ')"
       echo "Proof saved   : $OUTPUT ($proof_bytes bytes) — FAKE"

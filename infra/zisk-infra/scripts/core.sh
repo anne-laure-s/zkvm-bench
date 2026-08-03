@@ -157,17 +157,49 @@ prove_remote() {
   # Timed from HERE, before the first exchange with the prover: the workspace call is part of what `input`
   # costs, and starting the clock after it would flatter the very change being measured.
   # %N (Linux — core.sh runs on the producer box): tenths, because at ~2 s whole seconds hide real gains.
+  # THE FETCH RIDES THIS ROUND TRIP TOO. Once the pump made the transfer itself fast, the fixed cost around it
+  # became the biggest remaining term: at 90-135 ms RTT every separate box->prover exchange is ~0.19 s, and
+  # asking the pump for the block used to be its own. The prover already knows everything needed to decide —
+  # it has just stat'd the input — so it decides and fetches in the same shell, and reports the verdict on a
+  # fourth line. One exchange instead of two, on every block.
+  #
+  # This also fixes a latent gate: the pump attempt used to live inside the `PULL_VIA` branch although the pump
+  # does not use PULL_VIA at all (it has its own PUMP_BOX). With PULL_VIA unset and WITNESS_PUMP set, the pump
+  # would silently never be tried.
+  local abs_input; abs_input="$(cd "$(dirname "$INPUT")" && pwd)/$(basename "$INPUT")"
+  local lin_size; lin_size="$(stat -c %s "$INPUT" 2>/dev/null || stat -f %z "$INPUT" 2>/dev/null || echo 0)"
+  local pump_cmd=""
+  [[ -n "${WITNESS_PUMP:-}" ]] && pump_cmd="${PUMP_SOCK:+PUMP_SOCK=$PUMP_SOCK }$WITNESS_PUMP"
   local t_start; t_start="$(date +%s.%N)"
-  local ws_meta ws_abs rsum rinsize
-  ws_meta="$("${ssh[@]}" "mkdir -p \"$ws\"/elfs \"$ws\"/inputs \"$ws\"/proofs \"$ws\"/reports && cd \"$ws\" && pwd \
+  local ws_meta ws_abs rsum rinsize fetched
+  ws_meta="$("${ssh[@]}" "mkdir -p \"$ws\"/elfs \"$ws\"/inputs \"$ws\"/proofs \"$ws\"/reports && cd \"$ws\" \
+&& WS=\"\$(pwd)\" && echo \"\$WS\" \
 && { sha256sum elfs/$elf_name 2>/dev/null || shasum -a 256 elfs/$elf_name 2>/dev/null; } | awk '{print \$1}' \
-&& { stat -c %s inputs/$in_name 2>/dev/null || stat -f %z inputs/$in_name 2>/dev/null || echo 0; }")" \
+&& SZ=\"\$(stat -c %s inputs/$in_name 2>/dev/null || stat -f %z inputs/$in_name 2>/dev/null || echo 0)\" \
+&& echo \"\$SZ\" \
+&& if [ \"\$SZ\" = '$lin_size' ] && [ '$lin_size' != 0 ]; then echo PREFETCHED; \
+elif [ -n '$pump_cmd' ]; then $pump_cmd get '$abs_input' \"\$WS/inputs/$in_name\" >/dev/null 2>&1 \
+&& echo PUMP || echo NOFETCH; \
+else echo NOFETCH; fi \
+&& { echo -n 'date    : '; date -u; \
+echo -n 'host    : '; uname -a; \
+echo -n 'cpus    : '; nproc 2>/dev/null || sysctl -n hw.ncpu; \
+echo -n 'zisk    : '; cargo-zisk --version 2>/dev/null || echo '(no cargo-zisk)'; \
+echo '--- gpu ---'; nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv 2>/dev/null || echo '(no nvidia-smi)'; } 2>&1")" \
     || { echo "ERROR: cannot prepare remote workspace '$ws'" >&2; return 1; }
   ws_abs="$(printf '%s\n' "$ws_meta" | sed -n 1p)"
   rsum="$(printf '%s\n' "$ws_meta" | sed -n 2p)"
   # Line 3: the size the prover ALREADY has for this input, 0 if absent. This is what makes overlap possible —
   # a witness shipped ahead of time by prove-farm's prefetcher costs nothing here.
   rinsize="$(printf '%s\n' "$ws_meta" | sed -n 3p)"
+  # Line 4: PREFETCHED (already there) | PUMP (streamed over the persistent channel) | NOFETCH (fall through
+  # to scp). NOFETCH is not an error — it is the designed fallback, and it must stay cheap to reach.
+  fetched="$(printf '%s\n' "$ws_meta" | sed -n 4p)"
+  # Lines 5+: the remote environment for the run record. This used to be its OWN exchange, per block, for data
+  # that is constant across a run — host, cpu count, zisk version, GPU model — plus two process spawns that
+  # simply fail on a Mac prover (`cargo-zisk`, `nvidia-smi`). Only `date` varies, and it is stamped here anyway.
+  # A round trip is ~0.19 s at this RTT; that is what a per-block snapshot of unchanging facts was costing.
+  local rem_env; rem_env="$(printf '%s\n' "$ws_meta" | sed -n '5,$p')"
   [[ -n "$ws_abs" ]] || { echo "ERROR: remote workspace '$ws' did not resolve" >&2; return 1; }
   ws="$ws_abs"
 
@@ -202,10 +234,10 @@ prove_remote() {
   # failure we say so loudly and fall back to pushing: a slow pipeline beats a stopped one, but a silent
   # fallback would let a broken config masquerade as a working optimisation.
   local pulled=0 prefetched=0
-  # BOTH directions need these options — the input pull below AND the artifact push-back in `retrieve`. Declare
-  # them here, at function scope, never inside a branch. They used to be declared inside the `elif` that pulls
-  # the input, so a PREFETCHED input took the first branch, left pull_opts unset, and `set -u` killed the
-  # retrieve step at the tar: "line 301: pull_opts: unbound variable". Every block the prefetcher successfully
+  # Declared at function scope, never inside a branch — even though only the scp fallback uses it now that the
+  # artifact push-back is gone. It used to be declared inside the `elif` that pulls the input, so a PREFETCHED
+  # input took the first branch, left pull_opts unset, and `set -u` killed the
+  # retrieve step at the tar: "pull_opts: unbound variable". Every block the prefetcher successfully
   # shipped therefore FAILED — and failed again on every retry, because the input was still sitting on the
   # prover and matched on size again. 31 blocks poisoned, 0 recovered, while the feature looked like it was
   # working: `(prefetched N …)` in the farm log, `<< N FAIL (rc=1 no-report no-proof)` eight seconds later.
@@ -215,12 +247,15 @@ prove_remote() {
   # proved, and the transfer has already happened off the critical path. Size, not hash: a hash would cost the
   # very round trip this is avoiding, and these names are content-addressed by block — a same-named input of
   # the same length is the same witness.
-  local lin_size; lin_size="$(stat -c %s "$INPUT" 2>/dev/null || stat -f %z "$INPUT" 2>/dev/null || echo 0)"
-  if [[ "$lin_size" != 0 && "$rinsize" == "$lin_size" ]]; then
+  local via="scp"
+  if [[ "$fetched" == PREFETCHED ]]; then
     echo "Input already on the prover (prefetched, $lin_size B) — no transfer on the critical path."
-    prefetched=1; pulled=1
+    prefetched=1; pulled=1; via="prefetched"
+  elif [[ "$fetched" == PUMP ]]; then
+    pulled=1; via="pump"
+    echo "Pulled input over the persistent channel (setup paid once, and on the workspace round trip)."
   elif [[ -n "${PULL_VIA:-}" ]]; then
-    local abs_input; abs_input="$(cd "$(dirname "$INPUT")" && pwd)/$(basename "$INPUT")"
+    [[ -n "$pump_cmd" ]] && echo "NOTE: the pump did not serve this block — using scp." >&2
     # -C only. Multiplexing was tried here and made things WORSE: input went from 3-4 s to 2.5-23 s, wildly
     # variable, while `retrieve` (small, same options) stayed at 0.5 s. Sharing one ControlMaster channel means
     # sharing one TCP connection and one ssh channel window, and a single 10 MB stream does not want either —
@@ -253,23 +288,15 @@ prove_remote() {
     # transfer is a separate process relaying every byte through the master over a unix socket. Here the
     # long-lived ssh IS the data path — one process, no relay. See infra/zisk-infra/witness-pump.
     #
-    # Tried first, and its failure is never fatal: no pump, stale socket, dead channel or a pruned witness all
-    # just exit non-zero and drop through to the scp below. Worst case is the old speed, not a stalled block.
-    local via="scp"
-    if [[ -n "${WITNESS_PUMP:-}" ]] \
-       && "${ssh[@]}" "${PUMP_SOCK:+PUMP_SOCK=$PUMP_SOCK }$WITNESS_PUMP get '$abs_input' '$ws/inputs/$in_name'"; then
-      pulled=1; via="pump"
-      echo "Pulled input over the persistent channel (setup paid once, not per block)."
-    fi
-    if [[ $pulled == 0 ]]; then
-      [[ -n "${WITNESS_PUMP:-}" ]] && echo "NOTE: the pump did not serve this block — using scp." >&2
-      echo "Pulling input from $PULL_VIA (direct, bypassing the tunnel for the payload)..."
-      if "${ssh[@]}" "scp -q $pull_opts '$PULL_VIA:$abs_input' '$ws/inputs/$in_name'"; then
-        pulled=1
-      else
-        echo "WARNING: $REMOTE could not pull from $PULL_VIA — falling back to pushing through the tunnel." >&2
-        echo "         Check from the remote: ssh $pull_opts $PULL_VIA true" >&2
-      fi
+    # The pump is tried on the workspace round trip above, not here — see the fold there. Its failure is never
+    # fatal: no pump, stale socket, dead channel or a pruned witness all report NOFETCH and land in this branch.
+    # Worst case is the old speed, not a stalled block.
+    echo "Pulling input from $PULL_VIA (direct, bypassing the tunnel for the payload)..."
+    if "${ssh[@]}" "scp -q $pull_opts '$PULL_VIA:$abs_input' '$ws/inputs/$in_name'"; then
+      pulled=1
+    else
+      echo "WARNING: $REMOTE could not pull from $PULL_VIA — falling back to pushing through the tunnel." >&2
+      echo "         Check from the remote: ssh $pull_opts $PULL_VIA true" >&2
     fi
   fi
   if [[ $pulled == 0 ]]; then
@@ -290,13 +317,9 @@ prove_remote() {
     echo "backend  : $backend"
     echo "remote   : $REMOTE:$port"
     echo "--- remote environment ---"
+    # Collected on the workspace round trip, not on one of its own — see rem_env above.
+    printf '%s\n' "$rem_env"
   } > "$run_dir/env.txt"
-  "${ssh[@]}" "{ echo -n 'date    : '; date -u; \
-    echo -n 'host    : '; uname -a; \
-    echo -n 'cpus    : '; nproc 2>/dev/null || sysctl -n hw.ncpu; \
-    echo -n 'zisk    : '; cargo-zisk --version 2>/dev/null || echo '(no cargo-zisk)'; \
-    echo '--- gpu ---'; nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv 2>/dev/null || echo '(no nvidia-smi)'; }" \
-    >> "$run_dir/env.txt" 2>&1 || true
 
   local logpref=""
   [[ -n "${RUST_LOG:-}" ]] && logpref="RUST_LOG=$RUST_LOG "
@@ -315,56 +338,55 @@ prove_remote() {
 ${ZISK_MOCK_PER_MSTEP:+ZISK_MOCK_PER_MSTEP=$ZISK_MOCK_PER_MSTEP }\
 ${ZISK_MOCK_SPEED:+ZISK_MOCK_SPEED=$ZISK_MOCK_SPEED }\
 ${ZISK_MOCK_JITTER:+ZISK_MOCK_JITTER=$ZISK_MOCK_JITTER }\
-${ZISK_MOCK_DIST:+ZISK_MOCK_DIST=$ZISK_MOCK_DIST }"
+${ZISK_MOCK_DIST:+ZISK_MOCK_DIST=$ZISK_MOCK_DIST }\
+${ZISK_MOCK_PROOF_BYTES:+ZISK_MOCK_PROOF_BYTES=$ZISK_MOCK_PROOF_BYTES }"
   fi
-  "${ssh[@]}" "set -o pipefail; ${logpref}${mockenv}ZISK_PROVE_BACKEND=$backend $remote_runner \
+  # THE ARTIFACTS COME BACK ON THIS SAME EXCHANGE. They used to be fetched by a second call after the run
+  # returned, which cost a full round trip (~0.19 s at this RTT) to ask for something the prover had already
+  # finished writing. The split is only in the code: the runner's own output goes to STDERR (so it still streams
+  # live, and prove-farm captures both anyway), leaving STDOUT free to carry the tar. One exchange, both jobs.
+  #
+  # Note what this does NOT fix, because it is worth knowing: the proof still travels prover -> box, and in the
+  # mock topology it then travels back through the tunnel when ethproofs-submit POSTs it to the mock running on
+  # the prover itself. That byte detour is ~480 B mock / 381 KB real, i.e. ~0.1 s — cheap next to moving the run
+  # record off the box, which would break the single-clock discipline rtp-latency.py depends on (t_proved is the
+  # record's mtime, on the same clock as the producer's stamps).
+  echo "Retrieving artifacts into $run_dir ..."
+  local getdir; getdir="$(mktemp -d)"
+  local members="proofs/$base.proof.bin reports/$base.json reports/$base.log proofs/$base.pv.bin"
+  # AND THE ARTIFACTS COME BACK OFF THE TUNNEL. Everything on the box->prover ssh, in BOTH directions, is
+  # TCP-in-TCP through the reverse forward: 3.8 Mbit/s against 25 direct. Sending the tar on that connection's
+  # stdout was free while a mock proof was 480 bytes; at a realistic 381 KB it is ~0.82 s. The pump already
+  # holds a DIRECT prover->box channel, so the prover pushes the tarball up it and pays only the ack.
+  # Measured push of 381 KB: 0.53 s (5.9 Mbit/s — a transfer this small never leaves slow-start, so it does not
+  # reach the link's 25). The 0.82 s it replaces is CALCULATED from the tunnel rate, not measured today: the
+  # first live run should confirm it in `retrieve_secs` before this is believed.
+  #
+  # Fallback stays exactly the old path: if the push fails the prover cats the tarball to stdout instead, so a
+  # broken pump costs the tunnel's speed, never the block.
+  local box_tar="$getdir/pushed.tar"
+  local push_cmd="cat $ws/art.tar"
+  [[ -n "$pump_cmd" ]] && push_cmd="$pump_cmd put $ws/art.tar '$box_tar' >&2 && echo PUSHED >&2 || cat $ws/art.tar"
+  "${ssh[@]}" "set -o pipefail; { ${logpref}${mockenv}ZISK_PROVE_BACKEND=$backend $remote_runner \
     --elf $ws/elfs/$elf_name \
     --input $ws/inputs/$in_name $hints_arg \
     --mode $mode \
     --output $ws/proofs/$base.proof.bin \
     --public-values $ws/proofs/$base.pv.bin \
-    --report $ws/reports/$base.json 2>&1 | tee $ws/reports/$base.log"
-
-  local t_run; t_run="$(date +%s.%N)"
-
-  # ONE round trip instead of four. The four artifacts are tiny — a 480 B proof, three small text files — so
-  # what those scp calls cost was not bandwidth but latency: a full request/response each, over a tunnel where
-  # a round trip is expensive. Multiplexing removed the handshakes, not the round trips. tar streams all four
-  # in a single exchange on the connection that is already open.
-  #
-  # Public values are best-effort (ZisK exposes them differently across versions), so tar is allowed to report
-  # a missing member on stderr and still write the rest — hence 2>/dev/null on both ends rather than a check.
-  echo "Retrieving artifacts into $run_dir ..."
-  local getdir; getdir="$(mktemp -d)"
-  local members="proofs/$base.proof.bin reports/$base.json reports/$base.log proofs/$base.pv.bin"
-  if [[ -n "${PULL_VIA:-}" ]]; then
-    # Same inversion as the witness, in the other direction: the tar stream rides a connection the PROVER opens
-    # to us, not the tunnel. The payload is small, so what this buys is the round trip, not bandwidth — but at
-    # this point the round trip IS the cost. The ssh command itself still goes through the tunnel; it is a few
-    # hundred bytes.
-    #
-    # And since the round trip IS the cost, multiplex THIS connection — the opposite call from the input pull,
-    # and not a contradiction of it. The rule the pull comment states is the one being applied: mux is for many
-    # small round trips, not for one bulk stream. This is the small-round-trip case. Measured prover->box:
-    # a fresh handshake is 1.09-1.22 s, a reused channel 0.19-0.20 s, and `retrieve` currently sits at a 1.6 s
-    # median for ~1 KB of artifacts — i.e. it is almost entirely handshake. One control socket per PULL_VIA,
-    # persisted across blocks, so only the first block of a run pays it.
-    #
-    # The socket lives on the PROVER (this ssh runs there), so the path must be short and prover-side: a unix
-    # socket path is capped at 104 bytes on macOS and %C alone is 64 hex chars, which $ws/... would overflow.
-    # PULL_BACK_SSH_OPTS overrides; set it to "$pull_opts" to go back to a fresh connection per block.
-    local back_opts="${PULL_BACK_SSH_OPTS:-$pull_opts -o ControlMaster=auto -o ControlPath=/tmp/zisk-pb-%C -o ControlPersist=120}"
-    local tarball="$getdir/artifacts.tar"
-    if "${ssh[@]}" "cd $ws && tar cf - $members 2>/dev/null | ssh $back_opts '$PULL_VIA' \"cat > '$tarball'\"" \
-       && [[ -s "$tarball" ]]; then
-      tar xf "$tarball" -C "$getdir" 2>/dev/null; rm -f "$tarball"
-    else
-      echo "WARNING: direct push-back from $REMOTE failed — falling back to the tunnel." >&2
-      "${ssh[@]}" "cd $ws && tar cf - $members 2>/dev/null" | tar xf - -C "$getdir" 2>/dev/null
-    fi
-  else
-    "${ssh[@]}" "cd $ws && tar cf - $members 2>/dev/null" | tar xf - -C "$getdir" 2>/dev/null
+    --report $ws/reports/$base.json 2>&1 | tee $ws/reports/$base.log; } >&2
+cd $ws && tar cf - $members 2>/dev/null > $ws/art.tar; $push_cmd; rm -f $ws/art.tar" \
+    > "$getdir/stream.tar"
+  # stderr is deliberately NOT redirected: it now carries the prover's own log, streamed live. Silencing it here
+  # would have thrown away every line the prover prints — the whole reason the log moved to stderr was to keep
+  # it visible once stdout was needed for the tar.
+  # Whichever arrived: the pushed tarball (direct channel) or the streamed one (tunnel fallback).
+  if [[ -s "$box_tar" ]]; then
+    tar xf "$box_tar" -C "$getdir" 2>/dev/null; rm -f "$box_tar"
+  elif [[ -s "$getdir/stream.tar" ]]; then
+    tar xf "$getdir/stream.tar" -C "$getdir" 2>/dev/null
   fi
+  rm -f "$getdir/stream.tar"
+
   mv "$getdir/proofs/$base.proof.bin" "$run_dir/proof.bin"   2>/dev/null
   mv "$getdir/reports/$base.json"     "$run_dir/report.json" 2>/dev/null
   mv "$getdir/reports/$base.log"      "$run_dir/prove.log"   2>/dev/null
@@ -381,8 +403,29 @@ ${ZISK_MOCK_DIST:+ZISK_MOCK_DIST=$ZISK_MOCK_DIST }"
   # than the changes being made and a real improvement can read as no change at all. The clock is read on the
   # PRODUCER (Linux), so date +%N is available — the prover's macOS bash never sees these.
   # bash has no float arithmetic, so every subtraction goes through awk. One call, not four.
-  local ph; ph="$(awk -v a="$t_start" -v b="$t_in" -v c="$t_run" -v d="$t_get" \
-    'BEGIN{printf "%.1f %.1f %.1f %.1f %.1f", b-a, c-b, d-c, (b-a)+(d-c), d-a}')"
+  # `remote` CHANGED MEANING when the run and the artifact fetch became one exchange, and the change is worth
+  # stating because it makes historical numbers in RTP-FINDINGS shift by ~0.2 s:
+  #   before — remote = wall time of the run exchange (so it included the ssh round trip that launched it)
+  #   now    — remote = the PROVER'S OWN reported duration, read from the report.json it just sent back
+  #            retrieve = the rest of that exchange (the launch round trip, the tar, the artifact bytes)
+  # The phase boundary survives the merge because the prover already measures itself; without that it would
+  # have been lost, and a `retrieve` regression would have surfaced as "the prover got slower" — which is
+  # exactly how 1.6 s of pure ssh handshake hid in this pipeline for weeks.
+  # If report.json is missing (a failed prove), there is nothing to split on: attribute the whole exchange to
+  # remote and leave retrieve at 0 rather than inventing a division.
+  local prover_secs; prover_secs="$(python3 - "$run_dir/report.json" <<'PY' 2>/dev/null || echo ""
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    v=d.get("prove_secs") or d.get("total_secs") or d.get("elapsed_secs")
+    print(f"{float(v):.3f}" if v is not None else "")
+except Exception:
+    print("")
+PY
+)"
+  local ph; ph="$(awk -v a="$t_start" -v b="$t_in" -v d="$t_get" -v ps="${prover_secs:-}" \
+    'BEGIN{ w=d-b; rem=(ps=="")?w:ps; get=w-rem; if (get<0) get=0;
+            printf "%.1f %.1f %.1f %.1f %.1f", b-a, rem, get, (b-a)+get, d-a }')"
   local p_in p_rem p_get p_tr p_tot; read -r p_in p_rem p_get p_tr p_tot <<<"$ph"
   local in_bytes; in_bytes="$(stat -c %s "$INPUT" 2>/dev/null || stat -f %z "$INPUT" 2>/dev/null || echo 0)"
   local in_mbits; in_mbits="$(awk -v b="$in_bytes" -v s="$p_in" 'BEGIN{printf "%.1f", (s>0? b*8/s/1000000 : 0)}')"

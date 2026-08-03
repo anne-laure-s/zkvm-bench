@@ -30,6 +30,7 @@ it for a block over the short control connection it already holds.
   prover:  witness-pump serve            long-lived: holds `ssh box … witness-pump send`
   box:     witness-pump send             reads a path per line, writes LE64(len) + bytes
   prover:  witness-pump get SRC DST      what prove_remote calls; returns 0 on success
+  prover:  witness-pump put SRC DEST     push artifacts UP the same channel, so they skip the tunnel
 
 ONE TRANSFER AT A TIME, deliberately. Requests are served serially. Two concurrent bulk streams on this link
 is the failure mode that took inputs from 4 s to 24-34 s while the queue grew — see RTP-FINDINGS. A serial
@@ -43,6 +44,7 @@ name-and-size check would accept as a valid input.
 
   PUMP_SOCK=~/.zisk-witness-pump.sock   PUMP_BOX=<ssh target of the box, as the PROVER sees it>
   PUMP_SSH_OPTS="-C -o BatchMode=yes"   PUMP_TIMEOUT=120 (seconds for one transfer)
+  PUMP_REMOTE_CMD=<path to this file on the box>
 """
 import os, socket, struct, subprocess, sys, time
 
@@ -62,27 +64,60 @@ def log(msg):
 
 # ── box side ────────────────────────────────────────────────────────────────────────────────────────
 def mode_send():
-    """Read one path per line on stdin; for each, write LE64(size) then the bytes. A negative length says
-    "could not read this one" and keeps the stream usable — the alternative is dying and making the pump
-    reconnect for what is usually a typo or a pruned witness."""
-    out = sys.stdout.buffer
-    for line in sys.stdin:
-        path = line.strip()
-        if not path:
+    """Serve requests on stdin, framed replies on stdout.
+
+      <path>                     GET: reply LE64(size) + size bytes  (LE64(-1) if unreadable)
+      PUT\\t<dest>\\t<length>      the body follows on stdin; reply LE64(0) ok / LE64(-1) failed
+
+    A negative length keeps the stream usable instead of dying: a pruned witness is routine here (retention
+    deletes a framed input once its proof is in hand), and tearing the channel for it would cost a reconnect.
+
+    REQUESTS ARE READ FROM THE BINARY STREAM, one readline at a time — never `for line in sys.stdin`. The text
+    wrapper reads ahead, so a PUT body would be partly swallowed into its buffer and the file written short. A
+    protocol that carries binary bodies cannot share a stream with a buffering text iterator."""
+    inp, out = sys.stdin.buffer, sys.stdout.buffer
+    while True:
+        raw = inp.readline()
+        if not raw:
+            return 0
+        req = raw.decode(errors="replace").rstrip("\n")
+        if not req:
             continue
         try:
-            size = os.path.getsize(path)
-            with open(path, "rb") as f:
-                out.write(HDR.pack(size))
-                sent = 0
-                while sent < size:
-                    chunk = f.read(1 << 20)
-                    if not chunk:                       # file shrank under us: the reader will time out
-                        break                           # rather than be handed a short body silently
-                    out.write(chunk)
-                    sent += len(chunk)
+            if req.startswith("PUT\t"):
+                _, dest, length = req.split("\t", 2)
+                need = int(length)
+                os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+                # Straight to <dest>.part, renamed only once every byte declared has arrived: the box must never
+                # see a half-written artifact under its real name, same rule as the input side.
+                part = dest + ".part"
+                got = 0
+                with open(part, "wb") as f:
+                    while got < need:
+                        b = inp.read(min(1 << 20, need - got))
+                        if not b:
+                            raise ConnectionError("body truncated")
+                        f.write(b); got += len(b)
+                os.replace(part, dest)
+                out.write(HDR.pack(0))
+            else:
+                path = req
+                size = os.path.getsize(path)
+                with open(path, "rb") as f:
+                    out.write(HDR.pack(size))
+                    sent = 0
+                    while sent < size:
+                        chunk = f.read(1 << 20)
+                        if not chunk:                   # file shrank under us: the reader will time out
+                            break                       # rather than be handed a short body silently
+                        out.write(chunk)
+                        sent += len(chunk)
             out.flush()
-        except OSError:
+        except Exception:                               # noqa: BLE001 — never die on one bad request
+            try:
+                os.unlink(part)                         # noqa: F821 — only bound on the PUT path
+            except (OSError, NameError, UnboundLocalError):
+                pass
             out.write(HDR.pack(-1))
             out.flush()
     return 0
@@ -138,6 +173,35 @@ class Channel:
             buf += chunk
         return bytes(buf)
 
+    def push(self, src, dest):
+        """Send a local file UP the channel to `dest` on the box. Returns the byte count; raises on failure.
+
+        WHY THIS DIRECTION EXISTS. The artifacts (proof, report, log, public values) are written on the prover and
+        the box needs them. They used to ride the box->prover ssh's stdout as a tar — which means back through the
+        REVERSE TUNNEL, at the 3.8 Mbit/s that TCP-in-TCP gives, against 25 direct. Invisible while the mock
+        proof was 480 bytes (~1 ms); with a realistically sized 381 KB proof that return leg is **0.82 s**.
+        The pump already holds a direct prover->box connection, so pushing costs no new handshake — only the ack.
+
+        ONE push of one tarball, not four of one file each. Each PUT costs an ack round trip (~0.1-0.2 s at this
+        RTT), so four artifacts pushed separately would spend more on acks than the tunnel spent on bytes."""
+        if not self.connect():
+            raise ConnectionError("no channel")
+        deadline = time.time() + TIMEOUT
+        size = os.path.getsize(src)
+        self.p.stdin.write(f"PUT\t{dest}\t{size}\n".encode())
+        with open(src, "rb") as f:
+            left = size
+            while left:
+                b = f.read(1 << 20)
+                if not b:
+                    raise ConnectionError(f"local read short with {left} bytes to go")
+                self.p.stdin.write(b); left -= len(b)
+        self.p.stdin.flush()
+        (rc,) = HDR.unpack(self._readn(HDR.size, deadline))
+        if rc != 0:
+            raise ConnectionError(f"the box refused the push to {dest}")
+        return size
+
     def fetch(self, src, dst):
         """Pull one file. Returns its size. Raises on any problem; the caller reports and lets the box fall
         back to scp."""
@@ -183,13 +247,16 @@ def mode_serve():
             with conn:
                 try:
                     req = conn.makefile("r").readline().strip()
+                    op = "get"
+                    if req.startswith("put\t"):
+                        op = "put"; req = req[4:]
                     src, _, dst = req.partition("\t")
                     if not src or not dst:
                         conn.sendall(b"ERR malformed request\n")
                         continue
                     t0 = time.time()
                     try:
-                        n = ch.fetch(src, dst)
+                        n = ch.push(src, dst) if op == "put" else ch.fetch(src, dst)
                     except FileNotFoundError as e:
                         # The box could not read it, and said so with a clean negative length — the stream is
                         # still correctly framed, so KEEP the channel. This is a routine case, not a fault:
@@ -207,9 +274,9 @@ def mode_serve():
                         log(f"FAILED {os.path.basename(src)}: {e} — the prover will scp it instead")
                         conn.sendall(f"ERR {e}\n".encode())
                         continue
-                    dt = time.time() - t0
-                    log(f"streamed {os.path.basename(src)} {n/1048576:.1f} MB in {dt:.2f}s "
-                        f"({n*8/dt/1e6:.1f} Mbit/s)" if dt > 0 else f"streamed {os.path.basename(src)}")
+                    dt = max(time.time() - t0, 1e-6)
+                    log(f"{'pushed' if op == 'put' else 'streamed'} {os.path.basename(src)} "
+                        f"{n/1048576:.1f} MB in {dt:.2f}s ({n*8/dt/1e6:.1f} Mbit/s)")
                     conn.sendall(f"OK {n}\n".encode())
                 except OSError as e:
                     log(f"client error: {e}")
@@ -224,8 +291,9 @@ def mode_serve():
     return 0
 
 
-# ── prover side: the one-shot client prove_remote calls ─────────────────────────────────────────────
-def mode_get(src, dst):
+# ── prover side: the one-shot clients ───────────────────────────────────────────────────────────────
+def _ask(line):
+    """One request to the local pump. 0 on OK, 1 on anything else — the caller's fallback does the rest."""
     try:
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         c.settimeout(TIMEOUT + 10)
@@ -234,12 +302,24 @@ def mode_get(src, dst):
         print(f"witness-pump: no pump at {SOCK} ({e})", file=sys.stderr)
         return 1
     with c:
-        c.sendall(f"{src}\t{dst}\n".encode())
+        c.sendall(line.encode())
         reply = c.makefile("r").readline().strip()
     if reply.startswith("OK "):
         return 0
     print(f"witness-pump: {reply or 'no reply'}", file=sys.stderr)
     return 1
+
+
+def mode_get(src, dst):
+    """Pull SRC on the box down to DST here. What prove_remote asks for on the workspace round trip."""
+    return _ask(f"{src}\t{dst}\n")
+
+
+def mode_put(src, dest):
+    """Push SRC here up to DEST on the box, over the channel the pump already holds. Called by the prover at the
+    end of a run so the artifacts never ride the reverse tunnel — 0.82 s of a 381 KB proof at the tunnel's
+    3.8 Mbit/s, against ~0.13 s direct plus one ack."""
+    return _ask(f"put\t{src}\t{dest}\n")
 
 
 def main(argv):
@@ -257,6 +337,11 @@ def main(argv):
             print("usage: witness-pump get SRC DST", file=sys.stderr)
             return 2
         return mode_get(argv[2], argv[3])
+    if m == "put":
+        if len(argv) != 4:
+            print("usage: witness-pump put SRC DEST_ON_BOX", file=sys.stderr)
+            return 2
+        return mode_put(argv[2], argv[3])
     print(f"unknown mode: {m}", file=sys.stderr)
     return 2
 
