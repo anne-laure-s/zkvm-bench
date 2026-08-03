@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""witness-pump — one long-lived connection that streams witnesses, instead of one connection per block.
+
+WHY THIS EXISTS. A witness pull costs ~4.1 s for a ~10 MB file, of which roughly 2 s is connection setup:
+TCP, the SSH banner exchange, an ephemeral key exchange and authentication — ~15 round trips on a link whose
+RTT is 90-135 ms. Phase-timed with `scp -vv`: authenticated at 0.93 s, first file byte after that. Every block
+pays it again because every block spawns a new `scp`, and SSH re-does the key exchange per connection on
+purpose (forward secrecy).
+
+Measured on the real link, byte-verified, 3 witnesses of ~10 MB per round, interleaved:
+
+| one connection PER file | 12.30 s median | 4.10 s/witness | 19.5 Mbit/s |
+| ONE connection for all three | 8.19 s median | 2.73 s/witness | **29.3 Mbit/s** |
+
+**+1.37 s per witness, +33 %.** The number that makes it credible rather than another artefact: the single
+connection reaches 29.3 Mbit/s, which IS this link's measured rate (25-29 Mbit/s on incompressible data). The
+per-file variant is stuck at 19.5 because two thirds of the way through every transfer it stops and re-handshakes.
+
+WHY NOT ControlMaster, WHICH ALREADY DOES THIS. Because it does not, for bulk. With `ControlMaster` the
+transfer runs in a SEPARATE process that talks to the master over a Unix socket, and the master relays every
+byte — an extra userspace hop on the whole payload. Measured twice: it saves ~0.9 s of handshake on a 1 KB
+payload (which is why `retrieve` uses it and gains 1.1 s) and gives all of it back on a multi-MB stream
+(3.63 s fresh vs 3.93 s warm; and 3.12 vs 4.43 s/file with `scp -O`). Here the long-lived `ssh` IS the data
+path — one process, no relay — which is the whole difference.
+
+DIRECTION. The prover is behind NAT and the box is not, so only the prover can open the connection; that is
+already why `PULL_VIA` exists. So the durable process lives on the PROVER, and `prove_remote` (on the box) asks
+it for a block over the short control connection it already holds.
+
+  prover:  witness-pump serve            long-lived: holds `ssh box … witness-pump send`
+  box:     witness-pump send             reads a path per line, writes LE64(len) + bytes
+  prover:  witness-pump get SRC DST      what prove_remote calls; returns 0 on success
+
+ONE TRANSFER AT A TIME, deliberately. Requests are served serially. Two concurrent bulk streams on this link
+is the failure mode that took inputs from 4 s to 24-34 s while the queue grew — see RTP-FINDINGS. A serial
+pump cannot reproduce it.
+
+FAILURE IS SLOW, NEVER FATAL. Anything that goes wrong — pump not running, socket stale, ssh dead, short read —
+makes `get` exit non-zero, and prove_remote falls back to its own `scp`. That is the pre-pump behaviour, so the
+worst case is the old speed, not a stopped pipeline. The destination is written to `<dst>.part` and renamed only
+on a complete, length-checked read: a truncated transfer must never leave a file that prove_remote's
+name-and-size check would accept as a valid input.
+
+  PUMP_SOCK=~/.zisk-witness-pump.sock   PUMP_BOX=<ssh target of the box, as the PROVER sees it>
+  PUMP_SSH_OPTS="-C -o BatchMode=yes"   PUMP_TIMEOUT=120 (seconds for one transfer)
+"""
+import os, socket, struct, subprocess, sys, time
+
+SOCK    = os.path.expanduser(os.environ.get("PUMP_SOCK") or "~/.zisk-witness-pump.sock")
+BOX     = os.environ.get("PUMP_BOX") or ""
+SSHOPTS = (os.environ.get("PUMP_SSH_OPTS") or "-C -o BatchMode=yes").split()
+TIMEOUT = float(os.environ.get("PUMP_TIMEOUT") or 120)
+# Where this same script lives ON THE BOX. Overridable so the pump can be exercised against a staged copy
+# before the repo carries it, and so a non-default clone path does not require editing the source.
+REMOTE_CMD = os.environ.get("PUMP_REMOTE_CMD") or "zkvm-bench/infra/zisk-infra/witness-pump"
+HDR     = struct.Struct("<q")          # LE64 length; negative = the sender could not read the file
+
+
+def log(msg):
+    print(f"{time.strftime('%H:%M:%S')} witness-pump: {msg}", flush=True)
+
+
+# ── box side ────────────────────────────────────────────────────────────────────────────────────────
+def mode_send():
+    """Read one path per line on stdin; for each, write LE64(size) then the bytes. A negative length says
+    "could not read this one" and keeps the stream usable — the alternative is dying and making the pump
+    reconnect for what is usually a typo or a pruned witness."""
+    out = sys.stdout.buffer
+    for line in sys.stdin:
+        path = line.strip()
+        if not path:
+            continue
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                out.write(HDR.pack(size))
+                sent = 0
+                while sent < size:
+                    chunk = f.read(1 << 20)
+                    if not chunk:                       # file shrank under us: the reader will time out
+                        break                           # rather than be handed a short body silently
+                    out.write(chunk)
+                    sent += len(chunk)
+            out.flush()
+        except OSError:
+            out.write(HDR.pack(-1))
+            out.flush()
+    return 0
+
+
+# ── prover side: the long-lived pump ────────────────────────────────────────────────────────────────
+class Channel:
+    """The persistent ssh to the box. Reconnects lazily, so an outage costs one failed request."""
+
+    def __init__(self):
+        self.p = None
+
+    def alive(self):
+        return self.p is not None and self.p.poll() is None
+
+    def connect(self):
+        if self.alive():
+            return True
+        if not BOX:
+            log("PUMP_BOX is not set — nothing to connect to")
+            return False
+        # `exec` so the remote shell does not sit between us and the sender, holding a pipe buffer.
+        cmd = ["ssh", *SSHOPTS, BOX, f"exec {REMOTE_CMD} send"]
+        try:
+            self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL, bufsize=0)
+            log(f"channel open to {BOX}")
+            return True
+        except OSError as e:
+            log(f"cannot start the channel: {e}")
+            self.p = None
+            return False
+
+    def close(self):
+        if self.p is not None:
+            try:
+                self.p.stdin.close()
+                self.p.kill()
+            except OSError:
+                pass
+            self.p = None
+
+    def _readn(self, n, deadline):
+        """Read exactly n bytes or raise. A short read means the channel is broken, not that the file ended:
+        the length came from the sender, so anything less is a torn stream and must not be renamed into place."""
+        buf = bytearray()
+        while len(buf) < n:
+            if time.time() > deadline:
+                raise TimeoutError(f"timed out with {len(buf)}/{n} bytes")
+            chunk = self.p.stdout.read(min(1 << 20, n - len(buf)))
+            if not chunk:
+                raise ConnectionError(f"channel closed with {len(buf)}/{n} bytes")
+            buf += chunk
+        return bytes(buf)
+
+    def fetch(self, src, dst):
+        """Pull one file. Returns its size. Raises on any problem; the caller reports and lets the box fall
+        back to scp."""
+        if not self.connect():
+            raise ConnectionError("no channel")
+        deadline = time.time() + TIMEOUT
+        self.p.stdin.write((src + "\n").encode())
+        self.p.stdin.flush()
+        (size,) = HDR.unpack(self._readn(HDR.size, deadline))
+        if size < 0:
+            raise FileNotFoundError(f"the box could not read {src}")
+        part = dst + ".part"
+        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+        got = 0
+        with open(part, "wb") as f:
+            while got < size:
+                chunk = self._readn(min(1 << 20, size - got), deadline)
+                f.write(chunk)
+                got += len(chunk)
+        os.replace(part, dst)          # atomic: no half-written input is ever visible under its real name
+        return size
+
+
+def mode_serve():
+    # A unix socket path is capped at ~104 bytes on macOS (108 on Linux), and the failure is a bare
+    # `OSError: AF_UNIX path too long` that says nothing about which path or why. The prover here is a Mac,
+    # so say it plainly — this is the same limit that bit the ssh ControlPath in prove_remote.
+    if len(SOCK.encode()) > 100:
+        log(f"PUMP_SOCK is too long for a unix socket ({len(SOCK)} bytes, limit ~104): {SOCK}")
+        log("  pick something short, e.g. PUMP_SOCK=/tmp/zisk-pump.sock")
+        return 1
+    if os.path.exists(SOCK):
+        os.unlink(SOCK)                                  # a stale socket from a killed pump
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCK)
+    srv.listen(8)
+    ch = Channel()
+    log(f"serving on {SOCK} (box={BOX or '<unset>'}, timeout={TIMEOUT:g}s)")
+    ch.connect()                                          # fail loudly at startup, not on the first block
+    try:
+        while True:
+            conn, _ = srv.accept()
+            with conn:
+                try:
+                    req = conn.makefile("r").readline().strip()
+                    src, _, dst = req.partition("\t")
+                    if not src or not dst:
+                        conn.sendall(b"ERR malformed request\n")
+                        continue
+                    t0 = time.time()
+                    try:
+                        n = ch.fetch(src, dst)
+                    except FileNotFoundError as e:
+                        # The box could not read it, and said so with a clean negative length — the stream is
+                        # still correctly framed, so KEEP the channel. This is a routine case, not a fault:
+                        # retention deletes a framed input once its proof is in hand, so the pump will be
+                        # asked for pruned blocks in normal operation. Tearing the channel each time would
+                        # spend ~2 s reconnecting for nothing.
+                        log(f"absent: {os.path.basename(src)} — the prover will scp it instead")
+                        conn.sendall(f"ERR {e}\n".encode())
+                        continue
+                    except Exception as e:
+                        # Any TRANSPORT error, though, must drop the channel: a torn stream leaves unread
+                        # bytes in the pipe, and the next request would read THOSE as its length. Reconnecting
+                        # is cheap (~2 s, once); mis-framing every later transfer is not recoverable.
+                        ch.close()
+                        log(f"FAILED {os.path.basename(src)}: {e} — the prover will scp it instead")
+                        conn.sendall(f"ERR {e}\n".encode())
+                        continue
+                    dt = time.time() - t0
+                    log(f"streamed {os.path.basename(src)} {n/1048576:.1f} MB in {dt:.2f}s "
+                        f"({n*8/dt/1e6:.1f} Mbit/s)" if dt > 0 else f"streamed {os.path.basename(src)}")
+                    conn.sendall(f"OK {n}\n".encode())
+                except OSError as e:
+                    log(f"client error: {e}")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ch.close()
+        try:
+            os.unlink(SOCK)
+        except OSError:
+            pass
+    return 0
+
+
+# ── prover side: the one-shot client prove_remote calls ─────────────────────────────────────────────
+def mode_get(src, dst):
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(TIMEOUT + 10)
+        c.connect(SOCK)
+    except OSError as e:
+        print(f"witness-pump: no pump at {SOCK} ({e})", file=sys.stderr)
+        return 1
+    with c:
+        c.sendall(f"{src}\t{dst}\n".encode())
+        reply = c.makefile("r").readline().strip()
+    if reply.startswith("OK "):
+        return 0
+    print(f"witness-pump: {reply or 'no reply'}", file=sys.stderr)
+    return 1
+
+
+def main(argv):
+    if len(argv) < 2:
+        print(__doc__.strip().splitlines()[0], file=sys.stderr)
+        print("usage: witness-pump {send|serve|get SRC DST}", file=sys.stderr)
+        return 2
+    m = argv[1]
+    if m == "send":
+        return mode_send()
+    if m == "serve":
+        return mode_serve()
+    if m == "get":
+        if len(argv) != 4:
+            print("usage: witness-pump get SRC DST", file=sys.stderr)
+            return 2
+        return mode_get(argv[2], argv[3])
+    print(f"unknown mode: {m}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

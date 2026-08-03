@@ -240,12 +240,36 @@ prove_remote() {
     # CONSUMES STDIN and eats the rest of the list, so the loop transfers one file while the scp arm transfers
     # three. Use `ssh -n` in a loop, and verify bytes received, not just elapsed time. The tell was a result
     # above the link rate — 69 Mbit/s on a 28 Mbit/s link is a broken measurement, never a fast one.
-    echo "Pulling input from $PULL_VIA (direct, bypassing the tunnel for the payload)..."
-    if "${ssh[@]}" "scp -q $pull_opts '$PULL_VIA:$abs_input' '$ws/inputs/$in_name'"; then
-      pulled=1
-    else
-      echo "WARNING: $REMOTE could not pull from $PULL_VIA — falling back to pushing through the tunnel." >&2
-      echo "         Check from the remote: ssh $pull_opts $PULL_VIA true" >&2
+    # WITNESS_PUMP — the one thing that DOES move this number: a connection that stays open across blocks.
+    #
+    # What the ~2 s of per-block setup buys nobody: TCP, banner, key exchange, auth, ~15 round trips at
+    # 90-135 ms RTT, repaid on every block because every block spawns a fresh scp. A long-lived channel pays
+    # it once. Measured byte-verified on the real link, 3 witnesses of ~10 MB, interleaved:
+    #   one connection per file : 12.30 s median -> 4.10 s/witness, 19.5 Mbit/s
+    #   ONE streaming connection:  8.19 s median -> 2.73 s/witness, 29.3 Mbit/s  (= the link's own rate)
+    # End to end through the pump itself: 2.36-2.57 s per witness at 32.7-37.8 Mbit/s. **~1.6 s per block.**
+    #
+    # This is NOT what ControlMaster does, which is why that measured neutral-to-harmful above: there the
+    # transfer is a separate process relaying every byte through the master over a unix socket. Here the
+    # long-lived ssh IS the data path — one process, no relay. See infra/zisk-infra/witness-pump.
+    #
+    # Tried first, and its failure is never fatal: no pump, stale socket, dead channel or a pruned witness all
+    # just exit non-zero and drop through to the scp below. Worst case is the old speed, not a stalled block.
+    local via="scp"
+    if [[ -n "${WITNESS_PUMP:-}" ]] \
+       && "${ssh[@]}" "${PUMP_SOCK:+PUMP_SOCK=$PUMP_SOCK }$WITNESS_PUMP get '$abs_input' '$ws/inputs/$in_name'"; then
+      pulled=1; via="pump"
+      echo "Pulled input over the persistent channel (setup paid once, not per block)."
+    fi
+    if [[ $pulled == 0 ]]; then
+      [[ -n "${WITNESS_PUMP:-}" ]] && echo "NOTE: the pump did not serve this block — using scp." >&2
+      echo "Pulling input from $PULL_VIA (direct, bypassing the tunnel for the payload)..."
+      if "${ssh[@]}" "scp -q $pull_opts '$PULL_VIA:$abs_input' '$ws/inputs/$in_name'"; then
+        pulled=1
+      else
+        echo "WARNING: $REMOTE could not pull from $PULL_VIA — falling back to pushing through the tunnel." >&2
+        echo "         Check from the remote: ssh $pull_opts $PULL_VIA true" >&2
+      fi
     fi
   fi
   if [[ $pulled == 0 ]]; then
