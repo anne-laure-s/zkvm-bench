@@ -227,6 +227,19 @@ prove_remote() {
     # it wants its own connection, which is what it had. Multiplexing pays off for MANY SMALL round trips (the
     # box->prover control calls, where it belongs and stays); it is the wrong tool for one bulk transfer.
     # The handshake it would have saved is ~0.3 s. The contention it caused was measured in seconds.
+    #
+    # NO -O, and no raw `ssh cat` either — both were tried and neither survives contact with production.
+    #
+    # `scp -O` (the legacy SCP protocol instead of SFTP) benched at 19 % on an 8-round A/B and delivered
+    # **+1 %** over 43 real blocks, size-normalised (0.572 -> 0.566 s/MB). A raw stream (`ssh host "cat f"`)
+    # benched 9 % better than -O, which on that showing is also noise. And on INCOMPRESSIBLE data with
+    # compression off — the clean test — scp and a raw stream are identical at 25-28 Mbit/s, i.e. the link.
+    # There is no protocol-level win here to collect.
+    #
+    # A cautionary note on how the 9 % nearly became "3.6x": in `while read f; do ssh ...; done < list`, ssh
+    # CONSUMES STDIN and eats the rest of the list, so the loop transfers one file while the scp arm transfers
+    # three. Use `ssh -n` in a loop, and verify bytes received, not just elapsed time. The tell was a result
+    # above the link rate — 69 Mbit/s on a 28 Mbit/s link is a broken measurement, never a fast one.
     echo "Pulling input from $PULL_VIA (direct, bypassing the tunnel for the payload)..."
     if "${ssh[@]}" "scp -q $pull_opts '$PULL_VIA:$abs_input' '$ws/inputs/$in_name'"; then
       pulled=1

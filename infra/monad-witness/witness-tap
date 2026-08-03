@@ -70,17 +70,13 @@ Config (env, all optional except the paths' defaults being sane on nyc-003):
   KEEP_RECENT=10 (never touched, may be in flight)      SKIP_AFTER=100 (un-proved -> abandoned)
   KEEP_SAMPLE=1000 (benchmark corpus)   KEEP_BIG_MB=14   KEEP_SLOW_SECS=45  (outliers worth profiling)
   ETHPROOFS_URL=               CLUSTER=  VM=ZisK  GUEST=monad-zisk  SOURCE=<hostname>
-  PROVER=                      ship each framed input to this ssh target as soon as it exists (off if empty)
-  PROVER_PORT=22  PROVER_WS=/workspace                  where its inputs/ live
-  SHIP_VIA=                    how the PROVER reaches THIS box, so the payload skips the reverse tunnel
-  SHIP_TIMEOUT=60              kill a push that outlives this; the prover then fetches the block itself
 
   ./witness-tap [--once] [--dry-run]
 
 --dry-run never deletes and never writes to the queue; it prints what it would do. Use it first: this is
 the only piece of the pipeline that removes files.
 """
-import csv, json, os, re, socket, subprocess, sys, tempfile, time, urllib.request
+import csv, json, os, re, socket, subprocess, sys, time, urllib.request
 
 WITNESS_RE = re.compile(r"^(\d+)\.witness$")
 
@@ -106,34 +102,6 @@ KEEP_SAMPLE   = int(env("KEEP_SAMPLE", 1000))    # block % this == 0 -> kept for
 KEEP_BIG_MB   = float(env("KEEP_BIG_MB", 14))    # witness this large -> kept (outlier worth profiling)
 KEEP_SLOW_SECS = float(env("KEEP_SLOW_SECS", 45))  # proof took this long -> kept (outlier)
 SETTLE_SECS   = float(env("SETTLE_SECS", 2))     # ignore a witness younger than this (still being written)
-# SHIP — push each framed input to the prover the moment it exists, instead of letting the prover fetch it
-# when it is already needed. Off unless PROVER is set, so nothing changes for a benchmark run.
-#
-# Why here and not in cli/prove-farm, which already has a prefetcher: the farm has to *predict* which block it
-# will take next, and it is wrong most of the time. Measured over 40 blocks at the tip, `--newest-first` means
-# the farm proves the newest available block, so the prefetcher's target is always "the next block to arrive" —
-# it waits for it, then races a 4-5 s transfer against the remainder of a ~7 s proof. Two nearly equal periods
-# drifting against each other, so it lands in beats: **35 % hits, transport 0.85 s on a hit and 5.20 s on a
-# miss, median 4.75 s with a 2.47 s standard deviation.** Bimodal, and the block size does not predict which
-# mode you get (6.6 MB on hits vs 7.4 MB on misses) — it is pure phase.
-#
-# The tap needs no prediction at all: it *knows* a witness exists, because it just framed it. Shipping from
-# here starts the transfer at the earliest physically possible instant and makes the hit unconditional.
-# prove_remote already accepts a pre-existing input by name+size, so nothing downstream changes.
-#
-# ONE transfer at a time, deliberately. The failure mode this replaces is two bulk streams sharing a 25 Mbit/s
-# link: when the farm fell behind, its stale prefetches ran concurrently with the critical-path pull and inputs
-# went to 24-34 s, size-independent, while `backlog` climbed 14 -> 31. A single in-flight push cannot do that.
-# At one 7 MB witness per 12 s slot the average demand is ~5 Mbit/s, so serial is not a constraint.
-PROVER        = env("PROVER")                    # ssh target of the prover, e.g. anne-laure@localhost
-PROVER_PORT   = env("PROVER_PORT", "22")
-PROVER_WS     = env("PROVER_WS", "/workspace")   # its zisk workspace; inputs/ live under it
-# How the PROVER reaches THIS box. Same inversion prove_remote uses: the payload rides a connection the prover
-# opens directly, not the reverse tunnel, which measured 3.8 Mbit/s against 25 for a direct link.
-SHIP_VIA      = env("SHIP_VIA")
-# A push that outlives this has lost its race anyway, and holding the single slot is worse than
-# dropping it: 3x the ~4-5 s a median witness takes, so a slow link still succeeds.
-SHIP_TIMEOUT  = float(env("SHIP_TIMEOUT", 60))
 ETHPROOFS_URL = env("ETHPROOFS_URL")
 CLUSTER       = env("CLUSTER")
 VM            = env("VM", "ZisK")
@@ -241,103 +209,6 @@ def promote(block, wit, root_src, dry):
         log(f"ERROR: gen-inputs failed for {block}: {(r.stderr or r.stdout).strip().splitlines()[-1:]}")
         return ""
     return round(time.time(), 3)
-
-# Shipper state: at most one transfer in flight, plus the blocks waiting for it. Newest-first out of the
-# pending set, because the farm is --newest-first too: if we can only ship one, ship the one it will ask for.
-_ship_proc = None       # subprocess.Popen of the in-flight push, or None
-_ship_block = None      # which block it is carrying
-_ship_pending = []      # blocks framed but not yet shipped
-_ship_t0 = 0.0
-_ship_err = None       # path stderr is captured to (a file, never a pipe — see ship_pump)
-
-def ship_enqueue(block):
-    """Note that `block` has been framed and is ready to go. Cheap and non-blocking — the transfer itself is
-    started by ship_pump() so that a slow link can never delay the framing loop."""
-    if PROVER and block not in _ship_pending and block != _ship_block:
-        _ship_pending.append(block)
-
-def ship_pump(last_witness, dry):
-    """Reap a finished push, then start the next one. Called once per cycle; never blocks.
-
-    Stale entries are dropped rather than sent: a witness the farm has already moved past is exactly the
-    wasted transfer this whole mechanism exists to avoid. KEEP_RECENT is the right horizon — it is the same
-    "might still be in flight" window retention uses, so the two cannot disagree about what is live."""
-    global _ship_proc, _ship_block, _ship_t0, _ship_err
-    if not PROVER or dry:
-        return
-    if _ship_proc is not None:
-        rc = _ship_proc.poll()
-        took = time.time() - _ship_t0
-        if rc is None:
-            # One at a time, by design — but never forever. A hung ssh (dead tunnel, black-holed link) would
-            # otherwise hold the single slot for the rest of the run and silently disable shipping entirely.
-            # A push that cannot finish in SHIP_TIMEOUT has already lost its race; the prover will fetch the
-            # block itself, which is the normal path, not an error.
-            if took > SHIP_TIMEOUT:
-                _ship_proc.kill()
-                _ship_proc.wait()
-                log(f"WARNING: shipping {_ship_block} timed out after {took:.0f}s — killed; the prover will "
-                    f"transfer it itself. (SHIP_TIMEOUT={SHIP_TIMEOUT:g})")
-            else:
-                return
-            rc = -1
-        elif rc == 0:
-            log(f"shipped {_ship_block} to the prover in {took:.1f}s (off the prover's critical path)")
-        if rc != 0:
-            # Say it out loud. The farm's prefetcher logged only successes, and a completely broken push was
-            # indistinguishable from having nothing to push — 12 minutes of total failure read as "the
-            # transport is slow". A best-effort path must still be a loud one.
-            #
-            # stderr goes to a FILE, not a pipe: a pipe that fills blocks the child forever, poll() then never
-            # returns, and the one shipping slot is wedged for good. Low probability, permanent consequence.
-            err = ""
-            try:
-                with open(_ship_err) as f:
-                    lines = [l.strip() for l in f if l.strip()]
-                err = lines[0] if lines else ""
-            except OSError:
-                pass
-            if took <= SHIP_TIMEOUT:
-                log(f"WARNING: shipping {_ship_block} FAILED rc={rc} after {took:.1f}s — the prover will "
-                    f"transfer it itself: {err or 'no stderr'}")
-        # Not safe_unlink(): that guard exists to protect the witness dir and rightly refuses a path outside
-        # it. This is our own scratch file in the temp dir, so remove it directly.
-        try:
-            os.unlink(_ship_err)
-        except (OSError, TypeError):
-            pass
-        _ship_proc, _ship_block, _ship_err = None, None, None
-    if not _ship_pending:
-        return
-    # Drop anything the farm has certainly passed, then take the newest of what is left.
-    if last_witness:
-        _ship_pending[:] = [b for b in _ship_pending if b > last_witness - KEEP_RECENT]
-    if not _ship_pending:
-        return
-    block = max(_ship_pending)
-    _ship_pending.remove(block)
-    src = os.path.join(QUEUE, f"{CHAIN_ID}-{block}.bin")
-    if not os.path.exists(src):
-        return
-    dst = f"{PROVER_WS}/inputs/{CHAIN_ID}-{block}.bin"
-    if SHIP_VIA:
-        # The prover pulls from us over its own direct connection; only this short command crosses the tunnel.
-        inner = (f"mkdir -p '{PROVER_WS}/inputs' && "
-                 f"scp -q -C -o BatchMode=yes -o StrictHostKeyChecking=accept-new '{SHIP_VIA}:{src}' '{dst}'")
-        cmd = ["ssh", "-o", "BatchMode=yes", "-p", PROVER_PORT, PROVER, inner]
-    else:
-        # No direct path back: push through whatever connection we have. Slower, still correct.
-        cmd = ["sh", "-c",
-               f"ssh -o BatchMode=yes -p {PROVER_PORT} {PROVER} \"mkdir -p '{PROVER_WS}/inputs'\" && "
-               f"scp -q -C -o BatchMode=yes -P {PROVER_PORT} '{src}' '{PROVER}:{dst}'"]
-    try:
-        _ship_err = os.path.join(tempfile.gettempdir(), f"witness-tap-ship-{block}.err")
-        with open(_ship_err, "wb") as errf:
-            _ship_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errf)
-        _ship_block, _ship_t0 = block, time.time()
-    except OSError as e:
-        log(f"WARNING: could not start the push for {block}: {e}")
-        _ship_proc, _ship_block, _ship_err = None, None, None
 
 def prove_status():
     """block -> (status, prove_secs) for THIS guest, read from cli/prove-farm.csv — the same record its
@@ -539,9 +410,6 @@ def cycle(seen, dry):
                     # Framing failed: leave the raw witness, record nothing, retry next cycle. Writing a
                     # manifest row here would mark the block seen and it would never come back.
                     continue
-                # Framed and on disk: hand it to the shipper. Queued, not sent — ship_pump() decides when,
-                # so a slow or broken link cannot stall the framing of the next block.
-                ship_enqueue(b)
             # A dry run must NOT record anything: a recorded block is never reprocessed, so writing the
             # manifest here would make the following real run skip the promotion it just previewed.
             if dry:
@@ -565,10 +433,6 @@ def cycle(seen, dry):
                 safe_unlink(wit, dry)
                 safe_unlink(rootf, dry)
 
-    # Reap/advance the shipper before retention, so a block still being pushed is never a candidate for
-    # deletion in the same cycle. (KEEP_RECENT already protects it, but the ordering makes that independent
-    # of the horizon anyone later picks.)
-    ship_pump(last, dry)
 
     # Retention runs over everything present, driven by what the prover has actually done.
     dropped, abandoned, kept = prune(blocks, last, sizes, status, dry)
