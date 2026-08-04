@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""netprofile — remember every network this prover has run on, and what it measured there.
+
+WHY THIS EXISTS, and it is not primarily about tuning. Over one session the prover moved between two Wi-Fi
+networks, and every throughput figure gathered on the first was silently reused as a reference on the second:
+
+  802.11n  2.4 GHz  ch 1   20 MHz   57 Mbit/s PHY   RTT 137 ms (sigma 68)   one stream 20 Mbit/s
+  802.11ac 5 GHz    ch 128 80 MHz  866 Mbit/s PHY   RTT  85 ms (sigma 11)   one stream 32-62 Mbit/s
+
+The "25-29 Mbit/s link" recorded in RTP-FINDINGS and used in a dozen calculations was the FIRST WI-FI, never the
+WAN — which does 47-62 Mbit/s. Half a day of arithmetic was off by ~2x for want of knowing the link had changed.
+So the first job here is measurement hygiene: say loudly when the link is not the one the numbers came from.
+
+WHAT IDENTIFIES A NETWORK. The gateway's MAC address plus the Wi-Fi channel and band:
+  * the MAC is stable per router and distinguishes two different boxes (the gateway IP does not — it is
+    192.168.1.x almost everywhere)
+  * channel+band distinguishes the 2.4 GHz and 5 GHz radios OF THE SAME router, which behave nothing alike
+  * the SSID is deliberately unused: macOS redacts it without Location permission, so it is not dependable
+
+WHAT IT MEASURES. RTT and jitter to the box, single-stream throughput, and N-stream aggregate throughput, on
+incompressible data with compression off. Incompressible because `ssh -C` on zeros measures gzip, not the link;
+compression off because the point is the pipe, not the payload.
+
+  netprofile probe   BOX     measure, store, print the verdict (exit 0; 2 if the link changed materially)
+  netprofile show    [BOX]   print what is remembered for the current network, measure nothing
+  netprofile params  BOX     print shell assignments for the current network (for `eval` in rtp-up)
+
+MEASURE ONLY WHEN THE LINK IS QUIET. A probe run while the pipeline is transferring measures its own
+interference — that mistake produced two contradictory curves in one afternoon here. rtp-up calls this BEFORE
+starting the prover, and `probe` refuses if it can see the pump serving.
+
+  NETPROFILE_DB=~/.zisk-networks.json   PROBE_MB=8   PROBE_NS=1,4   PROBE_ROUNDS=2
+"""
+import json, os, socket, subprocess, sys, time
+
+DB      = os.path.expanduser(os.environ.get("NETPROFILE_DB") or "~/.zisk-networks.json")
+PROBE_MB     = float(os.environ.get("PROBE_MB") or 8)
+PROBE_NS     = [int(x) for x in (os.environ.get("PROBE_NS") or "1,4").split(",")]
+PROBE_ROUNDS = int(os.environ.get("PROBE_ROUNDS") or 2)
+# How much a remembered figure may drift before the link counts as "not the one those numbers came from".
+# 35 %: below that is this link's own round-to-round spread; above it, comparisons across runs stop meaning
+# anything. The old network's single-stream samples spanned 20-62 Mbit/s across the day, which is why this is
+# a coarse gate and not a tight one.
+DRIFT = float(os.environ.get("NETPROFILE_DRIFT") or 0.35)
+
+
+def sh(*cmd, **kw):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=kw.get("t", 20)).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+# ── identity ────────────────────────────────────────────────────────────────────────────────────────
+def fingerprint():
+    """(id, human label). The id must be stable across reconnections and distinct per radio."""
+    gw = ""
+    for line in sh("route", "-n", "get", "default").splitlines():
+        if "gateway:" in line:
+            gw = line.split()[-1]
+    mac = ""
+    if gw:
+        out = sh("arp", "-n", gw)
+        for tok in out.replace("(", " ").replace(")", " ").split():
+            if tok.count(":") == 5:
+                mac = tok.lower()
+    chan = ""
+    prof = sh("system_profiler", "SPAirPortDataType", t=25)
+    seen_current = False
+    for line in prof.splitlines():
+        if "Current Network Information" in line:
+            seen_current = True
+        elif seen_current and "Channel:" in line:
+            chan = line.split(":", 1)[1].strip()
+            break
+    phy = ""
+    seen_current = False
+    for line in prof.splitlines():
+        if "Current Network Information" in line:
+            seen_current = True
+        elif seen_current and "PHY Mode:" in line:
+            phy = line.split(":", 1)[1].strip()
+            break
+    if not mac and not chan:
+        return "unknown", "unidentified link (no gateway MAC, no Wi-Fi)"
+    ident = f"{mac or 'nogw'}|{chan or 'wired'}"
+    label = f"{phy or '?'} {chan or 'wired'}".strip()
+    return ident, label
+
+
+# ── measurement ─────────────────────────────────────────────────────────────────────────────────────
+def measure(box):
+    """RTT + throughput. Returns a dict, or None if the box is unreachable."""
+    rtt = jit = None
+    # `ping` does not read ssh_config, so an ssh ALIAS is not a resolvable name: `nyc-003` is expanded to
+    # nyc-003.devcore4.com by a Host stanza, and pinging the alias silently fails and reports "RTT ?".
+    # `ssh -G` prints the config as ssh itself resolves it, which is the only reliable expansion.
+    host = box.split("@")[-1]
+    for line in sh("ssh", "-G", box, t=15).splitlines():
+        if line.startswith("hostname "):
+            host = line.split(None, 1)[1].strip()
+            break
+    out = sh("ping", "-c", "10", "-q", host, t=30)
+    for line in out.splitlines():
+        if "min/avg/max" in line:
+            parts = line.split("=")[-1].split("/")
+            try:
+                rtt, jit = float(parts[1]), float(parts[3].split()[0])
+            except (IndexError, ValueError):
+                pass
+    nbytes = int(PROBE_MB * 1048576)
+    remote_dir = "/tmp/netprofile.$$"
+    # Incompressible, and compression OFF on the wire: this measures the pipe. Files are made on the box and
+    # removed afterwards; nothing is left behind on a failure path either (the `; rm -rf` is unconditional).
+    mk = f"mkdir -p {remote_dir} && for i in $(seq 1 {max(PROBE_NS)}); do " \
+         f"head -c {nbytes} /dev/urandom > {remote_dir}/p$i.bin; done && echo {remote_dir}"
+    rdir = sh("ssh", "-o", "BatchMode=yes", box, mk, t=180)
+    if not rdir:
+        return None
+    res = {}
+    try:
+        for n in sorted(set(PROBE_NS)):
+            best = []
+            for _ in range(PROBE_ROUNDS):
+                procs, t0 = [], time.time()
+                for i in range(1, n + 1):
+                    procs.append(subprocess.Popen(
+                        ["ssh", "-n", "-q", "-o", "BatchMode=yes", box, f"cat {rdir}/p{i}.bin"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                ok = all(p.wait() == 0 for p in procs)
+                dt = time.time() - t0
+                if ok and dt > 0:
+                    best.append(n * nbytes * 8 / dt / 1e6)
+            if best:
+                best.sort()
+                res[n] = round(best[len(best) // 2], 1)
+    finally:
+        sh("ssh", "-o", "BatchMode=yes", box, f"rm -rf {rdir}", t=30)
+    if not res:
+        return None
+    return {"rtt_ms": rtt, "rtt_jitter_ms": jit, "mbit": res,
+            "probe_mb": PROBE_MB, "ts": int(time.time())}
+
+
+# ── registry ────────────────────────────────────────────────────────────────────────────────────────
+def load():
+    try:
+        with open(DB) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save(db):
+    tmp = DB + ".part"
+    with open(tmp, "w") as f:
+        json.dump(db, f, indent=2, sort_keys=True)
+    os.replace(tmp, DB)          # atomic: a killed probe must not leave a half-written registry
+
+
+def derive(m):
+    """Parameters this link implies. Kept separate from the measurement so a future consumer can be added
+    without re-probing every network already on file.
+
+    `channels` is the N whose aggregate first stops improving by more than 25 %, and rtp-up now APPLIES it:
+    witness-pump splits one witness across that many channels. It was worth nothing on the previous network —
+    four streams aggregated 38 Mbit/s there and that 38 was the WiFi ceiling, so real witnesses showed equal
+    medians. On this one, measured on a real 13.24 MB witness with the arm order alternated, n=8:
+    N=1 1.40 s -> N=4 1.00 s, paired +0.37 s, favourable 8/8. Unanimous, because this link's RTT jitter is
+    sigma 11 ms against the old one's 68 — the effect may have existed before and simply been unmeasurable."""
+    mb = m.get("mbit") or {}
+    ns = sorted(int(k) for k in mb)
+    best_n, prev = (ns[0] if ns else 1), None
+    for n in ns:
+        v = mb[n] if n in mb else mb[str(n)]
+        if prev is not None and v < prev * 1.25:
+            break
+        best_n, prev = n, v
+    return {"channels": best_n}
+
+
+def fmt(m):
+    mb = m.get("mbit") or {}
+    thr = "  ".join(f"N={n}:{mb[n] if n in mb else mb[str(n)]:.0f}" for n in sorted(int(k) for k in mb))
+    r = f"{m['rtt_ms']:.0f} ms" if m.get("rtt_ms") else "?"
+    j = f" (sigma {m['rtt_jitter_ms']:.0f})" if m.get("rtt_jitter_ms") else ""
+    return f"RTT {r}{j} · {thr} Mbit/s"
+
+
+def drifted(old, new):
+    """Did the single-stream figure move enough that older measurements are no longer comparable?"""
+    def one(m):
+        mb = m.get("mbit") or {}
+        return mb.get(1) or mb.get("1")
+    a, b = one(old), one(new)
+    if not a or not b:
+        return False
+    return abs(b - a) / a > DRIFT
+
+
+def main(argv):
+    if len(argv) < 2:
+        print(__doc__.strip().splitlines()[0], file=sys.stderr)
+        print("usage: netprofile {probe BOX|show [BOX]|params BOX}", file=sys.stderr)
+        return 2
+    mode = argv[1]
+    ident, label = fingerprint()
+    db = load()
+    known = db.get(ident)
+
+    if mode == "show":
+        if not known:
+            print(f"netprofile: this network ({label}) is not on file yet — run `netprofile probe <box>`")
+            return 0
+        print(f"netprofile: {label}  [{ident}]")
+        print(f"  measured   {fmt(known['last'])}")
+        print(f"  params     {known.get('params')}")
+        print(f"  first seen {time.strftime('%Y-%m-%d %H:%M', time.localtime(known['first_seen']))}"
+              f" · runs {known.get('runs', 1)}")
+        return 0
+
+    if mode == "params":
+        p = (known or {}).get("params") or {"channels": 1}
+        for k, v in p.items():
+            print(f"NETPROFILE_{k.upper()}={v}")
+        return 0
+
+    if mode != "probe" or len(argv) < 3:
+        print("usage: netprofile {probe BOX|show [BOX]|params BOX}", file=sys.stderr)
+        return 2
+    box = argv[2]
+
+    # Refuse while the pump is serving: a probe run against live traffic measures its own interference.
+    sock = os.environ.get("PUMP_SOCK") or os.path.expanduser("~/.zisk-witness-pump.sock")
+    if os.path.exists(sock):
+        try:
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); c.settimeout(2)
+            c.connect(sock); c.close()
+            print("netprofile: the pump is serving — refusing to probe (it would measure its own interference)",
+                  file=sys.stderr)
+            return 1
+        except OSError:
+            pass
+
+    print(f"netprofile: measuring {label} → {box} "
+          f"({PROBE_MB:g} MB x {PROBE_ROUNDS} rounds x N={PROBE_NS}, incompressible, no compression)")
+    m = measure(box)
+    if m is None:
+        print(f"netprofile: could not measure {box} — leaving the registry untouched", file=sys.stderr)
+        return 1
+    params = derive(m)
+    changed = False
+    if known is None:
+        print(f"netprofile: NEW NETWORK — {label}")
+        print(f"  {fmt(m)}")
+        db[ident] = {"label": label, "first_seen": m["ts"], "runs": 1, "last": m,
+                     "history": [m], "params": params}
+        changed = True
+    else:
+        was = known["last"]
+        print(f"netprofile: known network — {label}, seen {known.get('runs', 1)}x")
+        print(f"  before  {fmt(was)}")
+        print(f"  now     {fmt(m)}")
+        if drifted(was, m):
+            print(f"  !! single-stream throughput moved by more than {DRIFT*100:.0f}% — measurements taken on")
+            print(f"     this network BEFORE now are not comparable with the ones taken after.")
+            changed = True
+        known["last"] = m
+        known["runs"] = known.get("runs", 1) + 1
+        known["label"] = label
+        known.setdefault("history", []).append(m)
+        known["history"] = known["history"][-20:]      # bounded: a registry is not a time series database
+        known["params"] = params
+    save(db)
+    print(f"  params  {params}   (stored in {DB})")
+    # channels is recorded, not applied — see derive(). Say so rather than implying rtp-up will use it.
+    if params.get("channels", 1) > 1:
+        print(f"  note: N={params['channels']} would help, but parallel range fetching is not implemented"
+              f" — the figure is recorded for when it is.")
+    return 2 if changed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -46,12 +46,15 @@ name-and-size check would accept as a valid input.
   PUMP_SSH_OPTS="-C -o BatchMode=yes"   PUMP_TIMEOUT=120 (seconds for one transfer)
   PUMP_REMOTE_CMD=<path to this file on the box>
 """
-import os, socket, struct, subprocess, sys, time
+import os, socket, struct, subprocess, sys, threading, time
 
 SOCK    = os.path.expanduser(os.environ.get("PUMP_SOCK") or "~/.zisk-witness-pump.sock")
 BOX     = os.environ.get("PUMP_BOX") or ""
 SSHOPTS = (os.environ.get("PUMP_SSH_OPTS") or "-C -o BatchMode=yes").split()
 TIMEOUT = float(os.environ.get("PUMP_TIMEOUT") or 120)
+# Parallel channels for ONE witness. 1 = the single-channel path. netprofile measures the right value per
+# network and records it; rtp-up passes it. See Pool for why this exists again after being removed once.
+CHANNELS = max(1, int(os.environ.get("PUMP_CHANNELS") or 1))
 # Where this same script lives ON THE BOX. Overridable so the pump can be exercised against a staged copy
 # before the repo carries it, and so a non-default clone path does not require editing the source.
 REMOTE_CMD = os.environ.get("PUMP_REMOTE_CMD") or "zkvm-bench/infra/zisk-infra/witness-pump"
@@ -100,6 +103,22 @@ def mode_send():
                         f.write(b); got += len(b)
                 os.replace(part, dest)
                 out.write(HDR.pack(0))
+            elif req.startswith("GET\t"):
+                # A byte RANGE, so N channels can each carry a slice of one witness. `seek`, never
+                # `tail -c +N | head -c` — that was measured and it charges box-side pipe work to the network.
+                _, path, off, ln = req.split("\t", 3)
+                off, ln = int(off), int(ln)
+                with open(path, "rb") as f:
+                    f.seek(off)
+                    out.write(HDR.pack(ln))
+                    left = ln
+                    while left:
+                        chunk = f.read(min(1 << 20, left))
+                        if not chunk:
+                            break                       # file shrank: the reader times out on a short body
+                        out.write(chunk); left -= len(chunk)
+            elif req.startswith("SIZE\t"):
+                out.write(HDR.pack(os.path.getsize(req.split("\t", 1)[1])))
             else:
                 path = req
                 size = os.path.getsize(path)
@@ -127,8 +146,10 @@ def mode_send():
 class Channel:
     """The persistent ssh to the box. Reconnects lazily, so an outage costs one failed request."""
 
-    def __init__(self):
+    def __init__(self, idx=0):
+        self.idx = idx
         self.p = None
+        self.lock = threading.Lock()
 
     def alive(self):
         return self.p is not None and self.p.poll() is None
@@ -202,9 +223,38 @@ class Channel:
             raise ConnectionError(f"the box refused the push to {dest}")
         return size
 
+    def size_of(self, src):
+        deadline = time.time() + TIMEOUT
+        if not self.connect():
+            raise ConnectionError("no channel")
+        self.p.stdin.write(f"SIZE\t{src}\n".encode()); self.p.stdin.flush()
+        (n,) = HDR.unpack(self._readn(HDR.size, deadline))
+        if n < 0:
+            raise FileNotFoundError(src)
+        return n
+
+    def range_into(self, src, off, ln, part):
+        """Fetch [off, off+ln) and write it at that offset in `part`. Own fd, own seek — no shared position,
+        no lock. Measured: N threads writing one preallocated file this way costs 0.5 ms for 8 MB and is flat
+        in N, so the write path is not why an earlier version of this showed no gain."""
+        deadline = time.time() + TIMEOUT
+        if not self.connect():
+            raise ConnectionError(f"channel {self.idx}: no connection")
+        self.p.stdin.write(f"GET\t{src}\t{off}\t{ln}\n".encode()); self.p.stdin.flush()
+        (declared,) = HDR.unpack(self._readn(HDR.size, deadline))
+        if declared < 0:
+            raise FileNotFoundError(src)
+        if declared != ln:
+            raise ConnectionError(f"asked {ln} bytes at {off}, sender declared {declared}")
+        with open(part, "r+b") as f:
+            f.seek(off)
+            left = ln
+            while left:
+                b = self._readn(min(1 << 20, left), deadline)
+                f.write(b); left -= len(b)
+
     def fetch(self, src, dst):
-        """Pull one file. Returns its size. Raises on any problem; the caller reports and lets the box fall
-        back to scp."""
+        """Whole file over this one channel — the single-channel path, unchanged."""
         if not self.connect():
             raise ConnectionError("no channel")
         deadline = time.time() + TIMEOUT
@@ -225,6 +275,74 @@ class Channel:
         return size
 
 
+class Pool:
+    """N persistent channels, and one witness split across them.
+
+    WHY N > 1 IS BACK. It was built, measured worthless, and removed — on a link where four parallel streams
+    aggregated 38 Mbit/s and that 38 WAS the ceiling, because the prover sat on 802.11n / 2.4 GHz sharing a
+    channel with nine networks. There was nothing to win, and real witnesses confirmed it: equal medians.
+    The prover then moved to 802.11ac / 5 GHz / 80 MHz on an empty channel, and the numbers changed shape:
+
+      one stream 36.6 Mbit/s · four streams 78.5 Mbit/s aggregate · RTT 85 ms
+      and one stream reaches 47-62 Mbit/s on a 20 MB transfer but only 32-37 on 8 MB
+
+    That gap is slow-start, and a witness is 2-16 MB — squarely inside it. So N windows ramping at once now have
+    headroom that did not exist before. `infra/monad-witness/netprofile` is what measures and remembers this per
+    network, precisely so the decision is not carried across a move again.
+
+    STILL ONE WITNESS AT A TIME. N channels serve ONE request; requests are serialised by mode_serve. Two
+    different blocks in flight is the failure mode that took inputs to 24-34 s while the queue grew."""
+
+    def __init__(self, n):
+        self.chs = [Channel(i) for i in range(max(1, n))]
+
+    def connect_all(self):
+        return sum(1 for c in self.chs if c.connect())
+
+    def close_all(self):
+        for c in self.chs:
+            c.close()
+
+    def fetch(self, src, dst):
+        if len(self.chs) == 1:
+            return self.chs[0].fetch(src, dst)
+        size = self.chs[0].size_of(src)
+        if size <= 0:
+            raise FileNotFoundError(src)
+        n = len(self.chs)
+        step = size // n
+        ranges = [(i * step, step if i < n - 1 else size - i * step) for i in range(n)]
+        ranges = [(o, l) for o, l in ranges if l > 0]        # a tiny file needs fewer channels than N
+        part = dst + ".part"
+        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+        with open(part, "wb") as f:
+            f.truncate(size)                                 # size it once so every worker can seek freely
+        errs, done = [], [0] * len(ranges)
+
+        def work(k, ch, off, ln):
+            try:
+                with ch.lock:
+                    ch.range_into(src, off, ln, part)
+                done[k] = ln
+            except Exception as e:                           # noqa: BLE001 — every failure is a fallback
+                errs.append(f"ch{ch.idx}: {e}")
+                ch.close()                                   # a torn stream would mis-frame later requests
+        ts = [threading.Thread(target=work, args=(k, self.chs[k], o, l), daemon=True)
+              for k, (o, l) in enumerate(ranges)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(TIMEOUT + 10)
+        if errs or sum(done) != size:
+            try:
+                os.unlink(part)
+            except OSError:
+                pass
+            raise ConnectionError("; ".join(errs) or f"reassembled {sum(done)}/{size} bytes")
+        os.replace(part, dst)      # all-or-nothing: a partial reassembly never appears under the real name
+        return size
+
+
 def mode_serve():
     # A unix socket path is capped at ~104 bytes on macOS (108 on Linux), and the failure is a bare
     # `OSError: AF_UNIX path too long` that says nothing about which path or why. The prover here is a Mac,
@@ -238,9 +356,9 @@ def mode_serve():
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(SOCK)
     srv.listen(8)
-    ch = Channel()
-    log(f"serving on {SOCK} (box={BOX or '<unset>'}, timeout={TIMEOUT:g}s)")
-    ch.connect()                                          # fail loudly at startup, not on the first block
+    pool = Pool(CHANNELS)
+    log(f"serving on {SOCK} (box={BOX or '<unset>'}, channels={CHANNELS}, timeout={TIMEOUT:g}s)")
+    log(f"channels open: {pool.connect_all()}/{CHANNELS}")                                          # fail loudly at startup, not on the first block
     try:
         while True:
             conn, _ = srv.accept()
@@ -256,7 +374,7 @@ def mode_serve():
                         continue
                     t0 = time.time()
                     try:
-                        n = ch.push(src, dst) if op == "put" else ch.fetch(src, dst)
+                        n = pool.chs[0].push(src, dst) if op == "put" else pool.fetch(src, dst)
                     except FileNotFoundError as e:
                         # The box could not read it, and said so with a clean negative length — the stream is
                         # still correctly framed, so KEEP the channel. This is a routine case, not a fault:
@@ -270,7 +388,7 @@ def mode_serve():
                         # Any TRANSPORT error, though, must drop the channel: a torn stream leaves unread
                         # bytes in the pipe, and the next request would read THOSE as its length. Reconnecting
                         # is cheap (~2 s, once); mis-framing every later transfer is not recoverable.
-                        ch.close()
+                        pool.close_all()
                         log(f"FAILED {os.path.basename(src)}: {e} — the prover will scp it instead")
                         conn.sendall(f"ERR {e}\n".encode())
                         continue
@@ -283,7 +401,7 @@ def mode_serve():
     except KeyboardInterrupt:
         pass
     finally:
-        ch.close()
+        pool.close_all()
         try:
             os.unlink(SOCK)
         except OSError:

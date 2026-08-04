@@ -230,14 +230,44 @@ if [ -z "$PROVER" ]; then
   # PUMP_SOCK stays SHORT — a unix socket path is capped at ~104 bytes on macOS, the same limit that bit the
   # ssh ControlPath, and the pump refuses to start rather than emit a bare "AF_UNIX path too long".
   run "pkill -f 'witness-pump serve' 2>/dev/null; rm -f '$PUMP_SOCK'; true"
-  run "PUMP_SOCK='$PUMP_SOCK' PUMP_BOX='$BOX' nohup '$MOCK_RUNNER_DIR/witness-pump' serve >> ~/witness-pump.log 2>&1 &"
+
+  # PROFILE THE LINK, now that nothing is transferring on it. This slot is the only valid one: the old pump is
+  # dead and the new one is not up, so the probe measures the network instead of measuring itself — the mistake
+  # that produced two contradictory throughput curves in one afternoon.
+  #
+  # Its first job is not tuning, it is measurement hygiene. Moving this prover between two Wi-Fi networks in one
+  # session silently reused the first link's figures as the second's reference: the "25-29 Mbit/s" in
+  # RTP-FINDINGS was 802.11n on a congested 2.4 GHz channel, while the WAN behind it does 47-62. Half a day of
+  # arithmetic was off by ~2x for want of a line saying "this is not the link those numbers came from".
+  #
+  # rc=2 means new-or-changed. It is deliberately NOT fatal — a link change is information, not an error.
+  PUMP_CHANNELS="${PUMP_CHANNELS:-}"
+  if [ "$DRY" != 1 ] && [ -x "$HERE/netprofile" ]; then
+    step "Link profile"
+    PUMP_SOCK="$PUMP_SOCK" "$HERE/netprofile" probe "$BOX" 2>&1 | sed 's/^/   /' || true
+    # And APPLY it. netprofile measures how many parallel channels this network rewards and remembers it per
+    # network; the pump splits one witness across that many. Measured on this link, real 13.24 MB witness,
+    # order alternated, sha-verified, n=8: 1.40 s -> 1.00 s, paired +0.37 s, favourable 8/8 — the first
+    # unanimous result in this whole investigation, and it is unanimous because the new link's RTT jitter is
+    # sigma 11 ms instead of 68, so a 0.37 s effect is finally above the noise.
+    # An explicit PUMP_CHANNELS in the environment always wins, for pinning a measurement.
+    if [ -z "$PUMP_CHANNELS" ]; then
+      eval "$("$HERE/netprofile" params "$BOX" 2>/dev/null || true)"
+      PUMP_CHANNELS="${NETPROFILE_CHANNELS:-1}"
+      say "channels: $PUMP_CHANNELS (from the link profile — PUMP_CHANNELS=N to pin it)"
+    else
+      say "channels: $PUMP_CHANNELS (pinned)"
+    fi
+  fi
+  PUMP_CHANNELS="${PUMP_CHANNELS:-1}"
+  run "PUMP_SOCK='$PUMP_SOCK' PUMP_BOX='$BOX' PUMP_CHANNELS='$PUMP_CHANNELS' nohup '$MOCK_RUNNER_DIR/witness-pump' serve >> ~/witness-pump.log 2>&1 &"
   if [ "$DRY" != 1 ]; then
     # Give it a moment to bind and open the channel, then check BOTH: a socket with no channel behind it
     # would fail every block silently into the scp fallback, which is exactly the "deployed but not working"
     # trap this script exists to catch.
     sleep 3
-    if [ -S "$PUMP_SOCK" ] && grep -q 'channel open' ~/witness-pump.log 2>/dev/null; then
-      say "witness-pump serving on $PUMP_SOCK, channel open to $BOX"
+    if [ -S "$PUMP_SOCK" ] && grep -q 'channels open' ~/witness-pump.log 2>/dev/null; then
+      say "witness-pump serving on $PUMP_SOCK, $PUMP_CHANNELS channel(s) to $BOX"
     else
       say "WARNING: witness-pump did not come up — every block will fall back to scp (~1.4 s slower each)"
       say "  check: tail ~/witness-pump.log"
