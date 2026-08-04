@@ -31,6 +31,19 @@ Each run is saved (never overwritten) under `runs/mg-<chain>-<block>-<ts>/`:
 `timing.txt` (`workers_secs` / `aggregate_secs` / `total_secs` / `num_segments`) · `worker-*.log` ·
 `aggregate.log` · `gpu-util.csv` · `proof.json` · `env.txt`.
 
+### Single GPU / no aggregation
+`NUM_GPUS=1` is a first-class case: one worker proves **every** segment on GPU 0 (serially, like the
+stock prover), then the same single aggregate step.
+```sh
+NUM_GPUS=1 ./submit.sh 20000000                  # single-GPU, end-to-end (app proofs + final STARK)
+NUM_GPUS=1 SKIP_AGGREGATE=1 ./submit.sh 20000000 # app-proof phase only — segments kept, no final STARK
+./aggregate.sh runs/mg-1-20000000-<ts>           # finish that run later (same record, updated in place)
+```
+`SKIP_AGGREGATE=1` reports `"mode": "prove-segments"` and `aggregate_secs=skipped`, so a partial run
+is never mistaken for a complete block proof. Aggregation is single-GPU no matter how many GPUs the
+app phase used, so its cost is identical at `NUM_GPUS=1` and `NUM_GPUS=8` — splitting it out lets you
+get the app proofs first and decide whether to pay the (still unmeasured on GPU) tail.
+
 ## All blocks (the full benchmark set)
 `prove-all.sh` sweeps every cached block through `submit.sh` (path ①) — resume-able, one run record each:
 ```sh

@@ -9,7 +9,14 @@
 # latency (the ethproofs metric).
 #
 #   NUM_GPUS=8 ./submit.sh <block>
+#   NUM_GPUS=1 ./submit.sh <block>                  # single-GPU: 1 worker proves every segment
+#   NUM_GPUS=1 SKIP_AGGREGATE=1 ./submit.sh <block> # app-proof phase only (segments kept on disk)
 # Timing (timing.txt): workers_secs (the fan-out) + aggregate_secs + total_secs (the latency).
+#
+# SKIP_AGGREGATE=1 stops after the workers: you get the per-segment app proofs (the phase that
+# actually scales with GPUs) without paying the single-GPU aggregation tail, which is the long,
+# still-unmeasured part (docs/openvm-benchmark.md). The segments are kept, so `./aggregate.sh <run>`
+# can finish the same run into a final STARK later.
 set -uo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
@@ -69,18 +76,28 @@ if [[ "$fail" != 0 ]]; then echo ">>> a worker FAILED — see $run/worker-*.log"
 nseg=$(ls "$segdir"/seg-*.bitcode 2>/dev/null | wc -l | tr -d ' ')
 echo "workers done: $nseg segment proofs in $((t1 - t0))s"
 
-ta=$(date +%s)
-# shellcheck disable=SC2086
-RUST_LOG="${RUST_LOG:-info}" "$BIN" --mode aggregate --segments-out "$segdir" --output-dir "$run" \
-  "${common[@]}" $extra > "$run/aggregate.log" 2>&1 \
-  || { echo ">>> aggregate FAILED — see $run/aggregate.log" >&2; exit 1; }
-t2=$(date +%s)
+agg_secs=""
+if [[ "${SKIP_AGGREGATE:-0}" == 1 ]]; then
+  t2=$t1
+  echo "SKIP_AGGREGATE=1 — stopping after the app-proof phase (no final STARK)."
+  echo "  segment proofs kept in $segdir"
+  echo "  finish this run later with: ./aggregate.sh $run"
+else
+  ta=$(date +%s)
+  # shellcheck disable=SC2086
+  RUST_LOG="${RUST_LOG:-info}" "$BIN" --mode aggregate --segments-out "$segdir" --output-dir "$run" \
+    "${common[@]}" $extra > "$run/aggregate.log" 2>&1 \
+    || { echo ">>> aggregate FAILED — see $run/aggregate.log" >&2; exit 1; }
+  t2=$(date +%s)
+  agg_secs=$((t2 - ta))
+fi
 [[ -n "${SAMPLER:-}" ]] && { kill "$SAMPLER" 2>/dev/null || true; }
 
-{ echo "workers_secs=$((t1 - t0))"; echo "aggregate_secs=$((t2 - ta))"; echo "total_secs=$((t2 - t0))"
+{ echo "workers_secs=$((t1 - t0))"; echo "aggregate_secs=${agg_secs:-skipped}"; echo "total_secs=$((t2 - t0))"
   echo "num_segments=$nseg"; } | tee "$run/timing.txt"
 [[ -f "$run/gpu-util.csv" ]] && awk -F', *' '{if($4+0>p)p=$4+0} END{if(p)print "peak_vram_mib_per_gpu="p}' "$run/gpu-util.csv" | tee -a "$run/timing.txt"
-echo "block_hash (aggregate): $(grep -oE 'block_hash \(aggregate\): [0-9a-f]+' "$run/aggregate.log" | grep -oE '[0-9a-f]{64}' | head -1)"
+[[ -f "$run/aggregate.log" ]] && \
+  echo "block_hash (aggregate): $(grep -oE 'block_hash \(aggregate\): [0-9a-f]+' "$run/aggregate.log" | grep -oE '[0-9a-f]{64}' | head -1)"
 
 # ---- report.json — the shared cross-zkVM prove contract (see cli/report-schema.md), so
 # profiling/results.py reads OpenVM runs like sp1/zisk. Backend = "multi-process-multi-gpu" (path ①).
@@ -88,7 +105,7 @@ proof_bytes=""; [[ -f "$run/proof.json" ]] && proof_bytes="$(wc -c < "$run/proof
 # cycles (OpenVM work-unit): best-effort from the block's execute report if it was minted.
 cycles=""; exec_report="$ROOT/inputs/openvm-reth/${tag}.exec-report.json"
 [[ -f "$exec_report" ]] && cycles="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("cycles",""))' "$exec_report" 2>/dev/null || echo '')"
-python3 - "$run/report.json" "$BLOCK" "$N" "$((t2 - t0))" "$((t1 - t0))" "$((t2 - ta))" "$nseg" "$proof_bytes" "$cycles" "${keygen_excluded:-0}" <<'PY'
+python3 - "$run/report.json" "$BLOCK" "$N" "$((t2 - t0))" "$((t1 - t0))" "$agg_secs" "$nseg" "$proof_bytes" "$cycles" "${keygen_excluded:-0}" <<'PY'
 import json, sys
 p, block, n, total, workers, agg, nseg, pbytes, cycles, keyex = sys.argv[1:11]
 def num(x):
@@ -99,8 +116,10 @@ def num(x):
         try: return float(x)
         except ValueError: return None
 n_i = num(n)
+# No aggregation -> this is NOT a final STARK: say so, so a downstream reader never mistakes the
+# app-proof phase for a complete block proof.
 json.dump({
-    "mode": "prove-stark",
+    "mode": "prove-stark" if num(agg) is not None else "prove-segments",
     "zkvm": "OpenVM",
     "block": num(block),
     "num_gpus": n_i,

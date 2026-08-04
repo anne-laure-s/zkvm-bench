@@ -51,6 +51,17 @@ NUM_GPUS=8 cluster/submit.sh $BLOCK          # multi-GPU (path ①: one process 
 #     · gpu-util.csv · proof.json · env.txt
 ```
 
+**Single GPU** — same driver, one worker proving every segment (serially, like the stock prover):
+```sh
+NUM_GPUS=1 cluster/submit.sh $BLOCK                  # end-to-end: app proofs + final STARK
+NUM_GPUS=1 SKIP_AGGREGATE=1 cluster/submit.sh $BLOCK # app-proof phase only (segments kept on disk)
+cluster/aggregate.sh runs/mg-1-$BLOCK-<ts>           # finish that run later, same record updated in place
+```
+Aggregation is single-GPU whatever the app phase used, so it costs the same at 1 or 8 GPUs — and it is
+the long, still-unmeasured-on-GPU tail. `SKIP_AGGREGATE=1` gets you the app proofs first; the run then
+reports `"mode": "prove-segments"`, never passing for a complete block proof. Details:
+[cluster/README.md](cluster/).
+
 ### 4 · Mac — retrieve
 ```sh
 cluster/fetch-runs.sh $REMOTE $PORT          # from infra/openvm-infra/ -> results/
@@ -73,7 +84,7 @@ Pre-warm the cache first (`scripts/mint-witnesses.sh`, ~34 blocks, ship it) or k
 |------|------|
 | `run` | dispatcher — `build-elf` · `build-bin` · `gen-input` · `execute` · `prove` · `verify` |
 | `openvm-runner` | `openvm-reth-benchmark` wrapper; emits `report.json` (timings, proof_bytes, cycles) |
-| `cluster/` | on-box multi-GPU proving — **one process per GPU** (path ①, `submit.sh`); no coordinator |
+| `cluster/` | on-box proving — **one process per GPU** (path ①, `submit.sh`, `NUM_GPUS=1..8`); `aggregate.sh` finishes a run left un-aggregated; no coordinator |
 | `patches/` | the multi-GPU patch (`apply.sh`) + its manifest |
 | `guests/openvm-reth/guest.sh` | builds the benchmark binary (guest ELF `include_bytes!`'d in) |
 | `docs/` | multi-GPU design + patch, benchmark results |
