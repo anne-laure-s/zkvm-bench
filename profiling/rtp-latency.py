@@ -90,8 +90,20 @@ def read_runs(results_dir, chain_id, guest):
                 work = x.get("steps", x.get("cycles"))
             except (OSError, ValueError):
                 pass
+        # timing.json sits beside report.json and is the ONLY source for the transport phases — prove_remote
+        # writes it, nothing else has them. Optional on purpose: `--mock` without `--remote` never calls
+        # prove_remote, so those runs legitimately have no transport to report and the column stays empty
+        # rather than reading 0 (which would say "instant" where the truth is "did not happen").
+        tr = {}
+        try:
+            with open(os.path.join(os.path.dirname(rep), "timing.json")) as tf:
+                tr = json.load(tf)
+        except (OSError, ValueError):
+            pass
         if b not in out or t > out[b]["t_proved"]:
             out[b] = {"t_proved": t, "prove_secs": r.get("prove_secs"), "total_secs": r.get("total_secs"),
+                      "transport": tr.get("transport_secs"), "input_secs": tr.get("input_secs"),
+                      "retrieve_secs": tr.get("retrieve_secs"),
                       "proof_bytes": r.get("proof_bytes"), "mode": r.get("mode"),
                       "work": work, "backend": r.get("backend"),
                       "run_dir": os.path.dirname(rep)}
@@ -188,27 +200,42 @@ def main():
             # the run record's work-unit if it has one, else the profiler's exec-report
             "block": b, "mode": r["mode"], "work": r["work"] if r["work"] is not None else work.get(b),
             "proof_bytes": r["proof_bytes"],
-            "exec_lag": delta(m["t_witness"], m["t_block"]),      # chain time -> witness (incl. finality)
-            "queue": delta(m["t_queued"], m["t_witness"]),        # witness -> framed in the queue
+            # THE STAGES, as three prefixes and three nested totals. Each prefix is one machine's own work, so a
+            # regression lands on the stage that caused it instead of in a remainder. The totals nest —
+            # e2e >= pipeline >= service — so the difference between two of them IS the prefix between them,
+            # and no column is ever a subtraction of the others' errors.
+            "node":      delta(m["t_avail"],   m["t_block"]),     # the RPC node: block visible after its own ts
+            "witness":   delta(m["t_witness"], m["t_avail"]),     # the replay: execute + dump
+            "queue":     delta(m["t_queued"],  m["t_witness"]),   # the tap: framed into the prover queue
+            "transport": r["transport"],                          # prove_remote's own phases (timing.json)
             "prove_secs": r["prove_secs"],
-            "pipeline": delta(r["t_proved"], m["t_witness"]),     # THE number: witness -> proof in hand
+            # `service` is RECONSTRUCTED: the original column was lost, and its commit message said "without RPC
+            # time & queue time -> the pure latency of the pipeline". Defined here as everything after the block
+            # was offered to the prover, which is what excluding those two leaves: transport + prove + retrieve.
+            "service":   delta(r["t_proved"], m["t_queued"]),
+            "pipeline":  delta(r["t_proved"], m["t_witness"]),    # THE number: witness -> proof in hand
+            "e2e":       delta(r["t_proved"], m["t_block"]),      # chain time -> proof in hand, the whole thing
+            "exec_lag":  delta(m["t_witness"], m["t_block"]),     # kept: node+witness, the producer's total
             "submitted": s.get("ts"), "verified": s.get("verified"),
             # mock-cluster (local) says mode=mock; the mock prover on a real remote says backend=mock-remote
             "mock": s.get("mock") or r["mode"] == "mock" or "mock" in str(r.get("backend") or ""), "reason": s.get("reason"),
         })
 
     w = max(len("block"), 8)
-    hdr = (f"{'block':>{w}}  {'mode':<12} {'work':>13} {'chain→wit':>10} {'wit→queue':>10} "
-           f"{'prove':>8} {'wit→proof':>10}  verdict")
+    # Prefixes then totals, left to right, so the eye reads a block's life in order and the three nested totals
+    # sit together at the end where they can be compared.
+    hdr = (f"{'block':>{w}}  {'mode':<10} {'node':>6} {'witness':>8} {'queue':>6} {'transp':>7} "
+           f"{'prove':>7} │ {'service':>8} {'pipeline':>9} {'e2e':>7}  verdict")
     print(hdr); print("-" * len(hdr))
     for x in rows:
         verdict = ("✓ verified" if x["verified"] is True else
                    "✗ rejected" if x["verified"] is False else "—")
         if x["mock"]:
             verdict += "  [MOCK]"
-        print(f"{x['block']:>{w}}  {str(x['mode'] or '—'):<12} {str(x['work'] or '—'):>13} "
-              f"{fmt(x['exec_lag']):>10} {fmt(x['queue']):>10} {fmt(x['prove_secs']):>8} "
-              f"{fmt(x['pipeline']):>10}  {verdict}")
+        print(f"{x['block']:>{w}}  {str(x['mode'] or '—'):<10} {fmt(x['node']):>6} "
+              f"{fmt(x['witness']):>8} {fmt(x['queue']):>6} {fmt(x['transport']):>7} "
+              f"{fmt(x['prove_secs']):>7} │ {fmt(x['service']):>8} {fmt(x['pipeline']):>9} "
+              f"{fmt(x['e2e']):>7}  {verdict}")
 
     real = [x for x in rows if not x["mock"] and x["pipeline"] is not None]
     mocks = len(rows) - len([x for x in rows if not x["mock"]])
@@ -239,10 +266,15 @@ def main():
     else:
         print("no real proof yet — nothing to summarise.")
     if mocks:
-        print(f"{mocks} mock row(s) shown but EXCLUDED from the summary: a mock-cluster proof does not\n"
-              f"  measure a prover, AND cli/prove-farm --mock skips prove_remote entirely — so the witness\n"
-              f"  upload (~7 MB/block) and the proof download are ABSENT from these numbers, not modelled.\n"
-              f"  The pipeline latency above is optimistic by exactly those two transfers.")
+        # Do NOT claim the transfers are missing: that is true of `--mock` ALONE, and false of `--mock --remote`,
+        # which is the configuration actually used for RTP — there the witness really is shipped and the proof
+        # really is fetched. Saying otherwise made a measured pipeline read as an optimistic one.
+        print(f"{mocks} mock row(s) shown but EXCLUDED from the summary: the DURATION is modelled, not proved,\n"
+              f"  so it measures the plumbing, not a prover. Everything around it is real — with\n"
+              f"  `--mock --remote` the witness is shipped and the proof fetched exactly as they would be.\n"
+              f"  (`--mock` WITHOUT `--remote` skips prove_remote, and then both transfers are absent.)\n"
+              f"  Read e2e as bimodal: blocks proved on arrival, and blocks picked up later from the queue —\n"
+              f"  with --newest-first the latter were skipped first, so their e2e is a queue wait, not a latency.")
     if incoherent:
         print(f"{len(incoherent)} row(s) dropped as incoherent (proof older than its witness — records "
               f"from a different run): {', '.join(str(b) for b in incoherent[:6])}"

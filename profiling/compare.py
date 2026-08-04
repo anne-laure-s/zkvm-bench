@@ -434,6 +434,32 @@ def summarize(axis, rows, gas_map=None):
          'cv': (statistics.pstdev(ratios) / statistics.mean(ratios) * 100) if len(ratios) > 1 else 0.0}
     inv = {r['a']['work'] / r['b']['work']: b for b, r in rows.items() if r['b']['work']}
     s['block_min'], s['block_max'] = inv[s['ratio_min']], inv[s['ratio_max']]
+    # Two regimes, not one distribution. On ~22% of blocks `rsp` runs the BN254 pairing precompile in
+    # PURE SOFTWARE (substrate_bn::U256::mul = 40% of its work on those blocks, vs 6% elsewhere), while
+    # monad-sp1 spends 2.4%, zisk-reth 1.9% and monad-zisk 1.0% — so rsp, not the others, is the
+    # outlier. That single gap is what makes rsp *more expensive than Monad* on 68 blocks and drags the
+    # SP1 mean (1.16x) below its median (1.22x). Reporting one median silently averages an engine
+    # comparison with an rsp precompile gap, so both are computed.
+    #
+    # Detector: multiplication intensity (mul/work) above CURVE_Z x the axis median, for either guest.
+    # Multiplications are the signature of software 256-bit curve arithmetic and `mul` is counted for
+    # every block, so this needs no extra profiling. Calibrated on this data: at 2.5x it flags 80
+    # blocks and catches 100% of the 68 where the ratio flips, plus 12 pairing-heavy blocks where rsp
+    # stays ahead anyway — which is the physically meaningful population, not just the flips.
+    CURVE_Z = 2.5
+    if all((r[k].get('ops') or {}).get('mul') is not None and r[k].get('work')
+           for r in rows.values() for k in 'ab'):
+        it = {k: {b: r[k]['ops']['mul'] / r[k]['work'] for b, r in rows.items()} for k in 'ab'}
+        m = {k: statistics.median(it[k].values()) for k in 'ab'}
+        flag = {b for b in rows if any(it[k][b] > CURVE_Z * m[k] for k in 'ab')}
+        rat = lambda bs: [rows[b]['a']['work'] / rows[b]['b']['work']
+                          for b in bs if rows[b]['b']['work']]
+        clean = rat(set(rows) - flag)
+        if flag and clean:
+            s['curve'] = {'n': len(flag), 'z': CURVE_Z,
+                          'med_flag': statistics.median(rat(flag)),
+                          'med_clean': statistics.median(clean),
+                          'blocks': sorted(int(b) for b in flag)}
     # Representative REAL blocks at the median / p10 / p90 of the ratio (the "medoid" and the
     # quantile blocks). Deliberately not a synthetic median/decile profile: a flamegraph whose
     # every function carries its own cross-block median sums to no real block's total and matches
@@ -462,7 +488,7 @@ def summarize(axis, rows, gas_map=None):
     # Per-block shares, then the MEDIAN of those — not the aggregate (big blocks would dominate)
     # and not the median-ratio block alone (its ratio is typical, its composition need not be:
     # measured 11.2% vs a true 8.8% on the precompile row).
-    shares, opr, nrat, ncnt = {}, {}, {}, {}
+    shares, opr, nrat, ncnt, nvol = {}, {}, {}, {}, {}
     for r in rows.values():
         ca, cb = r['a'].get('cats'), r['b'].get('cats')
         if ca and cb:
@@ -482,6 +508,13 @@ def summarize(axis, rows, gas_map=None):
                     # the point of asking what kind of work a guest does
                     ncnt.setdefault(k, ([], []))[0].append(na[k])
                     ncnt[k][1].append(nb[k])
+                    # VOLUME as well as ratio. A ratio with no volume beside it invites chasing
+                    # noise: `divrem` reads 4.8x here on 0.012% of cycles, and sorting the table by
+                    # ratio puts it near the top. One column makes it self-disqualifying instead of
+                    # needing a hand-written warning per case.
+                    _tn = sum(na.values())
+                    if _tn:
+                        nvol.setdefault(k, []).append(na[k] / _tn)
         oa, ob = r['a'].get('ops'), r['b'].get('ops')
         if oa and ob:
             # Only when BOTH sides list the operation. ziskemu prints a TRUNCATED per-opcode table
@@ -520,7 +553,7 @@ def summarize(axis, rows, gas_map=None):
         if zisk:
             return {'all instructions': r.get('work'),
                     'arithmetic + logic': sum(o.values()) or None,
-                    'keccak calls': r.get('kec'),
+                    'keccak permutations': r.get('kec'),
                     'memory': None}
         return {'all instructions': r.get('work'),
                 'arithmetic + logic': (sum(g.get(k, 0) for k in ('branch','shift','mul','divrem'))
@@ -540,12 +573,21 @@ def summarize(axis, rows, gas_map=None):
     if opr:
         s['op_ratios'] = sorted(((k, statistics.median(v), len(v)) for k, v in opr.items()
                                  if len(v) >= need), key=lambda t: -t[1])
+    # What the per-opcode counter covers, relative to the work unit. On SP1 `ops` are genuine
+    # instruction counts and sum to ~54% of cycles (only some opcodes are grouped). On ZisK `opsn`
+    # sums to ~22x the STEP count — it is a per-opcode counter on an unrelated scale, so its
+    # magnitudes are NOT instruction counts and must not be labelled as such. Guest-to-guest ratios
+    # stay valid either way (same counter on both sides); absolute magnitudes do not.
+    _cov = [sum((r['a'].get('opsn') or r['a'].get('ops') or {}).values()) / r['a']['work']
+            for r in rows.values() if r['a'].get('work')]
+    if _cov: s['ops_coverage'] = statistics.median(_cov)
     if nrat:
-        # (op, ratio, blocks, median count A, median count B) — quantity as well as ratio
+        # (op, ratio, blocks, median count A, median count B, median share of the counted ops)
         s['insn_ratios'] = sorted(
             ((k, statistics.median(v), len(v),
               statistics.median(ncnt[k][0]) if ncnt.get(k) else None,
-              statistics.median(ncnt[k][1]) if ncnt.get(k) else None)
+              statistics.median(ncnt[k][1]) if ncnt.get(k) else None,
+              statistics.median(nvol[k]) if nvol.get(k) else None)
              for k, v in nrat.items() if len(v) >= need), key=lambda t: -t[1])
     at = [r['a'].get('secs') for r in rows.values() if r['a'].get('secs')]
     bt = [r['b'].get('secs') for r in rows.values() if r['b'].get('secs')]
@@ -623,8 +665,14 @@ def print_summary(s):
         print(f"  {u+'/Mgas (median)':22} {n(s['a_per_mgas']):>18} {n(s['b_per_mgas']):>18} "
               f"{x(s['a_per_mgas']/s['b_per_mgas']):>10}")
     if 'pw_unit' in s:
+        # This row printed the MEDIAN OF PER-BLOCK RATIOS while every other row in the table
+        # prints the quotient of the two medians it displays — so the third column was not the
+        # first divided by the second (1.361x next to 39.4G/28.6G = 1.376x), and it contradicted
+        # the same row in the HTML. Aggregate/aggregate here; the per-block median is printed
+        # below, where median-of-ratios belongs.
         print(f"  {'median '+s['pw_unit']+' (prover)':22} {n(s['a_pw_median']):>18} "
-              f"{n(s['b_pw_median']):>18} {x(s.get('pw_ratio_median')):>10}")
+              f"{n(s['b_pw_median']):>18} "
+              f"{x(s['a_pw_median']/s['b_pw_median'] if s.get('b_pw_median') else None):>10}")
     if 'a_nsecs_median' in s:      # honest time (gas-estimation pass off)
         print(f"  {'exec secs (median)':22} {s['a_nsecs_median']:>18.3f} {s['b_nsecs_median']:>18.3f} "
               f"{x(s['a_nsecs_median']/max(s['b_nsecs_median'],1e-9)):>10}")
@@ -635,6 +683,9 @@ def print_summary(s):
               f"{x(s['a_secs_median']/max(s['b_secs_median'],1e-9)):>10}")
     print(f"\n  per-block ratio  median {x(s['ratio_median'])}  mean {x(s['ratio_mean'])}  "
           f"p10 {x(s['ratio_p10'])}  p90 {x(s['ratio_p90'])}  cv {s['cv']:.1f}%")
+    if s.get('pw_ratio_median'):
+        print(f"  per-block {s['pw_unit']:6} median {x(s['pw_ratio_median'])}"
+              f"   (median of per-block ratios — not the quotient of the two medians above)")
     print(f"  spread           min {x(s['ratio_min'])} @{s['block_min']}   "
           f"max {x(s['ratio_max'])} @{s['block_max']}")
     if 'ratio_small' in s:
@@ -720,6 +771,17 @@ section{margin-top:38px;border-top:1px solid var(--line);padding-top:26px}
 .insight{background:linear-gradient(180deg,rgba(232,176,75,.10),rgba(232,176,75,.03));
  border:1px solid rgba(232,176,75,.28);border-radius:13px;padding:15px 17px;margin-bottom:20px;font-size:14px}
 .insight b{color:var(--accent)}.insight b.cA{color:var(--gold)}.insight b.cB{color:var(--blue)}
+.env{border-left:2px solid var(--accent-dim);background:rgba(176,156,247,.06);border-radius:0 8px 8px 0;
+ padding:11px 13px;margin:14px 0 0;font-size:12.5px;line-height:1.65;color:var(--fg)}
+.env b{color:var(--accent)}.env .cA{color:var(--gold)}.env .cB{color:var(--blue)}
+.env em{color:var(--muted);font-style:normal}
+.env code{font-family:var(--mono);font-size:11px;color:var(--accent)}
+table.cv{width:100%;border-collapse:collapse;margin:8px 0 0;font-size:12.5px}
+table.cv th{text-align:left;font-weight:500;color:var(--muted);font-size:11px;
+ text-transform:uppercase;letter-spacing:.08em;padding:4px 8px;border-bottom:1px solid var(--line)}
+table.cv td{padding:5px 8px;border-bottom:1px solid var(--line)}
+table.cv td:nth-child(2),table.cv td:nth-child(3){text-align:right;font-family:var(--mono)}
+table.cv td i{color:var(--muted);font-style:normal;font-size:11.5px}
 /* histogram */
 .hist{display:flex;align-items:flex-end;gap:2px;height:132px;margin:6px 0 0;position:relative}
 .one{position:absolute;top:0;bottom:0;width:0;border-left:1px dashed rgba(231,234,242,.45)}
@@ -744,13 +806,42 @@ section{margin-top:38px;border-top:1px solid var(--line);padding-top:26px}
 .hp .syn{font-size:12.5px;color:var(--fg);margin:8px 0 10px;line-height:1.55}
 .hp table{margin:0;font-size:11.5px}
 .hp th,.hp td{padding:.22rem .45rem}
-.hp .scroll{max-height:300px;overflow:auto}
-.hp .scroll table{min-width:100%;white-space:nowrap}
+/* `.scroll` is emitted by _table wherever that builder is used, but was only ever STYLED under
+   `.hp` — so outside the drill-down the div did nothing and its wide table spilled straight out of
+   the rounded card (the off-pattern block table, ~20 columns). The container is generic now; only
+   the height cap stays specific to the drill-down, which is the one that can run 80 rows. */
+/* `.scroll` is emitted by _table wherever that builder is used but was only ever STYLED under `.hp`,
+   so outside the drill-down the div did nothing and its table spilled out of the rounded card — and
+   gave the whole page a horizontal scrollbar. Height is capped as well as width, for two reasons
+   beyond length: it puts the horizontal bar inside the viewport (at the foot of a 950px-tall box it
+   is off-screen while you read the top rows), and vertical scrolling is what keeps the sticky header
+   alive — sticky pins to the nearest scrollport, so `overflow-x` alone silently kills it. */
+/* 100vh, not a tighter cap: the height limit must bite only when the table is taller than the screen,
+   since that is exactly when its horizontal bar would otherwise be unreachable. Anything shorter
+   renders whole and its bar comes into view on a normal page scroll. Measured at 90vh, a 20-row /
+   839px table inside an 863px viewport was capped for no benefit — it fit. */
+.scroll{overflow:auto;max-height:100vh}
+.scroll table{min-width:100%;white-space:nowrap}
+.hp .scroll{max-height:300px}
+/* Clipping alone gives no affordance: macOS overlay scrollbars are invisible at rest, so a cut-off
+   column reads as a truncated number rather than as "there is more to the right". A permanent thin
+   bar says it instead — preferred over a fade, which would dim real digits. */
+.scroll::-webkit-scrollbar{height:9px;width:9px}
+.scroll::-webkit-scrollbar-track{background:transparent}
+.scroll::-webkit-scrollbar-thumb{background:var(--line);border-radius:5px}
+.scroll::-webkit-scrollbar-thumb:hover{background:var(--dim)}
+/* Chrome >=121 ignores ::-webkit-scrollbar entirely once scrollbar-width/-color are set (measured:
+   the 9px gutter collapses to 0), so the standard properties go only to engines without the
+   pseudo-element — Firefox — instead of silently disabling the rules above. */
+@supports not selector(::-webkit-scrollbar){
+ .scroll{scrollbar-color:var(--line) transparent;scrollbar-width:thin}
+}
 /* Header row stays put while the body scrolls, so you can still tell which column you are in at
    row 80. Needs an OPAQUE background — the usual translucent th would let rows show through. */
 th{position:sticky;top:0;z-index:2;background:var(--panel2)!important;
   box-shadow:inset 0 -1px 0 var(--line)}
 .hint{font-family:var(--mono);font-size:10.5px;color:var(--dim);margin-top:8px}
+.hint.offr{margin:0 0 5px}   /* sits above its table, so the gap belongs underneath */
 /* "+24%" deviation badge next to a value. currentColor + opacity makes it inherit the hue of the
    figure it belongs to — muted red inside a ratio cell, muted gold/blue inside a paired one — so
    the badge is always visually tied to its own number. */
@@ -781,6 +872,11 @@ tbody tr:hover{background:var(--panel2)}
 .hi{color:var(--red);font-weight:600}.lo{color:var(--green);font-weight:600}
 .rbar{display:inline-block;height:6px;border-radius:3px;background:var(--green);vertical-align:middle;margin-right:6px}
 .rbar.over{background:var(--red)}
+/* No ratio exists when the other guest reports nothing in a family, and the colour has to say so:
+   the `over` test was `r and r >= 1`, so a missing ratio fell through to GREEN — reading as "Monad
+   spends less" on rows where it spends 23.8M against zero. Neutral for "not comparable". */
+.rbar.na{background:var(--dim);opacity:.5}
+.na{color:var(--dim);font-weight:600}
 details{margin-top:8px}summary{cursor:pointer;font-family:var(--mono);font-size:12px;color:var(--muted);
  padding:9px 0}summary:hover{color:var(--fg)}
 .note{color:var(--muted);font-size:12.5px;line-height:1.6;margin:12px 0 0}
@@ -826,7 +922,7 @@ function _cols(D, list, med) {
   const duo = (ka, kb, fmt) => e => '<td>' + (e[ka] == null ? '—' :
     '<span class=cA>' + fmt(e[ka]) + dev(ka, e[ka]) + '</span><br><span class=cB>' +
     fmt(e[kb]) + dev(kb, e[kb]) + '</span>') + '</td>';
-  if (has('kecA')) cols.push(['keccak calls', duo('kecA', 'kecB', _f)]);
+  if (has('kecA')) cols.push(['keccak perms', duo('kecA', 'kecB', _f)]);
   if (has('kecR')) cols.push(['keccak ratio', pcell('kecR', 'kecA', 'kecB')]);
   if (has('ecR'))  cols.push(['secp256k1 ratio', pcell('ecR', 'ecA', 'ecB')]);
   if (has('sysR')) cols.push(['all precompiles ratio', one('sysR', _x)]);
@@ -1026,10 +1122,131 @@ document.querySelectorAll('.hist').forEach(hist => {
     }
   }
 });
+
+// ── say when a table has columns off to the right ──────────────────────────────────────────────
+// A clipped column reads as a truncated number, not as "there is more". The horizontal bar exists
+// but sits at the foot of the box, which is below the fold on a tall table — so the cue has to be
+// above it. Counted from the layout, never asserted: a table that fits says nothing, and the count
+// is recomputed on resize. Runs last so it also sees the tables built by the code above.
+function _hidden(sc) {
+  const cells = sc.querySelector('tr') ? [...sc.querySelector('tr').cells] : [];
+  const edge = sc.getBoundingClientRect().right;
+  return cells.filter(c => c.getBoundingClientRect().right > edge + 1).length;
+}
+function _cue() {
+  document.querySelectorAll('.scroll').forEach(sc => {
+    let tag = sc.previousElementSibling;
+    if (!tag || !tag.classList.contains('offr')) {
+      tag = document.createElement('p');
+      tag.className = 'hint offr';
+      sc.parentElement.insertBefore(tag, sc);
+    }
+    const n = sc.scrollWidth > sc.clientWidth + 1 ? _hidden(sc) : 0;
+    const txt = n ? '▸ ' + n + ' more column' + (n > 1 ? 's' : '') +
+                    ' to the right — the table scrolls sideways' : '';
+    // write only on change: these writes are themselves DOM mutations, so an unconditional one turns
+    // any mutation-driven re-run into an endless loop
+    if (tag.textContent !== txt) tag.textContent = txt;
+    const disp = n ? '' : 'none';
+    if (tag.style.display !== disp) tag.style.display = disp;
+  });
+}
+_cue();
+addEventListener('resize', _cue);
+// The drill-down and per-block panels build their tables on click, long after this runs, so those
+// tables need a second pass. Driven by the click that creates them — bounded, unlike observing the
+// document, which _cue's own writes would retrigger forever.
+document.addEventListener('click', () => setTimeout(_cue, 0));
 """
 
 # Work families live in hotspots.py, next to its `module()` classifier — reading a profile is its
 # job, and putting them there means `hotspots diff` gets the same grouping. We only consume them.
+
+# Software BN254 pairing arithmetic, deliberately NARROWER than hotspots' `elliptic-curve crypto`
+# family: that family also holds secp256k1/ecrecover, which is identical between the guests (secp
+# syscall counts came out at exactly 1.000x over ~228k calls), so including it would dilute the very
+# thing being measured. These are the libraries that implement the BN254 (alt_bn128) pairing and
+# field arithmetic in pure Rust/C++, with no zkVM precompile behind them.
+# The accelerated counterpart: a patched crate backed by a zkVM precompile rather than plain Rust.
+# `zkvm_bn254_*` is the SP1-side patched symbol; `ziskos::zisklib` is ZisK's in-VM library. Measured
+# here, `rsp` is the ONLY guest with 0% of this and all its curve work in software — monad-sp1 runs
+# on the same backend and does have zkvm_bn254_g1_mul, so this is a missing patch, not a limit of SP1.
+BN254_ACCEL_RE = re.compile(r'zkvm_bn254|zkvm_secp|zisklib', re.I)
+
+BN254_RE = re.compile(r'substrate_bn|bn254|bn128|alt_bn|pairing|arkworks|ark_(bn|ec|ff)|blst'
+                      r'|(?<![a-z])Fq(?![a-z])|(?<![a-z])Fq2|G1Affine|G2Affine', re.I)
+
+
+def bn254_share(axis, side_k, blocks, cache):
+    """Mean share of a guest's attributed work spent in software BN254 arithmetic, over `blocks`.
+
+    Read from the SAME per-block cache profile_blocks fills, so it costs nothing extra and cannot
+    drift from what the family table shows. Returns (share, n_blocks_found) — n matters, because the
+    pairing-heavy regime holds only ~9 of the 50 profiled blocks."""
+    ax = AXES[axis]; side = ax[side_k]
+    stamp = int(os.path.getmtime(rp(side['elf'])))
+    tot, n = 0.0, 0
+    for b in blocks:
+        e = cache.get(f"fn2/{axis}/{side['name']}/{b}/{stamp}")
+        if not e or not e.get('fns'): continue
+        num = sum(c for fn, c in e['fns'] if BN254_RE.search(fn))
+        den = sum(c for _f, c in e['fns'])
+        if den: tot += num / den; n += 1
+    return (tot / n, n) if n else (None, 0)
+
+
+def bn254_paths(axis, side_k, blocks, cache):
+    """(software share, accelerated share, has_accel_symbol) over `blocks`, same cache.
+
+    Separating the two answers the actionable question: is a guest slow at pairing because the work
+    is inherently expensive, or because it never got the precompile-backed crate?"""
+    ax = AXES[axis]; side = ax[side_k]
+    stamp = int(os.path.getmtime(rp(side['elf'])))
+    soft = acc = den = 0
+    sym = False
+    for b in blocks:
+        e = cache.get(f"fn2/{axis}/{side['name']}/{b}/{stamp}")
+        if not e or not e.get('fns'): continue
+        for fn, c in e['fns']:
+            den += c
+            if BN254_ACCEL_RE.search(fn): acc += c; sym = True
+            elif BN254_RE.search(fn):     soft += c
+    return (soft / den, acc / den, sym) if den else (None, None, False)
+
+
+_HASH_RE = re.compile(r'keccak|sha3|sha256|tiny_keccak|blake|xor_block', re.I)
+
+
+def percall(axis, side_k, side, blocks, cache, rows, rx=_HASH_RE, counter=None):
+    """Attributed instructions of a symbol group, PER CALL of a shared precompile.
+
+    Generic on purpose: whenever both guests reach the same precompile, its own cost is identical per
+    call, so a family ratio built from instruction counts describes the WRAPPER, not the work. Read
+    alone it inverts the conclusion — a guest that uses the accelerated path can look like the one
+    hashing in software. Splitting per call separates the two.
+
+    The Pearson r matters as much as the median: a cost flat across a wide range of call counts does
+    not depend on payload size, which makes it per-call SETUP rather than work. Returns
+    (median, lo, hi, r, n) or None."""
+    ax = AXES[axis]; g = ax[side_k]['name']
+    stamp = int(os.path.getmtime(rp(ax[side_k]['elf'])))
+    xs, ys, rats = [], [], []
+    for b in blocks:
+        e = cache.get(f"fn2/{axis}/{g}/{b}/{stamp}")
+        r0 = rows.get(str(b)) or rows.get(b)
+        if not e or not e.get('fns') or not r0: continue
+        R = r0[side]
+        calls = counter(R) if counter else (R.get('kec') or (R.get('sys') or {}).get('KECCAK_PERMUTE'))
+        den = sum(c for _f, c in e['fns'])
+        if not calls or not den or not R.get('work'): continue
+        w = sum(c for fn, c in e['fns'] if rx.search(fn)) / den * R['work']
+        xs.append(calls); ys.append(w); rats.append(w / calls)
+    if len(rats) < 3: return None
+    mx, my = statistics.mean(xs), statistics.mean(ys)
+    num = sum((a - b_) * (c - my) for a, b_, c in ((a, mx, c) for a, c in zip(xs, ys)))
+    den2 = (sum((a - mx) ** 2 for a in xs) * sum((c - my) ** 2 for c in ys)) ** .5
+    return (statistics.median(rats), min(rats), max(rats), (num / den2 if den2 else 0.0), len(rats))
+
 
 def profile_blocks(axis, side_k, blocks, cache):
     """Profile one guest over SEVERAL blocks and fold the mean into work families.
@@ -1046,9 +1263,10 @@ def profile_blocks(axis, side_k, blocks, cache):
     # Cached PER BLOCK, not per block-list: raising the sample from 10 to 50 must profile 40 blocks,
     # not 50. The classification is part of each key — without it, editing hotspots' FAMILIES would
     # silently keep the old grouping (it did: a trie-node fix stayed invisible until cleared).
-    fv = hashlib.sha1(repr(hs.FAMILIES).encode()).hexdigest()[:8]
     stamp = int(os.path.getmtime(elf))
-    k1 = lambda b: f"fam1/{axis}/{side['name']}/{b}/{stamp}/{fv}"
+    # v2 caches RAW per-function counts, not family sums: the taxonomy then changes for free
+    # (it changed twice, and each time the old cache had to be thrown away).
+    k1 = lambda b: f"fn2/{axis}/{side['name']}/{b}/{stamp}"
     todo = [b for b in blocks if k1(b) not in cache]
     # Chunked: hotspots aborts the whole process on a single bad input, so profiling 50 blocks in one
     # call risked losing all of them (it did — an axis profiled for ~20 min and cached nothing).
@@ -1089,12 +1307,15 @@ def profile_blocks(axis, side_k, blocks, cache):
                             mb = re.search(r'(\d{6,})', tag)
                             b = tag2blk.get(mb.group(1)) if mb else None
                             if b is None: continue
-                            fams, tot = {}, 0
-                            for fn in e.get('functions', []):
-                                c = fn.get('count') or 0; tot += c
-                                fam = hs.family(f"{fn.get('module','')}::{fn.get('name','')}")
-                                fams[fam] = fams.get(fam, 0) + c
-                            cache[k1(b)] = {'fams': fams, 'total': tot}
+                            fns = sorted(((f"{fn.get('module','')}::{fn.get('name','')}",
+                                           fn.get('count') or 0)
+                                          for fn in e.get('functions', [])),
+                                         key=lambda t: -t[1])[:120]
+                            cache[k1(b)] = {'fns': fns,
+                                            'total': sum(c for _n, c in
+                                                         ((f"{fn.get('module','')}::{fn.get('name','')}",
+                                                           fn.get('count') or 0)
+                                                          for fn in e.get('functions', [])))}
         finally:
             for t in tmps:
                 if os.path.exists(t): os.remove(t)
@@ -1102,7 +1323,8 @@ def profile_blocks(axis, side_k, blocks, cache):
     if not got: return None
     fams = {}
     for g in got:
-        for k, v in g['fams'].items(): fams[k] = fams.get(k, 0) + v
+        for nm, c in g.get('fns', []):
+            k = hs.family(nm); fams[k] = fams.get(k, 0) + c
     n_ = len(got)
     return {'fams': {k: v / n_ for k, v in fams.items()},
             'total': sum(g['total'] for g in got) / n_, 'blocks': blocks, 'n': n_}
@@ -1146,7 +1368,11 @@ def _hist(ratios, s, rows=None, gas_map=None, tx_map=None):
         tx = r0['b'].get('txs') or r0['a'].get('txs') or tm.get(b)
         e = {'b': int(b), 'r': round(rat, 4), 'aw': r0['a']['work'], 'bw': r0['b']['work'],
              'g': g, 'tx': tx, 'pr': round(pa / pb, 4) if (pa and pb) else None,
-             'as': r0['a'].get('secs'), 'bs': r0['b'].get('secs')}
+             # nsecs first: `secs` carries SP1's gas-estimation pass, which reverses which guest
+             # looks faster on 26% of blocks here (block 25552073: 3.74s vs 5.26s gas-on says A wins,
+             # 2.13s vs 2.03s honest says it loses). Same fix as the metric bar row.
+             'as': r0['a'].get('nsecs') or r0['a'].get('secs'),
+             'bs': r0['b'].get('nsecs') or r0['b'].get('secs')}
         if g and tx: e['gtx'] = round(g / tx)
         # per-side work per Mgas: strips block size out, so a bucket groups by efficiency
         if g:
@@ -1224,7 +1450,10 @@ def _hist(ratios, s, rows=None, gas_map=None, tx_map=None):
         if not r0: continue
         d = {}
         for side, k in (('a', 'a'), ('b', 'b')):
-            o = r0[side].get('ops')
+            # opsn first: the panel says which opcodes a block "runs more of", i.e. COUNTS. On ZisK
+            # `ops` holds per-opcode COSTS (keccak 6.5e9 = calls x 25 x 3022), so the panel was
+            # comparing cost while labelled as operations. SP1's `ops` are already counts.
+            o = r0[side].get('opsn') or r0[side].get('ops')
             if o: d[k] = o
         if d: ops[b] = d
     payload = {'unit': s['unit'], 'A': s['a_name'], 'B': s['b_name'],
@@ -1242,7 +1471,83 @@ def _hist(ratios, s, rows=None, gas_map=None, tx_map=None):
             f"<span><i>swing</i> ±{s['cv']:.1f}%</span></div>"
             f"<script type='application/json' id='hd-{ax}'>{json.dumps(payload)}</script>"
             f"<div class=hp id='hp-{ax}'></div>"
-            f"<p class=hint>▸ click any bar to list the blocks it holds</p>")
+            f"<p class=hint>▸ click any bar to list the blocks it holds</p>"
+            + _curve_note(s))
+
+def _near(ratios, med, w=.10):
+    """Share of blocks within w of the median — measured, so the prose can't overstate clustering."""
+    return 100 * sum(1 for r in ratios if abs(r - med) / med <= w) / max(1, len(ratios))
+
+
+def _accel_note(s):
+    """Why one guest pays: software crate vs precompile-backed crate. The actionable half."""
+    pth = s.get('bn254_path') or {}
+    A, B = s['a_name'], s['b_name']
+    pa, pb = pth.get('a'), pth.get('b')
+    if not (pa and pb) or pa[0] is None or pb[0] is None: return ""
+    # The claim worth making is only available when one side has the accelerated symbol and the
+    # other does not — on the SAME backend, which rules out a zkVM limitation.
+    if pb[2] or not pa[2]: return ""
+    return (f" <b>And it is a missing patch, not a limit of the backend:</b> across all profiled "
+            f"blocks <span class=cA>{A}</span> reaches BN254 through a <b>precompile-backed crate</b> "
+            f"({pa[1]*100:.2f}% of its work in <code>zkvm_bn254_*</code>, {pa[0]*100:.2f}% left in "
+            f"plain software), while <span class=cB>{B}</span> has <b>none of it</b> "
+            f"({pb[1]*100:.2f}%) and does <b>{pb[0]*100:.2f}%</b> of its work in software "
+            f"<code>substrate_bn</code>. Same emulator, same blocks — {B} simply is not linking the "
+            f"accelerated path {A} already uses.")
+
+
+def _curve_note(s):
+    """The left tail is not one distribution — see the CURVE_Z block in summarize().
+
+    Every percentage here is measured (bn254_share over the profiled picks of each regime); an
+    earlier version hardcoded five of them, which would have gone stale on the next guest rebuild."""
+    c = s.get('curve')
+    if not c: return ""
+    A, B, n = s['a_name'], s['b_name'], s['n']
+    bn = s.get('bn254') or {}
+    pc = lambda t: f"{t[0]*100:.1f}%" if t and t[0] is not None else "n/a"
+    nb = lambda t: t[1] if t else 0
+    ha, hb = (bn.get('a') or {}).get('hot'), (bn.get('b') or {}).get('hot')
+    ca, cb = (bn.get('a') or {}).get('cold'), (bn.get('b') or {}).get('cold')
+    # Control from the other axis, if it profiled anything: the claim is that ONE guest is the
+    # outlier, which cannot be shown from a single pair.
+    ctl = []
+    for oax, ob in (s.get('_other_bn254') or {}).items():
+        if not ob: continue
+        for k, nm in (('a', 'a_name'), ('b', 'b_name')):
+            t = (ob.get(k) or {}).get('hot') or (ob.get(k) or {}).get('all')
+            # 'hot' on the other axis is that axis's share on the SAME pairing-heavy blocks
+            # (flag borrowed in main()); 'all' only appears if it profiled nothing per-regime.
+            if t and t[0] is not None:
+                ctl.append(f"{s.get('_other_names', {}).get((oax, k), k)} {pc(t)}")
+    return (f"<p class=env><b>The low tail is a {B} precompile gap, not a {A} win.</b> On "
+            f"<b>{c['n']} of {n} blocks</b> ({c['n']/n*100:.0f}%) one guest runs 256-bit curve "
+            f"arithmetic — the BN254 pairing precompile — in <b>pure software</b>. Share of each "
+            f"guest's own attributed work spent there, measured on the profiled blocks: "
+            f"<span class=cB>{B}</span> <b>{pc(hb)}</b> on those blocks against {pc(cb)} on the "
+            f"rest (n={nb(hb)}/{nb(cb)} profiled), while <span class=cA>{A}</span> spends "
+            f"<b>{pc(ha)}</b> against {pc(ca)}"
+            + (f" — and on the other axis, on those same blocks, {' and '.join(ctl)}" if ctl else "")
+            + f". So {B} is the outlier, not the others."
+            + _accel_note(s)
+            + f" Split accordingly:</p>"
+            f"<table class=cv><tr><th>blocks</th><th>n</th><th>median ratio</th><th></th></tr>"
+            f"<tr><td>without software curve arithmetic</td><td>{n - c['n']}</td>"
+            f"<td class={'hi' if c['med_clean'] >= 1 else 'lo'}>{x(c['med_clean'])}</td>"
+            f"<td><i>compares the two engines</i></td></tr>"
+            f"<tr><td>with it</td><td>{c['n']}</td>"
+            f"<td class={'hi' if c['med_flag'] >= 1 else 'lo'}>{x(c['med_flag'])}</td>"
+            f"<td><i>{B} pays for BN254 in software</i></td></tr>"
+            f"<tr><td>all blocks — the headline above</td><td>{n}</td>"
+            f"<td class={'hi' if s['ratio_median'] >= 1 else 'lo'}>{x(s['ratio_median'])}</td>"
+            f"<td><i>averages the two</i></td></tr></table>"
+            f"<p class=note>Detected from multiplication intensity (mul/cycle above "
+            f"{c['z']}× the median for either guest), so it covers every block without extra "
+            f"profiling. <b>Quote the engine figure when comparing engines</b>, and the all-blocks "
+            f"figure when comparing the guests as they ship today — the difference is a fixable "
+            f"{B} implementation gap, not an EVM one.</p>")
+
 
 def _bars(items, A, B):
     """Side-by-side bars per metric, each pair scaled to its own max (shape, not absolute units)."""
@@ -1264,6 +1569,12 @@ def _bars(items, A, B):
 
 def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
     gas_map = gas_map or {}; tx_map = tx_map or {}
+    # The "one guest is the outlier" claim needs the other axis as a control, and _hist/_curve_note
+    # only receive their own summary — hand them what they need rather than widen the signature.
+    _nm = {(o['axis'], k): o[k + '_name'] for o in summaries for k in 'ab'}
+    for o in summaries:
+        o['_other_bn254'] = {p['axis']: p.get('bn254') for p in summaries if p is not o}
+        o['_other_names'] = _nm
     pairs = " · ".join(f"{s['a_name']} vs {s['b_name']}" for s in summaries)
     h = [f"<title>zkVM guest comparison — {pairs}</title>",
          f"<style>{_CSS}</style>", "<div class=wrap>",
@@ -1286,9 +1597,22 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
         h.append("<section>")
         h.append(f"<div class=axhead><span class=nm>{ax.upper()}</span>"
                  f"<span class=vs>{A} &nbsp;vs&nbsp; {B}</span></div>")
+        # "N blocks between X and Y" reads as contiguous. It is not: a block runs only when BOTH
+        # guests have an input, and the reth-side .bin is missing for ~10% of the span. State the
+        # gap rather than let the reader assume. (Checked: the ratio is nearly independent of block
+        # size — corr(ratio, witness size) = -0.04 on SP1, -0.20 on ZisK, and dropping the largest
+        # 10% of blocks moves the median by 0.9% / 0.03% — so the gap does not bias the figures.)
+        _bs = sorted(int(b) for b in rows)
+        _gap = (_bs[-1] - _bs[0] + 1) - len(_bs)
         h.append(f"<p class=sub style='margin-bottom:14px'><b>{s['n']} blocks</b> between "
-                 f"<b>{min(rows, key=int)}</b> and <b>{max(rows, key=int)}</b>, each executed by both "
-                 f"guests on the {AXES[ax]['backend'].upper()} emulator.</p>")
+                 f"<b>{_bs[0]}</b> and <b>{_bs[-1]}</b>, each executed by both "
+                 f"guests on the {AXES[ax]['backend'].upper()} emulator."
+                 + (f" The span is <b>not contiguous</b>: {_gap} of its "
+                    f"{_bs[-1]-_bs[0]+1} block numbers ({_gap/(_bs[-1]-_bs[0]+1)*100:.0f}%) are absent, "
+                    f"because a block runs only when <i>both</i> guests have an input and the "
+                    f"{B}-side one is missing there. Checked for selection bias: the ratio is nearly "
+                    f"independent of block size, and dropping the largest 10% of blocks moves the "
+                    f"median by under 1%." if _gap else "") + "</p>")
         h.append(f"<div class=legend><span><span class=sw style='background:var(--gold)'></span>{A}</span>"
                  f"<span><span class=sw style='background:var(--blue)'></span>{B}</span></div>")
         # headline cards — every value symmetric and colour-coded, every label spelled out
@@ -1334,11 +1658,20 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
                    f"{u} than <b class=cB>{B}</b> on the median block of this range.")
         if pwu and s.get('pw_ratio_median'):
             pw_pct = (s['pw_ratio_median'] - 1) * 100
-            gap = "lower than" if s['pw_ratio_median'] < s['ratio_median'] else "higher than"
-            verdict += (f" Measured as <b>prover work</b> the gap is <b>{pw_pct:+.1f}%</b> — {gap} the "
-                        f"{u} gap, i.e. the extra work sits in operations that are "
-                        f"{'cheaper' if s['pw_ratio_median'] < s['ratio_median'] else 'dearer'} than "
-                        f"average to prove.")
+            # Drawing "the extra work is dearer/cheaper to prove" from ANY difference overstated a
+            # 0.4pp gap on SP1 (1.225x PGU vs 1.221x cycles) as a finding. Only call the direction
+            # when the two ratios differ by more than 2% of each other; ZisK's 1.361 vs 1.462 (7%)
+            # clears that, SP1's does not.
+            rel = (s['pw_ratio_median'] - s['ratio_median']) / s['ratio_median']
+            verdict += f" Measured as <b>prover work</b> the gap is <b>{pw_pct:+.1f}%</b>"
+            if abs(rel) > .02:
+                verdict += (f" — {'lower' if rel < 0 else 'higher'} than the {u} gap, i.e. the extra "
+                            f"work sits in operations that are "
+                            f"{'cheaper' if rel < 0 else 'dearer'} than average to prove.")
+            else:
+                verdict += (f", within {abs(rel)*100:.1f}% of the {u} gap — too close to call either "
+                            f"way, so the extra work is not concentrated in operations that are "
+                            f"notably cheap or dear to prove.")
         h.append(f"<div class=insight>{verdict}</div>")
         # distribution + metric bars
         h.append("<div class=grid2>")
@@ -1356,8 +1689,15 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
                  (f"total {u}", s['a_total'], s['b_total'], n),
                  (f"{u} per Mgas", s.get('a_per_mgas'), s.get('b_per_mgas'), n)]
         if pwu: items.append((f"median {pwu} (prover)", s.get('a_pw_median'), s.get('b_pw_median'), n))
-        if s.get('a_secs_median'):
-            items.append(("median exec secs", s.get('a_secs_median'), s.get('b_secs_median'),
+        # This row published a_secs_median — SP1's GAS-ON wall clock, inflated x1.79 by the
+        # gas-estimation pass (8.35s where the honest figure is 4.66s). That pass is pure
+        # instrumentation overhead no other stack has, and it once reordered the two guests. Prefer
+        # the --no-gas median when it exists, and say in the label which one is on screen.
+        if s.get('a_nsecs_median'):
+            items.append(("median exec secs (gas pass off)", s['a_nsecs_median'],
+                          s['b_nsecs_median'], lambda v: f"{v:.2f}s"))
+        elif s.get('a_secs_median'):
+            items.append(("median exec secs", s['a_secs_median'], s['b_secs_median'],
                           lambda v: f"{v:.2f}s"))
         # No prose here: the labels carry the numbers. The one thing a careful reader may wonder —
         # why these ratios differ slightly from the cards' — lives in the heading's tooltip:
@@ -1366,12 +1706,23 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
         # aggregate answers "how much more work in total", the per-block median "what a typical
         # block costs". Each pair of bars is scaled to its own max, so bar length is only
         # comparable within a row.
-        h.append(f"<div class=pane><h2 title=\"Each pair is scaled to its own maximum, so compare bar "
-                 f"length only within a row. These ratios are aggregate ÷ aggregate (of medians or "
-                 f"totals); the cards above show the median of the per-block ratios, which differs "
-                 f"slightly — dividing two medians is not the median of the divisions.\">"
-                 f"{A} <span style='color:var(--gold)'>▬</span> vs {B} "
-                 f"<span style='color:var(--blue)'>▬</span></h2>{_bars(items, A, B)}</div>")
+        # The gap between the two statistics was documented only in a title= tooltip and called
+        # "slight". Measured here it reaches 6% (cycles 1.221x vs 1.151x on SP1), which is enough
+        # to change a quoted headline, and a tooltip is invisible in a printed synthesis. State it
+        # in the body, with the actual spread.
+        _agg = s['a_median'] / s['b_median'] if s['b_median'] else None
+        _dev = abs(s['ratio_median'] - _agg) / _agg * 100 if _agg else 0
+        h.append(f"<div class=pane><h2>{A} <span style='color:var(--gold)'>▬</span> vs {B} "
+                 f"<span style='color:var(--blue)'>▬</span></h2>"
+                 f"<p class=note style='margin:0 0 12px'>Each ratio here is <b>aggregate ÷ "
+                 f"aggregate</b> — the two medians (or totals) shown on the row, divided. The cards "
+                 f"above instead give the <b>median of the per-block ratios</b>, and dividing two "
+                 f"medians is not the median of the divisions: on this axis the two differ by "
+                 f"<b>{_dev:.1f}%</b> ({x(_agg)} here vs {x(s['ratio_median'])} in the cards). Both "
+                 f"are wanted — the aggregate answers <i>how much more work in total</i>, the "
+                 f"per-block median <i>what a typical block costs</i> — so quote whichever you mean "
+                 f"and say which. Each pair of bars is scaled to its own maximum, so bar length is "
+                 f"comparable only within a row.</p>{_bars(items, A, B)}</div>")
         h.append("</div>")
         # ── where the gap comes from ──
         # The question the distribution raises but cannot answer: not "how big is the gap" but
@@ -1379,7 +1730,8 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
         if s.get('families') or s.get('insn_ratios'):
             h.append("<div class=grid2>")
             if s.get('families'):
-                fa, fb, ta, tb, picks = s['families']
+                fa, fb, _raw_a, _raw_b, picks = s['families']   # _raw_* are SAMPLES
+                # on SP1 (fam_scale~200x); never mix them with the rescaled fa/fb.
                 base = s['ratio_median']
                 fams = sorted(set(fa) | set(fb), key=lambda k: -(fa.get(k, 0)))
                 mx = max([fa.get(k, 0) for k in fams] + [1])
@@ -1390,44 +1742,222 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
                          f"<p class=note style='margin:0 0 10px'>Instructions per block, grouped by "
                          f"what the code is doing. Mean over <b>{len(picks)} blocks</b> sampled "
                          f"across the ratio range. <span class=cA>{A}</span> above, "
-                         f"<span class=cB>{B}</span> below.</p>"
-                         f"<table><tr><th>kind of work</th><th>instructions</th><th>ratio</th>"
+                         f"<span class=cB>{B}</span> below.</p>")
+                # What the bar encodes, named. Length and colour answer different questions here and
+                # the page said neither; the biggest family is full width, which is why a 46% share can
+                # sit beside a 100% bar — different denominators, one glyph. Above the table, not below:
+                # a key is read before the rows, and the same position on all three bar tables.
+                _big = max(fams, key=lambda k: fa.get(k, 0))
+                # The grey state is only described when a row actually has it, so the key never lists a
+                # colour the reader cannot find in the table.
+                # exactly the rows where the ratio is None, i.e. the denominator is zero — matching the
+                # render condition rather than approximating it
+                _nz = [k for k in fams if not fb.get(k, 0)]
+                _grey = (f" <span class=na>grey</span> where no ratio exists because "
+                         f"<span class=cB>{B}</span> reports nothing here "
+                         f"({len(_nz)} row{'s' if len(_nz) > 1 else ''}) — not a win, a missing "
+                         f"measurement." if _nz else "")
+                h.append(f"<p class=hint style='margin:0 0 5px'><b>bar</b> — length: what "
+                         f"<span class=cA>{A}</span> spends here, against its own largest family "
+                         f"(<i>{_big}</i>, full width). colour: <span class=hi>red</span> where "
+                         f"<span class=cA>{A}</span> spends more than <span class=cB>{B}</span> in this "
+                         f"family, <span class=lo>green</span> where less.{_grey} The share column "
+                         f"divides by each guest's total, the bar by the largest family — so they do "
+                         f"not match.</p>")
+                h.append(f"<table><tr><th>kind of work</th><th>instructions</th>"
+                         f"<th>share of<br>own work</th><th>ratio</th>"
                          f"<th></th></tr>")
+                # Shares as well as absolute counts, because the absolute figures are NOT safe to
+                # compare across backends: on a sampling profiler they carry the scale factor, and
+                # any family that dominates one backend (e.g. an allocator at ~46% of both guests'
+                # work) compresses every other share there. A family's share of its OWN guest's work
+                # is scale-free and is the only unit that means the same thing on both axes.
+                # Divide by the sum of the same dict — mixing a rescaled numerator with the raw
+                # attributed total once produced 9182%.
+                _sfa, _sfb = sum(fa.values()) or 1, sum(fb.values()) or 1
+                # Every family the table can show must have an entry here, and no entry may name a
+                # family that does not exist: `signature recovery` sat here for a family hotspots never
+                # defines, and three real families had no description at all. Asserted below.
                 doc = {
-                    'C++ abstraction layer':
-                        'Boost.Outcome result wrappers, STL iterators and containers, hash maps, '
-                        'smart-pointer destructors — the machinery a C++ codebase carries around its '
-                        'own logic. Not the logic itself.',
-                    'state / trie': 'Merkle-trie traversal, node decoding, RLP, storage/account lookups.',
+                    # Measured, not assumed: 0.00% of this family is error-result machinery. Those
+                    # symbols classify with whatever payload type they carry — a result holding a trie
+                    # node lands in state/trie — so naming them here was wrong for every guest, not
+                    # just this pair.
+                    'containers / abstraction':
+                        'Iterators, hash containers and their key hashing, byte buffers, growable '
+                        'vectors, variant dispatch (STL or Rust) — machinery carried around the logic, '
+                        'not the logic itself. Error-result wrappers are NOT here: a demangled name '
+                        'starts with the return type, so they classify with the payload they carry.',
+                    'state / trie': 'Merkle-trie traversal, node decoding, RLP, storage/account lookups. '
+                                    'Also holds error-result wrappers whose payload is a trie type.',
+                    'witness decoding':
+                        'Parsing the witness: RLP metadata, compact nibbles, deserialisation. Measured, '
+                        'it also holds RLP *encoding* — the name pattern matches both directions — so '
+                        'read a ratio here as "RLP work", not "decode work".',
                     'EVM interpreter': 'Opcode dispatch and execution of the block\u2019s transactions.',
-                    'hashing (keccak/sha)': 'Keccak/SHA rounds, whether a precompile or a software routine.',
+
                     '256-bit arithmetic': 'mulmod/addmod/division on 256-bit words, done in software.',
                     'memory / allocation': 'memcpy/memset, allocator work.',
-                    'signature recovery': 'ecrecover: secp256k1 curve operations.',
+                    'elliptic-curve crypto':
+                        'secp256k1 for ecrecover, plus BN254/BLS field and pairing arithmetic for the '
+                        'precompiles — software or precompile-backed, which is what its size tells you.',
+                    'block / consensus logic':
+                        'Block-level rules rather than execution: transaction and header validation, '
+                        'base and blob fee, receipts, bloom.',
+                    'runtime plumbing':
+                        'Language runtime rather than protocol work — panic paths, formatting, sorting, '
+                        'critical sections, destructor dispatch.',
                     'other': 'Names no family pattern matched.',
                 }
+                WARN = {'hashing (keccak/sha)':
+                        "Read with care when both guests share a precompile: this row counts the "
+                        "instructions AROUND the hash, not the hash, and a guest that inlines its "
+                        "wrapper attributes them to its callers instead — which makes its figure "
+                        "look small for a compilation reason rather than a cost one. See the "
+                        "per-permutation panel below.",
+                        'byte/bit manipulation':
+                        "Not comparable between guests: __bswapdi2 is an OUTLINED libgcc function that "
+                        "C++ calls, while Rust's swap_bytes/to_be_bytes are inlined into their callers "
+                        "and never appear as a symbol. Both guests do this work (RISC-V has no "
+                        "byte-swap instruction); only Monad's is visible. Read the absolute figure."}
+                # Every family the table can show must be described by doc OR by WARN — both feed
+                # the title= — and no entry may name a family hotspots never defines. `signature
+                # recovery` sat in doc for a non-existent family, and three real families had no
+                # description at all; nothing checked either.
+                _known = {n for n, _ in _hotspots().FAMILIES} | {'other'}
+                _orphan = (set(doc) | set(WARN)) - _known
+                _undesc = set(fams) - set(doc) - set(WARN)
+                if _orphan or _undesc:
+                    print(f"  [warn] family descriptions: naming nothing {sorted(_orphan)}, "
+                          f"undescribed {sorted(_undesc)}")
                 for k in fams:
                     va, vb = fa.get(k, 0), fb.get(k, 0)
                     r = (va / vb) if vb else None
                     tip = doc.get(k, '')
+                    warn = WARN.get(k)
+                    # built out here: a literal cannot be split across lines inside an f-string
+                    # expression, and inlining it was a syntax error that silently left the previous
+                    # HTML in place while its checks ran against the stale file
+                    _rt = f"ratio {x(r)}" if r is not None else f"no ratio — {B} reports none here"
                     h.append(f"<tr><td style='text-align:left'"
-                             + (f" title=\"{tip}\"" if tip else "") + f">{k}</td>"
+                             + (f" title=\"{warn or tip}\"" if (warn or tip) else "")
+                             + f">{'⚠ ' if warn else ''}{k}</td>"
                              f"<td><span class=cA>{n(va)}</span><br>"
                              f"<span class=cB>{n(vb)}</span></td>"
-                             f"<td class={'hi' if r and r >= 1 else 'lo'}>{x(r)}</td>"
-                             f"<td style='width:28%'><span class='rbar"
-                             f"{' over' if r and r >= 1 else ''}' "
+                             f"<td><span class=cA>{va/_sfa*100:.2f}%</span><br>"
+                             f"<span class=cB>{vb/_sfb*100:.2f}%</span></td>"
+                             # `na` where no ratio exists, for the number as well as the bar: with the
+                             # old `hi if r and r >= 1 else lo` a missing ratio was styled green.
+                             # `r is None`, NOT `not r`: r == 0.0 is a real measurement (this guest
+                             # spends nothing where the other does) and must stay green, not go grey.
+                             f"<td class={'na' if r is None else ('hi' if r >= 1 else 'lo')}>"
+                             f"{x(r)}</td>"
+                             # The bar carries TWO variables — length and colour — and neither is the
+                             # column it sits next to, so each row states its own reading on hover.
+                             f"<td style='width:28%' title=\"{k}: {A} {n(va)}, "
+                             f"{va/_sfa*100:.1f}% of its own work · {B} {n(vb)}, "
+                             f"{vb/_sfb*100:.1f}% of its own · {_rt}\">"
+                             f"<span class='rbar"
+                             f"{' na' if r is None else (' over' if r >= 1 else '')}' "
                              f"style='width:{max(2, 100*va/mx):.0f}%'></span></td></tr>")
-                h.append(f"</table><p class=note>{len(picks)} profiled runs per guest, cached until "
+                h.append("</table>")
+                # Micro-synthesis: a family that dominates BOTH guests says something about the
+                # backend, not about either guest — and it mechanically compresses every other
+                # share on this axis, which is what makes cross-axis share comparisons misleading.
+                # Data-driven so it appears on whichever axis it is true of (today: SP1's allocator).
+                # Shares must divide by the sum of the SAME dict: fa/fb are rescaled to estimated
+                # instructions while ta/tb are the raw attributed totals, so mixing them overstated
+                # every share by the scale factor (91.8% instead of 45.5%).
+                sfa, sfb = sum(fa.values()), sum(fb.values())
+                if sfa and sfb:
+                    shr = {k: (fa.get(k, 0) / sfa, fb.get(k, 0) / sfb) for k in fams}
+                    dom = max(fams, key=lambda k: min(shr[k]))
+                    sa_, sb_ = shr[dom]
+                    if min(sa_, sb_) > .25 and dom != 'EVM interpreter':
+                        h.append(
+                            f"<p class=env><b>Read first: on {s['axis'].upper()} the biggest single cost is "
+                            f"{dom} — for both guests.</b> {sa_*100:.0f}% of "
+                            f"<span class=cA>{A}</span>'s work and {sb_*100:.0f}% of "
+                            f"<span class=cB>{B}</span>'s, more than the EVM itself. That is a property "
+                            f"of this <i>backend</i>, not of either client, so it is the one number here "
+                            f"that a fix would improve for <i>every</i> {s['axis'].upper()} guest. "
+                            f"<em>It also inflates every other family's share on this axis (they divide "
+                            f"by a total this family dominates) — which is why a family's ratio is "
+                            f"comparable within an axis but its share is not comparable across "
+                            f"axes.</em></p>")
+                # A family ratio built on instruction counts describes the WRAPPER whenever both
+                # guests share a precompile — read alone, `hashing 12x` says "this guest hashes in
+                # software" when it may be the only one using the accelerated path. Split it.
+                # A cross-guest per-call ratio is only meaningful if BOTH guests expose the
+                # wrapper as visible code. Above this factor, assume they do not.
+                INLINE_Z = 3.0
+                if s.get('percall_hash'):
+                    pa, pb = s['percall_hash']['a'], s['percall_hash']['b']
+                    ka = statistics.median([r['a'].get('kec') or (r['a'].get('sys') or {}).get(
+                        'KECCAK_PERMUTE') or 0 for r in rows.values()])
+                    kb = statistics.median([r['b'].get('kec') or (r['b'].get('sys') or {}).get(
+                        'KECCAK_PERMUTE') or 0 for r in rows.values()])
+                    _r = (pa[0] / pb[0]) if pb[0] else None
+                    _suspect = _r is not None and (_r > INLINE_Z or _r < 1 / INLINE_Z)
+                    h.append(
+                        f"<p class=env><b>The hashing row is about the call, not the hash.</b> Both "
+                        f"guests reach the same keccak precompile, so the hash itself costs them the "
+                        f"same per permutation and only the <i>number</i> of permutations "
+                        f"(<span class=cA>{n(ka)}</span> / <span class=cB>{n(kb)}</span>, "
+                        f"{x(ka/kb) if kb else '—'}) changes that part. What the family row measures "
+                        f"is the instructions <i>around</i> each permutation:</p>"
+                        f"<table class=cv><tr><th></th><th>instructions<br>per call</th>"
+                        f"<th>range over<br>profiled blocks</th><th>varies with<br>payload?</th></tr>"
+                        + "".join(
+                            f"<tr><td><span class=c{S}>{N}</span></td>"
+                            f"<td>{n(P[0])}</td><td>{n(P[1])} – {n(P[2])}</td>"
+                            f"<td>r = {P[3]:+.2f} — {'yes' if abs(P[3]) < .9 else 'no'}</td></tr>"
+                            for S, N, P in (('A', A, pa), ('B', B, pb)))
+                        + f"</table>"
+                        f"<p class=note>A cost <b>flat</b> across a wide range of permutation "
+                        f"counts (r near 1, narrow range) does not depend on how much data is hashed "
+                        f"— it is reduced by performing fewer permutations or by making the wrapper "
+                        f"cheaper, not by hashing less. A cost that <b>varies</b> tracks the payload."
+                        + (f" <b>⚠ Do not read the ratio of these two as a cost difference here.</b> "
+                           f"They differ by {_r:.1f}×, past the {INLINE_Z:.0f}× point above which a "
+                           f"gap is more likely a <b>compilation</b> difference than a real one: a "
+                           f"guest that <b>inlines</b> its precompile wrapper charges the work to its "
+                           f"callers, so nothing is attributed to a hashing symbol and its figure "
+                           f"collapses — it can even fall below what the wrapper itself costs. Check "
+                           f"which side exposes it before comparing: <code>nm -C &lt;elf&gt; | grep "
+                           f"-i keccak</code>. Measured on this repo, that is exactly what happens "
+                           f"— one guest calls the wrapper across the C ABI and keeps the symbol, "
+                           f"the other inlines it."
+                           if _suspect else
+                           " Both guests expose the wrapper at a comparable scale here, so the ratio "
+                           "is readable.")
+                        + f"</p>")
+                h.append(f"<p class=note>{len(picks)} profiled runs per guest, cached until "
                          f"the guest is rebuilt"
                          + (f". This backend's profiler <b>samples</b> (1 in {s['fam_scale']:.0f}), so "
                             f"the counts are scaled estimates; the ratios are unaffected"
                             if s.get('fam_scale', 1) > 2 else "")
-                         + f". <b>C++ abstraction layer</b> is Boost.Outcome result wrappers, STL "
-                         f"iterators and hash containers, smart-pointer destructors — the machinery a "
-                         f"C++ codebase carries around its logic, not the logic itself"
-                         + f". Attributed: <span class=cA>{n(ta)}</span> / "
-                         f"<span class=cB>{n(tb)}</span>; unmatched names go to <i>other</i>.</p></div>")
+                         + f". <b>containers / abstraction</b> is the machinery a codebase carries "
+                         f"<i>around</i> its logic — iterators, hash containers and their key hashing, "
+                         f"byte buffers, growable vectors, variant dispatch — not the logic itself"
+                         + f". Families come from classifying <b>function names</b>, so they are "
+                         f"approximate: a name-based taxonomy must carry both languages' vocabulary or "
+                         f"it measures the patterns rather than the guests (this one was corrected "
+                         f"several times — C++ <i>and</i> Rust container idioms, byte swaps split out of "
+                         f"arithmetic, curve crypto out of arithmetic, state access into trie). "
+                         f"<b>The useful sanity check is agreement between the two axes</b>: the same "
+                         f"guest pair should give a similar family ratio on both, so a wide disagreement "
+                         f"is a <i>candidate</i> bug — but it can also be genuine, since the two reth "
+                         f"guests differ from each other (different keccak and curve libraries, "
+                         f"different drivers). Explain it before trusting it"
+                         + (f". On this backend the profiler samples, so a family under ~1% of the total "
+                            f"is sampling noise" if s.get('fam_scale', 1) > 2 else "")
+                         + (f". The table accounts for <span class=cA>{s['fam_cov'][0]*100:.0f}%</span>"
+                            f" / <span class=cB>{s['fam_cov'][1]*100:.0f}%</span> of each guest's real "
+                            f"work on these blocks (the remainder is functions outside the top 120 "
+                            f"kept per run); unmatched names go to <i>other</i>"
+                            if s.get('fam_cov') else "")
+                         + f".</p></div>")
             if s.get('insn_ratios'):
                 # INSTRUCTION COUNTS, not cost. The cost view answered "what will proving charge",
                 # which is a different question and needed a `Main` row that merely restated the
@@ -1435,27 +1965,81 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
                 # the baseline is the overall work-unit ratio.
                 base = s['ratio_median']
                 top = s['insn_ratios'][:10]
-                mx = max([t[3] or 0 for t in top] + [1])
-                h.append(f"<div class=pane><h2>what kind of work, and how much of it</h2>"
-                         f"<p class=note style='margin:0 0 10px'>Instructions executed per block "
-                         f"(median over the {s['n']} blocks), by operation. Overall "
+                mx = max([t[3] or 0 for t in top] + [1])   # bar scaled by A's count
+                h.append(f"<div class=pane><h2>which machine operations</h2>"
+                         f"<p class=note style='margin:0 0 10px'>The same work seen one level down: "
+                         f"individual machine operations, median over all {s['n']} blocks (not the "
+                         f"profiled sample). Overall "
                          f"<span class=cA>{A}</span> runs <b>{x(base)}</b> the {u} of "
                          f"<span class=cB>{B}</span> — an operation whose ratio beats that is where "
                          f"the extra work concentrates; one below it is work {A} does <i>less</i> "
-                         f"of.</p>"
-                         f"<table><tr><th>operation</th><th>per block</th><th>ratio</th>"
+                         f"of.</p>")
+                # The bar's colour threshold is the OVERALL ratio, not parity, so a row can show a red
+                # 1.45x beside a green bar — measured on 3 of the rows here. Both are right: the number
+                # answers "more than the other guest?", the bar continues the column it sits next to,
+                # which asks "worse than this guest's average?". Unstated, that reads as a bug, so the
+                # key says which question the colour answers and names the disagreeing rows outright.
+                _split = [k for k, v, _c, _a, _b, _v in top if (v >= 1) != (v >= base)]
+                _note = ("" if not _split else
+                         f" That is why <code>{'</code>, <code>'.join(_split[:3])}</code> "
+                         f"show a {'red' if base > 1 else 'green'} ratio beside a "
+                         f"{'green' if base > 1 else 'red'} bar: above 1× yet still better than this "
+                         f"guest's own average.")
+                h.append(f"<p class=hint style='margin:0 0 5px'><b>bar</b> — length: how many of these "
+                         f"<span class=cA>{A}</span> runs, against the largest row here. colour: it "
+                         f"continues the column beside it, so <span class=hi>red</span> means the "
+                         f"operation's ratio is <i>worse than this guest's overall</i> {x(base)} — not "
+                         f"merely above 1×.{_note}</p>")
+                h.append(f"<table><tr><th>operation</th><th>median count<br>per block</th>"
+                         f"<th>share of<br>counted ops</th>"
+                         f"<th>median of<br>per-block ratios</th>"
                          f"<th>vs {x(base)} overall</th><th></th></tr>")
-                for k, v, cnt, ca, cb in top:
+                for k, v, cnt, ca, cb, vol in top:
                     rel = (v / base - 1) * 100
                     w = max(2, 100 * (ca or 0) / mx)
                     h.append(f"<tr><td style='text-align:left' title='measured on {cnt} block(s) "
                              f"where both guests report it'>{k}</td>"
                              f"<td><span class=cA>{n(ca)}</span><br><span class=cB>{n(cb)}</span></td>"
-                             f"<td class={'hi' if v >= 1 else 'lo'}>{v:.2f}×</td>"
+                             f"<td>{('%.3f%%' % (vol*100)) if vol else '—'}</td>"
+                             # Same precision as the baseline it is compared against: at 2 decimals
+                             # `shift` printed 1.22x beside a 1.221x baseline, so its red bar looked
+                             # wrong — the real ratio is 1.2241, above the baseline. The colour was
+                             # right and the rounding made it unreadable.
+                             f"<td class={'hi' if v >= 1 else 'lo'}>{x(v)}</td>"
                              f"<td class={'hi' if rel > 0 else 'lo'}>{rel:+.0f}%</td>"
-                             f"<td style='width:26%'><span class='rbar{' over' if v >= base else ''}' "
+                             # Hover reading per row, because the bar's colour tracks the column beside
+                             # it while its length tracks the count column three to the left.
+                             f"<td style='width:26%' title=\"{k}: {A} {n(ca)} vs {B} {n(cb)} "
+                             f"per block · ratio {v:.2f}× · {rel:+.0f}% against this guest's overall "
+                             f"{x(base)}\">"
+                             f"<span class='rbar{' over' if v >= base else ''}' "
                              f"style='width:{w:.0f}%'></span></td></tr>")
-                h.append(f"</table><p class=note>These are counts of executed instructions — nothing "
+                # Same trap as the metric bars: the ratio column is the MEDIAN OF PER-BLOCK RATIOS
+                # (deliberately — the baseline it is compared against, s['ratio_median'], is the same
+                # statistic), but the count column holds MEDIANS OF COUNTS, so dividing the two
+                # displayed numbers does not give the displayed ratio. Measured here it is off by up
+                # to 21% (mul: 5.68M/7.86M = 0.72 next to a shown 0.87). Say so, with the figure.
+                _dev = max(((abs(v - (ca / cb)) / (ca / cb) * 100)
+                            for _k, v, _c, ca, cb, _vl in top if ca and cb), default=0)
+                # "counts of executed instructions" was wrong on one axis: ZisK's per-opcode
+                # counter sums to ~22x the step count, so its magnitudes are not instruction counts
+                # at all. State what the counter actually covers, measured, instead of asserting a
+                # meaning it does not have on both backends.
+                _oc = s.get('ops_coverage')
+                _scale = ("" if not _oc else
+                          (f" These counters are genuine instruction counts and cover "
+                           f"<b>{_oc*100:.0f}%</b> of {u} — only some opcodes are grouped."
+                           if _oc <= 1.2 else
+                           f" <b>Read the shares, not the magnitudes:</b> this backend's per-opcode "
+                           f"counter sums to <b>{_oc:.0f}×</b> the {u} count, so its absolute figures "
+                           f"are not instruction counts. Guest-to-guest ratios stay valid, since the "
+                           f"same counter is used on both sides."))
+                h.append(f"</table><p class=note>The ratio is the <b>median of the per-block "
+                         f"ratios</b> — the same statistic as the {x(base)} baseline it is measured "
+                         f"against — so it is <b>not</b> the quotient of the two counts beside it, "
+                         f"which are medians of counts. On this axis the two differ by up to "
+                         f"<b>{_dev:.0f}%</b>.{_scale} These are counts of executed operations "
+                         f"— nothing "
                          f"about how much each costs to prove. For that, the <b>{pwu or 'prover'}</b> "
                          f"ratio in the cards above ({x(s.get('pw_ratio_median'))}) is the figure to "
                          f"read; it differs from {x(base)} precisely because the operations that grew "
@@ -1489,7 +2073,12 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
             # Table rendered by the shared JS builder (see _table): same per-block columns as the
             # histogram drill-down, so the two can never drift apart. Python only supplies the frame.
             h.append(f"<div class=pane><h2>{len(outs)} blocks break the pattern</h2>"
-                     f"<p class=note style='margin:0 0 10px'>Almost every block lands near "
+                     # "Almost every block lands near X" was asserted, not measured: true on ZisK
+                     # (96% within +-10% of the median) but FALSE on SP1, where only 66% are — the
+                     # distribution has a second mode from rsp's software-BN254 blocks. Say the
+                     # measured concentration instead, so the sentence can't go stale.
+                     f"<p class=note style='margin:0 0 10px'>"
+                     f"<b>{_near(ratios, s['ratio_median']):.0f}%</b> of blocks land within ±10% of "
                      f"{x(s['ratio_median'])}. These don't — each is a lead worth profiling, because "
                      f"something in the block changed which guest wins. <b>How they were picked:</b> "
                      f"each block's distance from the middle one is measured against how much blocks "
@@ -1500,13 +2089,25 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
                      f"how the block differs from the other {s['n']}.</p>"
                      f"<div id='ol-{ax}'></div></div>")
         # full table, collapsed
+        # Same scroller as every other wide table (see `.scroll`): 9 numeric columns overflow the card
+        # on a narrow viewport — measured at 799px into 648, which also gave the whole PAGE a
+        # horizontal scrollbar — and 373 rows of it otherwise run 13,000px down the document.
         h.append("<details><summary>▸ every block — %d rows: %s, %sgas, txs, ratio</summary>"
                  "<div class=pane>" % (len(rows), u, (pwu + ", ") if pwu else ""))
         pwcols = f"<th>{A} {pwu}</th><th>{B} {pwu}</th><th>{pwu} ratio</th>" if pwu else ""
-        h.append(f"<table><tr><th>block</th><th>gas</th><th>txs</th><th>{A} {u}</th><th>{B} {u}</th>"
-                 f"<th>ratio</th>{pwcols}</tr>")
         zs = {e['block']: e['z'] for e in outs}
         rmax = max(ratios) or 1
+        # Here the bar's length is the RATIO itself, unlike the two tables above where it is a volume.
+        # Same glyph, different variable, so say which one and against what — the scale's top end is the
+        # worst block in the sample, not 1x, so a full bar means "worst here", not "twice as slow".
+        # Outside the .scroll: a key that scrolls sideways with its table stops being a key.
+        h.append(f"<p class=hint style='margin:0 0 5px'><b>bar</b> — length: this block's ratio against "
+                 f"the highest in the sample ({x(rmax)}, full width). colour: "
+                 f"<span class=hi>red</span> where <span class=cA>{A}</span> costs more on the block, "
+                 f"<span class=lo>green</span> where less.</p>")
+        h.append("<div class=scroll>")
+        h.append(f"<table><tr><th>block</th><th>gas</th><th>txs</th><th>{A} {u}</th><th>{B} {u}</th>"
+                 f"<th>ratio</th>{pwcols}</tr>")
         for b in sorted(rows, key=lambda b: -(rows[b]['a']['work'] / max(rows[b]['b']['work'], 1))):
             r0 = rows[b]; r = r0['a']['work'] / r0['b']['work'] if r0['b']['work'] else None
             g = r0['b'].get('gas') or r0['a'].get('gas') or gas_map.get(b)
@@ -1517,7 +2118,10 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
                 pr = (pa / pb) if (pa and pb) else None
                 pw = (f"<td>{n(pa)}</td><td>{n(pb)}</td>"
                       f"<td class={'hi' if pr and pr > 1 else 'lo'}>{x(pr)}</td>")
+            # The bar shares its cell with the ratio, so the tooltip goes on the cell: it states the
+            # length's reference (the sample's worst block), which no number in the row carries.
             bar = (f"<span class='rbar{' over' if r and r>=1 else ''}' "
+                   f"title=\"{x(r)} — {r/rmax*100:.0f}% of the sample's highest ratio {x(rmax)}\" "
                    f"style='width:{max(2, round(38*r/rmax))}px'></span>") if r else ""
             tx = r0['b'].get('txs') or r0['a'].get('txs') or tx_map.get(b)
             h.append(f"<tr><td title=\"{'flagged as off-pattern' if z else ''}\">"
@@ -1526,7 +2130,7 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
                      # threshold 1x, like the bar beside it and the histogram legend — not the
                      # median, which left every below-median ratio with no colour at all
                      f"<td class={'hi' if r and r >= 1 else 'lo'}>{bar}{x(r)}</td>{pw}</tr>")
-        h.append("</table></div></details>")
+        h.append("</table></div></div></details>")   # table, .scroll.tall, .pane
         # What the columns mean — kept to what a reader of the numbers needs; provenance lives in
         # the code comment above _PW_DOC.
         note = (f"<p class=note><b>{u}</b> is deterministic — identical on any machine. ")
@@ -1680,12 +2284,12 @@ def main():
     ap.add_argument('--html', dest='html_out', nargs='?', const=os.path.join(HERE, 'results', 'compare.html'),
                     help='where to write the HTML report (default results/compare.html — written '
                          'even without this flag; use --no-report to skip)')
-    ap.add_argument('--families', type=int, default=10, metavar='N',
+    ap.add_argument('--families', type=int, default=50, metavar='N',
                     help='profile N blocks per guest, stratified across the ratio distribution, to '
-                         'break the work down by kind (default 10; 0 disables). One profiled '
-                         'execution each — ~13s on ZisK, ~24s on SP1 — cached until the guest ELF '
-                         'changes. Measured: 5 -> 10 moved every family by 1-4%% except the '
-                         'EVM-interpreter row (-17%%), so 10 is the safer default')
+                         'break the work down by kind (default 50; 0 disables). One profiled '
+                         'execution each — ~13s on ZisK, ~24s on SP1 — cached PER BLOCK, so raising N '
+                         'only profiles the new ones. Sample size matters: 10 -> 50 moved the C++ '
+                         'family from 13.6x to 5.11x on SP1, so a small sample was not settled')
     ap.add_argument('--no-report', action='store_true',
                     help='terminal summary only: skip the HTML and JSON files')
     ap.add_argument('--emu', default='~/.zisk/bin/ziskemu')
@@ -1792,6 +2396,38 @@ def main():
                 sa, ka = _scaled('a', fa)
                 sb, kb = _scaled('b', fb)
                 s['families'] = (sa, sb, fa['total'], fb['total'], picks)
+                # Coverage, not the raw attributed count: on SP1 the raw figure is a SAMPLE
+                # (3.4M next to a 670M table reads as a 200x inconsistency). What the reader needs
+                # is the share of real work the table accounts for — scale-free, so it means the
+                # same thing on both axes. The shortfall is the top-120 truncation in profile_blocks.
+                def _cov(side_k, scaled):
+                    got = [(rows.get(b) or rows.get(str(b)))[side_k]['work']
+                           for b in picks if (rows.get(b) or rows.get(str(b)))]
+                    return (sum(scaled.values()) / statistics.mean(got)) if got else 0.0
+                s['fam_cov'] = (_cov('a', sa), _cov('b', sb))
+                # Per-call hashing cost. The family ratio alone is misleading whenever both guests
+                # call the same keccak precompile: it describes the wrapper, not the hash.
+                pc = {k: percall(axis, k, k, picks, cache, rows) for k in 'ab'}
+                if pc['a'] and pc['b']: s['percall_hash'] = pc
+                # Software-BN254 share per REGIME, computed rather than written into the prose: the
+                # panel used to carry five hardcoded percentages (40/6/2.4/1.9/1.0), which would go
+                # stale on any guest rebuild and had the SP1 section quoting ZisK figures it could
+                # not check. Split the profiled picks by the same flag the headline split uses.
+                if s.get('curve'):
+                    hot = set(s['curve']['blocks'])
+                    pk_hot = [b for b in picks if b in hot]
+                    pk_cold = [b for b in picks if b not in hot]
+                    s['bn254'] = {k: {'hot': bn254_share(axis, k, pk_hot, cache),
+                                      'cold': bn254_share(axis, k, pk_cold, cache)}
+                                  for k in 'ab'}
+                    # Which PATH each guest takes is a property of the binary, not of the block, so
+                    # measure it over every profiled pick.
+                    s['bn254_path'] = {k: bn254_paths(axis, k, picks, cache) for k in 'ab'}
+                else:
+                    # No split on this axis (no per-block mul counter) — still report the share over
+                    # all profiled blocks, so the other axis can be cited as a control.
+                    s['bn254'] = {k: {'all': bn254_share(axis, k, picks, cache)} for k in 'ab'}
+                    s['bn254_path'] = {k: bn254_paths(axis, k, picks, cache) for k in 'ab'}
                 s['fam_scale'] = round(max(ka, kb), 1)      # >1 means sampled, not counted
                 save_cache(cache)
         print_summary(s)
@@ -1800,6 +2436,24 @@ def main():
         if args.spread: spread(axis, s, args.spread_side)
 
     if not summaries: return 1
+    # Cross-axis control, computed once both axes are summarised. "This block runs BN254 in software"
+    # is a property of the BLOCK, not of the backend, so the axis that HAS a per-block mul counter
+    # can label blocks for the axis that does not. Without this the control compared 37.8% on
+    # pairing-heavy blocks against a ZisK figure averaged over ALL blocks — different populations,
+    # so it could not support "one guest is the outlier".
+    _hot = next((set(t['summary']['curve']['blocks']) for t in payload.values()
+                 if t['summary'].get('curve')), None)
+    if _hot:
+        for s in summaries:
+            fams = s.get('families')
+            if not fams or s.get('curve'): continue      # its own split already covers it
+            picks = fams[4]
+            s['bn254'] = {k: {'hot':  bn254_share(s['axis'], k, [b for b in picks if b in _hot], cache),
+                              'cold': bn254_share(s['axis'], k, [b for b in picks if b not in _hot], cache)}
+                          for k in 'ab'}
+            s['bn254_path'] = {k: bn254_paths(s['axis'], k, picks, cache) for k in 'ab'}
+            s['bn254_borrowed'] = True                   # labelled: the flag came from the other axis
+
     # One command = one full run: the report is produced unless explicitly declined.
     if not args.no_report:
         args.html_out = args.html_out or os.path.join(HERE, 'results', 'compare.html')

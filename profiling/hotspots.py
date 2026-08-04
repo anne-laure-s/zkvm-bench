@@ -45,15 +45,58 @@ FAMILIES = [
     ('hashing (keccak/sha)',   r'keccak|sha3|sha256|sha2|tiny_keccak|blake'),
     # `k256` must not be bare: it is a substring of "keccak256" (84M instructions in one measured
     # profile), which only the pattern ORDER kept out of this family. Anchored, not order-dependent.
-    ('signature recovery',     r'secp256k1|ecrecover|ecdsa|(?<![a-z0-9])k256'),
+    # Elliptic-curve crypto, all of it: secp256k1 (ecrecover), BN254 (substrate_bn — the pairing
+    # precompile), BLS12-381. MEASURED WHY THIS MATTERS: substrate_bn::U256::mul was 97.6% of rsp's
+    # "256-bit arithmetic" family, so that family was comparing Monad's word arithmetic against
+    # reth's pairing precompile — apples to oranges, and it produced a 0.63x that meant nothing.
+    ('elliptic-curve crypto',  r'secp256k1|ecrecover|ecdsa|(?<![a-z0-9])k256|recover_?block'
+                               r'|compute_sender|substrate_bn|bn254|bls12_?381|pairing|modexp|modpow'
+                               r'|num_bigint|monty|EvmCrypto|crypto_bigint'),
+    # Byte/bit manipulation is NOT arithmetic: `__bswapdi2` was 41-47% of the arithmetic family on
+    # the Monad side, so counting it there inflated that ratio by roughly its share.
+    # ⚠️ NOT COMPARABLE BETWEEN GUESTS. `__bswapdi2` is an OUTLINED libgcc function that C++ calls;
+    # Rust's `swap_bytes`/`to_be_bytes` are inlined intrinsics attributed to their callers. Both zkVMs
+    # are RISC-V, whose base ISA has no byte-swap instruction, so the work is a shift sequence either
+    # way — reth converts too (big-endian words vs little-endian ruint limbs), it just never appears
+    # as a symbol. Measured: ZERO byte-order symbols in either reth guest. Read Monad's absolute
+    # figure (~22M instructions/block), never the ratio.
+    ('byte/bit manipulation',  r'bswap|to_be_bytes|from_be_bytes|byteswap|htonl|ntohl|popcount'
+                               r'|count_ones|leading_zeros|trailing_zeros|clz|ctz'),
     ('256-bit arithmetic',     r'mulmod|addmod|submod|div_rem|div_result|udivti3|umodti3|uint256'
-                               r'|intx|u256|bswap'),
+                               r'|intx|u256|Uint<256'),
+    # Witness decoding is its own family, and must precede state/trie: the guests use different
+    # witness formats (bincode/serde vs RLP), so folding one into "trie" and leaving the other in
+    # "other" compared nothing. Measured: Monad decodes its witness with LESS work (0.42x).
+    ('witness decoding',       r'bincode|serde|parse_metadata|(?<![a-z])rlp|decode'),
     # PartialNode / PartialTrieDb are trie node types: Boost.Outcome wrappers around them are trie
-    # work, and without naming them here ~half the C++ family was in fact mis-filed trie work.
-    ('state / trie',           r'trie|mpt|SparseState|PartialTrieDb|PartialNode|nibble|rlp|proof'),
-    ('EVM interpreter',        r'interpreter|revm|evmc|Intercode|opcode|execute_block|push<|swap<|dup<'),
+    # work, and without naming them here ~half the abstraction family was mis-filed trie work.
+    # State ACCESS belongs here too, not just trie structure: Monad's BlockState/State readers were
+    # ~54% of its `other` family while reth's equivalents sat in trie — an asymmetry that made `other`
+    # look like a Monad-specific 6.8x cost.
+    ('state / trie',           r'trie|mpt|SparseState|PartialTrieDb|PartialNode|nibble|proof'
+                               r'|account_state|current_account|StateDelta|storage_at|BlockState'
+                               r'|AccountState|get_storage|read_storage|read_code|access_storage'
+                               r'|pop_accept|can_merge|State::merge|BranchData|LeafValue|sload|sstore'),
+    # `evmc` must not be bare: `std::basic_string<unsigned char, evmc::byte_traits<…>>` is a
+    # C++ string type, and it was 26.5% of Monad's EVM family while reth's equivalent buffer
+    # (Vec<u8>/Bytes) sat in containers — an asymmetry worth ~0.24x on the interpreter ratio.
+    # Block-level logic: fees, calldata accounting, consensus validation, receipts, the guest's
+    # own driver. Real work, present in both guests, and it was the bulk of what remained in `other`.
+    ('block / consensus logic', r'tokens_in_calldata|base_fee|blob_gas|validate_block|validation'
+                                r'|Receipt|BlockExecutor|run::run|client::main|envelope|bloom'),
+    # Runtime plumbing with no domain meaning: locks, drop glue, sorting.
+    ('runtime plumbing',       r'critical_section|drop_in_place|quicksort|sort::|panic|fmt::'),
+    ('EVM interpreter',        r'interpreter|revm|Intercode|opcode|execute_block|push<|swap<'
+                               r'|dup<|evmc::(?!byte_traits)|alloy_evm|MainnetHandler'),
+    # SYMMETRY MATTERS HERE. This family first carried only C++ vocabulary (std::/boost::/unordered),
+    # so Rust's equivalent machinery — RawVec growth, Vec/Box/iterator adapters, bytes:: — fell into
+    # "memory" or "other" instead. That asymmetry alone inflated the Monad/reth ratio ~9x (60.3x vs
+    # 6.9x on the same profiles). Keep both vocabularies, or the number is about the patterns rather
+    # than the guests.
+    ('containers / abstraction', r'std::|boost::|ankerl|hashbrown|immer|unordered|vector|map|hash'
+                                 r'|raw_vec|RawVec|::vec::|Vec<|smallvec|arrayvec|bytes::|Box<'
+                                 r'|iter::|indexmap'),
     ('memory / allocation',    r'memcpy|memmove|memset|memcmp|alloc|dealloc|Heap|free|malloc|tlsf'),
-    ('C++ abstraction layer',  r'std::|boost::|ankerl|hashbrown|immer|unordered|vector|map|hash'),
 ]
 
 def family(name):

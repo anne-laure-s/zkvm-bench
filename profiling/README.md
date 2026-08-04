@@ -121,7 +121,8 @@ groups instead. Collecting all this needs one re-run per axis; afterwards it's c
 (hashing, 256-bit arithmetic, state/trie, EVM interpreter, containers/runtime, memory) by classifying
 **function names**, since the two guests share no module names. It needs one profiling run per guest
 per sampled block (~13 s ZisK, ~24 s SP1), cached until the guest ELF changes; `--families N` sets the
-sample size (default 10), `--families 0` skips it.
+sample size (default 50), `--families 0` skips it; profiles are cached **per block**, so raising N
+only profiles the blocks you add.
 
 The sample is **stratified**: one block from the middle of each of N equal-population slices of the
 ratio distribution. That matters more than N does — sampling the endpoints (0–100 %) gives the two most
@@ -129,8 +130,8 @@ extreme blocks 1/N of the weight each though they stand for one block in hundred
 256-bit-arithmetic family 2.5× (146 M vs 59 M instructions); clustering near the median makes the
 mirror mistake, dropping tails that carry real work. Stratified is unbiased for the mean and steadier
 than a random draw of the same size. On sample size, measured rather than assumed: 5 → 10 moved every family by
-1–4 % except the EVM-interpreter row (−17 %), so **10 is the default** — the extra runs are cheap and
-cached, and they steady the one row that was still moving.
+1–4 % except the EVM-interpreter row (−17 %), and 10 → 50 moved the C++ family from 13.6× to 5.11× on SP1 — a small sample was
+not settled, so **50 is the default**. Profiles are cached per block, so the cost is paid once.
 
 Note the two profilers differ in kind: ZisK's attributes essentially every instruction, SP1's **samples**
 (1 in ~270 measured), so its family counts are scaled to the real cycle count. Ratios survive sampling;
@@ -245,6 +246,16 @@ a warning — work-units only compare within one ELF version. `--baseline` uses 
 an expected ELF-bump change from a real determinism regression (exit 1 only on the latter → CI-friendly).
 
 ## Also here
+- [FINDINGS.md](FINDINGS.md) — **internal**, not a deliverable and never linked from one: the
+  Monad-vs-reth results, and the
+  62 traps that each produced a plausible wrong answer (gas-pass reordering the guests, taxonomy
+  asymmetry inflating a ratio 9×, endpoint sampling, sampled-vs-counted profilers, silent cache misses,
+  two unlabelled ratio statistics shown side by side, a non-contiguous span described as contiguous…).
+  **The one that changes a conclusion:** the 68 SP1 blocks where Monad looks cheaper are blocks where
+  `rsp` runs BN254 in software — Monad is flat there and `rsp` costs 1.5× more. Engine-to-engine the
+  SP1 median is **1.263×**, not 1.221×. `rsp` is the only one of the four guests with **no**
+  precompile-backed BN254 crate (0 % vs `monad-sp1`'s `zkvm_bn254_g1_mul`, same emulator) — a missing
+  patch, not a limit of SP1.
 - [CALLGRAPH-NOTES.md](CALLGRAPH-NOTES.md) — why the zisk profile is **flat** (a heuristic limit, not
   a frame-pointer issue) + the experimental `ziskemu-callstack.patch`.
 - `template.html` — the shared hotspots renderer. **All generated output goes under `results/`**
