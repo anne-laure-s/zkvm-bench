@@ -702,6 +702,81 @@ onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CON
 # The cadence is only meaningful in the tip phase: phase_sessions() starts the tap for `tip` and not for
 # `catchup`, so catch-up keeps advancing the replay at full speed and sampling never slows the backlog drain.
 
+step "Witness format vs guest generation"
+# THE ONE FAILURE THIS EXISTS TO CATCH: a guest built for one witness wire format, fed witnesses in the other.
+# It is not a graceful failure — the guest panics or reads garbage — and nothing about it is visible by
+# inspection, because witness FILENAMES are identical across formats. Two independent moving parts decide it:
+#
+#   the PRODUCER's format   <- the monad branch on the box (al/rtp emits rlp-list; the OffsetTrieDb lineage
+#                              emits MZW\x01), i.e. whatever MONAD_BRANCH checked out above
+#   the GUEST's format      <- guests/monad/monad-zkvm-guest-zisk.elf in the box's clone, which is a symlink
+#                              target chosen by `use-gen` and committed
+#
+# They travel by different routes — one is a branch checkout, the other a tracked binary in this repo — so
+# they desync on any commit that touches only one of them. Concretely: `git add -A` of a working tree where
+# use-gen has installed a new generation ships an offset guest to a box still replaying on al/rtp, and every
+# block breaks at once with no line naming the cause. Hence a check before the prover starts, not after.
+#
+# gen/ is UNTRACKED — it is local state on this Mac — so the box cannot resolve a sha to a generation. The sha
+# is read there, the map applied here, and one witness is pulled to read its real format with the same detector
+# use-gen uses. ~7 MB once per rtp-up run: the cheapest possible price for not discovering this per block.
+if [ "$DRY" = 1 ]; then
+  say "dry run — format check skipped"
+else
+  box_elf_sha="$(onbox_q "sha256sum $BOX_REPO/guests/monad/monad-zkvm-guest-zisk.elf 2>/dev/null | awk '{print \$1}'")"
+  elf_gen=""
+  for d in "$MAC_REPO"/guests/monad/gen/*/; do
+    [ -f "$d/elf/monad-zkvm-guest-zisk.elf" ] || continue
+    if [ "$(shasum -a 256 "$d/elf/monad-zkvm-guest-zisk.elf" | awk '{print $1}')" = "$box_elf_sha" ]; then
+      elf_gen="$(basename "$d")"
+    fi
+  done
+  # The producer was started seconds ago and the tap deletes a raw witness as soon as it frames it, so the
+  # window is narrow and the first look will usually miss. Poll rather than conclude from one empty listing.
+  wit=""; for _ in $(seq 1 45); do
+    wit="$(onbox_q "ls -t \$HOME/witnesses/*.witness 2>/dev/null | head -1")"
+    [ -n "$wit" ] && break
+    sleep 1
+  done
+  if [ -z "$wit" ]; then
+    say "WARNING: no witness appeared on $BOX in 45 s — format left UNCHECKED"
+    say "  the producer may still be starting; re-run this script once it is emitting, or check by hand:"
+    say "    ssh $BOX 'ls -t ~/witnesses/*.witness | head -1'"
+  else
+    tmp_wit="$(mktemp -t rtpfmt)"
+    if scp -q "$BOX:$wit" "$tmp_wit" 2>/dev/null; then
+      prod_fmt="$("$MAC_REPO"/guests/monad/witness-fmt --quiet "$tmp_wit" 2>/dev/null || echo unreadable)"
+    else
+      prod_fmt="unreadable"
+    fi
+    rm -f "$tmp_wit"
+    # The generation's own witnesses ARE the statement of what its guest reads — no separate metadata to drift.
+    guest_fmt="unknown"
+    if [ -n "$elf_gen" ]; then
+      sample="$(ls "$MAC_REPO"/guests/monad/gen/"$elf_gen"/witnesses/*.witness 2>/dev/null | head -1)"
+      [ -n "$sample" ] && guest_fmt="$("$MAC_REPO"/guests/monad/witness-fmt --quiet "$sample" 2>/dev/null || echo unknown)"
+    fi
+    say "producer ($MONAD_BRANCH on $BOX): $prod_fmt   ·   guest (${elf_gen:-UNKNOWN generation}): $guest_fmt"
+    if [ -z "$elf_gen" ]; then
+      say "WARNING: the box's ELF ($(printf %.12s "$box_elf_sha")…) matches no generation in guests/monad/gen/,"
+      say "  so its expected format cannot be known and the pair is UNCHECKED. File the ELF into a generation"
+      say "  directory (with its witnesses) to make this checkable — that is what gen/ is for."
+    elif [ "$prod_fmt" = unreadable ] || [ "$guest_fmt" = unknown ]; then
+      say "WARNING: could not read one side — pair left UNCHECKED (producer=$prod_fmt guest=$guest_fmt)"
+    elif [ "$prod_fmt" != "$guest_fmt" ]; then
+      say "the box is replaying on '$MONAD_BRANCH', which emits '$prod_fmt' witnesses."
+      say "the committed guest is generation '$elf_gen', which reads '$guest_fmt'."
+      say "Resolve by moving ONE of the two, not both:"
+      say "  · keep the guest -> put the box on the branch of that generation's lineage (MONAD_BRANCH=...)"
+      say "  · keep the branch -> select the matching generation and commit it:"
+      say "      cd $MAC_REPO/guests/monad && ./use-gen            # lists generations and their formats"
+      die "witness format mismatch — refusing to start the prover on a guest that cannot read these witnesses."
+    else
+      say "match: both '$prod_fmt' — the guest can read what the producer emits"
+    fi
+  fi
+fi
+
 step "Starting the prover (mock on $PROVER_WHERE, transfers real)"
 # ALWAYS restarted, never "already running". A live session carries the environment and the code it was
 # started with: after a git pull or a config change, leaving it alone means the new behaviour is deployed but

@@ -505,7 +505,15 @@ submit_one(){  # $1=block  $2=run_dir
     p_man=""
     [ -r "$mf" ] && p_man="$({ head -1 "$mf"; grep -m1 "^$b," "$mf"; } 2>/dev/null | base64 | tr -d '\n')"
     # One exchange: build the shaped dir, drop the two inputs in, submit, clean up. `cp` not `ln`, because
-    # ethproofs-submit may read a file the workspace could prune under it mid-submission.
+    # the workspace really does prune under it — core.sh sweeps anything stale on every block, and `ln` would
+    # hand ethproofs-submit a name that can vanish mid-submission.
+    #
+    # AND THIS IS WHERE THE PROVER'S ARTIFACTS DIE. core.sh deletes the input right after the prove but keeps
+    # proof/report/log when REMOTE_SUBMIT is set, precisely because this exchange still needs them; nothing else
+    # ever reads them again, so the same exchange takes them out. The `rm` runs on the failure path too (rc is
+    # captured before it), which is safe: the box already holds all four artifacts in its own run record and
+    # core.sh fails the block outright if the proof did not come back, so these are never the last copy. The
+    # fallback below then submits from the box's copy without needing the prover at all.
     if ssh -o BatchMode=yes -p "${PORT:-22}" "$REMOTE" \
         "d=\$(mktemp -d) && cp '$rws/proofs/$rbase.proof.bin' \"\$d/proof.bin\" \
          && cp '$rws/reports/$rbase.json' \"\$d/report.json\" \
@@ -515,7 +523,8 @@ submit_one(){  # $1=block  $2=run_dir
          && '$REMOTE_SUBMIT' --run-dir \"\$d\" --block '$b' ${VM:+--vm '$VM'} --guest '$GUEST' \
               --manifest \"\$d/manifest.csv\" \
               --ethproofs-url '$ETHPROOFS_URL' --token '$ETHPROOFS_TOKEN' --cluster '$ETHPROOFS_CLUSTER'; \
-         rc=\$?; rm -rf \"\$d\"; exit \$rc" > "$slog" 2>&1; then
+         rc=\$?; rm -rf \"\$d\" '$rws/proofs/$rbase.proof.bin' '$rws/proofs/$rbase.pv.bin' \
+              '$rws/reports/$rbase.json' '$rws/reports/$rbase.log'; exit \$rc" > "$slog" 2>&1; then
       log "<< submit $b ok  ($(tail -n1 "$slog"))"
       return 0
     fi

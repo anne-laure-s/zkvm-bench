@@ -171,8 +171,22 @@ prove_remote() {
   local pump_cmd=""
   [[ -n "${WITNESS_PUMP:-}" ]] && pump_cmd="${PUMP_SOCK:+PUMP_SOCK=$PUMP_SOCK }$WITNESS_PUMP"
   local t_start; t_start="$(date +%s.%N)"
+  # AND THE SWEEP RIDES IT TOO — the safety net behind the per-block deletions further down. Those cover the
+  # normal path; this covers what no per-block rule can: a killed prover, a failed submit that never reached its
+  # own cleanup, a run interrupted between the prove and the retrieve. Without it the workspace only trends to
+  # empty, and "only leaks on failure" is how 26.8 GB accumulated in the first place.
+  #
+  # Age, not block number, is the criterion, and that is deliberate. A number-based rule ("delete anything below
+  # the current block") looks tighter but breaks prefetch: prove-farm ships the NEXT block ahead of time, so a
+  # future input is legitimately present and a naive sweep would delete the very thing the prefetch just paid for.
+  # In a pipeline where a block lives 12 s, nothing an hour old is in flight — including a prefetched input.
+  # `find -delete` is one pass in C, not a shell loop, so this stays cheap even against the 10k-file backlog it
+  # clears on its first run. elfs/ is never touched: the guest and the zkVM setup are what the prover legitimately
+  # keeps, and they are the whole of what survives.
+  local ws_keep_min="${ZISK_WS_KEEP_MIN:-60}"
   local ws_meta ws_abs rsum rinsize fetched
   ws_meta="$("${ssh[@]}" "mkdir -p \"$ws\"/elfs \"$ws\"/inputs \"$ws\"/proofs \"$ws\"/reports && cd \"$ws\" \
+&& { find inputs proofs reports -type f -mmin +$ws_keep_min -delete 2>/dev/null || true; } \
 && WS=\"\$(pwd)\" && echo \"\$WS\" \
 && { sha256sum elfs/$elf_name 2>/dev/null || shasum -a 256 elfs/$elf_name 2>/dev/null; } | awk '{print \$1}' \
 && SZ=\"\$(stat -c %s inputs/$in_name 2>/dev/null || stat -f %z inputs/$in_name 2>/dev/null || echo 0)\" \
@@ -228,7 +242,7 @@ echo '--- gpu ---'; nvidia-smi --query-gpu=name,memory.total,driver_version --fo
   #
   # So keep the tunnel for the control channel (a few hundred bytes of ssh command) and let the remote pull
   # the payload over a direct, un-nested connection: PULL_VIA is this machine's ssh target AS SEEN FROM THE
-  # REMOTE. On the witness box, PULL_VIA=aschmitt@nyc-003 turns 7-15 MB from ~15 s into ~3 s.
+  # REMOTE. On the witness box, PULL_VIA=<user>@<witness-box> turns 7-15 MB from ~15 s into ~3 s.
   #
   # The remote runs this non-interactively, so it needs its own key for us — no agent will be present. On
   # failure we say so loudly and fall back to pushing: a slow pipeline beats a stopped one, but a silent
@@ -367,6 +381,28 @@ ${ZISK_MOCK_PROOF_BYTES:+ZISK_MOCK_PROOF_BYTES=$ZISK_MOCK_PROOF_BYTES }"
   local box_tar="$getdir/pushed.tar"
   local push_cmd="cat $ws/art.tar"
   [[ -n "$pump_cmd" ]] && push_cmd="$pump_cmd put $ws/art.tar '$box_tar' >&2 && echo PUSHED >&2 || cat $ws/art.tar"
+  # THE PROVER KEEPS NOTHING — it is a compute surface, not an archive. Everything per-block is removed on the
+  # exchange that last needed it, so the workspace returns to elfs/ + the zkVM setup after every block. No extra
+  # round trip pays for this: the deletions ride exchanges that already happen.
+  #
+  # What it cost when nothing was deleted: 26.8 GB for 3594 blocks = 7.46 MB/block, i.e. 54 GB/day at
+  # PROVE_EVERY=1. The witness is 7.4 of those 7.46 MB, so the input below is 99 % of the problem.
+  #
+  # The INPUT is unconditionally dead here: the prove has run, and nothing reads it again. A retry re-fetches it,
+  # which costs one transfer on a rare path — the right trade against carrying every witness forever.
+  #
+  # The ARTIFACTS are only kept when REMOTE_SUBMIT will read them off the prover to POST without sending the
+  # proof back through the tunnel; that path deletes them itself once the submission has copied them out. When
+  # it is unset they go here, because the box already holds all four — the `mv`s below land them in $run_dir and
+  # the check after that FAILS THE BLOCK if the proof is missing. So the prover's copies are never the last copy.
+  # ABSOLUTE paths, unlike the tar's member list which must stay relative to be extractable by name. The `rm`
+  # shares a `;`-separated line with `cd $ws`, so a relative list would resolve against $HOME if that cd ever
+  # failed — pointing a recursive delete at the wrong directory. $ws is absolute here ($ws_abs, resolved above).
+  local ws_clean="$ws/inputs/$in_name" m
+  [[ $have_hints == 1 ]] && ws_clean="$ws_clean $ws/inputs/$hints_name"
+  if [[ -z "${REMOTE_SUBMIT:-}" ]]; then
+    for m in $members; do ws_clean="$ws_clean $ws/$m"; done
+  fi
   "${ssh[@]}" "set -o pipefail; { ${logpref}${mockenv}ZISK_PROVE_BACKEND=$backend $remote_runner \
     --elf $ws/elfs/$elf_name \
     --input $ws/inputs/$in_name $hints_arg \
@@ -374,7 +410,7 @@ ${ZISK_MOCK_PROOF_BYTES:+ZISK_MOCK_PROOF_BYTES=$ZISK_MOCK_PROOF_BYTES }"
     --output $ws/proofs/$base.proof.bin \
     --public-values $ws/proofs/$base.pv.bin \
     --report $ws/reports/$base.json 2>&1 | tee $ws/reports/$base.log; } >&2
-cd $ws && tar cf - $members 2>/dev/null > $ws/art.tar; $push_cmd; rm -f $ws/art.tar" \
+cd $ws && tar cf - $members 2>/dev/null > $ws/art.tar; $push_cmd; rm -rf $ws/art.tar $ws_clean" \
     > "$getdir/stream.tar"
   # stderr is deliberately NOT redirected: it now carries the prover's own log, streamed live. Silencing it here
   # would have thrown away every line the prover prints — the whole reason the log moved to stderr was to keep
