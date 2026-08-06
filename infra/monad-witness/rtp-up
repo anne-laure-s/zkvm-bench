@@ -396,6 +396,52 @@ that host's authorized_keys — the same way step 2 does it for this Mac."
 fi
 
 # ── 6. the box: code, producer, prover ─────────────────────────────────────────────────────────────
+# ── 5b. the monad BINARY must match the monad SOURCE, on the RTP branch ────────────────────────────
+#
+# This cost an hour of misdiagnosis. The producer's behaviour comes from a compiled binary, and nothing in the
+# pipeline notices when that binary was built from a different branch than the one checked out:
+#
+#   al/rtp carries `runloop_ethereum: wait for a block instead of asserting, honouring --block-db-timeout`,
+#   and drops the `->needs(as_eth_blocks_flag)` constraint in cmd/monad/main.cpp.
+#
+# The checkout was on al/rtp; the binary had been built from another branch, so it still enforced that
+# constraint and exited 107 on `--block-db-timeout` alone. That wrote an ALERT which reorg-recover correctly
+# refuses (it is not a reorg), and the failure message pointed at flags rather than at a stale build. Reading
+# RTP-FINDINGS made it worse: it states the wait "lives in the Monad runloop, not the Ethereum one", which was
+# true of the OLD branch and is exactly what al/rtp changes.
+#
+# So: check the branch, then check that the binary embeds the checked-out commit. Fatal, because running the
+# wrong binary produces failures that read as configuration problems.
+# MONAD_BRANCH= (empty) skips both checks.
+MONAD_BRANCH="${MONAD_BRANCH:-al/rtp}"
+MONAD_DIR_BOX="${MONAD_DIR_BOX:-\$HOME/monad}"
+if [ "$DRY" != 1 ] && [ -n "$MONAD_BRANCH" ]; then
+  step "monad: branch $MONAD_BRANCH, and a binary built from it"
+  mb="$(onbox_q "cd $MONAD_DIR_BOX && git rev-parse --abbrev-ref HEAD")"
+  [ "$mb" = "$MONAD_BRANCH" ] \
+    || die "$BOX's monad is on branch '$mb', not '$MONAD_BRANCH'. The RTP pipeline needs $MONAD_BRANCH — it is
+the branch where the ethereum runloop WAITS for a block instead of asserting. Switch it and rebuild:
+    ssh $BOX 'cd monad && git checkout $MONAD_BRANCH && cmake --build build --target monad -j\$(nproc)'
+  (MONAD_BRANCH= skips this check.)"
+  say "branch $mb"
+  mhead="$(onbox_q "cd $MONAD_DIR_BOX && git rev-parse HEAD")"
+  # The build commit is compiled in — monad prints it as "running with commit '<sha>'" — so it can be read out
+  # of the binary without starting it. If no 40-hex string is found at all, fall back to mtime: a binary older
+  # than the commit it should contain is stale beyond doubt.
+  if onbox_q "strings -a $MONAD_DIR_BOX/build/cmd/monad 2>/dev/null | grep -qF '$mhead' && echo yes" | grep -q yes; then
+    say "binary built from ${mhead:0:12} — matches the checkout"
+  elif onbox_q "test \$(stat -c %Y $MONAD_DIR_BOX/build/cmd/monad) -lt \$(cd $MONAD_DIR_BOX && git log -1 --format=%ct) && echo old" | grep -q old; then
+    die "$BOX's monad binary is OLDER than the commit checked out on $MONAD_BRANCH — it cannot contain it. Rebuild:
+    ssh $BOX 'cd monad && cmake --build build --target monad -j\$(nproc)'"
+  else
+    die "$BOX's monad binary does not contain the checked-out commit ${mhead:0:12} — it was built from another
+branch or another revision. That is what makes --block-db-timeout fail with 'requires --as-eth-blocks' on a
+checkout where that constraint no longer exists. Rebuild:
+    ssh $BOX 'cd monad && cmake --build build --target monad -j\$(nproc)'
+  (Incremental, but ~251 files differ across branches here — allow 10-40 min on 16 cores.)"
+  fi
+fi
+
 step "Updating the box's clone"
 onbox "cd $BOX_REPO && git pull --ff-only 2>&1 | tail -2"
 if [ "$DRY" != 1 ]; then
