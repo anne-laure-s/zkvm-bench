@@ -43,6 +43,10 @@
 #               HEAD_TAG=latest  CONFIRMATIONS=0 (the head — real time)  MOCK_RUNNER_DIR=$HOME/zisk-mock
 #               CATCHUP_TARGET=10 (blocks)  CATCHUP_POLL=30 (s)  CATCHUP_MAX_MIN=240
 #               FETCH_POLL=1  TAP_INTERVAL=1  REPLAY_POLL=1  SETTLE_SECS=0.5   (polling latency)
+#               PROVE_EVERY=1   prove every Nth BLOCK (not seconds — N counts blocks). 1 = every block.
+#                   Raise it when the prover cannot hold the 12 s slot. N=2 is the first value that fits;
+#                   100 = ethproofs sampling. Selection is `block % N == 0`, so the same blocks are picked
+#                   across runs and across zkVMs. Coverage then reports 1/N as its CEILING, not a shortfall.
 #               PROVER=<ssh target the BOX can reach>  PROVER_PORT=22
 #                   unset = the mock prover runs on this Mac through the tunnel: 20-34 s per block of pure
 #                   transport, the largest term left in the end-to-end. Set it to a datacenter host and the
@@ -82,6 +86,40 @@ REPLAY_POLL="${REPLAY_POLL:-0.3}"
 # The tap skips a witness younger than this so it never frames a half-written one. 2 s was cautious and
 # showed up whole in wit->queue; monad writes a witness in one pass, so 0.5 s is enough margin.
 SETTLE_SECS="${SETTLE_SECS:-0.5}"
+# PROVE EVERY N BLOCKS. N counts BLOCKS, not seconds — every other knob up to here is a duration, so the unit
+# is worth stating twice. The mechanism was always in witness-tap (`is_cadence = b % PROVE_EVERY == 0`) and
+# witness-follow always forwarded it; rtp-up simply never exposed it.
+#
+# WHY IT IS NOT A RETREAT — measured on 300 consecutive live blocks (25697053..25697390), not estimated:
+#   producer  t_block -> t_queued   median  8.34 s   p90 11.55 s    (of which 6.90 s is chain visibility)
+#   prover    full service (wall)   median 12.00 s   p90 15.00 s    (mock prove 7.19 s + transport 4.77 s)
+#   38% of blocks overrun the 12 s slot, and coverage was ALREADY 88.8% — 38 of those 338 blocks were
+#   dropped by --newest-first, silently and unreproducibly.
+# So the choice is not between full coverage and sampling; it is between an involuntary 88.8% at random and a
+# deliberate 1/N where every sampled block is proved at genuine real-time latency. On the same 300 services,
+# N=1 fits the slot 61.7% of the time and N=2 fits it 100% — N=2 is the answer, and N=3+ buys nothing more.
+# What you trade is coverage, and coverage is the number this pipeline is honest about: 1/N is the CEILING,
+# not a shortfall. Once the transport regression is fixed (4.77 s -> ~2.3 s) N=1 becomes tenable again: this
+# is a knob, not a permanent concession.
+#
+# The modulus is on the BLOCK NUMBER, not on arrival order, so the same blocks are selected across runs and
+# across zkVMs — which is what makes a cross-prover comparison possible at all. PROVE_EVERY=100 is the
+# ethproofs sampling cadence.
+#
+# ONE INTERACTION TO KNOW ABOUT. witness-tap abandons a block once it falls outside `b > last - SKIP_AFTER`,
+# and SKIP_AFTER counts BLOCKS (100), not sampled blocks. At N=2 or 4 that window still holds 50 or 25 sampled
+# blocks, so it never binds. At N >= 100 it holds at most one, and a tap that lags will drop sampled blocks
+# outright — raise SKIP_AFTER alongside N if you ever go that high.
+PROVE_EVERY="${PROVE_EVERY:-1}"
+# Validated here because there is no `set -e`: a non-numeric value would make `[ -gt ]` complain and carry on,
+# and 0 would reach witness-tap as `b % 0` — a ZeroDivisionError that kills the tap one block into the run.
+# `die` is defined further down, so this reports the failure itself. The numeric test is second on purpose:
+# `[ -lt ]` on a non-numeric value is itself an error, and the short-circuit keeps it from ever running.
+if ! printf '%s' "$PROVE_EVERY" | grep -Eq '^[0-9]+$' || [ "$PROVE_EVERY" -lt 1 ]; then
+  printf '\n\033[1mrtp-up: PROVE_EVERY must be a positive integer (1 = every block), got "%s"\033[0m\n' \
+    "$PROVE_EVERY" >&2
+  exit 1
+fi
 # The runner must live OUTSIDE ~/Documents: macOS TCC protects it, and a process started by sshd cannot
 # execute anything there ("Operation not permitted"). This is why the script copies it at all.
 MOCK_RUNNER_DIR="${MOCK_RUNNER_DIR:-$HOME/zisk-mock}"
@@ -634,6 +672,17 @@ if [ "$PURGE" = 1 ]; then
 fi
 
 step "Starting the producer (fetch · replay+witnesses · tap)"
+# A sampling cadence must never be invisible: it changes what `coverage` means, and a silent 1-in-N would read
+# as a pipeline dropping blocks. Announce it with the slot arithmetic that justifies it.
+if [ "$PROVE_EVERY" -gt 1 ]; then
+  say "cadence: proving every $PROVE_EVERY blocks (those where block % $PROVE_EVERY == 0)"
+  say "  the prover gets $((PROVE_EVERY * 12)) s per sampled block instead of 12 s — measured service is 12.0 s median, 15.0 s p90"
+  say "  coverage will read ~$((100 / PROVE_EVERY))% and that is the CEILING, not a shortfall"
+else
+  say "cadence: every block (PROVE_EVERY=1). Measured service is 12.0 s median / 15.0 s p90 on a 12 s slot,"
+  say "  so 38% of blocks overrun it and --newest-first drops the stragglers: coverage lands near 89%, at random."
+  say "  PROVE_EVERY=2 fits 100% of those services and makes the sampling deliberate and reproducible."
+fi
 if [ "$DRY" != 1 ] && [ -n "$(onbox_q "ls ~/monad/logs/ALERT 2>/dev/null")" ]; then
   # At CONFIRMATIONS=0 this is what a reorg looks like: the replay could not apply the next block on top of
   # one that left the canonical chain. Recovery is a rewind + re-fetch, and it must be deliberate.
@@ -649,7 +698,9 @@ fi
 # how the long-lived-monad path stayed undeployed while the logs showed a perfectly healthy producer — twice in
 # one day, on two different components. Restarting costs one block; not restarting costs the whole change.
 onbox "tmux kill-session -t replay-tip 2>/dev/null; tmux kill-session -t tap 2>/dev/null; pkill -f '[r]un_replay.py' 2>/dev/null; pkill -f '[w]itness-tap' 2>/dev/null; sleep 2; echo '   · tip sessions cleared (they would keep the old code and env)'"
-onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL TAP_INTERVAL=$TAP_INTERVAL REPLAY_POLL=$REPLAY_POLL SETTLE_SECS=$SETTLE_SECS TIP_DIRECT=$TIP_DIRECT BLOCK_DB_TIMEOUT=$BLOCK_DB_TIMEOUT ETHPROOFS_URL=http://localhost:$MOCK_PORT CLUSTER=local-ZisK-monad ./witness-follow start tip"
+onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL TAP_INTERVAL=$TAP_INTERVAL REPLAY_POLL=$REPLAY_POLL SETTLE_SECS=$SETTLE_SECS TIP_DIRECT=$TIP_DIRECT BLOCK_DB_TIMEOUT=$BLOCK_DB_TIMEOUT PROVE_EVERY=$PROVE_EVERY ETHPROOFS_URL=http://localhost:$MOCK_PORT CLUSTER=local-ZisK-monad ./witness-follow start tip"
+# The cadence is only meaningful in the tip phase: phase_sessions() starts the tap for `tip` and not for
+# `catchup`, so catch-up keeps advancing the replay at full speed and sampling never slows the backlog drain.
 
 step "Starting the prover (mock on $PROVER_WHERE, transfers real)"
 # ALWAYS restarted, never "already running". A live session carries the environment and the code it was

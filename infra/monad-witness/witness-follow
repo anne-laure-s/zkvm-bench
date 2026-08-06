@@ -28,7 +28,7 @@
 #   ./witness-follow stop                    SIGTERM the replay/tap (leaves the fetcher alone)
 #
 # Config (env): MONAD_DIR REPO WITNESS_DIR BLOCK_DB DB RPC NTHREADS MAX_BATCH MIN_FOLLOW_BATCH
-#               PY ETHPROOFS_URL CLUSTER QUEUE_MODULUS KEEP_RECENT
+#               PY ETHPROOFS_URL CLUSTER PROVE_EVERY KEEP_RECENT
 #               HEAD_TAG CONFIRMATIONS   (block-by-block; needs ./patch-fetch-blocks.py — see README)
 #               FETCH_POLL TAP_INTERVAL REPLAY_POLL   (polling latency: 6 s, 6 s and 12 s by default,
 #                                          waiting in the end-to-end budget for no benefit)
@@ -99,7 +99,7 @@ tip_direct_cmd() {
 tap_cmd() {
   echo "cd $HERE && WITNESS_DIR=$WITNESS_DIR REPO=$REPO BLOCK_DB=$BLOCK_DB RPC=$RPC \
 ${ETHPROOFS_URL:+ETHPROOFS_URL=$ETHPROOFS_URL }${CLUSTER:+CLUSTER=$CLUSTER }\
-${QUEUE_MODULUS:+QUEUE_MODULUS=$QUEUE_MODULUS }${KEEP_RECENT:+KEEP_RECENT=$KEEP_RECENT }\
+${PROVE_EVERY:+PROVE_EVERY=$PROVE_EVERY }${KEEP_RECENT:+KEEP_RECENT=$KEEP_RECENT }\
 ${TAP_INTERVAL:+INTERVAL=$TAP_INTERVAL }${SETTLE_SECS:+SETTLE_SECS=$SETTLE_SECS }\
 ./witness-tap 2>&1 | tee -a ~/witness-tap.log"
 }

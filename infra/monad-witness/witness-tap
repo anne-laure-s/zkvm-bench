@@ -9,7 +9,7 @@ firehose into the three things the RTP pipeline actually needs, and nothing else
                from the dump dir into the prover queue, via the guest's own gen-inputs --src-dir:
                <dump>/<block>.witness -> <repo>/guests/monad-zisk/fixtures/1-<block>.bin  (+ its root)
                No in-repo staging copy: at one 7 MB witness per 12 s slot that would double disk and I/O
-               for nothing. Set QUEUE_MODULUS=100 for the ethproofs SAMPLING cadence instead (cheap
+               for nothing. Set PROVE_EVERY=100 for the ethproofs SAMPLING cadence instead (cheap
                benchmark mode); 1 (the default) is real-time.
   2. PRUNE   — the RAW witness is deleted the moment it is framed. It is strictly redundant: the framed
                input is `LE64(len) + witness + pad`, so it CONTAINS the witness verbatim and the original is
@@ -66,7 +66,7 @@ mock's submissions.jsonl; joining the three is the latency report, not this loop
 Config (env, all optional except the paths' defaults being sane on nyc-003):
   WITNESS_DIR=~/witnesses      REPO=~/zkvm-bench        BLOCK_DB=~/block_db
   RPC=http://chi-001.devcore4.com:8545                  MANIFEST=<WITNESS_DIR>/../witness-manifest.csv
-  QUEUE_MODULUS=1 (RTP; 100 = ethproofs sampling)       INTERVAL=6
+  PROVE_EVERY=1 (RTP; 100 = ethproofs sampling)       INTERVAL=6
   KEEP_RECENT=10 (never touched, may be in flight)      SKIP_AFTER=100 (un-proved -> abandoned)
   KEEP_SAMPLE=1000 (benchmark corpus)   KEEP_BIG_MB=14   KEEP_SLOW_SECS=45  (outliers worth profiling)
   ETHPROOFS_URL=               CLUSTER=  VM=ZisK  GUEST=monad-zisk  SOURCE=<hostname>
@@ -91,7 +91,7 @@ BLOCK_DB      = os.path.abspath(os.path.expanduser(env("BLOCK_DB", f"{HOME}/bloc
 RPC           = env("RPC", "http://chi-001.devcore4.com:8545")
 MANIFEST      = os.path.abspath(os.path.expanduser(
                     env("MANIFEST", os.path.join(os.path.dirname(WITNESS_DIR), "witness-manifest.csv"))))
-QUEUE_MODULUS = int(env("QUEUE_MODULUS", 1))     # 1 = every block (RTP). 100 = ethproofs sampling.
+PROVE_EVERY = int(env("PROVE_EVERY", 1))     # 1 = every block (RTP). 100 = ethproofs sampling.
 INTERVAL      = float(env("INTERVAL", 6))        # half a slot: never more than one block behind
 # Retention policy (see the header): what makes a witness still worth its 7 MB.
 KEEP_RECENT   = int(env("KEEP_RECENT", 10))      # newest N always kept — nothing in flight is removed
@@ -380,7 +380,7 @@ def cycle(seen, dry):
     for b in blocks:
         wit  = os.path.join(WITNESS_DIR, f"{b}.witness")
         rootf = os.path.join(WITNESS_DIR, f"{b}.post_state_root")
-        is_cadence = (b % QUEUE_MODULUS == 0)
+        is_cadence = (b % PROVE_EVERY == 0)
         try:
             sizes[b] = os.path.getsize(wit)
         except OSError:
@@ -464,7 +464,7 @@ def main():
         sys.exit(f"witness-tap: no witness dir at {WITNESS_DIR} (set WITNESS_DIR=…)")
     if not os.access(GEN_INPUT, os.X_OK):
         sys.exit(f"witness-tap: {GEN_INPUT} not found/executable (is REPO={REPO} the zkvm-bench clone?)")
-    log(f"dir={WITNESS_DIR} repo={REPO} queue_modulus={QUEUE_MODULUS} keep_recent={KEEP_RECENT} "
+    log(f"dir={WITNESS_DIR} repo={REPO} prove_every={PROVE_EVERY} keep_recent={KEEP_RECENT} "
         f"manifest={MANIFEST}{' [DRY-RUN]' if dry else ''}{' [once]' if once else ''}"
         f"{f' heartbeat={ETHPROOFS_URL}' if ETHPROOFS_URL else ''}")
     seen = seen_blocks()
