@@ -132,6 +132,15 @@ AXES = {
     # ── Ablation axes (2026-08-09): the tip against itself minus ONE lever, so an axis prices that
     # lever alone. `ab-*` ablate the arith256 routings, `ab2-*` the guest-side levers. Read the
     # verdict in COST as well as steps — two of these levers inverted once the base moved.
+    # `ab2-bswap` was declared here and REMOVED 2026-08-10. Its ELF was a throwaway test build, never
+    # kept — so the axis had nothing to resolve and is not coming back. Do not re-add it.
+    # The byte/bit lever it was meant to price was measured by other means (22 blocks) and that
+    # survives: levers.py and the family table below read that result from results/, and the family
+    # itself is analysed in hotspots.py's taxonomy.
+    'opt-sp1': {'backend': 'sp1', 'unit': 'cycles',
+             'a': {'name': 'monad-r3-sp1', 'elf': 'guests/monad-variants/r3/monad-r3-sp1.elf',
+                   'src': 'monad'},
+             'b': {'name': 'rsp', 'elf': 'guests/rsp/rsp.elf', 'src': 'bin'}},
     'ab2-kec2': {'ephemeral': 'ablation of the word-wise keccak lever, 2026-08-09 re-verdict; drop when the r3 tip moves',
              'backend': 'zisk', 'unit': 'steps',
              'a': {'name': 'ab2-no-kec2', 'elf': 'guests/monad-variants/ab/ab2-no-kec2.elf',
@@ -192,11 +201,6 @@ AXES = {
                    'src': 'monad'},
              'b': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
                    'src': 'monad'}},
-    # `ab2-bswap` was declared here and REMOVED 2026-08-10. Its ELF was a throwaway test build, never
-    # kept — so the axis had nothing to resolve and is not coming back. Do not re-add it.
-    # The byte/bit lever it was meant to price was measured by other means (22 blocks) and that
-    # survives: levers.py and the family table below read that result from results/, and the family
-    # itself is analysed in hotspots.py's taxonomy.
     'ab-opstar': {'ephemeral': 'ablation of the operator* via arith256 lever, 2026-08-09 re-verdict; drop when the r3 tip moves',
              'backend': 'zisk', 'unit': 'steps',
              'a': {'name': 'ab-no-opstar', 'elf': 'guests/monad-variants/ab/ab-no-opstar.elf',
@@ -215,10 +219,26 @@ AXES = {
                    'src': 'monad'},
              'b': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
                    'src': 'monad'}},
-    'opt-sp1': {'backend': 'sp1', 'unit': 'cycles',
+    'monad-zisk-vs-zisk-reth': {'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-zisk', 'elf': 'guests/monad-zisk/monad-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'zisk-reth', 'elf': 'guests/zisk-reth/zisk-reth.elf',
+                   'src': 'bin'}},
+    'monad-r3-zisk-vs-monad-sam-zisk': {'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-sam-zisk', 'elf': 'guests/monad/gen/offsettriedb-rework-2026-08/elf/monad-zkvm-guest-zisk.elf',
+                   'src': 'monad'}},
+    'monad-sp1-vs-rsp': {'backend': 'sp1', 'unit': 'cycles',
+             'a': {'name': 'monad-sp1', 'elf': 'guests/monad-sp1/monad-sp1.elf',
+                   'src': 'monad'},
+             'b': {'name': 'rsp', 'elf': 'guests/rsp/rsp.elf',
+                   'src': 'bin'}},
+    'monad-r3-sp1-vs-monad-sam-sp1': {'backend': 'sp1', 'unit': 'cycles',
              'a': {'name': 'monad-r3-sp1', 'elf': 'guests/monad-variants/r3/monad-r3-sp1.elf',
                    'src': 'monad'},
-             'b': {'name': 'rsp', 'elf': 'guests/rsp/rsp.elf', 'src': 'bin'}},
+             'b': {'name': 'monad-sam-sp1', 'elf': 'guests/monad/gen/offsettriedb-rework-2026-08/elf/monad-zkvm-guest-sp1.elf',
+                   'src': 'monad'}},
 }
 # The default run is the shipped guest only: adding the levers axes must not silently change what
 # `./compare.py` with no arguments reports.
@@ -547,11 +567,43 @@ PURE_MSTEPS_PER_S = {
 
 
 def pure_secs(guest, work):
-    """Modelled pure execution seconds for `work` steps/cycles of `guest`."""
+    """Modelled pure execution seconds for `work` steps/cycles of `guest`.
+
+    Falls back through build IDENTITY when the name is unknown. The table is keyed by name, but a
+    build legitimately carries several: `monad-zisk` is a symlink to whichever generation is
+    selected, and its bytes are those of that generation's canonical pair (`monad-sam-zisk` today).
+    Keying only by name left those axes with an empty time column while the very same binary had a
+    measured rate under another name — so resolve through the content-addressed index rather than
+    ask anyone to keep alias rows in step.
+    """
     thr = PURE_MSTEPS_PER_S.get(guest)
+    if thr is None:
+        thr = _throughput_by_identity(guest)
     if not thr or not work:
         return None
     return round(work / (thr * 1e6), 4)
+
+
+_THR_ALIAS = {}
+
+
+def _throughput_by_identity(guest):
+    """Rate of any build sharing this one's sha256, or None."""
+    if guest in _THR_ALIAS:
+        return _THR_ALIAS[guest]
+    rate = None
+    try:
+        c = load_cache()
+        want = {i for i, _mt in c.builds_by_name(guest)}
+        if want:
+            for other, r in PURE_MSTEPS_PER_S.items():
+                if {i for i, _mt in c.builds_by_name(other)} & want:
+                    rate = r
+                    break
+    except Exception:
+        rate = None
+    _THR_ALIAS[guest] = rate
+    return rate
 
 
 def collect(axis, blocks, tools, cache, jobs, force, with_cost=False):
@@ -749,8 +801,14 @@ def _cost_time_axes(axis, rows):
     """Median per-block cost and pure-time ratios; empty when the axis carries no cost pass."""
     ax = AXES[axis]
     out = {}
-    cr = [r['a']['cost'] / r['b']['cost'] for r in rows.values()
-          if r['a'].get('cost') and r['b'].get('cost')]
+    # Prover cost is NOT a ZisK-only idea: ZisK reports COST, SP1 reports PGU (its report's `gas`
+    # field, which is prover gas and has nothing to do with EVM gas). Reading only `cost` left every
+    # SP1 axis with an empty column and made the metric look ZisK-specific, which it is not — the two
+    # are not comparable to each other, but each is the right prover-side number for its backend.
+    pwk = 'cost' if AXES[axis]['backend'] == 'zisk' else 'pgu'
+    out['cost_unit'] = 'COST' if pwk == 'cost' else 'PGU'
+    cr = [r['a'][pwk] / r['b'][pwk] for r in rows.values()
+          if r['a'].get(pwk) and r['b'].get(pwk)]
     if cr:
         out['cost_ratio_median'] = statistics.median(cr)
         out['cost_n'] = len(cr)
@@ -803,8 +861,8 @@ def summarize(axis, rows, gas_map=None):
          'a_total': sum(aw), 'b_total': sum(bw),
          'ratio_median': statistics.median(ratios), 'ratio_mean': statistics.mean(ratios),
          # THREE AXES. work (steps/cycles) is the verdict metric: deterministic and host-
-         # independent. cost is what the PROVER pays (ZisK's COST model, same collection pass) --
-         # it diverges from work when the instruction MIX changes, which is what optimisation
+         # independent. cost is what the PROVER pays -- ZisK's COST model or SP1's PGU, per
+         # backend, same collection pass -- and it diverges from work when the MIX changes, which
          # does. time is modelled from measured per-guest throughput (PURE_MSTEPS_PER_S) and
          # moves with mix density through an entirely different mechanism, so cost/time agreement
          # is a real confirmation and a divergence is a lead worth chasing.
@@ -2026,8 +2084,10 @@ def _three_axes(s):
     evidence and disagreement is a lead:
       - work: steps (ZisK) or cycles (SP1). Deterministic, host-independent — the metric every
         lever verdict on this branch was decided on.
-      - prover cost: ZisK's COST model, collected in the same instrumented pass. Weighted per
-        instruction class, so it moves when the instruction MIX changes even if work does not.
+      - prover cost: ZisK's COST model, or SP1's PGU (prover gas from the execution report -- not
+        EVM gas), collected in the same instrumented pass. Each is weighted per instruction class,
+        so it moves when the MIX changes even if work does not. The two units are per-backend and
+        are not comparable to each other; only their ratios are.
       - pure time: work / measured per-guest emulator throughput (see PURE_MSTEPS_PER_S). Also
         mix-sensitive, through a completely independent mechanism (real instruction timings on the
         reference host) — which is what makes it worth showing next to cost rather than instead.
@@ -2043,9 +2103,13 @@ def _three_axes(s):
              "<b>the verdict metric.</b> Deterministic and host-independent; every lever on this "
              "branch was accepted or rejected on it")]
     if c:
-        rows.append(('prover cost', c, s.get('cost_n', s['n']),
-                     "<b>what the prover actually pays.</b> ZisK's COST model, same collection "
-                     "pass — weighted per instruction class, so it tracks the MIX, not the count"))
+        unit = s.get('cost_unit', 'COST')
+        why = ("<b>what the prover actually pays.</b> ZisK's COST model, same collection pass — "
+               "weighted per instruction class, so it tracks the MIX, not the count"
+               if unit == 'COST' else
+               "<b>what the prover actually pays.</b> SP1's PGU (prover gas — unrelated to EVM gas), "
+               "read from the execution report, so it tracks the MIX, not the count")
+        rows.append((f'prover cost ({unit})', c, s.get('cost_n', s['n']), why))
     if t:
         rows.append(('pure exec time', t, s['n'],
                      "<b>emulator seconds on the reference host</b>, modelled as work ÷ measured "
