@@ -271,6 +271,12 @@ gitignored, so a fresh checkout does not have it. Create it (see zkvm/README.md)
   sshq "test -x \$HOME/.cargo/bin/cargo" || die "no cargo on $HOST"
   sshq "test -d \$HOME/.rustup/toolchains/zisk" || die "no zisk rust toolchain on $HOST"
 
+  # p_build runs `ninja -C build`, which needs a CONFIGURED cmake dir. A fresh clone has none, and
+  # ninja's own error names a missing build.ninja rather than the missing configure step.
+  sshq "test -f $MONAD_DIR/build/build.ninja" \
+    || die "no configured build in $MONAD_DIR/build on $HOST — cmake has never run there. \
+Configure it once (see the monad repo's build docs) before backfilling."
+
   # Space: the reset frees the old triedb, so compare against free+current rather than free alone.
   local free_g cur_g want_g
   free_g=$(sshq "df -BG --output=avail \$HOME | tail -1 | tr -dc 0-9")
@@ -829,10 +835,19 @@ EOF
         wait_window fetch "block_db fetch" 20 "echo \$(ls $BLOCK_DB 2>/dev/null | wc -l)/$FETCH_COUNT blocks"
       fi
     else
+      # Word the prompt for the case that is actually true. On a box with no trie there is nothing
+      # to destroy, and a red DESTROYS warning that does not apply teaches the reader to skim the
+      # one that does.
       printf '\n\033[1;31m'
-      echo "  ###  RESET + SNAPSHOT LOAD — this DESTROYS $DB on $HOST (~66 min, ~350 GB)  ###"
-      printf '\033[0m'
-      read -r -p "  destroy and reload now? [y/N] " a; [ "$a" = y ] || die "aborted — nothing destroyed"
+      if echo "$dbs" | grep -q '^DBSTATE=absent'; then
+        echo "  ###  SNAPSHOT LOAD — creates $DB on $HOST (~66 min, ~350 GB)  ###"
+        printf '\033[0m'
+        read -r -p "  create and load now? [y/N] " a; [ "$a" = y ] || die "aborted"
+      else
+        echo "  ###  RESET + SNAPSHOT LOAD — this DESTROYS $DB on $HOST (~66 min, ~350 GB)  ###"
+        printf '\033[0m'
+        read -r -p "  destroy and reload now? [y/N] " a; [ "$a" = y ] || die "aborted — nothing destroyed"
+      fi
       STEPS=$((STEPS + 2))          # reset + load join the plan (fetch was already counted)
       step "triedb reset";      tmux_run reset "$(p_reset)"
       wait_window reset "triedb reset" 10 "tail -1 /tmp/wb-reset.log"

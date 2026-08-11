@@ -1,6 +1,6 @@
 # profiling — runbook
 
-What to type, and what it writes. Every command runs from `profiling/`.
+What to type, and what it writes. Every command runs from `profiling/` unless it opens with a `cd`.
 For *which tool answers which question*, see [`README.md`](README.md); for the cache, see
 [`cache-format.md`](cache-format.md).
 
@@ -22,47 +22,181 @@ with fewer axes rather than an error.
 | any `sp1` axis | **`sp1-runner`**, plain release build | `infra/sp1-infra/sp1-runner/target/release/sp1-runner`. `--runner` overrides |
 | `hotspots --backend sp1`, `compare.py --deep` on an sp1 axis, **and the per-family columns (on by default)** | **`sp1-runner`, profiling build** | same crate, `target-prof/release/` — a *second* build, not the same binary |
 
+Installing them, from a fresh clone — the ZisK emulator first (it is the whole `zisk` side), then the
+two `sp1-runner` builds:
+
 ```bash
+# ZisK — the installer puts ziskup and the toolchain under ~/.zisk
+# (same one-liner as infra/zisk-infra/README.md § Setup)
+curl https://raw.githubusercontent.com/0xPolygonHermez/zisk/main/ziskup/install.sh | bash
+~/.zisk/bin/ziskemu --version                             # what compare.py looks for
+
+# SP1 — two builds of the same crate, and you need both for a full report
 cd ../infra/sp1-infra/sp1-runner
 cargo build --release                                     # target/release       -> compare.py
 cargo build --release --no-default-features \
       --features profiling --target-dir target-prof       # target-prof/release  -> hotspots.py
+cd ../../../profiling
 ```
+
+`--no-default-features` is not optional on the second one: the default `native-gnark` feature builds a
+Go library this binary never uses (see [`sp1-runner/README.md`](../infra/sp1-infra/sp1-runner/README.md)).
 
 ---
 
+## The short way: `cli/bench-pairs`
+
+Everything in the next section, driven for you. Name the comparisons you want and it works out what
+already exists, does only the rest, and ends on a `compare.html`:
+
+```bash
+./cli/bench-pairs --host <box> \
+    --pair monad-zisk:zisk-reth:zisk \
+    --pair al/zkvm-r3:sam/zkvm-zisk-sp1:zisk \
+    --pair monad-sp1:rsp:sp1
+```
+
+Each side of a `--pair` is either a **branch** (anything with a `/` — needs a build and a witness
+corpus) or a **guest** that already exists (`zisk-reth`, `rsp`, `monad-zisk`, or a path under
+`guests/monad-variants/`). The third field is the backend, and it has to match both sides.
+
+**`plan` is the default**: it prints what it would do and starts nothing. Read that first — one of the
+steps it may schedule resets a 350 GB trie on the box. Add `run` to execute.
+
+What it skips, because a full run is hours and almost none of it is usually necessary:
+
+| already there | how it knows |
+|---|---|
+| the branch's build | a generation's `PROVENANCE.md` names that branch and its `elf/` pair is staged |
+| the witness corpus | that generation holds a witness for every block of the range |
+| the selected generation | `current` already points at it, so no `use-gen` |
+| a reference guest's inputs | `1-<block>.bin` present for the range |
+| the measurements | nothing to skip — the cache is keyed by ELF **content**, so any build measured before is known wherever it now sits |
+| the axes | an axis with these two sides is already declared |
+
+`EPHEMERAL=1` marks the axes it declares, so `./axis.py prune` clears them when the campaign is over.
+`--blocks FIRST-LAST` overrides the range (default: the current generation's whole corpus), and
+`--report` the output path.
+
+**Expect gaps on the reference side.** A reth corpus is minted through a public archive RPC (Alchemy),
+which does not serve every block, so a 504-block range routinely resolves to ~365 for `zisk-reth` and
+~373 for `rsp`. `bench-pairs` prints the count before measuring for exactly one reason: so the `n` in
+the report reads as expected rather than as something to investigate. `cli/witness-farm` can retry the
+gaps, but a block the provider refused once it usually refuses again.
+
+Use the long way below when you want to run a phase on its own, or when something failed and you need
+to resume in the middle.
+
+### On a machine other than the usual one
+
+Three separate machines are involved and they are portable to three different degrees. Getting this
+wrong does not produce an error — it produces a number.
+
+| what | runs where | portable? |
+|---|---|---|
+| `bench-pairs` and `compare.py` | your laptop | **yes** — `--host` has no default and is read only when a corpus is missing |
+| witness generation (`witness-backfill`) | a **devcore box** | **no**, see below |
+| the pure-time calibration | the host that measured it | **no** — the seconds are that host's |
+
+**Witness generation needs a devcore box, and the reason is the snapshot.** Every path in
+`witness-backfill` is an env knob (`SNAPSHOTS`, `RPC`, `DB`, `MONAD_DIR`, `PY`…), but
+`/home/refdata/ETH/mainnet/snapshots/<V>` only exists on those boxes, and `<V>` must be **exactly**
+`FIRST-1` of your range. Without it there is no way to bring the state to the range at all —
+rebuilding it from elsewhere costs far more than moving the job to a box that has it. Preflight fails
+on this and lists the snapshots it did find.
+
+That also means **the block range and the box travel together**: `25551991..25552494` is anchored to
+the `25551990` snapshot. A different machine usually means a different range, and measurements on two
+different ranges are not comparable to each other.
+
+**A devcore box that has never done this needs an afternoon of setup, not just a `--host`.** A
+*missing triedb* is the easy part — `witness-backfill` probes it and `DBSTATE=absent` just means it
+creates and loads instead of rewinding, which is the ~66 min the snapshot load always costs. What
+stops a fresh box is everything around it: memlock and hugepages (**both need an admin**), a
+configured cmake build dir, the gitignored `zkvm/.cargo/config.toml`, the zisk rustup toolchain, and
+`run_replay.py`/`fetch_blocks.py` — which are **untracked files in `$MONAD_DIR`**, absent from the
+monad repo, so a fresh checkout does not have them however correct everything else is. Preflight
+checks every one of these and fails *before* anything destructive; the full table, with what is
+fatal and what only warns, is in
+[`infra/monad-witness/README.md`](../infra/monad-witness/README.md#moving-to-a-devcore-box-that-has-never-done-this).
+
+**The pure-time column belongs to one host.** Work (steps/cycles) and prover cost (COST/PGU) are
+deterministic and mean the same thing anywhere. Seconds do not: they are modelled from
+`PURE_MSTEPS_PER_S` in `compare.py`, measured on `CALIBRATION_CPU` (today an Apple M5 Max). Rendering
+a report elsewhere prints a note and puts a banner in the report — **the ratios still hold, the
+absolute seconds are the calibration host's**. To publish seconds measured from a new machine,
+recalibrate (below) and update **both** `PURE_MSTEPS_PER_S` and `CALIBRATION_CPU`. Do not edit one
+without the other: that is precisely the state the banner exists to catch.
+
+#### Recalibrating the pure-time table
+
+Do this on an **idle** machine, **sequentially** — a campaign's own per-block timings run under 4-way
+parallelism and read ~35 % slow, which is why the column is modelled from these rates instead of
+averaged from the cache. One run per guest is enough; the point is the rate, not any one block.
+
+```bash
+# frame the witness the way ev.sh does: LE64 length + payload + pad to 8
+python3 -c 'import sys,struct; d=open(sys.argv[1],"rb").read(); n=len(d); open(sys.argv[2],"wb").write(struct.pack("<Q",n)+d+b"\x00"*((-(8+n))%8))' \
+    guests/monad/current/witnesses/25551991.witness /tmp/w.bin
+```
+
+ZisK — the emulator reports the rate itself, so there is nothing to fit:
+
+```bash
+~/.zisk/bin/ziskemu -e guests/monad/current/elf/monad-zkvm-guest-zisk.elf -i /tmp/w.bin -o /dev/null -m
+```
+
+It prints one line: `process_rom() steps=251953621 duration=1.6923 tp=148.8852 Msteps/s …`. **`tp=` is
+the number for the table.** `duration=` times `process_rom()` only, so it already excludes the
+ELF→ROM conversion — 0.6–1.7 s per invocation depending on the ELF, which on a small block *is*
+essentially the whole wall-clock. Never time this with `date`.
+
+SP1 — same idea, its own tool. `--no-gas` matters: the gas pass is a separate and much slower
+estimation that does not belong in an execution figure.
+
+```bash
+infra/sp1-infra/sp1-runner/target-native/release/sp1-runner --mode execute --no-gas …
+```
+
+Read `elapsed_secs` (SDK executor time, excludes process startup) and pair it with the block's cycles
+from the cache, since `--no-gas` does not populate the counter. Take `cycles / elapsed_secs`.
+
+Two things to know before quoting any of it. Per-block rates vary with the instruction mix (109–130 M
+steps/s for the optimized guest across the calibration blocks), so the column is worth ±15 % — fine
+for a ratio, not for a budget. And the ZisK **ASM** backend (`cargo-zisk execute --asm`) runs the same
+guests ~2.4× faster (≈300 M steps/s), so a number from that backend is not comparable to one from
+here; it is a different regime, not a faster flag.
+
 ## Compare two versions of the guest, A to Z
 
-**In five lines.** Old-vs-new is **two axes** (one per backend), **three commands** (`witness-backfill`
-→ `axis.py add` → `compare.py`), and **one check you cannot skip**: that the old build can read the
-witness generation you selected — nothing downstream verifies it. Budget ~2 h on the box for step 1
-(it destroys the box's triedb) and ~1–2 h locally for step 4 at a cold cache. Everything below is the
-detail; step 5 is the old-vs-new part.
+**The shape of it.** Old-vs-new is **two axes** (one per backend) and **four commands** —
+`witness-backfill` (§1) → `use-gen` (§2) → `axis.py add`, twice (§5) → `compare.py` (§5) — plus
+[the prerequisites above](#prerequisites), which are a build of their own. Budget ~2 h on the box for
+step 1 (it destroys the box's triedb) and ~1–2 h locally per backend at a cold cache.
 
-From a branch of the monad tree to a ratio. Steps 1–2 run against the devcore box (`HOST`); 3–5 are
-local.
+**Before you start, one question decides whether this is a 20-minute job or a two-hour one:
+do you already have the OLD build's ELF?**
 
-### 0. Does this branch even need its own corpus?
+| | |
+|---|---|
+| **yes** — the old generation's `gen/<OLD-GEN>/elf/` is still on disk, or you have the pair from the box | skip to **§5**. Nothing needs the box. |
+| **no** | you need step 1 **twice** — once per branch — and each run produces its own generation. See *Where the old ELF comes from* in §5 before spending the first two hours. |
 
-A witness is produced by the **node**; the ELF is the **guest** that reads it. A branch that changes
-only the guest emits the same witness bytes, and then it needs **no corpus of its own** — its build is
-a *variant* reading the existing one (`guests/monad-variants/`, as `r3` does beside the `sam`
-generation), and the whole reset + load + replay is waste.
+`witness-backfill` is where an ELF comes from: it builds **both** guest ELFs on the box from the branch
+it replays and files them next to that branch's witnesses. Nothing else in this repo builds a Monad
+guest — `cli/gen-elf --guest monad-*` errors "pre-supplied" by design.
 
-That is answered by **comparing bytes**, not by reading source. A source diff is not an answer: clean
-would prove sameness, but two branches almost always differ somewhere outside `zkvm/` — a test, a
-README — so it reports "unknown" and helps nobody. Identical guest ELFs are not an answer either:
-they pin the *format*, not the *content*, and the node can change which trie nodes it emits without
-the reader noticing.
-
-So the probe is built into `again` (step 1): it replays the first **`PROBE=20`** blocks (the default;
-override it, or set `PROBE=0` to skip), compares their bytes to the corpus you name, and stops if they
-match.
+From a branch of the monad tree to a ratio. Step 1 runs against the devcore box (`HOST`); 2–5 are
+local. **§3–§4 build an axis against reth**, which is a different question: read them as the worked
+example of `axis.py add` + `compare.py`, then do the real thing in **§5**.
 
 ### 1. Witnesses + ELFs for the branch
 
 ```bash
-./witness-backfill plan al/zkvm-r4          # print every command, start nothing
+cd ../infra/monad-witness                   # the producer side — NOT profiling/
+export HOST=<your-devcore-box>              # required, no default (see below)
+
+./witness-backfill plan al/zkvm-r4          # print every command, start nothing (the default verb)
 ./witness-backfill run  al/zkvm-r4          # sync, build, replay, pull home
 ./witness-backfill status                   # where the remote run is
 ```
@@ -75,9 +209,9 @@ match.
 > (`./witness-follow stop`) — and note that the backfill leaves the box on the backfilled range, not
 > at the tip. `plan` prints every command and starts nothing; use it first.
 
-`HOST` has no default and no example anywhere in this repo, deliberately: the box is your
-infrastructure, not part of the project. Everything in `infra/monad-witness/` reads it from the
-environment.
+`HOST` is a placeholder above and stays one: the box is your infrastructure, not part of the project,
+so no hostname is committed anywhere in this repo. Everything in `infra/monad-witness/` reads it from
+the environment, and every verb refuses to start without it.
 
 Already have a loaded trie for this range from another branch? `again` rewinds it instead of
 reloading the snapshot — ~66 min becomes seconds:
@@ -96,7 +230,8 @@ Three guards fire, in this order:
 1. **the generation already exists** → refused before anything is built. Whether it resembles
    `AGAINST` is beside the point; it is on disk, so it is not regenerated. `FORCE=1` overrides.
 2. **`AGAINST` + `PROBE`** — `PROBE` defaults to **20** blocks. Their **bytes** are compared against
-   that corpus, and the run stops if they match: this branch then needs no corpus, only a variant.
+   that corpus, and the run stops if they match: this branch then needs no corpus of its own, only a
+   build under `guests/monad-variants/` reading the existing one.
    `PROBE=0` skips the check; a larger value trades seconds of replay for more confidence.
 3. **the rewind was refused** — usually because disk occupancy crossed 60% during the previous
    replay and the compaction took the history with it. It says so in full and asks before falling
@@ -120,8 +255,23 @@ bound.
 
 ### 2. Select the generation, and where the build lives
 
+**Step 1 already brought the ELFs home.** This is worth stating plainly, because it is the answer to
+"where do I get a build to compare": `witness-backfill` compiles both guest ELFs on the box from the
+branch it replays, verifies their sha256 on arrival, and files them beside that branch's witnesses —
+
+```
+guests/monad/gen/<GEN>/witnesses/          the corpus that branch's node produced
+guests/monad/gen/<GEN>/elf/monad-zkvm-guest-zisk.elf     ← the build, for a `zisk` axis
+guests/monad/gen/<GEN>/elf/monad-zkvm-guest-sp1.elf      ← the build, for an `sp1` axis
+guests/monad/gen/<GEN>/PROVENANCE.md       branch, commit, host, both sha256 — written by the tool
+```
+
+Those two paths are what §3 and §5 name on an axis. There is no build step to run locally and nothing
+to copy. Run step 1 on a second branch and you get a second generation with its own `elf/` — that is
+how you end up holding an old build and a new one at the same time.
+
 ```bash
-cd ../../guests/monad
+cd ../../guests/monad                       # from infra/monad-witness/
 ./use-gen                                   # list; the new one should appear
 ./use-gen <GEN>                             # point `current` + `fixtures` at it, install its ELFs
 ```
@@ -137,9 +287,9 @@ up as a modification to commit.
 > pinned. `compare.py` prints a warning when two axes of a run land on the same build (it compares
 > `a_ident`/`b_ident`, the sha of what actually ran), but the axis names will not tell you.
 
-The pair the axis will name is already in `guests/monad/gen/<GEN>/elf/` — **nothing to move**. An axis
-takes its name from the declaration (`--a-name`), never from the filename, so no copy and no rename
-makes a build axis-able, and its sha256 is already in the generation's `PROVENANCE.md`.
+An axis takes its name from the declaration (`--a-name`), never from the filename, so **no copy and no
+rename makes a build axis-able** — both generations' ELFs stay where step 1 put them, and the label is
+something you choose at `axis.py add` time.
 
 Do **not** copy the pair into `monad-variants/` to give it a nicer name: that creates a second copy to
 keep in step by hand and buys nothing, since builds are addressed by content sha256 (`cache.py`) and
@@ -159,6 +309,25 @@ cd ../../profiling
 
 It prints how many blocks the axis resolves on. **Zero means the two sides share no block** — usually
 the reth side has no `.bin` for the new range; mint them with `cli/witness-farm` (section Witnesses).
+
+> ⚠️ **`axis.py` edits `compare.py`, which is a tracked file.** `add`, `rm`, `prune` and `gc` rewrite
+> the `AXES` literal in place — so declaring an axis is a **source change**, and it lands in
+> `git status` next to whatever else you were doing. Nothing warns you at commit time.
+>
+> The edit itself is safe: it re-parses the result and refuses to write if `compare.py` would no
+> longer load, and it preserves the executable bit. `git diff profiling/compare.py` shows exactly
+> what your axis added.
+>
+> What to do with it depends on what the axis is for:
+>
+> | the axis is | do this |
+> |---|---|
+> | a durable comparison of the project (old-vs-new of a branch that shipped) | commit it — that is how the next person reproduces your report |
+> | one campaign's scaffolding | declare it with `'ephemeral': '<why it exists, when to drop it>'` so `./axis.py prune` finds it later, and commit or not as you prefer |
+> | a one-off you are done with | `./axis.py rm <name>`. It discards **no** measurement — the cache is keyed by build content, not by axis, so re-adding it later is a cache hit |
+>
+> The failure mode this prevents is a stale axis nobody removed: it still resolves, still reports
+> coverage, and only the numbers look odd (see *Cleaning up after a campaign*).
 
 ### 4. Measure
 
@@ -181,7 +350,9 @@ so a re-run, an added block or a second axis on a build already measured is **se
 ### 5. The same, but old build vs new build
 
 Against reth you learn *how far from reth this build is*. Against the previous build you learn *what
-your commits did*, which is usually the question. It is one more axis, and three things change.
+your commits did*, which is usually the question. **This is the section to read if old-vs-new is what
+you came for** — it is two axes of its own (one per backend, since work-units never cross zkVMs), and
+three things change.
 
 **Both sides are Monad builds, so both read the Monad witness** — and there is a single lookup head
 (`guests/monad/fixtures`), so **the old build must be able to read the generation you selected**. Check
@@ -192,26 +363,52 @@ reciprocal and the report reads as a regression.
 
 **Both sides carry `--a-src monad` / `--b-src monad`**: old and new are both Monad builds, so both
 read the shared witness. The per-backend shape — framed for `ziskos`, verbatim for SP1 — is derived,
-not declared, so the ZisK and SP1 axes below differ only in `--backend` and the ELFs:
+not declared, so the ZisK and SP1 axes below differ only in `--backend` and the ELFs.
+
+Both ELFs are read straight out of their generation's `elf/` — the paths step 1 filed them under, per
+§2. `<NEW-GEN>` is the generation you selected with `use-gen`; `<OLD-GEN>` is the one the old branch
+produced, and it is **not** selected — only its ELF is used, never its witnesses.
 
 ```bash
+cd ../../profiling                          # from guests/monad/ (§3–§4 already left you here)
+# run the format check below FIRST — it is 30 s and nothing after it re-does it
+
 ./axis.py add r4-vs-r3 --backend zisk \
-    --a-name monad-r4-zisk --a-elf guests/monad-variants/r4/monad-r4-zisk.elf --a-src monad \
-    --b-name monad-r3-zisk --b-elf guests/monad-variants/r3/monad-r3-zisk.elf --b-src monad
+    --a-name monad-r4-zisk \
+    --a-elf guests/monad/gen/<NEW-GEN>/elf/monad-zkvm-guest-zisk.elf --a-src monad \
+    --b-name monad-r3-zisk \
+    --b-elf guests/monad/gen/<OLD-GEN>/elf/monad-zkvm-guest-zisk.elf --b-src monad
 
 ./axis.py add r4-vs-r3-sp1 --backend sp1 \
-    --a-name monad-r4-sp1 --a-elf guests/monad-variants/r4/monad-r4-sp1.elf --a-src monad \
-    --b-name monad-r3-sp1 --b-elf guests/monad-variants/r3/monad-r3-sp1.elf --b-src monad
+    --a-name monad-r4-sp1 \
+    --a-elf guests/monad/gen/<NEW-GEN>/elf/monad-zkvm-guest-sp1.elf --a-src monad \
+    --b-name monad-r3-sp1 \
+    --b-elf guests/monad/gen/<OLD-GEN>/elf/monad-zkvm-guest-sp1.elf --b-src monad
 
-./compare.py --block-min 25551991 --block-max 25552494 --axis r4-vs-r3 --axis r4-vs-r3-sp1
+./compare.py --block-min <FIRST> --block-max <LAST> --axis r4-vs-r3 --axis r4-vs-r3-sp1
 ```
 
-**Where the old ELF comes from.** A fresh clone has none: `guests/monad-variants/*/*.elf` and
-`gen/*/elf/` are git-ignored, and a retired generation's binaries may be deleted outright (see
-`gen/offsettriedb-prerework-2026-08/PROVENANCE.md`). So either copy the pair off the box, or run
-**step 1 again on the old branch** — which produces a *second* generation. Keep the NEW one selected
-(`./use-gen <GEN>`): the witnesses both sides read must be one set, or you are comparing two corpora
-and calling it a guest change.
+Writes the same four files as §4, `results/compare.html` first among them. `<FIRST>`/`<LAST>` are your
+generation's own bounds — step 1 printed them, and `PROVENANCE.md` records them.
+
+`opt-self` in `AXES` is exactly this shape, already declared: `./axis.py show opt-self` is the shortest
+way to see one before writing your own.
+
+> The `--a-elf` path is only ever a **location**. If the old build is not a generation's canonical pair
+> — you copied it off the box, or it is an ablation — park it under `guests/monad-variants/<name>/` and
+> point `--b-elf` there instead. That is what [that directory is for](../guests/monad-variants/README.md);
+> a build a generation *does* own has no business being copied into it (§2).
+
+**Where the old ELF comes from.** A fresh clone has none: `gen/*/elf/` and
+`guests/monad-variants/*/*.elf` are git-ignored, and a retired generation's binaries may be deleted
+outright (see `gen/offsettriedb-prerework-2026-08/PROVENANCE.md`). Two ways to get one, no third:
+
+- **copy the pair off the box**, into `guests/monad-variants/<name>/`;
+- **run step 1 again on the old branch** — which produces a *second* generation, with its own `elf/`
+  and its own witnesses.
+
+Either way, keep the NEW generation selected (`./use-gen <NEW-GEN>`): the witnesses both sides read
+must be one set, or you are comparing two corpora and calling it a guest change.
 
 > ⚠️ **Check that the old build reads this generation — nothing downstream will.** Two generations can
 > share a format word, a magic and a byte size and still be incompatible (`witness-fmt` cannot separate
@@ -225,21 +422,45 @@ and calling it a guest change.
 > cd ../guests/monad
 > b=$(ls -1 fixtures/*.witness | tail -1 | xargs basename | cut -d. -f1)   # tail: see below
 > mkdir -p /tmp/fmt-check && ln -sf "$PWD"/fixtures/$b.* /tmp/fmt-check/
-> ELF=../monad-variants/r3/monad-r3-zisk.elf WIT=/tmp/fmt-check ./ev.sh    # expect PASS(pv3)
+> ELF=gen/<OLD-GEN>/elf/monad-zkvm-guest-zisk.elf WIT=/tmp/fmt-check ./ev.sh
 > ```
 >
-> **`tail`, not `head`**: the strong verdict is `PASS(pv3)` — all three public values, compared
-> positionally against `<block>.expected_pv`. The **first** block of a generation is the one that has
-> no `.expected_pv` (its parent's post-root is not local, see the generation's `PROVENANCE.md`), so
-> `ev.sh` falls back there to a substring test on the post root alone — the weakest check in the set,
-> on the one block you would have picked. Anything other than `PASS(pv3)` (`PASS` alone, `PASS(rev)`,
-> `MISMATCH(...)`, `EMU-FAIL`, `SHORT`) means that build does not belong on an
-> axis over this generation — re-measure the old branch on its own generation instead, and compare the
-> two reports. (`ev.sh` rewrites `exec-verified.csv`; a plain `./ev.sh` regenerates the full one.)
+> **What counts as a pass** depends on what the generation carries, so read the verdict against the
+> table below rather than against a single expected string:
+>
+> | verdict | means |
+> |---|---|
+> | `PASS(pv3)` | all three public values matched positionally — the strong one. Needs `.expected_pv` |
+> | `PASS` | the post state root is in the output. The set has no `.expected_pv` for that block; the other two thirds are unchecked, but **the build reads this generation**, which is the question here |
+> | `PASS(rev)` | root matched byte-reversed — a real endianness answer, investigate before measuring |
+> | `MISMATCH…` · `EMU-FAIL` · `SHORT` | the build does **not** belong on an axis over this generation. Re-measure the old branch on its own generation and compare the two reports instead |
+>
+> **`tail`, not `head`**: the **first** block of a set never has an `.expected_pv` (its parent's
+> post-root is not local), so `head` would hand you the weakest check on the one block you picked.
+>
+> **`.expected_pv` is optional and a generation may well not have one.** Nothing in the measurement
+> path reads it: `compare.py`, `hotspots.py` and the runners execute the guest on the witness and never
+> look at a root — the files only sharpen `ev.sh`'s verdict from "the post root is in there somewhere"
+> to "all three public values, in position". `witness-backfill` does **not** produce them, so a
+> generation you just made has none. Add them if you want the strong verdict, on the generation's own
+> witness directory (it derives `pre` from each block's parent and cross-checks `hash` against the next
+> block's `parent_hash`, so it needs the whole set, not a temp dir):
+>
+> ```bash
+> ./gen-expected-pv.py gen/<GEN>/witnesses            # --check-only reports without writing
+> ```
+>
+> (`ev.sh` rewrites `exec-verified.csv`; a plain `./ev.sh` regenerates the full one.) Then
+> `cd ../../profiling` and run the block above.
 
 ---
 
-## The canonical report
+## compare.py — how much more
+
+The ratio between two builds, over a block set. `hotspots.py` below answers *where* the difference
+sits; the two share one cache, so a block either has measured is never re-executed by the other.
+
+### The canonical report
 
 ```bash
 ./compare.py --block-min 25551991 --block-max 25552607 \
@@ -281,7 +502,7 @@ must not move, the other is a range you read off your own generation.
 Add `--quick` to skip ZisK's instrumented COST pass (~10× slower); everything already cached is
 still reported.
 
-## One axis, or a sample
+### One axis, or a sample
 
 ```bash
 ./compare.py --block-min 25551991 --block-max 25552607 --axis cur-zisk   # one axis, full set
@@ -295,7 +516,7 @@ The HTML shows only the axes just run and prints which others the JSON holds.
 writes `results/compare-partial.*` instead of the canonical paths, and says so. Pass `--json` /
 `--html` to choose a path yourself; that overrides both behaviours.
 
-## Re-render a report without measuring
+### Re-render a report without measuring
 
 ```bash
 ./compare.py --summary-from results/compare.json
@@ -303,7 +524,7 @@ writes `results/compare-partial.*` instead of the canonical paths, and says so. 
 
 Rebuilds the HTML and the summary from an existing `--json` payload. Measures nothing.
 
-## Which blocks are off-pattern, and why
+### Which blocks are off-pattern, and why
 
 ```bash
 ./compare.py --block-min 25551991 --block-max 25552607 --axis cur-zisk --show-outliers 20
@@ -432,7 +653,9 @@ cd profiling
 
 ### Adding and removing one
 
-`axis.py` edits the `AXES` literal for you and runs the checks first:
+`axis.py` edits the `AXES` literal for you and runs the checks first. **It edits `compare.py` on
+disk** — a tracked file, so every one of these commands shows up in `git status`; see the warning in
+*Compare two versions of the guest* §3 for what to do with that diff.
 
 ```bash
 ./axis.py list                    # every axis, its builds, how many blocks it can run on
@@ -527,13 +750,22 @@ change together:
 ```
 guests/monad/gen/<generation>/witnesses/<block>.witness
                                         <block>.post_state_root
+                                        <block>.expected_pv    optional, see below
+guests/monad/gen/<generation>/elf/      the two ELFs built from the same checkout
+guests/monad/gen/<generation>/PROVENANCE.md
 guests/monad/current   -> gen/<generation>       symlink, set by ./use-gen
 guests/monad/fixtures  -> current/witnesses      the path the tooling globs
 ```
 
-`infra/monad-witness/witness-backfill` produces a whole generation — witnesses *and* ELFs — from a
-branch; see **Compare two versions of the guest, A to Z** above, which is the procedure. Write its
-`PROVENANCE.md`, then `./use-gen <name>`.
+`infra/monad-witness/witness-backfill` produces a whole generation — witnesses, both ELFs **and** its
+`PROVENANCE.md`, which it writes itself from the commit it built; see **Compare two versions of the
+guest, A to Z** above, which is the procedure. Then `./use-gen <name>`.
+
+`.expected_pv` is the only piece it does not write, and the only optional one: 96 bytes of
+`post || pre || hash` that turn `ev.sh`'s verdict into the positional `PASS(pv3)`. Execution,
+profiling and `compare.py` never read it. Add it when you want that verdict —
+`guests/monad/gen-expected-pv.py gen/<generation>/witnesses` (`--check-only` to report without
+writing) — and expect 1 block short of the set: the first has no local parent post-root.
 
 Never add witnesses to an existing generation's directory, and never copy between two: `witness-fmt`
 cannot always tell two generations apart, and the directory is what separates them.
@@ -582,8 +814,9 @@ does not need it — `compare.py` and `hotspots.py` read the witness directly an
 
 ## hotspots.py — where the cost goes
 
-`compare.py` says *how much more*; `hotspots.py` says *where*. Same two backends, same cache: a block
-one has measured is never re-executed by the other.
+Per-symbol cost for one build, or the module-level diff between two. Unlike `compare.py` it takes an
+**ELF and an input directly** — there is no axis — and writes a `profile.json` with an HTML view
+beside it.
 
 ### One build, one or more blocks
 
@@ -642,7 +875,13 @@ the terminal — this is what `compare.py --deep N` calls under the hood.
 
 Rebuilds the HTML from an existing `profile.json`. For template or `--meta` changes.
 
-## The ranked levers document
+## Regenerate a published artifact
+
+One script, one document. These read measurements produced elsewhere rather than making their own —
+run the canonical report first when a section says it needs one. (`inline-robust.py` is the exception:
+it collects profiles unless given `--verdict-only`.)
+
+### The ranked levers document
 
 ```bash
 ./levers.py
@@ -653,7 +892,7 @@ item. Requires `results/compare.json` carrying the `zisk` and `sp1` axes with **
 a partial run rather than build a plausible wrong document. Run the canonical report first.
 `--out` writes elsewhere.
 
-## The optimised-branch report
+### The optimised-branch report
 
 ```bash
 ./optimized.py            # results/optimized-{zisk,sp1}.json
@@ -664,7 +903,7 @@ Neither measures anything: both read a **frozen measurement set** left under `re
 campaign. Nothing regenerates it — the branch's ELFs are gone — and `results/` is git-ignored, so **on
 a fresh clone these two have nothing to read**. Skip them, or bring the payload in yourself.
 
-## Cross-guest work table
+### Cross-guest work table
 
 ```bash
 ./results.py
@@ -673,7 +912,7 @@ a fresh clone these two have nothing to read**. Skip them, or bring the payload 
 No arguments. Reads every `../guests/<name>/inputs/*.exec-report.json` and writes
 `results/results.html` — how much work each guest does per block, side by side.
 
-## Inlining-robustness verdict
+### Inlining-robustness verdict
 
 ```bash
 ./inline-robust.py --verdict-only
@@ -683,7 +922,7 @@ Writes `results/inline-verdict.json` from profiles already in the cache — the 
 column `compare.py` and `levers.py` read. Without `--verdict-only`, `--elf <no-inline build>` collects
 the profiles first (`--limit`, `--chunk`, `--guest`, `--emu` tune that pass).
 
-## RTP end-to-end latency
+### RTP end-to-end latency
 
 ```bash
 ./rtp-latency.py --manifest ~/witness-manifest.csv --results ../infra/zisk-infra/results \
@@ -696,7 +935,12 @@ prover do not share a clock.
 
 ---
 
-## Monad witness generations
+## The Monad guest itself
+
+The only commands here that do **not** run from `profiling/` — they act on the guest directory that
+every axis reads.
+
+### Witness generations
 
 ```bash
 cd ../guests/monad
@@ -713,7 +957,7 @@ modification to commit.
 > them; the directory they sit in is what does. Never copy witnesses between generation directories,
 > and read the target's `PROVENANCE.md` before measuring against it.
 
-## Execute + verify state roots
+### Execute + verify state roots
 
 ```bash
 cd ../guests/monad && ./ev.sh

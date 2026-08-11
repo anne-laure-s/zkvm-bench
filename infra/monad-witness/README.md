@@ -66,6 +66,37 @@ Validated 2026-07-29 on the devcore box. The first three are hard blockers — t
   served.
 - **pyenv** — a fresh tmux window has no pyenv in `PATH`; use the absolute interpreter (the `PY` knob).
 
+### Moving to a devcore box that has never done this
+
+**A missing triedb is the easy part** — `witness-backfill run` probes it, and `DBSTATE=absent` simply
+means it creates and loads instead of rewinding. That is the ~66 min the snapshot load always costs,
+not extra work. What actually stops a fresh box is everything around it. Preflight checks each of
+these and fails before anything destructive, but they are setup, not configuration — budget an
+afternoon, and note that **two of them need an admin**:
+
+| needed | why it is not just a knob | preflight |
+|---|---|---|
+| **memlock** raised (`ulimit -Hl` in GBs) | monad hard-asserts `!mlock()`; the DB will not open. Needs root — limits.conf or `setcap cap_ipc_lock+ep` | **warns only** |
+| **hugepages** configured | same layer, same blocker. Needs root | not checked |
+| `$MONAD_DIR` — a monad clone with the branch fetched | `sam/*` are force-pushed; a plain `git fetch` is rejected non-fast-forward | dies |
+| `$MONAD_DIR/build` **configured by cmake** | the build phase is `ninja -C build`; a fresh clone has no `build.ninja` | dies |
+| `run_replay.py`, `fetch_blocks.py` in `$MONAD_DIR` | **untracked — not in the monad repo.** Copy them from a box that has them | dies |
+| `$MONAD_DIR/zkvm/.cargo/config.toml` | carries `RISCV_TOOLCHAIN_DIR`, gitignored, so per-machine | dies |
+| cargo + the `zisk` rustup toolchain | builds the guest ELFs | dies |
+| python 3.12 at `$PY` | the replay scripts; pyenv is absent from a fresh tmux `PATH` | dies |
+| the **snapshot** at `$SNAPSHOTS/<FIRST-1>` | see below — this is the one that decides *which box* | dies, listing what it found |
+| ~`0.8 × DB_SIZE + 60` G free | the DB self-regulates as a fraction of its own capacity | dies |
+
+**The snapshot is what ties a range to a box.** `$SNAPSHOTS` is overridable, but
+`/home/refdata/ETH/mainnet/snapshots/<V>` only exists on devcore boxes, and `<V>` must be **exactly**
+`FIRST-1`. Our range `25551991..25552494` is anchored to `25551990`. A box whose snapshots do not
+include your `FIRST-1` cannot produce that corpus at all — and measurements over two different ranges
+are not comparable to each other, so "just use another range" changes what the numbers mean.
+
+The memlock line is a warning rather than a fatal on purpose: raising it needs someone else, and you
+may want to start the build while you wait. It will bite at the triedb reset — early, and long before
+the 66-minute load.
+
 ## The two phases
 
 They have opposite needs, so they are separate runs:
