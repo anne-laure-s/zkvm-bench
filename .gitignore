@@ -2,7 +2,9 @@
 # Per-stack build artifacts (target/, proofs/, runs/, extracted images, …) are covered by each
 # infra/<stack>-infra/.gitignore — git honors those nested files, so they are not repeated here.
 
-# Upstream clones — external code, tens of GB, not this project's (see README).
+# Upstream clones — external code, tens of GB, not this project's (see README). Contient les sources
+# witness/guest (rsp, openvm-eth, zisk-eth-client, zisk-ethproofs) ET l'arbre client monad, qui est un
+# clone de travail sur une branche, pas un vendor épinglé : cli/install-vendors ne le gère pas.
 /vendor/
 
 # ── guests/ : ignore build outputs + large/regenerable inputs; keep the small data ───────────
@@ -11,6 +13,12 @@ guests/rsp/*.elf
 guests/zisk-reth/*.elf
 guests/openvm-reth/*.elf
 guests/fibonacci/*.elf
+# Builds du guest Monad qui n'existent QUE pour être mesurés (axes de compare.py) : ni guests au sens
+# du registre, ni pre-supplied — des artefacts de build comme les autres, construits sur la devcore box.
+# ~68 MB qui traînaient en `??` sans être ni ignorés ni committés. Ce qui doit survivre à un clone,
+# c'est quel build a produit quel chiffre : guests/monad-variants/README.md EST versionné et porte
+# les sha256, même contrat que le PROVENANCE.md d'une génération.
+guests/monad-variants/*/*.elf
 
 # Block witnesses / inputs — large; regenerate with `cli/gen-witness` (or mint on the box).
 # KEPT on purpose: `*.commit` pins (small — they pin the ELF + inputs together), NOT matched below.
@@ -30,7 +38,9 @@ guests/*/fixtures/
 # Execute reports — regenerable locally via `./run execute`. They feed profiling/results.html
 # (itself regenerated, not shipped), so they are NOT committed; re-run `./run execute` then results.py.
 guests/*/inputs/*.exec-report.json
-# RSP writes a per-run execution report to ./report.csv (its default --report-path). Regenerable.
+# RSP écrit un rapport d'exécution à ./report.csv (son --report-path par défaut) quand on le lance
+# depuis la racine sans le flag. Aucun appel du repo ne fait ça (infra/sp1-infra/scripts/block-cycles.py
+# passe toujours --report-path), donc c'est une retombée de run manuel : ignorée là où elle tombe.
 /report.csv
 
 # Monad guest is pre-supplied and NOT regenerable. The whole inputs/ dir (witnesses ~79 MB + their
@@ -40,27 +50,60 @@ guests/monad/execute-out/
 guests/monad/inputs/
 guests/monad/exec-verified.csv
 
+# Monad guest artefacts are stored per GENERATION — a guest lineage plus the witness wire format it
+# reads, which change together (PartialTrieDb + RLP node list → OffsetTrieDb + offset blob). Bulk is
+# regenerable and stays out; the per-generation PROVENANCE.md is small, is the only record of which
+# branch and which ELF produced a set of numbers, and IS meant to be committed.
+guests/monad/gen/*/witnesses/
+guests/monad/gen/*/elf/
+# `current` selects the generation and `fixtures` is the stable path the tooling globs
+# (profiling/compare.py, infra/monad-openvm/segments.sh). Both are local state — a clone has no
+# artefacts to point at — and `guests/*/fixtures/` above cannot cover `fixtures` now that it is a
+# symlink: a trailing-slash pattern matches directories, and git treats a symlink as a file.
+guests/monad/current
+guests/monad/fixtures
+# (`fixtures-v2` avait sa règle ici : un set posé À CÔTÉ du layout au lieu dedans, que compare.py
+# consultait AVANT `fixtures` et qui gagnait donc silencieusement, pendant que use-gen désignait
+# encore l'autre génération. Il est devenu gen/offsettriedb-rework-2026-08 le 2026-08-10. Si un set
+# doit atterrir hors d'une génération, c'est le signe qu'il en manque une — pas qu'il faut une règle.)
+
 # ── profiling/ : all generated output (regenerate: `profiling/results.py`, `profiling/hotspots.py`) ─
 profiling/results/
+# Le cache de profils, dans sa forme par bloc (profiling/cache-format.md). Il vivait sous results/ et
+# était donc ignoré par ricochet ; en sortant de ce dossier il perdait sa couverture. Un cache est
+# régénérable par construction — s'il faut une info du cache dans un fichier versionné, c'est le signe
+# qu'elle n'est pas au bon endroit : les chiffres se rapportent par `migrate-cache.py`, pas se figent
+# dans la doc.
+profiling/cache/
 
-# ── cli/witness-farm outputs (the script itself is tracked; its generated output is not) ───────
-/wcache/
-/witness-farm-logs/
-/witness-farm.csv
-/witness-farm-parallel-logs/
+# ── run-data/ : TOUTE la sortie runtime des drivers cli/ (les drivers sont versionnés, ce qu'ils
+# produisent ne l'est pas). Une seule règle plutôt qu'une par producteur : la racine ne se salit plus
+# quand un driver gagne une sortie, et un nouveau fichier ne peut pas apparaître en `??` en attendant
+# qu'on pense à l'ignorer. Chaque script y accède par $RUNDATA (surchargeable → run d'essai jetable).
+#   witness-farm      → wcache/ · witness-farm.csv · witness-farm-logs/ · witness-farm-parallel-logs/
+#   prove-farm        → prove-farm.csv · prove-farm-logs/ · prove-runs/
+#   ethproofs / -mock → ethproofs-logs/ · ethproofs-mock-data/
+# ATTENTION : prove-farm.csv et prove-farm-logs/ existent AUSSI sur la devcore box, lus par
+# infra/monad-witness/{witness-tap,reorg-recover,archive-logs}. Les deux côtés doivent bouger ensemble.
+/run-data/
 
-# ── cli/prove-farm outputs (the driver is tracked; its proof records + logs are not) ───────────
-/prove-runs/
-/prove-farm-logs/
-/prove-farm.csv
-
-# ── cli/ethproofs-mock store (the home-made ethproofs.org stand-in; the server is tracked, its data not)
-/ethproofs-mock-data/
-
-# ── cli/ethproofs launcher logs + input-gen-server inputs (the launcher is tracked, its runtime output not)
-/ethproofs-logs/
+# ── Carnets de découvertes partagés nous ↔ agents. Volontairement HORS de git : ce sont des notes
+# de travail et de pièges, pas de la doc — la doc versionnée vit dans infra/*/docs/ et dans le
+# README.md de chaque sous-projet. Convention : FINDINGS.md = le carnet d'un sous-projet,
+# <SUJET>-FINDINGS.md = un carnet focalisé. Matchés à n'importe quelle profondeur, pour que le
+# prochain soit couvert d'office au lieu d'attendre qu'on le remarque dans `git status`.
+# AGENT-NOTES est à part (mémoire transverse, pas un carnet de sujet) et ancré à la racine pour ne
+# pas avaler un fichier du même nom qu'un sous-projet voudrait, lui, committer.
+/AGENT-NOTES.md
+*FINDINGS.md
 
 # ── Python / OS ──────────────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 .DS_Store
+
+# (L'arbre client monad vit maintenant sous vendor/monad — couvert par /vendor/ ci-dessus, plus
+# besoin d'une règle à lui. Il avait la sienne quand il était à la racine, et elle DEVAIT être
+# ancrée : écrite `monad/`, elle matchait un dossier de ce nom à N'IMPORTE QUELLE profondeur et
+# avalait donc aussi `guests/monad/`, cachant les artefacts du guest de `git status`. Si un jour un
+# clone revient à la racine, se souvenir du slash.)

@@ -27,14 +27,19 @@ STARK) — not that the raw work-units are interchangeable. The shared report co
 | **`infra/<stack>-infra/`** | Tooling per zkVM (`sp1-infra` · `zisk-infra` · `openvm-infra`): the `./run` dispatcher, `scripts/`, `cluster/` (on-box multi-GPU proving), the runner, `docs/`, and each guest's **recipe** (`<stack>-infra/guests/<name>/guest.sh`). Artifacts resolve from `../../guests/`. |
 | **`guests/monad/`** | The special **Monad** guest — block-replay ELFs (SP1 + ZisK) + `ev.sh` (execute-and-verify) + witnesses, for the cross-zkVM **execution**-time comparison. See `guests/monad/README.md`. |
 | **`infra/monad-witness/`** | The **producer** side, on a Monad node: drives the node's replay of Ethereum mainnet to dump Monad-guest witnesses at the tip, then queues the cadence blocks, prunes the rest, and records the timestamps the latency report joins on (`witness-follow` · `witness-tap`). The witness seam for the Monad guest — there is no other source for these witnesses. See [`infra/monad-witness/README.md`](infra/monad-witness/README.md). |
-| **`profiling/`** | Execution-analysis tools: **`hotspots.py`** (prover-agnostic hotspot profiler — *where* the cost goes) and **`results.py`** (cross-zkVM work-unit report → `results/results.html` — *how much* work per block). |
-| **`vendor/`** | Upstream clones (Axiom / Succinct / Polygon): `openvm-eth`, `rsp`, `zisk-eth-client` — the witness/guest **sources** from which the ELFs are built. Not this project's code; do not reorganize. |
+| **`profiling/`** | Execution-analysis tools. **`compare.py`** — *how much more* does one guest cost than another, over a block set (the headline ratios, `results/compare.html`); **`hotspots.py`** — *where* the cost goes, per function and opcode; **`results.py`** — *how much* work per block, all guests side by side. Start at [`profiling/RUNBOOK.md`](profiling/RUNBOOK.md): every workflow as a command, including building a guest from a branch and measuring it end to end. |
+| **`vendor/`** | Upstream clones (Axiom / Succinct / Polygon): `openvm-eth`, `rsp`, `zisk-eth-client` — the witness/guest **sources** the ELFs are built from, reproduced by `cli/install-vendors` at pinned commits. Also holds **`vendor/monad/`**, the Monad client tree (`category-labs/monad`): that one is a *working* clone on a branch, **not** a pinned vendor — `install-vendors` does not manage it, and `infra/monad-openvm/` builds the OpenVM guest from `vendor/monad/zkvm/openvm`. Not this project's code; do not reorganize. |
 | **`cli/`** | Guest-agnostic driver CLIs, run from the repo root — `cli/gen-elf` · `cli/gen-witness` · `cli/execute` · `cli/prove-farm` (each `--guest <name>`, `--list`; delegate to the guest's stack — `zisk` witness and `monad-*` return a clear error). Plus the two bulk **farm** drivers `cli/witness-farm` (collect witnesses) → `cli/prove-farm` (prove them on the cluster, via the uniform `run prove-cluster` verb). Also holds `guests.registry` + `reg.sh`, the single source of truth (each guest → stack, params, per-capability mode `elf`/`witness`/`exec`; add a guest = add a row), and `report-schema.md`, the shared `report.json` contract every runner emits. |
+| **`run-data/`** | **Runtime output** of every `cli/` driver, in one place and wholly git-ignored: `wcache/`, `witness-farm.csv`, `prove-farm.csv`, the `*-logs/`, the `ethproofs-mock-data/` store. Nothing here is a source — all of it regenerates by re-running the driver. Scripts reach it through `$RUNDATA` (overridable, to point a trial run at a throwaway directory). |
 
 This is a single git repo. The only nested git repos are the upstream clones under `vendor/` (each
 keeps its own `.git`, and `vendor/` is git-ignored). Build outputs and large regenerable inputs are
 git-ignored per [`.gitignore`](.gitignore); everything else — `cli/`, `guests/`, `profiling/`, and all
 three `infra/` — is versioned here.
+
+So the root holds nothing but **sources** (`cli/`, `guests/`, `infra/`, `profiling/`) and two ignored
+directories (`vendor/`, `run-data/`). A driver output that lands anywhere other than `run-data/` is a
+bug, not an exception to add to `.gitignore`.
 
 ## Requirements
 
