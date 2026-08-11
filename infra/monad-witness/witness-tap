@@ -20,7 +20,7 @@ firehose into the three things the RTP pipeline actually needs, and nothing else
                used to be recoverable from the raw copy, and no longer is.
 
                A witness exists to be proved, so its input is dropped once the proof is in hand. Retention
-               is driven by cli/prove-farm.csv (the same source its own `is_proven` uses), not by a blind
+               is driven by run-data/prove-farm.csv (the same source its own `is_proven` uses), not by a blind
                ring, and a block is KEPT when it is still interesting:
 
                  proved ok        -> drop the framed input; the proof is the artefact now
@@ -63,7 +63,7 @@ latency is measured on ONE clock and never mixes in the laptop's:
 Deliberately NOT here: proving and submission timings. Those come from prove-farm's report.json and the
 mock's submissions.jsonl; joining the three is the latency report, not this loop's job.
 
-Config (env, all optional except the paths' defaults being sane on nyc-003):
+Config (env, all optional except the paths' defaults being sane on the devcore box):
   WITNESS_DIR=~/witnesses      REPO=~/zkvm-bench        BLOCK_DB=~/block_db
   RPC=http://chi-001.devcore4.com:8545                  MANIFEST=<WITNESS_DIR>/../witness-manifest.csv
   PROVE_EVERY=1 (RTP; 100 = ethproofs sampling)       INTERVAL=6
@@ -211,10 +211,10 @@ def promote(block, wit, root_src, dry):
     return round(time.time(), 3)
 
 def prove_status():
-    """block -> (status, prove_secs) for THIS guest, read from cli/prove-farm.csv — the same record its
-    own is_proven() consults, so the tap and the prover never disagree about what is done."""
+    """block -> (status, prove_secs) for THIS guest, read from run-data/prove-farm.csv — the same record
+    its own is_proven() consults, so the tap and the prover never disagree about what is done."""
     out = {}
-    path = os.path.join(REPO, "prove-farm.csv")
+    path = os.path.join(REPO, "run-data", "prove-farm.csv")
     if not os.path.exists(path):
         return out
     try:

@@ -5,9 +5,11 @@ and dumping, per block, the zkVM witness the Monad guest consumes. It is the hom
 "co-located reth node" seam of [`cli/ethproofs-pipeline.md`](../../cli/ethproofs-pipeline.md) — except it
 feeds the **Monad** guest, not reth, so there is no other way to get these witnesses.
 
-Everything here runs on the devcore box (`nyc-003`). Two of the three long-running pieces are **not** in
-this repo — they live in the monad tree (branch `sam/osaka_witness_gen`) and are driven, not
-reimplemented:
+Everything here runs on the devcore box. Two of the three long-running pieces are **not** in
+this repo and are driven, not reimplemented. Be precise about where they are, because it has cost time:
+they are **untracked files in `~/monad/`** — in no branch at all, so their interfaces cannot be read from
+a checkout, and `origin` no longer carries the `sam/*` branches they were first written on. Read them on
+the box.
 
 | piece | what | whose |
 |---|---|---|
@@ -18,6 +20,10 @@ reimplemented:
 | **`witness-follow`** | brings them up per phase, and reports where they are | here |
 | **`witness-sim`** | rehearse the whole pipeline from an existing witness corpus, no node, no GPU | here |
 | **`patch-fetch-blocks.py`** | teaches the fetcher `--head-tag latest --confirmations N` → block-by-block instead of epoch bursts | here |
+| **`patch-run-replay.py`** | stops `run_replay.py` dying on an RPC blip (see Known gaps). Per box, not per repo | here |
+| **`patch-fixed-history.py`** | exposes `--fixed-history-length` on the node, so a bounded replay can be rewound instead of reloaded | here |
+| **`patch-run-replay-history.py`** | forwards that flag from `run_replay.py`, which has no passthrough. Both patches or neither | here |
+| **`witness-backfill`** | the **bounded** counterpart of `witness-follow`: regenerate a FIXED block set from a given monad branch, build both guest ELFs from the same checkout, and file them home as a `guests/monad/gen/<name>/` generation. It ends | here |
 
 ```
 chi-001 RPC ─► block_db ─► [monad replay + triedb] ─► ~/witnesses/<block>.witness
@@ -34,7 +40,7 @@ chi-001 RPC ─► block_db ─► [monad replay + triedb] ─► ~/witnesses/<b
 
 ## Box prerequisites
 
-Validated 2026-07-29 on nyc-003. The first three are hard blockers — the DB will not even open otherwise.
+Validated 2026-07-29 on the devcore box. The first three are hard blockers — the DB will not even open otherwise.
 
 - **memlock** — monad hard-asserts `!mlock(...)` in `HugeMem`; the default 8 MB hard limit is far too low
   (`ulimit -Hl` should be GBs). Hugepages must be configured too.
@@ -45,7 +51,7 @@ Validated 2026-07-29 on nyc-003. The first three are hard blockers — the DB wi
   block** with no expiry of State/Code (`OnDiskMachine::auto_expire()` is true only for the
   TxHash/BlockHash tables). Consequence: with a 1 TB file on a 913 GB filesystem, the **fs fills at
   ~625 GB of triedb, long before the DB's own 0.6/0.8 defenses ever fire**. Size it so `0.8 × capacity`
-  still fits alongside everything else — on nyc-003 (~245 GB used outside the triedb) that is **600 G**:
+  still fits alongside everything else — on the devcore box (~245 GB used outside the triedb) that is **600 G**:
   ```sh
   truncate -s 600G ~/triedb.db
   monad-mpt --storage ~/triedb.db --create --state-machine ethereum
@@ -73,7 +79,7 @@ They have opposite needs, so they are separate runs:
 
 **catch-up** — `--zkvm-witness` forces the interpreter (~4.6 vs ~8 blocks/s) *and* would dump ~7 MB for
 every block of the backlog: tens of thousands of blocks, hundreds of GB, all of it useless. So the
-backlog is replayed with the flag **off**. Measured on nyc-003: **7.1–9.0 blocks/s** (~8 avg) with
+backlog is replayed with the flag **off**. Measured on the devcore box: **7.1–9.0 blocks/s** (~8 avg) with
 compaction active, i.e. ~3 h for ~87 k blocks.
 
 **tip** — small batches (`MIN_FOLLOW_BATCH=1`, one monad restart per block) to keep the lag at one block,
@@ -84,10 +90,57 @@ Stop cleanly with `./witness-follow stop`: it SIGTERMs `run_replay.py`, which fo
 `ALERT` file means a batch genuinely *failed* — read it, fix the cause, then remove it. Never clear it
 blindly; `witness-follow start` refuses to run while it exists.
 
+### The third shape: a bounded backfill
+
+`catchup` and `tip` both follow the chain forever. Re-measuring a *new guest* on the *same blocks* is the
+opposite job — a fixed set, and it has to end — so it is a separate tool, `./witness-backfill`:
+
+```sh
+export HOST=<box>                      # the devcore box it runs on — required, no default
+./witness-backfill plan al/zkvm-r3      # prints every command, starts nothing (the default)
+./witness-backfill run  al/zkvm-r3
+```
+
+It derives the block set from the witnesses already in `guests/monad/current/witnesses` (so "the same
+blocks" is checked, not promised) — a fresh clone has none, so name the range instead:
+`BLOCKS=25551991-25552494`. It syncs the branch with `--force` (these branches are rebased), builds the
+guest ELFs **before** touching the trie and stops if that exact pair already exists as a generation,
+then resets the trie, loads the snapshot, fetches a block_db pruned to `[first-256 .. last]` — the only
+bound `run_replay.py` respects — replays, and pulls the corpus home with the ELFs and a written
+`PROVENANCE.md`. Nothing is deleted on the box until every checksum and the file count agree.
+
+### A second branch over the same range: `again`
+
+The load is the whole cost — ~66 min for ~350 GB, against ~2 min to replay 504 blocks. So doing it
+twice is almost entirely waste, and `again` avoids it by REWINDING the trie to the start of the range
+instead of reloading the snapshot:
+
+```sh
+AGAINST=offsettriedb-rework-2026-08 ./witness-backfill again al/zkvm-r4
+```
+
+Needs both patches above: `--fixed-history-length` pins the history so `monad-mpt --rewind-to` can
+still reach the start, and the node cannot see the flag unless `run_replay.py` forwards it.
+
+Three guards, in the order they fire:
+
+- **the generation already exists** → refused before anything is built. Whether it resembles
+  `AGAINST` is beside the point: it is on disk, so it is not regenerated.
+- **`AGAINST` + `PROBE`** (20 blocks by default) → after the first blocks are dumped, their **bytes**
+  are compared against that corpus. Identical means this branch needs no corpus at all: its guest is
+  a *variant* reading the existing one (`guests/monad-variants/`), and the run stops there. Byte
+  comparison and nothing else — a source diff reports "unknown" for any branch that also touched a
+  test, and identical ELFs pin the witness *format*, not its *content*.
+- **the rewind was refused** → `--rewind-to` prints a warning and exits **0**, so the outcome is
+  asserted (`latest_finalized_block_id` back at the start), never the exit code. On failure it says
+  so in full and asks before falling back to a reset + load. The usual cause is disk: crossing 60%
+  occupancy during the previous replay starts the slow-ring compaction, and the history it frees does
+  not come back.
+
 ## Cadence: every block, because the target is real-time
 
-`QUEUE_MODULUS=1` by default — **every block, as it arrives**. That is what real-time proving means; the
-÷100 sampling of an ethproofs benchmark cluster is a different, cheaper mode (`QUEUE_MODULUS=100`).
+`PROVE_EVERY=1` by default — **every block, as it arrives**. That is what real-time proving means; the
+÷100 sampling of an ethproofs benchmark cluster is a different, cheaper mode (`PROVE_EVERY=100`).
 
 How close the prover can get is now measurable rather than guessed. Four real monad witnesses emulated to
 **182–311 Msteps**, and this repo's own 16×5090 numbers solve to `secs ≈ 3.8 + steps/28.3e6` (479 Msteps →
@@ -116,7 +169,7 @@ piling up there means framing is failing or the replay is outrunning the tap. A 
 `SETTLE_SECS` (2 s) is left alone: framing a half-written one used to be recoverable from the raw copy, and
 no longer is.
 
-Everything below therefore acts on the **framed input**, driven by `cli/prove-farm.csv` (the same record
+Everything below therefore acts on the **framed input**, driven by `run-data/prove-farm.csv` (the same record
 `prove-farm`'s own `is_proven` reads) rather than by a blind ring. A block is kept while it is still
 *interesting*:
 
@@ -167,7 +220,38 @@ happily read those reports for its `work` column if they exist, and leave it bla
 
 ## Known gaps
 
-- **Block-by-block vs epoch bursts — half closed.** Measured on nyc-003: following `finalized` makes
+- **`run_replay.py` dies on any RPC blip, and does it silently.** Verified 2026-08-10 by reading the
+  source: the file contains **no `try`/`except` at all**. Every loop iteration calls
+  `rpc_block_number(rpc, "finalized")`, which is `requests.post(..., timeout=30)` followed by
+  `raise_for_status()` — so a slow RPC, a 5xx, or a malformed `result` raises, and the orchestrator
+  exits with a traceback. It exits **without writing `ALERT`**, because `ALERT` is only written when
+  the `monad` child returns non-zero. The symptom is a replay that "stopped on its own while
+  everything was fine", with no ALERT to explain it.
+
+  The insult on top: that RPC result feeds only `gap`, and `gap`'s one decision use is
+  `n_ready < max(1, min(min_follow_batch, gap))`. **With `--min-follow-batch 1` the threshold is 1
+  regardless of `gap`** — so in a bounded run the RPC call cannot change any behaviour, and can only
+  end the run.
+
+  Restarting is safe and is the workaround: the client resumes from the triedb's last finalized
+  block on every start (the script's own docstring says so), so a restart re-enters where it
+  stopped. **Fixed in three places, 2026-08-10:**
+
+  - `./patch-run-replay.py` wraps the lookup so a failure means "gap unknown" instead of fatal —
+    three exact-string edits, idempotent, revertible, refusing to apply if upstream moved.
+    `--host <box>` applies it remotely. Applied on the devcore box. It is applied **per box, not per repo**,
+    so a new machine starts out with the defect.
+  - `./witness-backfill` restarts a replay that vanished with no ALERT, up to `MAX_RESTARTS` (10).
+  - `./witness-follow`'s supervisor used to read "no ALERT" as "a clean stop" and return — so the
+    one failure that most needed a restart was the one it refused. A stop and a crash are genuinely
+    indistinguishable by exit code (run_replay.py's SIGTERM handler exits 1; so does an unhandled
+    exception; neither writes an ALERT), so `stop` now writes a `logs/STOP` marker and the
+    supervisor keys on that: STOP means deliberate, its absence means crash and it restarts —
+    `SUPERVISE_MAX_CRASHES` (20), `SUPERVISE_BACKOFF` (10 s), and the budget resets after a run
+    that stayed healthy for `SUPERVISE_HEALTHY_SECS` (300 s) so a long-lived producer cannot
+    exhaust it on unrelated blips.
+
+- **Block-by-block vs epoch bursts — half closed.** Measured on the devcore box: following `finalized` makes
   witnesses arrive in bursts of **exactly 32 blocks** (one epoch) every ~6 min, **~13–19 min** behind the
   head (observed lags: 66, 71, 89 blocks). That delay dominates every other number in the pipeline, and
   `--min-follow-batch 1` cannot touch it — the granularity comes from the *fetcher*, not the replay:

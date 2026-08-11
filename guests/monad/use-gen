@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# use-gen — select which Monad guest GENERATION the tooling sees.
+#
+# A generation is a guest lineage plus the witness wire format it reads; the two change together
+# (PartialTrieDb + RLP node list -> OffsetTrieDb + offset blob). Witness FILENAMES are identical
+# across formats, so mixing two sets is undetectable by inspection — hence one directory per
+# generation, and this script as the only way to switch.
+#
+#   ./use-gen                 list generations, mark the current one
+#   ./use-gen <generation>    point `current` at it and install its ELFs
+#
+# `current` and `fixtures` are symlinks (gitignored, local state). The two top-level ELFs are the
+# paths guests/monad-{zisk,sp1}/*.elf link to and ARE tracked, so switching shows up as a modification
+# to commit — that is deliberate: the ELF is what produced the numbers.
+set -eu
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$HERE"
+
+# Delegated to ./witness-fmt — the detector now has a second caller (rtp-up's compatibility guard) and two
+# copies of an RLP walk would be two things to keep in step. It also handles the framed shape, which this
+# inline version could not: the same witness reaches the prover with an LE64 length prefix, and a detector
+# blind to that would have left the whole RTP path unchecked.
+fmt() { ./witness-fmt "$1" | awk '{print $1, $2}'; }
+
+if [ $# -eq 0 ]; then
+  cur="$(readlink current 2>/dev/null || echo '(none)')"
+  printf "current: %s\n\n" "$cur"
+  for d in gen/*/; do
+    g="${d#gen/}"; g="${g%/}"
+    n=$(ls "$d/witnesses"/*.witness 2>/dev/null | wc -l | tr -d ' ')
+    e=$(ls "$d/elf"/*.elf 2>/dev/null | wc -l | tr -d ' ')
+    f="-"; [ "$n" -gt 0 ] && f=$(fmt "$(ls "$d/witnesses"/*.witness | head -1)")
+    printf "  %s %-26s %4s witnesses  %s elf  %s\n" \
+           "$([ "gen/$g" = "$cur" ] && echo '*' || echo ' ')" "$g" "$n" "$e" "$f"
+  done
+  exit 0
+fi
+
+G="$1"; D="gen/$G"
+[ -d "$D" ] || { echo "no such generation: $D"; exit 1; }
+n=$(ls "$D/witnesses"/*.witness 2>/dev/null | wc -l | tr -d ' ')
+[ "$n" -gt 0 ] || { echo "$D/witnesses is empty — nothing to select"; exit 1; }
+for e in monad-zkvm-guest-zisk.elf monad-zkvm-guest-sp1.elf; do
+  [ -f "$D/elf/$e" ] || { echo "missing $D/elf/$e — build it before selecting this generation"; exit 1; }
+done
+
+# Refuse a set that is not one format throughout: that is the failure this layout exists to prevent,
+# and it is invisible in a directory listing.
+first=$(ls "$D/witnesses"/*.witness | head -1)
+mid=$(ls "$D/witnesses"/*.witness | awk -v n="$n" 'NR==int(n/2)+1')
+last=$(ls "$D/witnesses"/*.witness | tail -1)
+f1=$(fmt "$first"); f2=$(fmt "$mid"); f3=$(fmt "$last")
+if [ "$f1" != "$f2" ] || [ "$f2" != "$f3" ]; then
+  echo "MIXED witness formats in $D/witnesses — refusing:"
+  printf "  %s  %s\n  %s  %s\n  %s  %s\n" \
+    "$(basename "$first")" "$f1" "$(basename "$mid")" "$f2" "$(basename "$last")" "$f3"
+  exit 1
+fi
+
+ln -sfn "$D" current
+[ -L fixtures ] || ln -s current/witnesses fixtures
+cp "$D/elf/monad-zkvm-guest-zisk.elf" "$D/elf/monad-zkvm-guest-sp1.elf" .
+
+echo "now using $G"
+echo "  witnesses  $n · format $f1"
+echo "  fixtures   -> $(readlink fixtures) -> $D/witnesses"
+for e in monad-zkvm-guest-zisk.elf monad-zkvm-guest-sp1.elf; do
+  echo "  $e  $(shasum -a 256 "$e" | cut -c1-16)…"
+done
+echo
+echo "the two ELFs are tracked — 'git status' will show them modified; that is the record of the switch"

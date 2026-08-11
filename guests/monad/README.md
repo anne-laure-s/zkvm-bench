@@ -28,27 +28,102 @@ proving) against the reth clients on SP1 / ZisK / OpenVM, over the common blocks
 - `guests/monad/execute-out/` — `ev.sh` outputs (framed `1-<block>.bin` · `.out` · `.log`)
 - `guests/monad/exec-verified.csv` — steps + root-verification recap (corrected guest)
 
-## Witnesses — provenance (git-ignored, ~79 MB)
+## Layout: one directory per generation
 
-**Two tiers** (both git-ignored):
-- `fixtures/<block>.witness` (+ `.post_state_root`) — raw **staging**: witnesses generated **elsewhere**
-  (Monad node; see below), accumulated in bulk and `<block>`-named. **No tool in this repo reads
-  `fixtures/`** — it is a holding area, independent of `inputs/` (currently a different block range and a
-  different naming scheme).
-- `inputs/1-<block>.witness` (+ `.post_state_root`) — the **curated working set** actually consumed by
-  `ev.sh` and `guests/monad-*/gen-inputs`, batch-tagged `1-<block>`. To execute/prove a block, place its
-  witness (+ expected root) here (see "To obtain" below).
+A **generation** is a guest lineage plus the witness wire format it reads. The two change together
+and are not interchangeable — `PartialTrieDb::from_witness` reads an RLP list of node preimages,
+`OffsetTrieDb` reads an offset blob — while the witness **filenames are identical across formats**.
+Mixing two sets is therefore invisible in a directory listing, which is why they never share a
+directory.
+
+```
+gen/<generation>/
+  witnesses/            <block>.witness + <block>.post_state_root   (git-ignored, GBs)
+                        + <block>.expected_pv — OPTIONAL, see below
+  elf/                  the two ELFs that read that format          (git-ignored)
+  PROVENANCE.md         branch, builder, ELF sha256, measured format, counts — TRACKED
+current   -> gen/<generation>                 selects the generation (git-ignored, local state)
+fixtures  -> current/witnesses                the path the tooling globs (git-ignored)
+monad-zkvm-guest-{zisk,sp1}.elf               the current ELFs — TRACKED, what produced the numbers
+```
+
+`fixtures/` is the stable path: `profiling/compare.py` and `infra/monad-openvm/segments.sh` glob it
+and need no change when the generation switches. Switching is one command:
+
+```sh
+./use-gen                            # list generations, mark the current one, show each format
+./use-gen offsettriedb-rework-2026-08   # select it
+```
+
+`use-gen` **refuses** a generation whose witnesses are not one format throughout (it samples the
+first, middle and last block), refuses one with no ELFs, and prints the ELF hashes it installed.
+Since the top-level ELFs are tracked, a switch shows up as a modification to commit — deliberately:
+the ELF is what produced the numbers.
+
+Only `PROVENANCE.md` is committed. It is the sole record of which branch and which ELF a set of
+figures came from, and it states the witness format as **measured** (the first four bytes of field
+[1]: `4d5a5701` = `MZW\x01` for the offset format, an RLP list header for the old one) rather than
+inferred from a directory name.
+
+### `.expected_pv` — optional, and not needed to run anything
+
+A witness and its ELF are all it takes to **execute** a block: that is what `profiling/compare.py`,
+`profiling/hotspots.py` and the two runners do, and none of them opens a root file. Verification is a
+separate concern, and it has two levels:
+
+| present in the set | `ev.sh` verdict | checks |
+|---|---|---|
+| `.post_state_root` only | `PASS` | the post root appears in the output (substring) |
+| `+ .expected_pv` (96 B, `post \|\| pre \|\| hash`) | `PASS(pv3)` | all three public values, positionally |
+
+`witness-backfill` writes the first and not the second, so a freshly produced generation reports `PASS`
+— that is a complete answer to "does this build read this generation", not a degraded one. To get the
+stronger verdict, generate them over the whole witness directory (it derives `pre` from each block's
+parent and cross-checks `hash` against the next block's `parent_hash`, so it needs the full set):
+
+```sh
+./gen-expected-pv.py gen/<generation>/witnesses     # --check-only reports without writing
+```
+
+Expect one block short of the set: the first has no local parent post-root.
+
+## Witnesses — provenance (git-ignored)
+
+**Two locations**, and which one a tool reads is not a detail — they hold different sets:
+
+- `fixtures/<block>.witness` (+ `.post_state_root`) — a **symlink to the selected generation**
+  (`current/witnesses`, see above). This is the working set: `profiling/compare.py` looks here
+  **first**, `ev.sh` and `infra/monad-openvm/segments.sh` read it exclusively, and
+  `guests/monad-*/gen-inputs --from fixtures` sources it. Switch generation and every one of them
+  follows, with no path to change.
+- `inputs/1-<block>.witness` (+ `.post_state_root`) — an older set, batch-tagged `1-<block>`, that
+  predates the generation split. It is `compare.py`'s **second** lookup and the default source of
+  `gen-inputs`. It covers a different, much smaller block range than the current generation, so a
+  block present in both can resolve to two different witnesses depending on which tool asks.
 
 The `1-<block>.witness` files are **pre-generated from a Monad node** (the Monad block-replay input) and
 are **not** regenerable through this repo — `cli/gen-witness --guest monad-*` deliberately errors
-("pre-supplied"). Because they total ~79 MB they are **git-ignored** (see the root `.gitignore`), so a
-fresh clone does **not** contain them and `ev.sh` cannot run until they are copied in. The whole
+("pre-supplied"). They are **git-ignored** (see the root `.gitignore`), so a fresh clone does **not**
+contain them and `ev.sh` cannot run until they are copied in. The whole
 `inputs/` dir — witnesses **and** their `1-<block>.post_state_root` roots — is git-ignored, and so is
 the `exec-verified.csv` recap (`ev.sh` regenerates it).
 
-- **Blocks:** `25224730`–`25224739` (Monad-only) + `25229951`, `25229957` (common with the reth guests).
-- **To obtain them:** see the internal Notion doc [*Running a witness through the zkVM guest (x86 · ZisK · SP1)*](https://app.notion.com/p/Running-a-witness-through-the-zkVM-guest-x86-ZisK-SP1-37475b0ba84081869a5ee686cbad7899).
-  Drop each `1-<block>.witness` **and** its `1-<block>.post_state_root` into `guests/monad/inputs/`, then run `guests/monad/ev.sh`.
+- **Blocks:** these 12 are what `inputs/` holds — `25224730`–`25224739` (Monad-only) plus `25229951`
+  and `25229957` (common with the reth guests). They are **not** the corpus the reports use: that is
+  the selected generation under `fixtures/` (see above), currently 504 blocks. `inputs/` predates the
+  generation split and stays as `compare.py`'s second lookup.
+- **To obtain a corpus:** the procedure is `infra/monad-witness/witness-backfill`, which replays a
+  branch on the devcore box and files the result as a **generation** (witnesses + both ELFs +
+  `PROVENANCE.md`) — see [`profiling/RUNBOOK.md` § Compare two versions of the guest, A to
+  Z](../../profiling/RUNBOOK.md#compare-two-versions-of-the-guest-a-to-z). That is the only supported
+  path, and what every current report was produced from.
+- **The 12 blocks in `inputs/` predate it** and are the exception, not the model: they were hand-copied
+  before the generation split, following the internal Notion doc [*Running a witness through the zkVM
+  guest (x86 · ZisK · SP1)*](https://app.notion.com/p/Running-a-witness-through-the-zkVM-guest-x86-ZisK-SP1-37475b0ba84081869a5ee686cbad7899).
+  To reproduce that set specifically: drop each `1-<block>.witness` **and** its
+  `1-<block>.post_state_root` into `guests/monad/inputs/`, then run `guests/monad/ev.sh`. Do **not**
+  use this to grow a corpus — a set landing outside a generation is the sign that a generation is
+  missing.
 
 ## Binaries used
 

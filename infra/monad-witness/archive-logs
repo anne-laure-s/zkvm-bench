@@ -5,7 +5,7 @@
 #
 #   MANY SMALL FILES, one per block — `~/monad/logs/monad_<b>_<b>.log` (with --min-follow-batch 1 the
 #     replay restarts monad per block, so each block gets its own file, startup banner included) and
-#     `prove-farm-logs/{prove,submit}-<guest>-<block>.log`. At ~300 blocks/h that is ~14 000 files a day
+#     `run-data/prove-farm-logs/{prove,submit}-<guest>-<block>.log`. At ~300 blocks/h that is ~14 000 files a day
 #     for ~30 MB. The cost is INODES, not bytes: directory listings slow down, `ls -t` crawls.
 #     -> rolled up into ONE archive per run. These files are near-identical to each other (the same monad
 #        banner over and over), so a single compressed stream shares its dictionary across all of them and
@@ -16,7 +16,7 @@
 #     -> rotated: COPIED then truncated in place, never moved. A move would leave the running process
 #        writing into an unlinked file, and the log would silently vanish.
 #
-# What it never touches: `~/witness-manifest.csv`, `prove-farm.csv`, the run records under
+# What it never touches: `~/witness-manifest.csv`, `run-data/prove-farm.csv`, the run records under
 # `infra/*/results/`, and `~/monad/logs/ALERT`. That is the DATA (and, for ALERT, a failure marker) — it is
 # compact, it is what the latency report reads, and it is not log noise.
 #
@@ -121,7 +121,7 @@ log "out=$OUT min-age=${MIN_AGE}min compressor=${COMP%% *}$([ "$DRY" = 1 ] && ec
 
 # Many-small-files: the per-block logs. ALERT is deliberately excluded by the name patterns.
 rollup monad "$MONAD_DIR/logs"       'monad_*.log'
-rollup prove "$REPO/prove-farm-logs" '*.log'
+rollup prove "$REPO/run-data/prove-farm-logs" '*.log'
 
 # Append-only: one file per long-running component.
 for f in "$HOME/fetch.log" "$HOME/replay-tip.log" "$HOME/replay-catchup.log" \

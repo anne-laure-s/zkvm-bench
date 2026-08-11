@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # witness-follow — bring up (and look at) the Monad witness seam on the devcore box.
 #
-# The seam has three long-running pieces. Two already exist in the monad tree (Sam's, branch
-# sam/osaka_witness_gen) and are NOT reimplemented here — this only orchestrates them and adds the third:
+# The seam has three long-running pieces. Two are Sam's and are NOT reimplemented here — this only
+# orchestrates them and adds the third. They are UNTRACKED files in ~/monad/ (in no branch at all, and
+# origin no longer carries the sam/* branches they began on), so read them on the box, not in a checkout:
 #
 #   fetch     fetch_blocks.py   raw blocks from an RPC -> block_db          (follows the chain, forever)
 #   replay    run_replay.py     block_db -> triedb, dumping zkVM witnesses  (follows block_db, forever)
@@ -30,6 +31,10 @@
 # Config (env): MONAD_DIR REPO WITNESS_DIR BLOCK_DB DB RPC NTHREADS MAX_BATCH MIN_FOLLOW_BATCH
 #               PY ETHPROOFS_URL CLUSTER PROVE_EVERY KEEP_RECENT
 #               HEAD_TAG CONFIRMATIONS   (block-by-block; needs ./patch-fetch-blocks.py — see README)
+#               SUPERVISE_MAX_CRASHES SUPERVISE_BACKOFF SUPERVISE_HEALTHY_SECS
+#                                          the tip supervisor restarts a crash that left no ALERT (20 tries,
+#                                          10 s apart, budget reset after 300 s of healthy running). A
+#                                          deliberate `stop` writes logs/STOP and is never fought.
 #               FETCH_POLL TAP_INTERVAL REPLAY_POLL   (polling latency: 6 s, 6 s and 12 s by default,
 #                                          waiting in the end-to-end budget for no benefit)
 #               TIP_DIRECT=1 BLOCK_DB_TIMEOUT=30s   at the tip, run ONE long-lived monad that waits for blocks
@@ -114,7 +119,12 @@ phase_sessions() { [ "$1" = tip ] && echo "fetch replay-tip tap" || echo "fetch 
 #
 # Deliberately NOT a blind retry loop. ./reorg-recover refuses anything that is not reorg-shaped and gives up
 # once its margin is exhausted, so a genuine fault (disk full, corruption) stops the loop instead of grinding
-# the database. And an exit WITHOUT an ALERT is a clean stop — `witness-follow stop` must not be fought.
+# the database.
+#
+# An exit without an ALERT used to be read as "a clean stop", so `witness-follow stop` would not be fought.
+# That was wrong in one direction: it is also how the ORCHESTRATOR dies (no try/except in
+# run_replay.py, and a 30 s HTTP call every iteration), and those crashes went unrestarted. The two are now
+# told apart by an explicit logs/STOP marker that cmd_stop writes, because both exit rc=1 with no ALERT.
 # run_tip_once — one run of the tip producer, on whichever path TIP_DIRECT selects.
 #
 # TIP_DIRECT=1 (default): monad directly, long-lived. TIP_DIRECT=0: the old run_replay.py path, kept so the two
@@ -144,17 +154,40 @@ run_tip_once() {
 }
 
 cmd_supervise() {
-  local rc
+  local rc crashes=0
   while :; do
     if ! tmux has-session -t fetch 2>/dev/null; then
       echo "supervise: fetcher not running (reorg-recover stops it by design) — starting it"
       tmux new-session -d -s fetch "$(fetch_cmd)"
       sleep 3
     fi
+    local t0; t0=$(date +%s)
     run_tip_once; rc=$?
     if [ ! -f "$MONAD_DIR/logs/ALERT" ]; then
-      echo "supervise: replay exited rc=$rc with no ALERT — a clean stop or a crash to look at. Not restarting."
-      return "$rc"
+      # "No ALERT" used to be read as "a clean stop". It is not: it is ALSO the signature of the
+      # orchestrator itself falling over, because ALERT is only written when the monad CHILD fails.
+      # run_replay.py catches no exception anywhere, and its per-iteration finalized lookup is a
+      # 30 s-timeout HTTP call — so one RPC blip took the producer down with nothing to explain
+      # it. patch-run-replay.py fixes that specific cause; this handles the class,
+      # including the boxes where the patch has not been applied.
+      if [ -f "$MONAD_DIR/logs/STOP" ]; then
+        echo "supervise: STOP present — deliberate stop (rc=$rc). Not restarting."
+        return 0
+      fi
+      local ran=$(( $(date +%s) - t0 ))
+      # A producer that ran healthily for a while and then crashed has earned a fresh budget;
+      # otherwise a long-lived run would eventually exhaust it on unrelated blips.
+      [ "$ran" -gt "${SUPERVISE_HEALTHY_SECS:-300}" ] && crashes=0
+      crashes=$((crashes + 1))
+      if [ "$crashes" -gt "${SUPERVISE_MAX_CRASHES:-20}" ]; then
+        echo "supervise: crashed $crashes times with no ALERT — giving up. Look at the newest \
+$MONAD_DIR/logs/*.log; if it is a requests/RPC traceback, apply ./patch-run-replay.py." >&2
+        return "$rc"
+      fi
+      echo "supervise: exited rc=$rc after ${ran}s with no ALERT and no STOP — that is a crash, \
+not a stop. Restarting ($crashes/${SUPERVISE_MAX_CRASHES:-20}) in ${SUPERVISE_BACKOFF:-10}s."
+      sleep "${SUPERVISE_BACKOFF:-10}"
+      continue
     fi
     echo "supervise: ALERT present — attempting reorg recovery"
     if ! MONAD_DIR="$MONAD_DIR" BLOCK_DB="$BLOCK_DB" DB="$DB" "$HERE/reorg-recover"; then
@@ -188,6 +221,8 @@ cmd_start() {
   [ -x "$REPO/guests/monad-zisk/gen-inputs" ] || die "no zkvm-bench clone at $REPO (git pull it first)"
   [ -f "$MONAD_DIR/logs/ALERT" ] && die "logs/ALERT present — a previous replay batch FAILED. Read it, \
 fix the cause, then rm it. Never clear it blindly."
+  # A stale STOP would make the supervisor quit on the first crash of a brand-new run.
+  rm -f "$MONAD_DIR/logs/STOP"
   [ "$phase" = tip ] && mkdir -p "$WITNESS_DIR"
   for s in $(phase_sessions "$phase"); do
     if tmux has-session -t "$s" 2>/dev/null; then echo "· $s already running"; continue; fi
@@ -215,6 +250,11 @@ ${FETCH_POLL:+FETCH_POLL=$FETCH_POLL }./witness-follow supervise >> ~/replay-sup
 
 cmd_stop() {
   local s
+  # Tell the supervisor this was deliberate. A stop and a crash are otherwise indistinguishable:
+  # run_replay.py's SIGTERM handler does sys.exit(1), and an unhandled exception exits 1 too, and
+  # NEITHER writes an ALERT. Without this marker the supervisor must either fight `stop` or ignore
+  # crashes — it used to do the latter (see cmd_supervise).
+  mkdir -p "$MONAD_DIR/logs" && : > "$MONAD_DIR/logs/STOP"
   for s in replay-catchup replay-tip tap profile; do
     tmux has-session -t "$s" 2>/dev/null || continue
     # SIGTERM run_replay.py: it forwards to monad and exits WITHOUT writing an ALERT (a clean stop).

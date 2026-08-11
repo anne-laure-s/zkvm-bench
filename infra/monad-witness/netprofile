@@ -7,7 +7,7 @@ networks, and every throughput figure gathered on the first was silently reused 
   802.11n  2.4 GHz  ch 1   20 MHz   57 Mbit/s PHY   RTT 137 ms (sigma 68)   one stream 20 Mbit/s
   802.11ac 5 GHz    ch 128 80 MHz  866 Mbit/s PHY   RTT  85 ms (sigma 11)   one stream 32-62 Mbit/s
 
-The "25-29 Mbit/s link" recorded in RTP-FINDINGS and used in a dozen calculations was the FIRST WI-FI, never the
+The "25-29 Mbit/s link" recorded early on and used in a dozen calculations was the FIRST WI-FI, never the
 WAN — which does 47-62 Mbit/s. Half a day of arithmetic was off by ~2x for want of knowing the link had changed.
 So the first job here is measurement hygiene: say loudly when the link is not the one the numbers came from.
 
@@ -92,8 +92,8 @@ def fingerprint():
 def measure(box):
     """RTT + throughput. Returns a dict, or None if the box is unreachable."""
     rtt = jit = None
-    # `ping` does not read ssh_config, so an ssh ALIAS is not a resolvable name: `nyc-003` is expanded to
-    # nyc-003.devcore4.com by a Host stanza, and pinging the alias silently fails and reports "RTT ?".
+    # `ping` does not read ssh_config, so an ssh ALIAS is not a resolvable name: `<box>` is expanded to
+    # <box>.<domain> by a Host stanza, and pinging the alias silently fails and reports "RTT ?".
     # `ssh -G` prints the config as ssh itself resolves it, which is the only reliable expansion.
     host = box.split("@")[-1]
     for line in sh("ssh", "-G", box, t=15).splitlines():

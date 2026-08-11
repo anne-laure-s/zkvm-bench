@@ -3,7 +3,7 @@
 #
 # Topology it wires (the one we settled on):
 #
-#   nyc-003                                    this Mac
+#   the box                                    this Mac
 #   ───────                                    ────────
 #   fetch_blocks.py  (latest-N, block by block)
 #   run_replay.py    (--zkvm-witness)
@@ -38,7 +38,7 @@
 # backlog with it on costs hours and tens of GB for blocks that have no real-time value). The script starts
 # the witness-less replay, polls the gap until it closes, then switches to the tip phase.
 #
-# Config (env): BOX=nyc-003  MAC_USER=$USER  TUN_SSH_PORT=2222  MOCK_PORT=8547
+# Config (env): BOX=<box> (required)  MAC_USER=$USER  TUN_SSH_PORT=2222  MOCK_PORT=8547
 #               MOCK_STORE=/tmp/ethproofs-rtp  MOCK_SECS=2.12  MOCK_PER_MSTEP=0.0364  MOCK_SPEED=2.5  MOCK_JITTER=0.5
 #               HEAD_TAG=latest  CONFIRMATIONS=0 (the head — real time)  MOCK_RUNNER_DIR=$HOME/zisk-mock
 #               CATCHUP_TARGET=10 (blocks)  CATCHUP_POLL=30 (s)  CATCHUP_MAX_MIN=240
@@ -56,7 +56,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAC_REPO="$(cd "$HERE/../.." && pwd)"
 
-BOX="${BOX:-nyc-003}"
+# No default: the box is infrastructure, not part of this repo. Checked below, after --help.
+BOX="${BOX:-}"
 MAC_USER="${MAC_USER:-$USER}"
 TUN_SSH_PORT="${TUN_SSH_PORT:-2222}"
 MOCK_PORT="${MOCK_PORT:-8547}"
@@ -205,6 +206,10 @@ onbox(){ if [ "$DRY" = 1 ]; then printf '   [%s] $ %s\n' "$BOX" "$*"; else ssh "
 # point of a dry run).
 onbox_q(){ ssh -o BatchMode=yes "$BOX" "$*" 2>/dev/null; }
 
+# Checked here rather than at assignment: --help must answer without a box.
+[ -n "$BOX" ] || die "BOX is required — the devcore box the producer runs on. There is no default: it \
+is infrastructure, not part of this repo.  e.g.  BOX=<box> $0"
+
 # ── teardown ────────────────────────────────────────────────────────────────────────────────────────
 if [ "$STOP" = 1 ]; then
   step "Stopping the box's sessions"
@@ -274,8 +279,8 @@ if [ -z "$PROVER" ]; then
   # that produced two contradictory throughput curves in one afternoon.
   #
   # Its first job is not tuning, it is measurement hygiene. Moving this prover between two Wi-Fi networks in one
-  # session silently reused the first link's figures as the second's reference: the "25-29 Mbit/s" in
-  # RTP-FINDINGS was 802.11n on a congested 2.4 GHz channel, while the WAN behind it does 47-62. Half a day of
+  # session silently reused the first link's figures as the second's reference: the "25-29 Mbit/s"
+  # recorded then was 802.11n on a congested 2.4 GHz channel, while the WAN behind it does 47-62. Half a day of
   # arithmetic was off by ~2x for want of a line saying "this is not the link those numbers came from".
   #
   # rc=2 means new-or-changed. It is deliberately NOT fatal — a link change is information, not an error.
@@ -323,7 +328,7 @@ step "Key auth from $BOX back to this Mac"
 # Test the PRIVATE half. Checking only `.pub` was a real bug: a leftover public key (or a wiped ~/.ssh that
 # kept nothing at all) let this step report success while the box had nothing to authenticate with, and the
 # run then survived purely on a forwarded agent — until the agent went away and every transfer stopped.
-# Before generating anything: is something on that host scheduled to DELETE it again? On nyc-003 the answer
+# Before generating anything: is something on that host scheduled to DELETE it again? On the devcore box the answer
 # is yes — an Ansible-managed crontab entry, `0 * * * * find ~/.ssh -type f -name 'id_*' -delete`, wipes the
 # private key at the top of every hour. That is why this step has "fired twice on a box where the key was
 # verified present hours earlier", and why ~/.ssh keeps coming back with only authorized_keys + known_hosts:
@@ -445,7 +450,7 @@ fi
 # The checkout was on al/rtp; the binary had been built from another branch, so it still enforced that
 # constraint and exited 107 on `--block-db-timeout` alone. That wrote an ALERT which reorg-recover correctly
 # refuses (it is not a reorg), and the failure message pointed at flags rather than at a stale build. Reading
-# RTP-FINDINGS made it worse: it states the wait "lives in the Monad runloop, not the Ethereum one", which was
+# An earlier write-up made it worse: it states the wait "lives in the Monad runloop, not the Ethereum one", which was
 # true of the OLD branch and is exactly what al/rtp changes.
 #
 # So: check the branch, then check that the binary embeds the checked-out commit. Fatal, because running the
@@ -708,6 +713,7 @@ step "Witness format vs guest generation"
 # inspection, because witness FILENAMES are identical across formats. Two independent moving parts decide it:
 #
 #   the PRODUCER's format   <- the monad branch on the box (al/rtp emits rlp-list; the OffsetTrieDb lineage
+#                              — the class is `OffsetTrie` since the al/zkvm-r3 rework, the format is the same —
 #                              emits MZW\x01), i.e. whatever MONAD_BRANCH checked out above
 #   the GUEST's format      <- guests/monad/monad-zkvm-guest-zisk.elf in the box's clone, which is a symlink
 #                              target chosen by `use-gen` and committed

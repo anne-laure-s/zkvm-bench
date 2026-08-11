@@ -22,7 +22,7 @@
 #               MAX_SECS=120     give up on one block after this long (a stuck emulator is not worth it)
 #               NEWEST_FIRST=1   profile the freshest block first, like the prover
 #
-# Requires the ZisK emulator on THIS box (`ziskemu`, via ziskup) — nyc-003 does not have it yet, and the
+# Requires the ZisK emulator on THIS box (`ziskemu`, via ziskup) — the devcore box does not have it yet, and the
 # script says so rather than silently producing nothing.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

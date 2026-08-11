@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# witness-fmt — name the wire format of a Monad zkvm witness.
+#
+#   ./witness-fmt <file> [<file> ...]      one line per file: "<magic> <format> <path>"
+#   ./witness-fmt --quiet <file>           print only the format word
+#
+# Formats, and why this script exists at all:
+#
+#   rlp-list   field [1] is an RLP list of MPT node preimages   (generation partialtriedb-2026-07)
+#   offset     field [1] starts with MZW\x01 = 4d5a5701          (generation offsettriedb-2026-08)
+#
+# A guest reads exactly one of them. Feeding it the other is not a graceful failure: the witness parses
+# as garbage or the guest panics, and in mock mode that surfaces as every block failing at once with no
+# hint of the cause. Witness FILENAMES are identical across formats, so the mismatch is invisible in a
+# directory listing — which is the whole reason the generation layout and this detector exist.
+#
+# Accepts BOTH shapes a witness appears in, because the two live at different points of the same
+# pipeline and a detector that only understood one would leave the other unchecked:
+#   raw     — as monad's --zkvm-witness writes it
+#   framed  — LE64 little-endian length + witness + padding, as witness-tap hands it to the prover
+# The frame is detected, not declared: if the first 8 bytes read as a length that plausibly bounds the
+# rest of the file, it is a frame. A raw witness starts with an RLP header, which never looks like that.
+set -uo pipefail
+
+quiet=0
+[[ "${1:-}" == --quiet ]] && { quiet=1; shift; }
+[[ $# -ge 1 ]] || { echo "usage: witness-fmt [--quiet] <witness> [...]" >&2; exit 2; }
+
+QUIET=$quiet python3 - "$@" <<'PY'
+import os, sys
+
+def rlp_hdr(b, i):
+    """Start offset and length of the RLP item at i. Raises IndexError on a truncated buffer, which the
+    caller treats as 'not a witness' rather than crashing."""
+    q = b[i]
+    if q < 0x80: return i, 1                    # single byte, is its own payload
+    if q < 0xb8: return i + 1, q - 0x80         # short string
+    if q < 0xc0:                                # long string: q-0xb7 length-of-length bytes
+        n = q - 0xb7
+        return i + 1 + n, int.from_bytes(b[i+1:i+1+n], 'big')
+    if q < 0xf8: return i + 1, q - 0xc0         # short list
+    n = q - 0xf7                                # long list
+    return i + 1 + n, int.from_bytes(b[i+1:i+1+n], 'big')
+
+def unframe(raw):
+    """Strip witness-tap's LE64 length prefix if present. Returns (bytes, 'framed'|'raw')."""
+    if len(raw) > 8:
+        n = int.from_bytes(raw[:8], 'little')
+        # A real frame's length fits in what follows and is not absurdly small. An RLP header in the
+        # first 8 bytes yields a gigantic or tiny n, so this test separates them without ambiguity.
+        if 1024 <= n <= len(raw) - 8:
+            return raw[8:8+n], 'framed'
+    return raw, 'raw'
+
+def detect(path):
+    with open(path, 'rb') as fh:
+        raw = fh.read()
+    if not raw:
+        return '', 'empty', 'raw'
+    b, shape = unframe(raw)
+    try:
+        # Walk to field [1]: outer list header, then past field [0] (the block RLP, megabytes long).
+        s, _   = rlp_hdr(b, 0)
+        s0, l0 = rlp_hdr(b, s)
+        s1, _  = rlp_hdr(b, s0 + l0)
+        magic = b[s1:s1+4]
+    except (IndexError, ValueError):
+        return '', 'unparsable', shape
+    h = magic.hex()
+    if h == '4d5a5701':
+        return h, 'offset', shape
+    if magic and 0xc0 <= magic[0] <= 0xff:
+        return h, 'rlp-list', shape
+    return h, 'unknown', shape
+
+quiet = os.environ.get('QUIET') == '1'
+rc = 0
+for p in sys.argv[1:]:
+    try:
+        h, fmt, shape = detect(p)
+    except OSError as e:
+        print(f"error: {p}: {e.strerror}", file=sys.stderr); rc = 1; continue
+    if fmt in ('unknown', 'unparsable', 'empty'):
+        rc = 1
+    if quiet:
+        print(fmt)
+    else:
+        print(f"{h or '-':8s} {fmt:10s} {shape:6s} {p}")
+sys.exit(rc)
+PY
