@@ -23,12 +23,12 @@ Two continuous drivers pair up for bulk witness→proof runs (outputs at the rep
 
 - **`cli/witness-farm [START_BLOCK]`** — continuously generate RSP + ZisK block witnesses (via the
   openvm-eth rpc-proxy over a hosted RPC), marching forward from a block, resumable. Writes
-  `guests/<dir>/fixtures/<tag>.bin` + a `witness-farm.csv` recap. Knobs (env): `STRIDE MARGIN NIBBLES
+  `guests/<dir>/fixtures/<tag>.bin` + a `run-data/witness-farm.csv` recap. Knobs (env): `STRIDE MARGIN NIBBLES
   RETRY_CU RSP_RPC_CU PROXY_START_TRIES RSP_SKIP_EXEC MAX_BLOCKS`. Deterministic proxy preimage
   failures at the current `--preimage-cache-nibbles` are marked `zisk=NIB<n>` and skipped (a higher
   `NIBBLES` re-attempts them); RSP is skipped for those blocks too (no comparable pair possible).
 - **`cli/prove-farm --guest <g> --remote user@host [--port p] [--mode m] [--num-gpus k]`** — prove those
-  witnesses on the remote cluster and record timings (`prove-farm.csv`). The prove-side analog of
+  witnesses on the remote cluster and record timings (`run-data/prove-farm.csv`). The prove-side analog of
   `cli/execute`: registry-driven, resumable, **zero per-stack branching**. One-shot by default;
   **`--watch`** makes it a **continuous consumer** (re-scan the queue, one proof at a time = natural
   backpressure for one cluster, idle-sleep when caught up), and **`--newest-first`** proves nearest the

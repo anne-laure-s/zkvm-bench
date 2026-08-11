@@ -82,12 +82,14 @@
 #   stress   --mock-secs 9 --mock-jitter 5 --mock-dist normal
 #            jitter is the STD DEV here, so ~1 draw in 3 leaves ±5 and the occasional 25 s proof piles the
 #            queue up. A uniform ±5 is bounded at [4,14] and never produces that.
-# Outputs (repo root, gitignored): prove-farm.csv, prove-farm-logs/. Run records land under the
-# stack's own results/ (written by run prove-cluster), same as a manual `run prove-cluster`.
+# Outputs (run-data/, gitignored): run-data/prove-farm.csv, run-data/prove-farm-logs/. Run records
+# land under the stack's own results/ (written by run prove-cluster), same as a manual
+# `run prove-cluster`.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"                  # repo root (cli/ lives one level down)
+RUNDATA="${RUNDATA:-$ROOT/run-data}"            # all runtime output lives here (see .gitignore)
 source "$HERE/reg.sh"
 
 die(){ echo "prove-farm: $*" >&2; exit 2; }
@@ -172,8 +174,8 @@ if [ -z "$ETHPROOFS_CLUSTER" ]; then
   fi
 fi
 
-OUT="$ROOT/prove-farm.csv"
-LOGDIR="$ROOT/prove-farm-logs"; mkdir -p "$LOGDIR"
+OUT="$RUNDATA/prove-farm.csv"
+LOGDIR="$RUNDATA/prove-farm-logs"; mkdir -p "$LOGDIR"
 [ -f "$OUT" ] || echo "ts,block,guest,mode,status,prove_secs,total_secs,proof_bytes,run_dir" > "$OUT"
 trap 'echo >&2; log "interrupted — stopping…"; exit 130' INT TERM
 

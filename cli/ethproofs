@@ -28,6 +28,7 @@
 # cli/ethproofs-mock (ethproofs) · the openvm-eth proxy (witness) · the prover cluster/coordinator.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUNDATA="${RUNDATA:-$ROOT/run-data}"   # all runtime output lives here (see .gitignore)
 
 GUEST=""; WITNESS_RPC="http://localhost:8545"; CHAIN_WS=""; ETHPROOFS_URL="http://localhost:8547"
 ETHPROOFS_TOKEN="dev"; ETHPROOFS_CLUSTER="1"; BLOCK_INTERVAL="100"; COORDINATOR=""; WS_PORT="8765"
@@ -63,7 +64,7 @@ preflight(){ local url="$1" name="$2" hp h p
   (exec 3<>"/dev/tcp/$h/$p") 2>/dev/null || log "⚠️  $name ($h:$p) not reachable — is it up?"
 }
 
-LOGDIR="$ROOT/ethproofs-logs"; mkdir -p "$LOGDIR"
+LOGDIR="$RUNDATA/ethproofs-logs"; mkdir -p "$LOGDIR"
 CHILDREN=()
 cleanup(){ for pid in ${CHILDREN[@]:-}; do kill "$pid" 2>/dev/null; done; [ "$DRY_RUN" = 1 ] || log "ethproofs: stopped."; }
 trap cleanup EXIT

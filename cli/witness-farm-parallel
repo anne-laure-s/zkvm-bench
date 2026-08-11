@@ -22,7 +22,8 @@
 # Env passthrough to workers: GUESTS SKIP_BUILD RETRY_CU PROXY_CONCURRENCY NIBBLES RSP_SKIP_EXEC
 #                             RSP_RPC_CU MARGIN.
 # SKIP_BUILD=1 skips the cargo builds and just asserts the binaries exist; a missing cargo implies it.
-# Outputs: witness-farm-parallel-logs/{proxy.log, worker-<i>/…, worker-<i>.csv}; merged → witness-farm.csv.
+# Outputs (under run-data/): witness-farm-parallel-logs/{proxy.log, worker-<i>/…, worker-<i>.csv};
+# merged → run-data/witness-farm.csv.
 # Witnesses land in the usual guests/{rsp,zisk-reth,openvm-reth}/fixtures/ — feed cli/prove-farm as always.
 #
 # GUESTS selects the arms (default `zisk rsp`; see cli/witness-farm). With `GUESTS=openvm` there is no
@@ -32,6 +33,7 @@
 #   ALCHEMY_URL=… GUESTS=openvm ./cli/witness-farm-parallel --jobs 8 --stride 1 --per-job 63 25551992
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUNDATA="${RUNDATA:-$ROOT/run-data}"   # all runtime output lives here (see .gitignore)
 
 JOBS=8; STRIDE=100; PER_JOB=0; START=""; DRY=0
 while [ $# -gt 0 ]; do case "$1" in
@@ -56,11 +58,11 @@ done
 RETRY_CU="${RETRY_CU:-9000}"; PROXY_CONCURRENCY="${PROXY_CONCURRENCY:-64}"; NIBBLES="${NIBBLES:-7}"
 PROXY_PORT="${PROXY_PORT:-8545}"; PROXY_URL="http://127.0.0.1:$PROXY_PORT"
 OPENVM_DIR="$ROOT/vendor/openvm-eth"; PROXY_BIN="$OPENVM_DIR/target/release/openvm-rpc-proxy"
-RSP_DIR="$ROOT/vendor/rsp"; WCACHE="$ROOT/wcache"
+RSP_DIR="$ROOT/vendor/rsp"; WCACHE="$RUNDATA/wcache"
 # Overridable so a trial run can be pointed at a throwaway directory. Without that, any test writes
 # into the real log tree and OVERWRITES worker-<i>/worker.log from previous runs — cli/witness-farm
 # has honoured OUT/LOGDIR for exactly this reason and this launcher did not.
-LOGROOT="${LOGROOT:-$ROOT/witness-farm-parallel-logs}"; OUT_MAIN="${OUT_MAIN:-$ROOT/witness-farm.csv}"
+LOGROOT="${LOGROOT:-$RUNDATA/witness-farm-parallel-logs}"; OUT_MAIN="${OUT_MAIN:-$RUNDATA/witness-farm.csv}"
 WSTRIDE=$(( JOBS * STRIDE ))
 log(){ echo "$(date +%H:%M:%S)  [parallel] $*" >&2; }
 rpc(){ curl -s "$1" -X POST -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":[]}"; }

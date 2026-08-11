@@ -41,7 +41,7 @@ accepted unless --token is given. Verification is mock by default (a real, well-
 
   ./cli/ethproofs-mock [--port 8547] [--store <dir>] [--token <expected-bearer>] [--verify-cmd <cmd>]
 
-Store (default: ethproofs-mock-data/ at the repo root, git-ignored): submissions.jsonl (append log,
+Store (default: run-data/ethproofs-mock-data/, git-ignored): submissions.jsonl (append log,
 replayed on restart) + proofs/<cluster>-<block>.bin (the decoded proofs).
 """
 import argparse, base64, json, os, subprocess, sys, threading
@@ -158,7 +158,7 @@ class Store:
             "cluster_id": body.get("cluster_id"),
             "vm": body.get("vm"),
             "guest": body.get("guest"),
-            "source": body.get("source"),               # free-form: who is reporting (e.g. "nyc-003")
+            "source": body.get("source"),               # free-form: who is reporting (e.g. the witness box)
             "chain_tip": body.get("chain_tip"),         # the head the producer is following
             "last_witness": body.get("last_witness"),   # newest block a witness exists for
             # framed inputs sitting in the queue — NOT an un-proven backlog (prove-farm leaves proven
@@ -512,7 +512,8 @@ def main():
     sys.stdout.reconfigure(line_buffering=True)  # live logs even when redirected (`ethproofs-mock &`)
     ap = argparse.ArgumentParser(description="home-made ethproofs.org stand-in")
     ap.add_argument("--port", type=int, default=int(os.environ.get("ETHPROOFS_MOCK_PORT", 8547)))
-    ap.add_argument("--store", default=os.environ.get("ETHPROOFS_MOCK_STORE", os.path.join(ROOT, "ethproofs-mock-data")))
+    ap.add_argument("--store", default=os.environ.get("ETHPROOFS_MOCK_STORE",
+                                                      os.path.join(ROOT, "run-data", "ethproofs-mock-data")))
     ap.add_argument("--token", default=os.environ.get("ETHPROOFS_MOCK_TOKEN"))
     ap.add_argument("--verify-cmd", default=os.environ.get("ETHPROOFS_MOCK_VERIFY_CMD"),
                     help="external verifier `<cmd> <proof_path> <block> <verifier_id>` (exit 0 = valid); "

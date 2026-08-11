@@ -28,11 +28,12 @@
 #
 # Env knobs: GUESTS STRIDE MARGIN PROXY_PORT NIBBLES RETRY_CU PROXY_CONCURRENCY RSP_RPC_CU
 #            MAX_BLOCKS MAX_FAILS RETRY_RPC RETRY_PAUSE PROXY_START_TRIES RSP_SKIP_EXEC
-# Lives in cli/ but writes its outputs (witness-farm.csv, wcache/, witness-farm-logs/) to the repo
-# root; run it from the repo root: ./cli/witness-farm
+# Lives in cli/ but writes its outputs (witness-farm.csv, wcache/, witness-farm-logs/) under
+# run-data/ at the repo root; run it from the repo root: ./cli/witness-farm
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # repo root (this script lives in cli/)
+RUNDATA="${RUNDATA:-$ROOT/run-data}"                      # all runtime output lives here (see .gitignore)
 : "${ALCHEMY_URL:?export ALCHEMY_URL=https://eth-mainnet.g.alchemy.com/v2/<key>}"
 # Which arms to run. Default is the historical pair, so an existing invocation behaves exactly as
 # before; naming `openvm` is opt-in. An arm not listed is neither built nor run, which is what
@@ -67,9 +68,9 @@ RSP_EW_BIN="$RSP_DIR/target-ew/release/rsp"    # --features execution-witness �
 RSP_BASIC_BIN="$RSP_DIR/target/release/rsp"    # no feature → eth_getProof (fallback)
 RSP_EW_CACHE="$RSP_DIR/ew-cache"
 RSP_BASIC_CACHE="$RSP_DIR/basic-cache"
-WCACHE="$ROOT/wcache"                         # proxy witness cache (shared RSP↔ZisK, resumable)
-OUT="${OUT:-$ROOT/witness-farm.csv}"          # CSV ledger (env-overridable → per-worker under cli/witness-farm-parallel)
-LOGDIR="${LOGDIR:-$ROOT/witness-farm-logs}"   # logs (env-overridable → per-worker; a shared proxy is reused, not restarted)
+WCACHE="$RUNDATA/wcache"                      # proxy witness cache (shared RSP↔ZisK, resumable)
+OUT="${OUT:-$RUNDATA/witness-farm.csv}"       # CSV ledger (env-overridable → per-worker under cli/witness-farm-parallel)
+LOGDIR="${LOGDIR:-$RUNDATA/witness-farm-logs}" # logs (env-overridable → per-worker; a shared proxy is reused, not restarted)
 RSP_FIX="$ROOT/guests/rsp/fixtures"           # collected RSP witnesses
 ZISK_FIX="$ROOT/guests/zisk-reth/fixtures"    # collected ZisK witnesses (+ hints)
 OPENVM_BIN="$OPENVM_DIR/target/release/openvm-reth-benchmark"
