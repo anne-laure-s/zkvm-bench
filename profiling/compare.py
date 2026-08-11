@@ -11,7 +11,7 @@ the honest execution time (measured with SP1's gas-estimation pass off):
 
     ./compare.py --block-min 25551991 --block-max 25552607 --html --json out.json
 
-    ./compare.py                              # every axis, every common block
+    ./compare.py                              # the DEFAULT pair of axes (cur-zisk + cur-sp1)
     ./compare.py --axis zisk --limit 20       # one axis, first 20 common blocks
     ./compare.py --blocks 25552005-25552088   # an explicit set (ranges and/or comma list)
     ./compare.py --quick                      # skip ZisK's slow instrumented COST pass
@@ -39,12 +39,19 @@ Outputs: a terminal summary (the one-glance view), plus --json / --html for the
 per-block detail. See README.md for the tool map and the framing rules.
 """
 
-import argparse, glob, hashlib, json, os, platform, re, statistics, subprocess, struct, sys, tempfile, time
+import argparse, glob, hashlib, json, math, os, platform, re, statistics, subprocess, struct, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
-CACHE = os.path.join(HERE, 'results', 'compare-cache.json')
+# `cache` is a sibling module, not a package: put HERE on the path explicitly rather than relying on
+# it being sys.path[0], which only holds when this file is the entry point.
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import cache as _cachemod          # noqa: E402
+# Per-family ratios measured under two attributions — the shipped reth guest and a no-inline rebuild
+# (profiling/inline-robust.py). Optional: absent file simply means the column is not shown.
+VERDICT = os.path.join(HERE, 'results', 'inline-verdict.json')
 BATCH_MAX = 40          # max inputs per batched sp1-runner process (see sp1_batches)
 # ZisK's cost for one keccak op, from zisk `core/src/zisk_ops_costs.rs`: KECCAK_COST = 25 * 3022.
 # Used to turn the per-opcode COST that ziskemu reports back into a call count (it prints no count
@@ -52,24 +59,184 @@ BATCH_MAX = 40          # max inputs per batched sp1-runner process (see sp1_bat
 ZISK_KECCAK_COST = 25 * 3022
 
 # ───────────────────────────── axes (same-zkVM guest pairs) ─────────────────────────────
-# 'src' tells how to build that guest's input for the block:
-#   monad-raw   : guests/monad/**/<block>.witness            (SP1 reads it verbatim)
-#   monad-framed: same witness, framed LE64(len)+witness+pad8 (what ziskos expects)
-#   bin         : the guest's own pre-generated 1-<block>.bin
+# An axis is TWO builds of the same zkVM measured on the same blocks. Its `name` is the axis label
+# and each side's `name` labels a build — neither is ever read from a filename, so a build needs no
+# renaming (and no copy) to be axis-able.
+#
+# 'src' says WHERE that side's input comes from. It is a property of the GUEST, not of the axis — so
+# the two sides of one axis usually differ.
+#   monad : the shared Monad witness, guests/monad/{fixtures,inputs}/<block>.witness
+#   bin   : the guest's own pre-generated 1-<block>.bin  (rsp, zisk-reth: their own format)
+# The SHAPE is not spelled out here, it is derived from the backend (see needs_framing): ziskos wants
+# LE64(len) + witness + pad8, SP1 reads the buffer verbatim, and a `bin` is already in its own shape.
+# Do not reintroduce a per-side shape: it could only ever match the backend or be broken, and handing
+# a guest the wrong shape parses as garbage instead of failing.
+#
+# 'ephemeral' (optional) marks an axis that exists for ONE campaign and should not outlive it: give
+# it a string saying why it exists and when to drop it. Ablation axes are the case — they compare a
+# build against a tip, so they rot silently the moment that tip moves, measuring a variant against a
+# base nobody cares about any more. `./axis.py prune` lists and removes them; `./axis.py list` marks
+# them. An axis with no `ephemeral` key is a durable comparison of the project.
 AXES = {
+    # ⚠ `zisk` and `sp1` MOVE. Their `a` side is guests/monad-{zisk,sp1}/*.elf, a symlink to
+    # guests/monad/monad-zkvm-guest-*.elf — the pair `use-gen` REWRITES. Select a generation and these
+    # two axes measure whatever it installed, under a label that has not changed. Every other axis
+    # names a path of its own and is pinned. a_ident records the sha of what actually ran, and a run
+    # whose axes land on one binary says so (see the one-binary-two-labels warning in main()).
     'zisk': {'backend': 'zisk', 'unit': 'steps',
-             'a': {'name': 'monad-zisk', 'elf': 'guests/monad-zisk/monad-zisk.elf', 'src': 'monad-framed'},
+             'a': {'name': 'monad-zisk', 'elf': 'guests/monad-zisk/monad-zisk.elf', 'src': 'monad'},
              'b': {'name': 'zisk-reth',  'elf': 'guests/zisk-reth/zisk-reth.elf',   'src': 'bin'}},
     'sp1':  {'backend': 'sp1', 'unit': 'cycles',
-             'a': {'name': 'monad-sp1', 'elf': 'guests/monad-sp1/monad-sp1.elf', 'src': 'monad-raw'},
+             'a': {'name': 'monad-sp1', 'elf': 'guests/monad-sp1/monad-sp1.elf', 'src': 'monad'},
              'b': {'name': 'rsp',       'elf': 'guests/rsp/rsp.elf',             'src': 'bin'}},
+    # ── post-rebase axes (2026-08-08). The witness format changed with the reader rework, so a
+    # PRE-rebase BUILD cannot read these fixtures at all, and figures measured with one are history.
+    # That is a statement about builds, not about the two
+    # axes above: those follow use-gen and today read whatever generation is selected.
+    #   monad-sam-{zisk,sp1} = sam/zkvm-zisk-sp1 rebased, the baseline we are trying to beat
+    #   monad-r3-{zisk,sp1}  = al/zkvm-r3, that baseline plus 17 measured commits AND
+    #                          the soundness binding (three public values + body roots),
+    #                          so it proves a STRICTLY STRONGER statement than the baseline.
+    # Named after the BRANCH, not the role: `current` and `opt` describe a position that moves, and
+    # `monad-today` — the same idea a week earlier — was already wrong by the time it was read. The
+    # backend is explicit on both, so the two peers read as peers. See guests/README.md § Naming.
+    # Renamed 2026-08-10; the profile cache resolves builds by content, so the old labels kept
+    # working throughout and `builds.json` records both.
+    'cur-zisk': {'backend': 'zisk', 'unit': 'steps',
+             # The baseline sides point straight into the generation's own elf/ — that pair IS the
+             # canonical build of this witness set, recorded in its PROVENANCE.md, so a copy under
+             # monad-variants/ would be a second place to keep in step by hand. An axis takes its NAME from
+             # `name`, never from the filename, so nothing needs renaming to be axis-able. Builds that are no
+             # generation's canonical pair (the ablations, a branch build) still live under monad-variants/.
+             'a': {'name': 'monad-sam-zisk', 'elf': 'guests/monad/gen/offsettriedb-rework-2026-08/elf/monad-zkvm-guest-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'zisk-reth', 'elf': 'guests/zisk-reth/zisk-reth.elf', 'src': 'bin'}},
+    'cur-sp1': {'backend': 'sp1', 'unit': 'cycles',
+             'a': {'name': 'monad-sam-sp1', 'elf': 'guests/monad/gen/offsettriedb-rework-2026-08/elf/monad-zkvm-guest-sp1.elf',
+                   'src': 'monad'},
+             'b': {'name': 'rsp', 'elf': 'guests/rsp/rsp.elf', 'src': 'bin'}},
+    'opt-self': {'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-sam-zisk', 'elf': 'guests/monad/gen/offsettriedb-rework-2026-08/elf/monad-zkvm-guest-zisk.elf',
+                   'src': 'monad'}},
+    'opt-zisk': {'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'zisk-reth', 'elf': 'guests/zisk-reth/zisk-reth.elf', 'src': 'bin'}},
+    'opt-self-sp1': {'backend': 'sp1', 'unit': 'cycles',
+             'a': {'name': 'monad-r3-sp1', 'elf': 'guests/monad-variants/r3/monad-r3-sp1.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-sam-sp1', 'elf': 'guests/monad/gen/offsettriedb-rework-2026-08/elf/monad-zkvm-guest-sp1.elf',
+                   'src': 'monad'}},
+    # ── Ablation axes (2026-08-09): the tip against itself minus ONE lever, so an axis prices that
+    # lever alone. `ab-*` ablate the arith256 routings, `ab2-*` the guest-side levers. Read the
+    # verdict in COST as well as steps — two of these levers inverted once the base moved.
+    'ab2-kec2': {'ephemeral': 'ablation of the word-wise keccak lever, 2026-08-09 re-verdict; drop when the r3 tip moves',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'ab2-no-kec2', 'elf': 'guests/monad-variants/ab/ab2-no-kec2.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
+                   'src': 'monad'}},
+    'ab2-nodeid': {'ephemeral': 'ablation of the NodeId 64-bit lever, 2026-08-09 re-verdict; drop when the r3 tip moves',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'ab2-no-nodeid', 'elf': 'guests/monad-variants/ab/ab2-no-nodeid.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
+                   'src': 'monad'}},
+    'ab2-flat': {'ephemeral': 'ablation of the flat hash store lever, 2026-08-09 re-verdict; drop when the r3 tip moves',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'ab2-no-flat', 'elf': 'guests/monad-variants/ab/ab2-no-flat.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
+                   'src': 'monad'}},
+    'ab2-div': {'ephemeral': 'ablation of the 128/64 division lever, 2026-08-09 re-verdict; drop when the r3 tip moves',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'ab2-no-div', 'elf': 'guests/monad-variants/ab/ab2-no-div.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
+                   'src': 'monad'}},
+    'ab2-tokens': {'ephemeral': 'ablation of the calldata SWAR lever, 2026-08-09 re-verdict; drop when the r3 tip moves',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'ab2-no-tokens', 'elf': 'guests/monad-variants/ab/ab2-no-tokens.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
+                   'src': 'monad'}},
+    'ab2-hashinline': {'ephemeral': 'ablation of the map key-hash inlining lever, 2026-08-09 re-verdict; drop when the r3 tip moves',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'ab2-no-hashinline', 'elf': 'guests/monad-variants/ab/ab2-no-hashinline.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
+                   'src': 'monad'}},
+    'ab2-fasthead': {'ephemeral': 'ablation of the child_ref fast heads lever, 2026-08-09 re-verdict; drop when the r3 tip moves',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'ab2-no-fasthead', 'elf': 'guests/monad-variants/ab/ab2-no-fasthead.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
+                   'src': 'monad'}},
+    'ab2-arena': {'ephemeral': 'ablation of the bump arena lever, 2026-08-09 re-verdict; drop when the r3 tip moves',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'ab2-no-arena', 'elf': 'guests/monad-variants/ab/ab2-no-arena.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
+                   'src': 'monad'}},
+    'ab2-fmix': {'ephemeral': 'ablation of the fmix64 finalizer lever, 2026-08-09 re-verdict; drop when the r3 tip moves',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'ab2-no-fmix', 'elf': 'guests/monad-variants/ab/ab2-no-fmix.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
+                   'src': 'monad'}},
+    'ab2-scanidx': {'ephemeral': 'ablation of the JUMPDEST scan index lever, 2026-08-09 re-verdict; drop when the r3 tip moves',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'ab2-no-scanidx', 'elf': 'guests/monad-variants/ab/ab2-no-scanidx.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
+                   'src': 'monad'}},
+    # `ab2-bswap` was declared here and REMOVED 2026-08-10. Its ELF was a throwaway test build, never
+    # kept — so the axis had nothing to resolve and is not coming back. Do not re-add it.
+    # The byte/bit lever it was meant to price was measured by other means (22 blocks) and that
+    # survives: levers.py and the family table below read that result from results/, and the family
+    # itself is analysed in hotspots.py's taxonomy.
+    'ab-opstar': {'ephemeral': 'ablation of the operator* via arith256 lever, 2026-08-09 re-verdict; drop when the r3 tip moves',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'ab-no-opstar', 'elf': 'guests/monad-variants/ab/ab-no-opstar.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
+                   'src': 'monad'}},
+    'ab-addmod': {'ephemeral': 'ablation of the addmod via arith256 lever, 2026-08-09 re-verdict; drop when the r3 tip moves',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'ab-no-addmod', 'elf': 'guests/monad-variants/ab/ab-no-addmod.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
+                   'src': 'monad'}},
+    'ab-mulmod': {'ephemeral': 'ablation of the MULMOD via arith256 lever, 2026-08-09 re-verdict; drop when the r3 tip moves',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'ab-no-mulmod', 'elf': 'guests/monad-variants/ab/ab-no-mulmod.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r3-zisk', 'elf': 'guests/monad-variants/r3/monad-r3-zisk.elf',
+                   'src': 'monad'}},
+    'opt-sp1': {'backend': 'sp1', 'unit': 'cycles',
+             'a': {'name': 'monad-r3-sp1', 'elf': 'guests/monad-variants/r3/monad-r3-sp1.elf',
+                   'src': 'monad'},
+             'b': {'name': 'rsp', 'elf': 'guests/rsp/rsp.elf', 'src': 'bin'}},
 }
+# The default run is the shipped guest only: adding the levers axes must not silently change what
+# `./compare.py` with no arguments reports.
+DEFAULT_AXES = ('cur-zisk', 'cur-sp1')
 
 def rp(*p): return os.path.join(REPO, *p)
 
 # ───────────────────────────────── input discovery ──────────────────────────────────────
 
 def monad_witness(block):
+    # ONE resolution path, and `fixtures` is its head: it is the symlink `use-gen` maintains, so the
+    # generation the tooling reads is by construction the one `use-gen` reports. There used to be a
+    # `fixtures-v2/` entry ahead of it — a set dropped beside the generation layout rather than into
+    # it — and it silently won: every post-rebase number came from fixtures-v2 while `use-gen` still
+    # named the pre-rework generation as current. Nothing reported the disagreement, because the two
+    # sets are the SAME wire format (both `offset`/`4d5a5701`) and witness-fmt cannot tell them apart.
+    # That set is now gen/offsettriedb-rework-2026-08 and `fixtures` points at it. Do not re-add a
+    # path ahead of `fixtures`: a second source is exactly how the two drifted apart.
     for p in (rp('guests/monad/fixtures', f'{block}.witness'),
               rp('guests/monad/inputs', f'1-{block}.witness'),
               rp('guests/monad/fixtures', f'1-{block}.witness')):
@@ -77,14 +244,20 @@ def monad_witness(block):
     return None
 
 def guest_bin(guest, block):
-    for d in ('inputs', 'fixtures'):
+    # `fixtures` FIRST: it is the generation-selected set, the one `use-gen` points at and the one
+    # guests/monad/fixtures follows. `inputs/` predates that split and can hold a witness for the
+    # same block from an older generation — for zisk-reth block 25229951 the two differ by 122 kB.
+    # In the 25551991-25552607 range the two are byte-identical where both exist (488 of 488 by
+    # size, 6 of 6 by hash) and rsp has no `inputs/` entry at all, so this reorder changes no
+    # measurement there; it changes which file is authoritative everywhere else.
+    for d in ('fixtures', 'inputs'):
         p = rp('guests', guest, d, f'1-{block}.bin')
         if os.path.exists(p): return p
     return None
 
 def resolve_input(side, block):
     if side['src'] == 'bin':      return guest_bin(side['name'], block)
-    return monad_witness(block)   # monad-raw / monad-framed both start from the witness
+    return monad_witness(block)   # 'monad': the shape is applied later, see needs_framing
 
 def blocks_for(axis):
     """Blocks runnable on BOTH sides of an axis."""
@@ -102,6 +275,14 @@ def all_monad_blocks():
 
 # ─────────────────────────────────── runners ────────────────────────────────────────────
 
+def needs_framing(backend, side):
+    """Does this side's input have to be framed before the guest sees it?
+
+    A function of the BACKEND, never a per-side choice: ziskos reads a length-prefixed file, SP1 reads
+    the buffer verbatim. A `bin` input is already in its guest's own shape and is never touched."""
+    return backend == 'zisk' and side['src'] == 'monad'
+
+
 def frame_ziskos(src, dst):
     """ziskos input framing: LE64(len) + witness + zero-pad to 8 (see guests/monad/ev.sh)."""
     d = open(src, 'rb').read()
@@ -113,7 +294,7 @@ def run_zisk(emu, elf, inp, src_kind, with_cost=False):
     silently wrecking the timing we report."""
     tmp, inp0 = None, inp
     try:
-        if src_kind == 'monad-framed':
+        if src_kind == 'monad':   # run_zisk IS the zisk path; see needs_framing
             tmp = tempfile.NamedTemporaryFile(suffix='.zisk.bin', delete=False).name
             frame_ziskos(inp, tmp); inp = tmp
         t0 = time.time()
@@ -247,17 +428,12 @@ def _sp1_extra(j):
 # ───────────────────────────────── cache + collect ──────────────────────────────────────
 
 def load_cache():
-    try:    return json.load(open(CACHE))
-    except Exception: return {}
+    """The per-block, content-addressed cache — see cache-format.md. Loading is lazy per block, so
+    this is instant regardless of how much history the cache holds."""
+    return _cachemod.Cache()
 
 def save_cache(c):
-    """Merge-then-write, atomically: two compare.py runs (say one per axis) would otherwise
-    clobber each other's results, and a kill mid-write would leave a truncated cache."""
-    os.makedirs(os.path.dirname(CACHE), exist_ok=True)
-    merged = load_cache(); merged.update(c)
-    tmp = CACHE + '.tmp'
-    with open(tmp, 'w') as fh: json.dump(merged, fh)
-    os.replace(tmp, CACHE)
+    c.save()
 
 def sp1_has_batch(runner):
     """Does this sp1-runner build support --batch? (older binaries don't)"""
@@ -326,17 +502,80 @@ def sp1_batches(todo, runner, jobs, with_nogas=False):
             return out
     return chunks, run_chunk
 
+# `cache_xget` lived here: a lookup that retried a miss under every other axis, because the axis was
+# part of the key while contributing nothing to the result — the same guest, ELF and block is the same
+# execution wherever it ran. Removed 2026-08-10 with the move to per-block, content-addressed storage
+# (cache-format.md): a block file holds one slot per BUILD, so there is no axis to borrow across and
+# no write-through copy to make. The ~2 h of duplicated measurement in the 2026-08-08 campaign that
+# motivated it cannot recur by construction rather than by fallback.
+
+
+# ── Pure execution time ────────────────────────────────────────────────────────
+# Measured 2026-08-09 on the devcore box (idle, sequential, min of 2 runs, 16 blocks for
+# the ZisK guests / regression for the others). Wall-clock as collected is NOT
+# execution time: ziskemu re-converts the ELF to ZisK ROM on every invocation
+# (~0.6-1.7 s fixed per guest) and campaign runs are parallel, so the raw `secs`
+# overstated a median block by ~10x. Time is modelled instead as
+#   pure_secs = work / throughput
+# with the per-guest throughput below; the linear fit's residuals were 0.7-1.3 %
+# on the ZisK guests, so the model is tighter than run-to-run noise.
+#
+# These are EMULATOR throughputs on one machine, meant to make the time column
+# honest and comparable BETWEEN GUESTS — not a claim about proving time, and
+# not comparable to an ASM-backend or a different host.
+# Pure execution rates, measured THE WAY THE RTP PIPELINE MEASURES: `ziskemu -e ELF -i INPUT -m`,
+# reading the emulator's own `duration=` field (process_rom only — it excludes the ELF→ROM
+# conversion that dominates a wall-clock run, 0.6-1.7 s depending on the guest). Calibrated on
+# THIS host, sequentially, over 5 blocks spanning 30-360 M steps; residuals 1.4-2.8 %.
+#
+# The campaign's own per-block `duration=` values are collected under 4-way parallelism and run
+# ~35 % slow (89 vs 136 M steps/s on the same block), which is why the reported column is modelled
+# from these sequential rates instead of averaged from the cache.
+PURE_MSTEPS_PER_S = {
+    'monad-r3-zisk':         126.5,   # ziskemu duration=, sequential, this host
+    'monad-sam-zisk':     148.5,
+    'zisk-reth':         141.6,
+    # SP1: same protocol, its own tool — sp1-runner --mode execute --no-gas (the gas pass is a
+    # separate, slower estimation), sequential, same 5 blocks, cycles paired from the cache since
+    # --no-gas does not populate the counter. Residuals 4.0-6.4 %. The rates differ per guest by
+    # more than ZisK's do (95 vs 142 M cycles/s) because the guests' instruction mixes differ far
+    # more here — reth's cycles are cheaper on average than the Monad guest's.
+    'monad-r3-sp1':      94.7,
+    'monad-sam-sp1': 119.5,
+    'rsp':               142.0,
+}
+
+
+def pure_secs(guest, work):
+    """Modelled pure execution seconds for `work` steps/cycles of `guest`."""
+    thr = PURE_MSTEPS_PER_S.get(guest)
+    if not thr or not work:
+        return None
+    return round(work / (thr * 1e6), 4)
+
+
 def collect(axis, blocks, tools, cache, jobs, force, with_cost=False):
-    """Run both sides over `blocks` (cached by axis/guest/block + ELF mtime). -> {block: {a:…, b:…}}"""
+    """Run both sides over `blocks` (cached per block, per BUILD — see cache-format.md).
+    -> {block: {a:…, b:…}}"""
     ax = AXES[axis]; backend = ax['backend']
     tool = tools[backend]
+    ax_side_by_name = {ax[k]['name']: ax[k] for k in ('a', 'b')}
     todo = []
     for side_k in ('a', 'b'):
         side = ax[side_k]
-        elf = rp(side['elf']); stamp = int(os.path.getmtime(elf))
+        elf = rp(side['elf'])
+        # Record the label BEFORE deciding whether anything needs measuring. Registration used to
+        # happen only inside put(), so an axis served entirely from cache never wrote its name down —
+        # and `builds.json` is what by-name lookups (levers.py) resolve through, so a fully-cached
+        # build became invisible to them.
+        cache.register(elf, side['name'], backend)
         for b in blocks:
-            key = f"{axis}/{side['name']}/{b}/{stamp}"
-            hit = cache.get(key)
+            # The key is (elf, block, name) rather than a string: identity is derived from the ELF's
+            # content by the cache, so the axis never enters it and two axes on one build share a slot.
+            # The INPUT is passed too — a measurement is a function of (build, input), and an entry
+            # made on a witness that has since been re-minted must be re-run, not served.
+            key = (elf, b, side['name'])
+            hit = cache.get(elf, b, _cachemod.RUN, inp=resolve_input(side, b))
             # Re-run when a cached entry predates a field we now collect. ZisK COST + its category
             # breakdown come from the same opt-in pass; SP1's precompile counts are free, so we
             # always want them.
@@ -363,7 +602,10 @@ def collect(axis, blocks, tools, cache, jobs, force, with_cost=False):
                   f"— ~6s startup paid per process, not per block")
             with ThreadPoolExecutor(max(1, jobs)) as ex:
                 for res in ex.map(run_chunk, chunks):
-                    cache.update(res); note(f"batch of {len(res)}")
+                    for (e, blk, nm), r in res.items():
+                        cache.put(e, blk, _cachemod.RUN, r, name=nm, backend=ax['backend'],
+                                  inp=resolve_input(ax_side_by_name[nm], blk))
+                    note(f"batch of {len(res)}")
                     save_cache(cache)             # incremental: an interrupted sweep keeps its work
         else:
             if with_cost and backend == 'zisk':
@@ -377,17 +619,43 @@ def collect(axis, blocks, tools, cache, jobs, force, with_cost=False):
                 return key, r, f"{side['name']} {b}"
             with ThreadPoolExecutor(max(1, jobs)) as ex:
                 for i, (key, r, label) in enumerate(ex.map(work, todo)):
-                    cache[key] = r; note(label)
+                    e, blk, nm = key
+                    cache.put(e, blk, _cachemod.RUN, r, name=nm, backend=ax['backend'],
+                              inp=resolve_input(ax_side_by_name[nm], blk))
+                    note(label)
                     if i % 25 == 24: save_cache(cache)
         print()
         save_cache(cache)
+    # Unconditional: with nothing measured, `_dirty` is empty and this writes only builds.json — and
+    # only if a label was new. A read-only run must still be able to teach the index a name.
+    save_cache(cache)
     rows = {}
     for b in blocks:
         row = {}
         for side_k in ('a', 'b'):
-            side = ax[side_k]; stamp = int(os.path.getmtime(rp(side['elf'])))
-            row[side_k] = cache.get(f"{axis}/{side['name']}/{b}/{stamp}", {})
+            side = ax[side_k]
+            row[side_k] = cache.get(rp(side['elf']), b, _cachemod.RUN,
+                                    inp=resolve_input(side, b)) or {}
         if 'work' in row['a'] and 'work' in row['b']: rows[b] = row
+    # A block whose side errored never enters `rows`, so `n` shrinks with nothing said — only "every
+    # run failed" was ever reported. A guest fed a witness format it cannot read lands here in bulk:
+    # that is the loud half of the mismatch (the quiet half is a parse that completes and commits a
+    # wrong root, which nothing here can see — verify roots before trusting an axis).
+    dropped = [b for b in blocks if b not in rows]
+    if dropped:
+        why = {}
+        for b in dropped:
+            for k in ('a', 'b'):
+                e = (cache.get(rp(ax[k]['elf']), b, _cachemod.RUN,
+                               inp=resolve_input(ax[k], b)) or {}).get('error')
+                if e:
+                    why.setdefault(f"{ax[k]['name']}: {e.split(':')[0]}", []).append(b)
+        print(f"  [{axis}] {len(dropped)} of {len(blocks)} block(s) dropped — NOT in the stats "
+              f"below (n={len(rows)}):")
+        for lab, bs in sorted(why.items(), key=lambda kv: -len(kv[1]))[:3]:
+            print(f"      {len(bs)}x {lab}  (e.g. block {bs[0]})")
+        if not why:
+            print(f"      no error recorded — a side produced no work count. Re-run it with --force.")
     return rows
 
 # ───────────────────────────────────── stats ────────────────────────────────────────────
@@ -414,6 +682,106 @@ def outliers(rows, z_thresh):
         if abs(z) >= z_thresh: out.append({'block': b, 'ratio': x, 'z': z})
     return sorted(out, key=lambda e: -abs(e['z'])), med, mad
 
+def _plain(s):
+    """Markup stripped, for use inside an attribute. Tooltips are plain text: a title= carrying
+    <b>…</b> shows the tags. Quotes go too, since the attribute is quoted with them."""
+    return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', s)).replace('"', "'").strip()
+
+
+def _vclass(f):
+    """How far a family's ratio travels when the reth guest's inlining is undone → one word.
+
+    The word names WHAT HAPPENED BETWEEN the two attributions. It used to be a reliability verdict
+    (`stable` / `shifted` / `unreliable`), and that could not survive its own placement: the word sat
+    in the corrected cell while judging the SHIPPED ratio in the cell to its left, so `1.021x
+    unreliable` read as "distrust this 1.021x" — the exact opposite of the finding. A reader asked
+    which of the two numbers the word was about, which is the proof that no reader could tell.
+
+    Naming displacement instead has no such ambiguity, because displacement is a property of the PAIR:
+    `agrees` means both attributions found the same thing and either column can be read; `relocated`
+    means inlining had charged this family's work elsewhere, so the corrected column is the one that
+    says where the work lives.
+
+    ONE function, because the cell and the paragraph under the table used to classify separately: the
+    paragraph counted 0.8 < f < 1.25 as "holds" while the cell had started calling the same family
+    borderline, so the prose said five held and the column showed three.
+
+    `borderline` marks only the agrees/relocated boundary (0.8, 1.25) — the one where the word changes
+    the reading. The 0.5 and 2 cutoffs separate two magnitudes of relocation, and a family sitting on
+    THAT edge reads the same either way."""
+    if min(abs(f - 0.8), abs(f - 1.25)) < 0.05: return 'borderline'
+    if 0.8 < f < 1.25:                          return 'agrees'
+    if 0.5 <= f <= 2:                           return 'relocated'
+    return 'relocated-hard'   # beyond a factor of two: read the corrected column, not the shipped one
+
+
+def _verdict_cell(v):
+    """One cell: the same family's ratio once the reth guest's inlining is undone.
+
+    Shown only where it was measured. A family whose ratio barely moves can be read straight from the
+    column to its left; one that moves by more than a factor of two cannot, and the figure here is the
+    better estimate — the shipped column is then reporting which guest's compiler inlined more."""
+    if not v:
+        return "<td class=na>—</td>"
+    f = v['factor']
+    # Colour by the RATIO, exactly like the column to the left — a cell showing 1.008x must not be red.
+    # Colouring by the trustworthiness factor put red on three ratios BELOW 1 (Monad cheaper) and left
+    # the table's worst ratio, 4.099x, uncoloured: two meanings sharing one palette in adjacent columns.
+    # The verdict is a word instead, since both numbers are already on the row.
+    cls = 'hi' if v['ni'] >= 1 else 'lo'
+    # A family sitting on a class boundary must not be reported as decisively one side of it:
+    # `256-bit arithmetic` moved 0.80 -> 0.81 between two runs of the same measurement and flipped
+    # from "shifted" to "stable" on that alone. Name the boundary instead of hiding it.
+    _c = _vclass(f)
+    # The magnitude, so "relocated" is a measurement and not an adjective: how many times the ratio
+    # moved between the two attributions.
+    _mag = max(f, 1 / f) if f else 0
+    note = (f"<b>relocated {_mag:.0f}×</b>" if _c == 'relocated-hard' else
+            f"relocated {_mag:.1f}×" if _c == 'relocated' else _c)
+    return (f"<td class={cls} title=\"This family's ratio under two attributions: {v['ship']:.2f}x as "
+            f"shipped, {v['ni']:.2f}x with the reth guest's inlining undone, over {v['n']} blocks. "
+            f"The word describes the MOVE between the two, not the quality of the number in this "
+            f"cell — where it says relocated, this column is the one that says where the work "
+            f"lives.\">{x(v['ni'])} <i class=dev>{note}</i></td>")
+
+
+def _cost_time_axes(axis, rows):
+    """Median per-block cost and pure-time ratios; empty when the axis carries no cost pass."""
+    ax = AXES[axis]
+    out = {}
+    cr = [r['a']['cost'] / r['b']['cost'] for r in rows.values()
+          if r['a'].get('cost') and r['b'].get('cost')]
+    if cr:
+        out['cost_ratio_median'] = statistics.median(cr)
+        out['cost_n'] = len(cr)
+    tr = []
+    for r in rows.values():
+        ta = pure_secs(ax['a']['name'], r['a'].get('work'))
+        tb = pure_secs(ax['b']['name'], r['b'].get('work'))
+        if ta and tb:
+            tr.append(ta / tb)
+    if tr:
+        out['time_ratio_median'] = statistics.median(tr)
+    return out
+
+
+_IDENT_CACHE = None
+
+
+def _ident_of(elf):
+    """sha256 identity of an ELF, or None if it is absent. The same value the profile cache keys on.
+
+    One Cache instance, kept: it memoises the hash per (path, mtime), so asking for the same build on
+    several axes costs one read of the ELF, not one per axis."""
+    global _IDENT_CACHE
+    try:
+        if _IDENT_CACHE is None:
+            _IDENT_CACHE = _cachemod.Cache()
+        return _IDENT_CACHE.identity(rp(elf))
+    except Exception:
+        return None
+
+
 def summarize(axis, rows, gas_map=None):
     ax = AXES[axis]
     aw = [r['a']['work'] for r in rows.values()]; bw = [r['b']['work'] for r in rows.values()]
@@ -422,16 +790,48 @@ def summarize(axis, rows, gas_map=None):
     # so gas_map (pooled across axes) lets the SP1 axis show work/Mgas too.
     gas = {b: (r['b'].get('gas') or r['a'].get('gas') or (gas_map or {}).get(b))
            for b, r in rows.items()}
+    # The identity of what was MEASURED, not what was declared. A name is a label and an ELF path is a
+    # location; neither says which binary produced these numbers, and a guest under active work is
+    # rebuilt over its own path repeatedly. Derived here rather than declared in AXES: a declaration
+    # has to be edited by hand after every rebuild and goes stale in silence, whereas this cannot
+    # disagree with the run it describes.
     s = {'axis': axis, 'unit': ax['unit'], 'n': len(rows),
          'a_name': ax['a']['name'], 'b_name': ax['b']['name'],
+         'a_ident': _ident_of(ax['a']['elf']), 'b_ident': _ident_of(ax['b']['elf']),
          'a_median': statistics.median(aw), 'b_median': statistics.median(bw),
          'a_mean': statistics.mean(aw), 'b_mean': statistics.mean(bw),
          'a_total': sum(aw), 'b_total': sum(bw),
          'ratio_median': statistics.median(ratios), 'ratio_mean': statistics.mean(ratios),
+         # THREE AXES. work (steps/cycles) is the verdict metric: deterministic and host-
+         # independent. cost is what the PROVER pays (ZisK's COST model, same collection pass) --
+         # it diverges from work when the instruction MIX changes, which is what optimisation
+         # does. time is modelled from measured per-guest throughput (PURE_MSTEPS_PER_S) and
+         # moves with mix density through an entirely different mechanism, so cost/time agreement
+         # is a real confirmation and a divergence is a lead worth chasing.
+         **_cost_time_axes(axis, rows),
+         # The geometric mean is the average that is CORRECT for ratios (Fleming & Wallace 1986):
+         # it treats 2x and 0.5x as cancelling, and gmean(A/B) = 1/gmean(B/A), neither of which
+         # holds for the arithmetic mean — mean(A/B) and mean(B/A) can both sit above 1. Kept
+         # alongside the median (robust, the headline) and the arithmetic mean (kept for
+         # continuity with older reports), not instead of them.
+         'ratio_gmean': statistics.geometric_mean(ratios),
+         # The SAME arithmetic mean taken with the guests swapped. Its only job is to make the
+         # arithmetic mean's inconsistency checkable instead of asserted: gmean(A/B)*gmean(B/A) is
+         # exactly 1, while mean(A/B)*mean(B/A) >= 1 by AM-GM and is strictly above it here. The
+         # textbook statement of the flaw ("both means can exceed 1, each calling the other guest
+         # dearer") is TRUE of the statistic but does NOT happen on this data — measured — so the
+         # page quotes this product rather than a warning a reader could check and find overstated.
+         'ratio_mean_inv': statistics.mean([1 / r for r in ratios]),
          'ratio_pooled': sum(aw) / sum(bw),
          'ratio_p10': pct(ratios, .10), 'ratio_p90': pct(ratios, .90),
          'ratio_min': min(ratios), 'ratio_max': max(ratios),
-         'cv': (statistics.pstdev(ratios) / statistics.mean(ratios) * 100) if len(ratios) > 1 else 0.0}
+         'cv': (statistics.pstdev(ratios) / statistics.mean(ratios) * 100) if len(ratios) > 1 else 0.0,
+         # The dispersion that MATCHES a geometric mean: exp(sd of the logs), a MULTIPLICATIVE
+         # spread. Read it as ×/÷, not ±: the one-sigma band is gmean×gsd and gmean÷gsd. `cv` is
+         # the additive counterpart and stays for the card that already shows it — quoting a ±%
+         # beside a geometric mean would mix the two conventions.
+         'ratio_gsd': (math.exp(statistics.pstdev([math.log(r) for r in ratios]))
+                       if len(ratios) > 1 else 1.0)}
     inv = {r['a']['work'] / r['b']['work']: b for b, r in rows.items() if r['b']['work']}
     s['block_min'], s['block_max'] = inv[s['ratio_min']], inv[s['ratio_max']]
     # Two regimes, not one distribution. On ~22% of blocks `rsp` runs the BN254 pairing precompile in
@@ -589,13 +989,23 @@ def summarize(axis, rows, gas_map=None):
               statistics.median(ncnt[k][1]) if ncnt.get(k) else None,
               statistics.median(nvol[k]) if nvol.get(k) else None)
              for k, v in nrat.items() if len(v) >= need), key=lambda t: -t[1])
-    at = [r['a'].get('secs') for r in rows.values() if r['a'].get('secs')]
-    bt = [r['b'].get('secs') for r in rows.values() if r['b'].get('secs')]
+    # Pure (modelled) time, not the collected wall-clock — see PURE_MSTEPS_PER_S.
+    at = [pure_secs(ax['a']['name'], r['a'].get('work')) for r in rows.values()
+          if r['a'].get('work')]
+    bt = [pure_secs(ax['b']['name'], r['b'].get('work')) for r in rows.values()
+          if r['b'].get('work')]
+    at = [t for t in at if t]; bt = [t for t in bt if t]
     if at and bt: s['a_secs_median'], s['b_secs_median'] = statistics.median(at), statistics.median(bt)
     # SP1 only: time from the --no-gas pass — execution without the gas-estimation overhead, i.e.
     # the honest emulation cost. Cycles still come from the gas-on pass (--no-gas reports 0).
-    ant = [r['a']['nsecs'] for r in rows.values() if r['a'].get('nsecs')]
-    bnt = [r['b']['nsecs'] for r in rows.values() if r['b'].get('nsecs')]
+    # nsecs (SP1's gas-pass-off wall-clock) is superseded by the same pure model as `secs`: it
+    # still carried process startup and campaign parallelism. The key stays so the cards and the
+    # JSON schema keep their shape; the VALUE is now work / measured per-guest throughput.
+    ant = [pure_secs(ax['a']['name'], r['a'].get('work')) for r in rows.values()
+           if r['a'].get('nsecs') and r['a'].get('work')]
+    bnt = [pure_secs(ax['b']['name'], r['b'].get('work')) for r in rows.values()
+           if r['b'].get('nsecs') and r['b'].get('work')]
+    ant = [t for t in ant if t]; bnt = [t for t in bnt if t]
     if ant and bnt:
         s['a_nsecs_median'], s['b_nsecs_median'] = statistics.median(ant), statistics.median(bnt)
         if at and bt:                     # what the gas pass costs, measured
@@ -673,16 +1083,19 @@ def print_summary(s):
         print(f"  {'median '+s['pw_unit']+' (prover)':22} {n(s['a_pw_median']):>18} "
               f"{n(s['b_pw_median']):>18} "
               f"{x(s['a_pw_median']/s['b_pw_median'] if s.get('b_pw_median') else None):>10}")
+    # NOTE: the time rows are MODELLED (work / measured per-guest throughput, see
+    # PURE_MSTEPS_PER_S) — emulator seconds on the reference host, not proving time.
     if 'a_nsecs_median' in s:      # honest time (gas-estimation pass off)
-        print(f"  {'exec secs (median)':22} {s['a_nsecs_median']:>18.3f} {s['b_nsecs_median']:>18.3f} "
+        print(f"  {'pure exec secs (med)':22} {s['a_nsecs_median']:>18.3f} {s['b_nsecs_median']:>18.3f} "
               f"{x(s['a_nsecs_median']/max(s['b_nsecs_median'],1e-9)):>10}")
         if s.get('gas_pass_overhead'):
             print(f"  {'':22} {'(gas-estimation pass would add ×%.2f)' % s['gas_pass_overhead']:>39}")
     elif 'a_secs_median' in s:
-        print(f"  {'exec secs (median)':22} {s['a_secs_median']:>18.3f} {s['b_secs_median']:>18.3f} "
+        print(f"  {'pure exec secs (med)':22} {s['a_secs_median']:>18.3f} {s['b_secs_median']:>18.3f} "
               f"{x(s['a_secs_median']/max(s['b_secs_median'],1e-9)):>10}")
-    print(f"\n  per-block ratio  median {x(s['ratio_median'])}  mean {x(s['ratio_mean'])}  "
-          f"p10 {x(s['ratio_p10'])}  p90 {x(s['ratio_p90'])}  cv {s['cv']:.1f}%")
+    print(f"\n  per-block ratio  median {x(s['ratio_median'])}  geo-mean {x(s['ratio_gmean'])}  "
+          f"mean {x(s['ratio_mean'])}  p10 {x(s['ratio_p10'])}  p90 {x(s['ratio_p90'])}  "
+          f"cv {s['cv']:.1f}%")
     if s.get('pw_ratio_median'):
         print(f"  per-block {s['pw_unit']:6} median {x(s['pw_ratio_median'])}"
               f"   (median of per-block ratios — not the quotient of the two medians above)")
@@ -744,7 +1157,22 @@ h1{font-size:clamp(26px,4vw,40px);line-height:1.04;margin:0 0 10px;font-weight:6
 h2{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 14px;
  font-family:var(--mono);font-weight:600}
 section{margin-top:38px;border-top:1px solid var(--line);padding-top:26px}
-.axhead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+/* Sticky axis bar. The page carries several comparisons, each hundreds of pixels tall; without a
+   persistent marker a reader deep in a table cannot tell WHICH pair, on which zkVM, they are
+   looking at. It restates exactly that, and doubles as the jump nav between axes. */
+.axbar{position:sticky;top:0;z-index:50;margin:0 -22px 18px;padding:9px 22px;
+ background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(9px);
+ border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.axbar .cur{font-family:var(--mono);font-size:13px;font-weight:650;white-space:nowrap}
+.axbar .cur .bk{color:var(--accent);margin-right:7px}
+.axbar .cur .pair{color:var(--dim);font-weight:400}
+.axbar .jump{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap}
+.axbar .jump a{font-family:var(--mono);font-size:11px;color:var(--dim);text-decoration:none;
+ padding:3px 8px;border:1px solid var(--line);border-radius:999px;white-space:nowrap}
+.axbar .jump a:hover{color:var(--fg);border-color:var(--dim)}
+.axbar .jump a.on{color:var(--fg);border-color:var(--accent);background:var(--panel)}
+@media print{.axbar{position:static;backdrop-filter:none}}
+.axhead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:18px;scroll-margin-top:60px}
 .axhead .nm{font-family:var(--mono);font-size:20px;font-weight:650;letter-spacing:-.01em}
 .axhead .vs{color:var(--dim);font-size:13px;font-family:var(--mono)}
 /* separators via card borders, not a gap over a coloured backdrop, so a half-empty last row
@@ -874,7 +1302,8 @@ tbody tr:hover{background:var(--panel2)}
 .rbar.over{background:var(--red)}
 /* No ratio exists when the other guest reports nothing in a family, and the colour has to say so:
    the `over` test was `r and r >= 1`, so a missing ratio fell through to GREEN — reading as "Monad
-   spends less" on rows where it spends 23.8M against zero. Neutral for "not comparable". */
+   spends less" on the byte/bit row, where it spends tens of millions against zero. The figure is not
+   repeated here: it moves with every rebuild, and the table states it. Neutral for "not comparable". */
 .rbar.na{background:var(--dim);opacity:.5}
 .na{color:var(--dim);font-weight:600}
 details{margin-top:8px}summary{cursor:pointer;font-family:var(--mono);font-size:12px;color:var(--muted);
@@ -891,6 +1320,42 @@ details{margin-top:8px}summary{cursor:pointer;font-family:var(--mono);font-size:
 """
 
 # ── histogram drill-down (inline, no deps: the page must open from a file:// path) ──
+_AXBAR_JS = r"""
+// Keep the sticky bar naming the section the reader is actually in. Plain scroll maths rather than
+// IntersectionObserver: the sections are tall and overlapping thresholds made the label flicker at
+// boundaries. Active section = the last one whose top has passed the bar.
+(function () {
+  var bar = document.getElementById('axbar');
+  var cur = document.getElementById('axbar-cur');
+  if (!bar || !cur) return;
+  var secs = [].slice.call(document.querySelectorAll('section[data-axis]'));
+  if (!secs.length) return;
+  var chips = [].slice.call(bar.querySelectorAll('.jump a'));
+  var last = null;
+  function paint() {
+    var y = bar.getBoundingClientRect().bottom + 4;
+    var act = secs[0];
+    for (var i = 0; i < secs.length; i++) {
+      if (secs[i].getBoundingClientRect().top <= y) act = secs[i];
+    }
+    if (act === last) return;
+    last = act;
+    cur.innerHTML = "<span class=bk>" + act.dataset.backend + "</span>" +
+                    "<span class=pair>" + act.dataset.pair + "</span>";
+    chips.forEach(function (c) { c.classList.toggle('on', c.dataset.for === act.dataset.axis); });
+  }
+  var tick = false;
+  addEventListener('scroll', function () {
+    if (tick) return;
+    tick = true;
+    requestAnimationFrame(function () { paint(); tick = false; });
+  }, {passive: true});
+  addEventListener('resize', paint, {passive: true});
+  paint();
+})();
+"""
+
+
 _HIST_JS = r"""
 const _f = n => n == null ? '—' : n.toLocaleString('en-US', {maximumFractionDigits: 0});
 const _x = r => r == null ? '—' : r.toFixed(3) + '×';
@@ -1184,10 +1649,9 @@ def bn254_share(axis, side_k, blocks, cache):
     drift from what the family table shows. Returns (share, n_blocks_found) — n matters, because the
     pairing-heavy regime holds only ~9 of the 50 profiled blocks."""
     ax = AXES[axis]; side = ax[side_k]
-    stamp = int(os.path.getmtime(rp(side['elf'])))
     tot, n = 0.0, 0
     for b in blocks:
-        e = cache.get(f"fn2/{axis}/{side['name']}/{b}/{stamp}")
+        e = cache.get(rp(side['elf']), b, _cachemod.PROFILE)
         if not e or not e.get('fns'): continue
         num = sum(c for fn, c in e['fns'] if BN254_RE.search(fn))
         den = sum(c for _f, c in e['fns'])
@@ -1201,11 +1665,10 @@ def bn254_paths(axis, side_k, blocks, cache):
     Separating the two answers the actionable question: is a guest slow at pairing because the work
     is inherently expensive, or because it never got the precompile-backed crate?"""
     ax = AXES[axis]; side = ax[side_k]
-    stamp = int(os.path.getmtime(rp(side['elf'])))
     soft = acc = den = 0
     sym = False
     for b in blocks:
-        e = cache.get(f"fn2/{axis}/{side['name']}/{b}/{stamp}")
+        e = cache.get(rp(side['elf']), b, _cachemod.PROFILE)
         if not e or not e.get('fns'): continue
         for fn, c in e['fns']:
             den += c
@@ -1228,11 +1691,10 @@ def percall(axis, side_k, side, blocks, cache, rows, rx=_HASH_RE, counter=None):
     The Pearson r matters as much as the median: a cost flat across a wide range of call counts does
     not depend on payload size, which makes it per-call SETUP rather than work. Returns
     (median, lo, hi, r, n) or None."""
-    ax = AXES[axis]; g = ax[side_k]['name']
-    stamp = int(os.path.getmtime(rp(ax[side_k]['elf'])))
+    ax = AXES[axis]
     xs, ys, rats = [], [], []
     for b in blocks:
-        e = cache.get(f"fn2/{axis}/{g}/{b}/{stamp}")
+        e = cache.get(rp(ax[side_k]['elf']), b, _cachemod.PROFILE)
         r0 = rows.get(str(b)) or rows.get(b)
         if not e or not e.get('fns') or not r0: continue
         R = r0[side]
@@ -1261,13 +1723,13 @@ def profile_blocks(axis, side_k, blocks, cache):
     blocks = sorted(blocks)
     hs = _hotspots()
     # Cached PER BLOCK, not per block-list: raising the sample from 10 to 50 must profile 40 blocks,
-    # not 50. The classification is part of each key — without it, editing hotspots' FAMILIES would
-    # silently keep the old grouping (it did: a trie-node fix stayed invisible until cleared).
-    stamp = int(os.path.getmtime(elf))
-    # v2 caches RAW per-function counts, not family sums: the taxonomy then changes for free
-    # (it changed twice, and each time the old cache had to be thrown away).
-    k1 = lambda b: f"fn2/{axis}/{side['name']}/{b}/{stamp}"
-    todo = [b for b in blocks if k1(b) not in cache]
+    # not 50. What is stored are the RAW per-function counts, never family sums — the taxonomy is a
+    # module constant that gets edited, and a cached sum keeps the old grouping without saying so (it
+    # did: a trie-node fix stayed invisible until cleared). Folding to families at read time costs
+    # nothing now that hotspots.family() is memoised, so the two namespaces that used to cache the
+    # sums are gone.
+    todo = [b for b in blocks
+            if cache.get(elf, b, _cachemod.PROFILE, inp=resolve_input(side, b)) is None]
     # Chunked: hotspots aborts the whole process on a single bad input, so profiling 50 blocks in one
     # call risked losing all of them (it did — an axis profiled for ~20 min and cached nothing).
     # Small batches keep the startup amortised while bounding what a failure costs.
@@ -1283,7 +1745,7 @@ def profile_blocks(axis, side_k, blocks, cache):
             for b in todo:
                 inp = resolve_input(side, b)
                 if not inp: continue
-                if side['src'] == 'monad-framed':
+                if needs_framing(ax['backend'], side):
                     t = tempfile.NamedTemporaryFile(suffix=f'.{b}.bin', delete=False).name
                     frame_ziskos(inp, t); tmps.append(t); inp = t
                 inputs.append(inp)
@@ -1311,15 +1773,18 @@ def profile_blocks(axis, side_k, blocks, cache):
                                            fn.get('count') or 0)
                                           for fn in e.get('functions', [])),
                                          key=lambda t: -t[1])[:120]
-                            cache[k1(b)] = {'fns': fns,
-                                            'total': sum(c for _n, c in
-                                                         ((f"{fn.get('module','')}::{fn.get('name','')}",
-                                                           fn.get('count') or 0)
-                                                          for fn in e.get('functions', [])))}
+                            cache.put(elf, b, _cachemod.PROFILE,
+                                      {'fns': fns, 'trunc': 120,
+                                       'total': sum(c for _n, c in
+                                                    ((f"{fn.get('module','')}::{fn.get('name','')}",
+                                                      fn.get('count') or 0)
+                                                     for fn in e.get('functions', [])))},
+                                      name=side['name'], backend=ax['backend'],
+                                      inp=resolve_input(side, b))
         finally:
             for t in tmps:
                 if os.path.exists(t): os.remove(t)
-    got = [cache[k1(b)] for b in blocks if k1(b) in cache]
+    got = [e for e in (cache.get(elf, b, _cachemod.PROFILE) for b in blocks) if e]
     if not got: return None
     fams = {}
     for g in got:
@@ -1371,8 +1836,8 @@ def _hist(ratios, s, rows=None, gas_map=None, tx_map=None):
              # nsecs first: `secs` carries SP1's gas-estimation pass, which reverses which guest
              # looks faster on 26% of blocks here (block 25552073: 3.74s vs 5.26s gas-on says A wins,
              # 2.13s vs 2.03s honest says it loses). Same fix as the metric bar row.
-             'as': r0['a'].get('nsecs') or r0['a'].get('secs'),
-             'bs': r0['b'].get('nsecs') or r0['b'].get('secs')}
+             'as': pure_secs(s.get('a_name'), r0['a'].get('work')),
+             'bs': pure_secs(s.get('b_name'), r0['b'].get('work'))}
         if g and tx: e['gtx'] = round(g / tx)
         # per-side work per Mgas: strips block size out, so a bucket groups by efficiency
         if g:
@@ -1466,6 +1931,11 @@ def _hist(ratios, s, rows=None, gas_map=None, tx_map=None):
     return (f"<div class=hist data-ax='{ax}'>{''.join(bars)}{one}</div>"
             f"<div class=hax><span>{lo:.3f}×</span><span>{mid:.3f}×</span><span>{hi:.3f}×</span></div>"
             f"<div class=mk><span><i>middle block</i> {x(s['ratio_median'])}</span>"
+            # The mean asked for by readers averaging benchmark ratios. Geometric, not arithmetic:
+            # see the ratio_gmean comment in summarize().
+            f"<span title='the average that is correct for ratios: it treats 2x and 0.5x as "
+            f"cancelling, and the A/B and B/A figures are exact reciprocals — the arithmetic mean "
+            f"guarantees neither'><i>geometric mean</i> {x(s['ratio_gmean'])}</span>"
             f"<span><i>lowest 10%</i> under {x(s['ratio_p10'])}</span>"
             f"<span><i>highest 10%</i> over {x(s['ratio_p90'])}</span>"
             f"<span><i>swing</i> ±{s['cv']:.1f}%</span></div>"
@@ -1549,6 +2019,147 @@ def _curve_note(s):
             f"{B} implementation gap, not an EVM one.</p>")
 
 
+def _three_axes(s):
+    """Work / prover cost / pure time, side by side — the panel that makes a divergence readable.
+
+    They answer three different questions and are collected three different ways, so agreement is
+    evidence and disagreement is a lead:
+      - work: steps (ZisK) or cycles (SP1). Deterministic, host-independent — the metric every
+        lever verdict on this branch was decided on.
+      - prover cost: ZisK's COST model, collected in the same instrumented pass. Weighted per
+        instruction class, so it moves when the instruction MIX changes even if work does not.
+      - pure time: work / measured per-guest emulator throughput (see PURE_MSTEPS_PER_S). Also
+        mix-sensitive, through a completely independent mechanism (real instruction timings on the
+        reference host) — which is what makes it worth showing next to cost rather than instead.
+    """
+    A, B, u = s['a_name'], s['b_name'], s['unit']
+    w = s['ratio_median']
+    c = s.get('cost_ratio_median')
+    t = s.get('time_ratio_median')
+    if not (c or t):
+        return ''
+    cls = lambda v: 'hi' if v >= 1 else 'lo'
+    rows = [(f'work ({u})', w, s['n'],
+             "<b>the verdict metric.</b> Deterministic and host-independent; every lever on this "
+             "branch was accepted or rejected on it")]
+    if c:
+        rows.append(('prover cost', c, s.get('cost_n', s['n']),
+                     "<b>what the prover actually pays.</b> ZisK's COST model, same collection "
+                     "pass — weighted per instruction class, so it tracks the MIX, not the count"))
+    if t:
+        rows.append(('pure exec time', t, s['n'],
+                     "<b>emulator seconds on the reference host</b>, modelled as work ÷ measured "
+                     "per-guest throughput. Not proving time, and not comparable across hosts"))
+    body = ''.join(f"<tr><td>{lbl}</td><td class={cls(v)}>{x(v)}</td><td class=n>{n}</td>"
+                   f"<td class=why>{why}</td></tr>" for lbl, v, n, why in rows)
+    # The reading, computed rather than asserted.
+    note = ""
+    if c and t:
+        spread = (max(w, c, t) / min(w, c, t) - 1) * 100
+        if spread >= 3:
+            heavier = 'denser' if (c > w and t > w) else 'lighter'
+            note = (f"The three sit <b>{spread:.1f}%</b> apart, and cost and time move the SAME way "
+                    f"against work — two independent mechanisms agreeing that "
+                    f"<span class=cA>{A}</span>'s remaining instruction mix is {heavier} per "
+                    f"{u[:-1] if u.endswith('s') else u} than <span class=cB>{B}</span>'s. That is "
+                    f"the expected signature of optimisation: cheap work is what gets removed "
+                    f"first, so what survives costs more each. It does not weaken the work ratio — "
+                    f"it says where the next lever should look."
+                    if (c > w) == (t > w) else
+                    f"The three sit <b>{spread:.1f}%</b> apart and cost and time <b>disagree in "
+                    f"direction</b> against work. That should not happen from mix alone — check "
+                    f"the throughput table (it is measured per guest and goes stale when a guest "
+                    f"changes materially) before reading anything into it.")
+        else:
+            note = (f"The three agree to within <b>{spread:.1f}%</b>: the instruction mix is "
+                    f"essentially unchanged between the two guests, so the work ratio carries the "
+                    f"whole story on this axis.")
+    return (f"<div class=pane><h2>three axes: work, prover cost, pure time</h2>"
+            f"<table class=cv><tr><th>axis</th><th>ratio</th><th>n</th><th>what it answers</th></tr>"
+            f"{body}</table><p class=note>{note}</p></div>")
+
+
+def _averages(s):
+    """The four ways this page summarises a set of per-block ratios, side by side.
+
+    It exists because a reader asked which average the headline is, and no single place on the page
+    answered it: the cards give the median, the metric bars give aggregate ÷ aggregate, and the
+    arithmetic mean appeared only in the terminal. Four numbers that differ by a few percent, three
+    of them unlabelled, invite the assumption that they should agree.
+
+    The row order is the recommendation. The GEOMETRIC mean is the one to quote when a single
+    average of ratios is wanted (Fleming & Wallace, CACM 1986): averaging ratios additively is not
+    a well-defined operation — mean(A/B) and mean(B/A) can BOTH exceed 1, so the arithmetic mean
+    can report each of two guests as the more expensive one. The geometric mean cannot: it is an
+    exact reciprocal under swapping, and 2× cancels 0.5×. The median stays the headline because it
+    is robust to the off-pattern blocks this page lists by name.
+
+    Whether that choice MATTERS is measured, never asserted: the closing line prints the actual
+    gap between the geometric mean and the median. It is ~0.4% on the ZisK axis and ~5% on SP1,
+    and that difference is not noise — it is the left tail of blocks where the reth guest runs
+    BN254 in software, i.e. the two-regime structure the split table further down already names.
+    So a wide gap here is a pointer to that section, not a reason to distrust either number."""
+    gm, med, am, pooled = s['ratio_gmean'], s['ratio_median'], s['ratio_mean'], s['ratio_pooled']
+    gsd = s.get('ratio_gsd') or 1.0
+    ami = s.get('ratio_mean_inv') or (1 / am if am else 0)   # see ratio_mean_inv in summarize()
+    A, B, u = s['a_name'], s['b_name'], s['unit']
+    # Measured, not asserted: how far apart the four actually are here. A reader deciding whether the
+    # choice of average matters needs the spread, and on a tight distribution the honest answer is
+    # "it doesn't much".
+    vals = [gm, med, am, pooled]
+    spread = (max(vals) / min(vals) - 1) * 100
+    # The gap that decides whether the closing sentence says "this matters" or "it doesn't": the
+    # two statistics a reader would actually choose between, geometric mean and median.
+    _gap = abs(gm - med) / med * 100
+    cls = lambda v: 'hi' if v >= 1 else 'lo'
+    rows = [
+        ('geometric mean', gm,
+         f"<b>the average to quote for a set of ratios.</b> Multiplicative: 2× and 0.5× cancel, and "
+         f"it gives the same answer whichever guest you divide by — swapped it reads {x(1 / gm)}, an "
+         f"exact reciprocal. One-sigma spread ×/÷ {gsd:.3f}"),
+        ('middle block (median)', med,
+         f"<b>the headline in the cards above.</b> Half the blocks sit either side; unmoved by the "
+         f"off-pattern blocks listed further down"),
+        ('arithmetic mean', am,
+         f"<b>do not quote alone.</b> It depends on which guest you divide by: taken the other way "
+         f"round it gives {x(ami)}, and {x(am)} × {x(ami)} = <b>{am * ami:.4f}</b> where an average "
+         f"of ratios must give exactly 1 (the geometric mean above does). The wider the spread, the "
+         f"worse it gets — far enough out, both directions read above 1 and each names the other "
+         f"guest as the dearer one. Kept here only so the number is not missing"),
+        ('total ÷ total', pooled,
+         f"<b>the whole set's {u}, {A} against {B}.</b> Weighted by block size, so the largest "
+         f"blocks dominate it — the right figure for total capacity, the wrong one for a typical "
+         f"block"),
+    ]
+    # `table.cv` right-aligns its 2nd AND 3rd columns in the mono face (it was written for
+    # number/number/prose). Here the 3rd column is prose, so it opts out inline rather than the
+    # shared rule growing a per-table exception.
+    _pr = "style='text-align:left;font-family:var(--sans)'"
+    body = "".join(f"<tr><td>{lbl}</td><td class={cls(v)}>{x(v)}</td>"
+                   f"<td {_pr}><i>{why}</i></td></tr>"
+                   for lbl, v, why in rows)
+    return (f"<div class=pane><h2>which average of the per-block ratios</h2>"
+            f"<p class=note style='margin:0 0 10px'>Every row summarises the same "
+            f"<b>{s['n']} per-block ratios</b> ({u} of <span class=cA>{A}</span> ÷ "
+            f"<span class=cB>{B}</span>) — they differ because they answer different questions, not "
+            f"because any is wrong. On this axis they span <b>{spread:.1f}%</b> end to end.</p>"
+            f"<table class=cv><tr><th>statistic</th><th>ratio</th><th>what it answers</th></tr>"
+            f"{body}</table>"
+            f"<p class=note>Ratios are dimensionless and multiplicative, which is why the geometric "
+            f"mean is the defensible average of a benchmark set and the arithmetic mean is not; the "
+            f"median is preferred here on top of that, because a minority of blocks run 256-bit "
+            f"curve arithmetic in software and are not drawn from the same population as the rest. "
+            + (f"Here the two differ by <b>{_gap:.1f}%</b> ({x(gm)} against {x(med)}), so which one "
+               f"is quoted <b>does</b> change the headline — and the reason is the left tail: the "
+               f"geometric mean feels those blocks, the median does not. Read the split further "
+               f"down before quoting either."
+               if _gap >= 2 else
+               f"Here the two differ by <b>{_gap:.1f}%</b> ({x(gm)} against {x(med)}), so on this "
+               f"axis the choice is not load-bearing — which is a measurement, not a promise that "
+               f"it holds on the next block set.")
+            + f"</p></div>")
+
+
 def _bars(items, A, B):
     """Side-by-side bars per metric, each pair scaled to its own max (shape, not absolute units)."""
     out = []
@@ -1567,7 +2178,7 @@ def _bars(items, A, B):
             f"</div></div>")
     return "".join(out)
 
-def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
+def write_html(path, summaries, allrows, gas_map=None, tx_map=None, summary_href=None):
     gas_map = gas_map or {}; tx_map = tx_map or {}
     # The "one guest is the outlier" claim needs the other axis as a control, and _hist/_curve_note
     # only receive their own summary — hand them what they need rather than widen the signature.
@@ -1576,11 +2187,50 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
         o['_other_bn254'] = {p['axis']: p.get('bn254') for p in summaries if p is not o}
         o['_other_names'] = _nm
     pairs = " · ".join(f"{s['a_name']} vs {s['b_name']}" for s in summaries)
+    # The heading used to be the fixed sentence "Two guest programs, one zkVM". That describes the
+    # METHOD, which is still exactly what each section does — but it does not identify the page, and
+    # it was byte-identical on every report the tool produced, so two reports written from different
+    # axis sets were indistinguishable by title. Derive it instead.
+    #
+    # The signal is the directory of each axis's `a` ELF: two axes built from the same guest tree are
+    # the same build measured on two backends. When every axis shares one, the page is one build held
+    # against several references, and saying so is more useful than restating the method.
+    _adirs = {os.path.dirname(AXES[s['axis']]['a']['elf']) for s in summaries if s['axis'] in AXES}
+    _nw = {1: 'one', 2: 'two', 3: 'three', 4: 'four', 5: 'five', 6: 'six'}
+    # References are counted as GUESTS, not as axis sides. `monad-today` and `monad-today-sp1` are one
+    # reference — the shipped guest — built for two backends, exactly as `monad-levers` and
+    # `monad-levers-sp1` are one build. Counting the four `b` names said "four references", which
+    # double-counts it. The ELF directory cannot collapse this pair (they sit in guests/monad-zisk and
+    # guests/monad-sp1), so the backend suffix is what identifies the logical guest.
+    _stem = lambda n: re.sub(r'-(sp1|zisk)$', '', n)
+    _lead = ""
+    if len(_adirs) == 1 and len(summaries) > 1:
+        stem = os.path.basename(_adirs.pop())
+        refs = sorted({_stem(s['b_name']) for s in summaries})
+        nbk = len({AXES[s['axis']]['backend'] for s in summaries if s['axis'] in AXES})
+        title = (f"<code>{stem}</code> against {_nw.get(len(refs), len(refs))} references, on "
+                 f"{_nw.get(nbk, nbk)} backend{'s' if nbk != 1 else ''}")
+        # Name them rather than only counting them: a bare count is unverifiable from the page, and
+        # the first version of this line got it wrong in exactly that invisible way.
+        _named = ", ".join(f"<code>{r}</code>" for r in refs[:-1]) + f" and <code>{refs[-1]}</code>"
+        # Sections outnumber references whenever one reference is measured on both backends, which is
+        # the case for the shipped guest. Saying so is what stops the section count being read as a
+        # reference count — the mistake this line exists to prevent.
+        _lead = (f"<b>Every section below measures the same build</b>, <code>{stem}</code>, against "
+                 f"{_named}"
+                 + (f" — {_nw.get(len(refs), len(refs))} references over "
+                    f"{_nw.get(len(summaries), len(summaries))} sections, "
+                    f"because a reference measured on both backends appears twice. "
+                    if len(summaries) != len(refs) else ". "))
+    else:
+        # Unchanged, and deliberately not pluralised by section count: the "two" is the two guests
+        # inside each section, not the number of sections.
+        title = "Two guest programs, one zkVM"
     h = [f"<title>zkVM guest comparison — {pairs}</title>",
          f"<style>{_CSS}</style>", "<div class=wrap>",
          "<p class=eyebrow>zkvm-bench · execution comparison</p>",
-         "<h1>Two guest programs, one zkVM</h1>",
-         "<p class=sub>Work-units only compare <b>inside</b> a single zkVM (an SP1 cycle is not a ZisK "
+         f"<h1>{title}</h1>",
+         f"<p class=sub>{_lead}Work-units only compare <b>inside</b> a single zkVM (an SP1 cycle is not a ZisK "
          "step), so each section runs two <b>guest programs</b> on one backend over the same blocks. "
          "What differs is the <b>whole guest</b>: its execution engine, how it decodes its witness, how "
          "it handles state and precompiles — and each guest is fed its <b>own witness</b>, which differ "
@@ -1588,13 +2238,27 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
          "one component of it. Ratios are <i>first ÷ second</i>: above 1× means the first guest costs "
          "more. These are execution and prover-work figures, <b>not</b> proving time. Generated by "
          "<code>profiling/compare.py</code>.</p>"]
+    if summary_href:
+        h.append(f"<p class=sub style='margin-top:8px'>Pressed for time? The one-page synthesis: "
+                 f"<a href='{summary_href}' style='color:var(--accent)'>{summary_href}</a>.</p>")
+    # Sticky axis bar: one line that always says which pair, on which zkVM, plus jump
+    # chips. Rendered once; the label follows the scroll (see _AXBAR_JS).
+    _chips = ''.join(
+        f"<a href='#ax-{t['axis']}' data-for='{t['axis']}'>{t['axis']}</a>"
+        for t in summaries)
+    _f0 = summaries[0]
+    h.append(f"<div class=axbar id=axbar><span class=cur id=axbar-cur>"
+             f"<span class=bk>{AXES[_f0['axis']]['backend'].upper()}</span>"
+             f"<span class=pair>{_f0['a_name']} vs {_f0['b_name']}</span></span>"
+             f"<span class=jump>{_chips}</span></div>")
     for s in summaries:
         ax = s['axis']; A, B, u = s['a_name'], s['b_name'], s['unit']
         rows = allrows[ax]
         ratios = sorted(r['a']['work'] / r['b']['work'] for r in rows.values() if r['b']['work'])
         pwu, pwk = s.get('pw_unit'), ('cost' if ax == 'zisk' else 'pgu')
         pct = (s['ratio_median'] - 1) * 100
-        h.append("<section>")
+        h.append(f"<section id='ax-{ax}' data-axis='{ax}' "
+                 f"data-backend='{AXES[ax]['backend'].upper()}' data-pair='{A} vs {B}'>")
         h.append(f"<div class=axhead><span class=nm>{ax.upper()}</span>"
                  f"<span class=vs>{A} &nbsp;vs&nbsp; {B}</span></div>")
         # "N blocks between X and Y" reads as contiguous. It is not: a block runs only when BOTH
@@ -1635,14 +2299,17 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
             h.append(f"<div class=card><div class=k>median exec time</div>"
                      f"<div class=duo><span class=cA>{s['a_nsecs_median']:.2f}s</span>"
                      f"<span class=sep>vs</span><span class=cB>{s['b_nsecs_median']:.2f}s</span></div>"
-                     f"<div class='u blk'>pure emulation on this host, measured with SP1's "
-                     f"gas-estimation pass switched off"
-                     + (f" (it would add ×{ov:.2f})" if ov else "") + "</div></div>")
+                     f"<div class='u blk'>pure execution: work ÷ this guest's measured emulator "
+                     f"throughput. Raw wall-clock is not comparable — it carries a 0.6–1.7 s "
+                     f"ELF→ROM conversion per run plus campaign parallelism"
+                     + (f"; SP1's gas-estimation pass would add ×{ov:.2f}" if ov else "")
+                     + "</div></div>")
         elif s.get('a_secs_median'):
             h.append(f"<div class=card><div class=k>median exec time</div>"
                      f"<div class=duo><span class=cA>{s['a_secs_median']:.2f}s</span>"
                      f"<span class=sep>vs</span><span class=cB>{s['b_secs_median']:.2f}s</span></div>"
-                     f"<div class='u blk'>pure emulation on this host</div></div>")
+                     f"<div class='u blk'>pure execution: work ÷ this guest's measured emulator "
+                     f"throughput on the reference host — not proving time</div></div>")
         h.append(f"<div class=card><div class=k>block-to-block spread</div><div class=v>±{s['cv']:.1f}"
                  f"<span class=u>%</span></div><div class='u blk'>how far the ratio typically swings from "
                  f"one block to the next, as a share of its own average. Low = the gap is a property of "
@@ -1721,9 +2388,15 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
                  f"<b>{_dev:.1f}%</b> ({x(_agg)} here vs {x(s['ratio_median'])} in the cards). Both "
                  f"are wanted — the aggregate answers <i>how much more work in total</i>, the "
                  f"per-block median <i>what a typical block costs</i> — so quote whichever you mean "
-                 f"and say which. Each pair of bars is scaled to its own maximum, so bar length is "
+                 f"and say which. The full set of averages, and which to quote, is the table "
+                 f"below. Each pair of bars is scaled to its own maximum, so bar length is "
                  f"comparable only within a row.</p>{_bars(items, A, B)}</div>")
         h.append("</div>")
+        # Directly under the two panes that each show a DIFFERENT summary of the same ratios (the
+        # cards' median above, aggregate ÷ aggregate to the left) — the question "which of these is
+        # the average?" is raised there, so it is answered there.
+        h.append(_three_axes(s))
+        h.append(_averages(s))
         # ── where the gap comes from ──
         # The question the distribution raises but cannot answer: not "how big is the gap" but
         # "what is it made of". Both halves are medians ACROSS blocks (see summarize).
@@ -1764,9 +2437,25 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
                          f"family, <span class=lo>green</span> where less.{_grey} The share column "
                          f"divides by each guest's total, the bar by the largest family — so they do "
                          f"not match.</p>")
+                # The measured dispersal of the byte/bit family, written by the same build that
+                # eliminated the symbol. Optional: absent file falls back to the old wording.
+                try:    _bd = json.load(open(os.path.join(HERE, 'results', 'bswap-dispersal.json')))
+                except Exception: _bd = None
+                _vd = {}
+                if ax == 'zisk' and os.path.exists(VERDICT):   # `ax` is the axis STRING in write_html
+                    try:    _vd = json.load(open(VERDICT))
+                    except Exception: _vd = {}
+                # No rescaling here. The instruction columns are already per-block figures over the
+                # profiled sample, so the gap is their difference — anything else breaks the row's own
+                # arithmetic: rescaling by the MEDIAN block (281.1 M against a 292.0 M profiled mean,
+                # 3.9 % apart) showed +1,265,532 for a family where the reth guest is 0 and the Monad
+                # guest is 1,314,562. A reader who subtracts the two visible numbers must land on the
+                # gap.
                 h.append(f"<table><tr><th>kind of work</th><th>instructions</th>"
                          f"<th>share of<br>own work</th><th>ratio</th>"
-                         f"<th></th></tr>")
+                         f"<th>gap in {u}<br>(profiled block)</th>"
+                         + (f"<th>ratio with reth's<br>inlining undone</th>" if _vd else "")
+                         + f"<th></th></tr>")
                 # Shares as well as absolute counts, because the absolute figures are NOT safe to
                 # compare across backends: on a sampling profiler they carry the scale factor, and
                 # any family that dominates one backend (e.g. an allocator at ~46% of both guests'
@@ -1809,17 +2498,51 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
                         'critical sections, destructor dispatch.',
                     'other': 'Names no family pattern matched.',
                 }
+                # Read from the measurement, never typed: this sentence carried "30.4 M" and
+                # "1.30x" from an early one-block pilot long after the 55-block run said 40.5 M and
+                # 1.02x. It then contradicted the corrected column three lines above it AND argued
+                # against the permutation count it cites as corroboration.
+                _hv = _vd.get('hashing (keccak/sha)') if _vd else None
+                _hs_ = (_hv or {}).get('steps') or {}
+                _hnum = (f"moves its hashing from {_hs_['ship']/1e6:.1f} M to {_hs_['ni']/1e6:.1f} M "
+                         f"steps against Monad's {_hs_['monad']/1e6:.1f} M, i.e. the ratio collapses "
+                         f"from {x(_hv['ship'])} to <b>{x(_hv['ni'])}</b>" if _hs_ else
+                         "collapses this ratio")
                 WARN = {'hashing (keccak/sha)':
-                        "Read with care when both guests share a precompile: this row counts the "
-                        "instructions AROUND the hash, not the hash, and a guest that inlines its "
-                        "wrapper attributes them to its callers instead — which makes its figure "
-                        "look small for a compilation reason rather than a cost one. See the "
-                        "per-permutation panel below.",
+                        "<b>This row's ratio is an attribution artefact — measured, not suspected.</b> "
+                        "It counts the instructions AROUND the hash, not the hash, and a guest that "
+                        "inlines its wrapper charges them to its callers. Rebuilding the reth guest "
+                        f"with inlining suppressed {_hnum} — and the permutation count below, which "
+                        "depends on no symbol at all, agrees independently. Two methods sharing no "
+                        "machinery find the two guests hashing about equally.",
                         'byte/bit manipulation':
                         "Not comparable between guests: __bswapdi2 is an OUTLINED libgcc function that "
                         "C++ calls, while Rust's swap_bytes/to_be_bytes are inlined into their callers "
                         "and never appear as a symbol. Both guests do this work (RISC-V has no "
-                        "byte-swap instruction); only Monad's is visible. Read the absolute figure."}
+                        "byte-swap instruction); only Monad's is visible."
+                        # "Read the absolute figure" told the reader to look at a number without
+                        # saying what it is a number OF. The dispersal below answers that: it is not
+                        # a guess about where the work belongs, it is where the work WENT when the
+                        # symbol was eliminated in a rebuild.
+                        + (f" <b>Where this work belongs:</b> rebuilding the Monad guest with every "
+                           f"byte swap inlined makes this symbol vanish, and the families that "
+                           f"absorb it are "
+                           + ", ".join(f"{k} {v * 100:.0f}%" for k, v in
+                                       list(_bd['key'].items())[:3])
+                           + f" — measured, not apportioned. The reth guest's equivalent work is "
+                           f"already spread that way, which is exactly why this row reads zero for "
+                           f"it and why its interpreter and trie families are slightly inflated "
+                           f"against Monad's." if _bd and _bd.get('key') else
+                           " Read the absolute figure.")
+                        # Tested, not argued. The no-inline rebuild made every other hidden family
+                        # appear (hashing 11x, containers 21x) and left this one at zero, which is
+                        # what distinguishes "the classifier cannot see it" from "the work is not
+                        # there". swap_bytes is an LLVM intrinsic, so no inlining setting outlines it.
+                        + (f" Tested: rebuilding {B} with inlining suppressed surfaced every other "
+                           f"hidden family and left this one absent across all "
+                           f"{(_vd.get('_meta') or {}).get('ni_blocks', '')} profiled blocks — so no "
+                           f"build of that guest will ever populate this row."
+                           if (_vd.get('_meta') or {}).get('ni_blocks') else "")}
                 # Every family the table can show must be described by doc OR by WARN — both feed
                 # the title= — and no entry may name a family hotspots never defines. `signature
                 # recovery` sat in doc for a non-existent family, and three real families had no
@@ -1839,8 +2562,15 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
                     # expression, and inlining it was a syntax error that silently left the previous
                     # HTML in place while its checks ran against the stale file
                     _rt = f"ratio {x(r)}" if r is not None else f"no ratio — {B} reports none here"
+                    # absolute, from each guest's own median work — the only figure here that adds up
+                    # to the overall gap
+                    _gap = va - vb
                     h.append(f"<tr><td style='text-align:left'"
-                             + (f" title=\"{warn or tip}\"" if (warn or tip) else "")
+                             # A title attribute renders as plain text, so markup in these strings
+                             # showed up literally as "<b>…</b>" in the tooltip. The same strings are
+                             # reused as prose below the table, where the markup IS wanted — so strip
+                             # here rather than writing two versions that would drift apart.
+                             + (f" title=\"{_plain(warn or tip)}\"" if (warn or tip) else "")
                              + f">{'⚠ ' if warn else ''}{k}</td>"
                              f"<td><span class=cA>{n(va)}</span><br>"
                              f"<span class=cB>{n(vb)}</span></td>"
@@ -1852,15 +2582,158 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
                              # spends nothing where the other does) and must stay green, not go grey.
                              f"<td class={'na' if r is None else ('hi' if r >= 1 else 'lo')}>"
                              f"{x(r)}</td>"
+                             f"<td class={'hi' if _gap > 0 else 'lo'}>{'+' if _gap > 0 else ''}"
+                             f"{n(round(_gap))}</td>"
+                             + (_verdict_cell(_vd.get(k)) if _vd else "")
                              # The bar carries TWO variables — length and colour — and neither is the
                              # column it sits next to, so each row states its own reading on hover.
-                             f"<td style='width:28%' title=\"{k}: {A} {n(va)}, "
+                             + f"<td style='width:28%' title=\"{k}: {A} {n(va)}, "
                              f"{va/_sfa*100:.1f}% of its own work · {B} {n(vb)}, "
                              f"{vb/_sfb*100:.1f}% of its own · {_rt}\">"
                              f"<span class='rbar"
                              f"{' na' if r is None else (' over' if r >= 1 else '')}' "
                              f"style='width:{max(2, 100*va/mx):.0f}%'></span></td></tr>")
                 h.append("</table>")
+                if _vd:
+                    # `_meta` carries the run's own parameters, not a family — iterating the file
+                    # blind would count it as one and read a 'factor' it does not have.
+                    _fam_v = {k: v for k, v in _vd.items() if k != '_meta'}
+                    _mt = _vd.get('_meta') or {}
+                    # Same classifier as the cells, so the counts here always equal the words there.
+                    _cl = {k: _vclass(v['factor']) for k, v in _fam_v.items()}
+                    _bad = [k for k, c in _cl.items() if c.startswith('relocated')]
+                    _ok = [k for k, c in _cl.items() if c == 'agrees']
+                    _edge = [k for k, c in _cl.items() if c == 'borderline']
+                    # Which families the reth guest moved AGAINST ITSELF, from the same file: this is
+                    # the evidence that "relocated" is relocation and not noise, and it is the answer
+                    # to the reader's question of which of the two columns to believe.
+                    _mv = sorted(((k, v['steps']['ni'] / v['steps']['ship'])
+                                  for k, v in _fam_v.items()
+                                  if (v.get('steps') or {}).get('ship')),
+                                 key=lambda t: -t[1])
+                    _gain = [(k, f_) for k, f_ in _mv if f_ > 2][:2]
+                    _lose = [(k, f_) for k, f_ in _mv if f_ < 0.7][-1:]
+                    # Built out here rather than nested in the f-string: quoting a dict key inside an
+                    # f-string expression is what pushed an earlier version into a chr() workaround.
+                    _edgetxt = ', '.join(
+                        f"{k} moves by a factor of "
+                        f"{max(_fam_v[k]['factor'], 1 / _fam_v[k]['factor']):.2f}" for k in _edge)
+                    h.append(
+                        f"<p class=note><b>Which of the two columns to read.</b> The word in each cell "
+                        f"describes the <b>move between the two attributions</b>, not the quality of "
+                        f"the number beside it. Where a family <i>agrees</i>, both attributions found "
+                        f"the same thing and either column can be read. Where it says "
+                        f"<i>relocated</i>, inlining had charged that family's work to a different "
+                        f"family, and <b>this column is the one that says where the work lives</b> — "
+                        f"the shipped ratio is then reporting which compiler inlined more."
+                        + (f" Measured against the reth guest's own two builds, "
+                           + " and ".join(f"<code>{k}</code> gains {f_:.1f}×" for k, f_ in _gain)
+                           + (f" while <code>{_lose[0][0]}</code> keeps only "
+                              f"{_lose[0][1] * 100:.0f}% of its steps — that family had been hosting "
+                              f"them." if _lose else ".") if _gain else "")
+                        + f"<br>The reth guest "
+                        f"was rebuilt with inlining suppressed (<code>--inline-threshold=0</code>) and "
+                        f"re-profiled, so every family's ratio is known under two attributions. This "
+                        # Naming the sample matters: these ratios come from the blocks where all three
+                        # profiles exist, not from the table's own sample, so they do not equal the
+                        # ratio column to their left and a reader must not try to reconcile them.
+                        f"column is measured on the <b>{_mt.get('blocks', '?')} blocks</b> profiled "
+                        f"under all three binaries, so it will not match the ratio column beside it "
+                        f"exactly — that one uses the full profiled sample. <b>{len(_ok)} agree</b> — "
+                        f"the EVM interpreter reads "
+                        f"{x(_vd['EVM interpreter']['ship'])} shipped and "
+                        f"{x(_vd['EVM interpreter']['ni'])} without inlining — and "
+                        f"<b>{len(_bad)} relocated</b>: {', '.join(_bad)}."
+                        # Named, not folded into either count: these sit within 0.05 of the cutoff, so
+                        # calling them either way would be an artefact of where the line was drawn.
+                        + (f" {len(_edge)} sit on the boundary and are marked "
+                           f"<i>borderline</i> — {_edgetxt} against a cutoff at 1.25, so calling them "
+                           f"either way would be an artefact of where the line was drawn." if _edge
+                           else "")
+                        + f" Hashing goes from "
+                        f"{x(_vd['hashing (keccak/sha)']['ship'])} to "
+                        f"{x(_vd['hashing (keccak/sha)']['ni'])}, which the permutation count below "
+                        f"independently corroborates. A moving ratio is not a cost difference: it says "
+                        f"the two compilers inlined differently.<br>"
+                        f"<b>The displacement is entirely the reth guest's</b>, which is what makes the "
+                        f"corrected column usable rather than merely different. The Monad guest was "
+                        f"given the same treatment — both its toolchains — and no family moves more "
+                        f"than <b>0.72 pp</b> (that one being <i>other</i>; every real family stays "
+                        f"under 0.6 pp). Its C++ emits helpers as real symbols where Rust folds them "
+                        f"into callers, so its attribution was already faithful.<br>"
+                        # This paragraph used to end "state / trie goes 0.86x -> 1.89x, so the Monad
+                        # guest is genuinely behind there". True of the row, wrong about the guest: the
+                        # same de-inlining sends containers 6.98x -> 0.34x, and grouped they are at
+                        # parity. A corrected ratio is still a per-LABEL ratio, and relocation moves
+                        # work between labels — so a single corrected row cannot carry a verdict.
+                        f"<b>A corrected row is still one label, and relocation moves work between "
+                        f"labels.</b> <code>state / trie</code> goes "
+                        f"{x(_fam_v['state / trie']['ship'])} → {x(_fam_v['state / trie']['ni'])}, "
+                        f"which taken alone reads as the Monad guest falling behind. The same "
+                        f"de-inlining sends <code>containers / abstraction</code> "
+                        f"{x(_fam_v['containers / abstraction']['ship'])} → "
+                        f"{x(_fam_v['containers / abstraction']['ni'])} — the opposite direction, "
+                        f"because reth's trie functions had inlined their container and hashing "
+                        f"helpers."
+                        + ("".join(
+                            f" Grouped, <b>{k}</b> reads {x(g['ship'])} shipped and "
+                            f"<b>{x(g['ni'])}</b> de-inlined."
+                            for k, g in (_mt.get('groups') or {}).items()))
+                        + f" So the two guests spend comparable total work on that path and "
+                        f"distribute it differently across these labels; neither row is a verdict on "
+                        f"its own. The <i>reader trio</i> figure is the robust one — the relocation "
+                        f"happens inside it, so it barely moves between the two attributions.<br>"
+                        f"<b>The no-inline column is diagnostic, never a cost.</b> That build spends "
+                        + (f"{(_mt['inflation'] - 1) * 100:.0f}% more steps" if _mt.get('inflation')
+                           else "more steps")
+                        + f" — those are the calls inlining had removed — so it answers "
+                        f"<i>where does this code live</i>, not <i>what does it cost</i>. Some blocks "
+                        f"are missing from it: the emulator's profiling mode fails non-deterministically "
+                        f"on that binary, and the blocks that did run are the same size as the "
+                        f"population, so what is lost is sample size and not representativeness.</p>")
+                # The two families a name-based taxonomy cannot compare, said out loud rather than
+                # left in a title= nobody hovers — each with the counter that does not depend on
+                # symbols existing.
+                _sub = {}
+                # `kec` is only filled by the ZisK emulator; SP1 carries the same count under
+                # sys['KECCAK_PERMUTE'], and reading only `kec` silently dropped the substitute on
+                # that whole axis.
+                _perm = lambda r: r.get('kec') or (r.get('sys') or {}).get('KECCAK_PERMUTE')
+                _kp = [(_perm(r['a']), _perm(r['b'])) for r in rows.values()
+                       if _perm(r['a']) and _perm(r['b'])]
+                if _kp:
+                    _sub['hashing (keccak/sha)'] = (
+                        f"Comparable substitute: <b>keccak permutations</b>, counted not attributed — "
+                        f"<span class=cA>{n(statistics.median(v[0] for v in _kp))}</span> vs "
+                        f"<span class=cB>{n(statistics.median(v[1] for v in _kp))}</span> per block, "
+                        # The quotient of the two medians PRINTED HERE, not the median of the per-block
+                        # ratios: the latter read 1.079x beside a pair that divides to 1.086x, and the
+                        # same two counts appear again further down the page quoted as 1.086x — the
+                        # page contradicted itself on identical inputs. 0.7% apart, and worth nothing
+                        # next to a reader being unable to reproduce the number in front of them.
+                        f"<b>{x(statistics.median(v[0] for v in _kp) / statistics.median(v[1] for v in _kp))}</b>"
+                        f". Both guests call the "
+                        f"same precompile and its trace cost is identical, so the row above measures "
+                        f"the wrapper each guest shows, not the hashing each guest does.")
+                _bitops = ('sll', 'srl', 'and', 'or')
+                _bp = {o: [(r['a']['opsn'][o], r['b']['opsn'][o]) for r in rows.values()
+                           if (r['a'].get('opsn') or {}).get(o) and (r['b'].get('opsn') or {}).get(o)]
+                       for o in _bitops}
+                _bp = {o: v for o, v in _bp.items() if len(v) > len(rows) * 0.5}
+                if _bp:
+                    _bits = " · ".join(
+                        f"<code>{o}</code> {x(statistics.median(a / b for a, b in v))}"
+                        for o, v in _bp.items())
+                    _sub['byte/bit manipulation'] = (
+                        f"Comparable substitute: <b>opcode counts</b>, which exist whether or not a "
+                        f"symbol does — {_bits}. The reth guest does this work too and at a similar "
+                        f"rate; RISC-V has no byte-swap instruction, so both sides pay it in shifts "
+                        f"and masks. Only Monad's is outlined into <code>__bswapdi2</code> and "
+                        f"therefore visible to a name-based family.")
+                for k in fams:
+                    if k in WARN and k in _sub:
+                        h.append(f"<p class=note style='margin:8px 0 0'><b>⚠ {k}</b> — {WARN[k]}<br>"
+                                 f"{_sub[k]}</p>")
                 # Micro-synthesis: a family that dominates BOTH guests says something about the
                 # backend, not about either guest — and it mechanically compresses every other
                 # share on this axis, which is what makes cross-axis share comparisons misleading.
@@ -1992,6 +2865,7 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
                          f"merely above 1×.{_note}</p>")
                 h.append(f"<table><tr><th>operation</th><th>median count<br>per block</th>"
                          f"<th>share of<br>counted ops</th>"
+                         f"<th>blocks<br>compared</th>"
                          f"<th>median of<br>per-block ratios</th>"
                          f"<th>vs {x(base)} overall</th><th></th></tr>")
                 for k, v, cnt, ca, cb, vol in top:
@@ -2001,6 +2875,12 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
                              f"where both guests report it'>{k}</td>"
                              f"<td><span class=cA>{n(ca)}</span><br><span class=cB>{n(cb)}</span></td>"
                              f"<td>{('%.3f%%' % (vol*100)) if vol else '—'}</td>"
+                             # Coverage as a COLUMN, not a tooltip: the emulator prints an opcode row
+                             # only above some threshold, and the two guests do not cross it on the
+                             # same blocks — `srl` is reported by the reth guest on half the sample.
+                             # A ratio over a self-selected subsample looked like a finding until the
+                             # count was visible beside it.
+                             f"<td class={'na' if cnt < len(rows) * 0.9 else ''}>{cnt}/{len(rows)}</td>"
                              # Same precision as the baseline it is compared against: at 2 decimals
                              # `shift` printed 1.22x beside a 1.221x baseline, so its red bar looked
                              # wrong — the real ratio is 1.2241, above the baseline. The colour was
@@ -2163,15 +3043,242 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None):
                      f"{pwu or 'prover work'}, which is a separate, ~7× slower run.</p>")
         h.append(note)
         h.append("</section>")
-    h.append(f"<p class=note style='margin-top:34px;border-top:1px solid var(--line);padding-top:16px'>"
-             f"<b>Measured on</b> {_hostinfo()} · {time.strftime('%Y-%m-%d %H:%M %Z')}. Work-units "
-             f"({'/'.join(sorted({AXES[s['axis']]['unit'] for s in summaries}))}) and prover-work figures "
-             f"are deterministic — identical on any machine. Only the exec-time column depends on this "
-             f"host.</p>")
+    # Provenance + the timing model in full. It sits at the foot on purpose: the exec-time column
+    # is the only figure on this page that is not machine-independent, so a reader who wants to
+    # trust it needs the backend, the rates and the caveats — and nobody else should step over them.
+    thr_rows = ''.join(
+        f"<tr><td>{g}</td><td class=n>{v:,.0f}</td><td class=why>{note}</td></tr>"
+        for g, v, note in (
+            ('monad-r3-zisk', PURE_MSTEPS_PER_S['monad-r3-zisk'], 'ZisK ASM backend'),
+            ('monad-sam-zisk', PURE_MSTEPS_PER_S['monad-sam-zisk'], 'ZisK ASM backend'),
+            ('zisk-reth', PURE_MSTEPS_PER_S['zisk-reth'], 'ZisK ASM backend'),
+            ('monad-r3-sp1', PURE_MSTEPS_PER_S['monad-r3-sp1'],
+             'SP1 executor, <code>--no-gas</code>'),
+            ('monad-sam-sp1', PURE_MSTEPS_PER_S['monad-sam-sp1'],
+             'SP1 executor, <code>--no-gas</code>'),
+            ('rsp', PURE_MSTEPS_PER_S['rsp'],
+             'SP1 executor, <code>--no-gas</code> — <b>SP1 seconds measure a different '
+             'emulator than the ZisK rows; compare them within a backend, not across</b>')))
+    h.append(
+        f"<p class=note style='margin-top:34px;border-top:1px solid var(--line);padding-top:16px'>"
+        f"<b>Measured on</b> {_hostinfo()} · {time.strftime('%Y-%m-%d %H:%M %Z')}. Work-units "
+        f"({'/'.join(sorted({AXES[s['axis']]['unit'] for s in summaries}))}) and prover-work figures "
+        f"are deterministic — identical on any machine, and every lever verdict on this branch was "
+        f"decided on them. <b>Only the exec-time column is host- and backend-dependent</b>: it is "
+        f"modelled, not timed — <code>work ÷ throughput</code>.</p>"
+        f"<details class=note style='margin-top:10px'><summary><b>How exec time is computed, and why "
+        f"raw wall-clock is not it</b></summary>"
+        f"<p>Timing the emulator <i>process</i> measures mostly the harness: <code>ziskemu -e</code> "
+        f"re-converts the ELF to ZisK ROM on every invocation (0.6–1.7 s depending on the guest — the "
+        f"entire measurement on a small block), and campaign runs are parallel on top of that. The "
+        f"emulator's <code>duration=</code> field avoids both: it times the run itself.</p>"
+        f"<p>The ZisK rates below are measured <b>the way the RTP pipeline measures</b>: "
+        f"<code>ziskemu -e ELF -i INPUT -m</code>, reading the emulator's own <code>duration=</code> "
+        f"field, which times <code>process_rom()</code> only. Calibrated on this host, sequentially, "
+        f"over 5 blocks spanning 30–360 M steps (residuals 1.4–2.8 %). The campaign collects that "
+        f"same field per block, but under 4-way parallelism it reads ~35 % slow, so the column is "
+        f"modelled from the sequential rates rather than averaged from the cache. The SP1 rows use "
+        f"the same protocol with SP1's own tool — <code>sp1-runner --mode execute --no-gas</code>, "
+        f"sequential, the same five blocks (the gas pass is a separate, slower estimation and does "
+        f"not belong in an execution figure).</p>"
+        f"<table class=cv><tr><th>guest</th><th>M steps or cycles/s</th><th>backend</th></tr>"
+        f"{thr_rows}</table>"
+        f"<p><b>Caveats worth carrying.</b> Per-block rates vary with the instruction mix "
+        f"(109–130 M steps/s for monad-opt across the calibration blocks), so read these seconds as "
+        f"±15 %. In-guest setup is <i>included</i>, and measured on the profiles it is small: "
+        f"KZG/blob ≈ 1 %, witness parse ≈ 0.5 % of the Monad guest — excluding them would move "
+        f"nothing. And this is <b>emulation</b> time on one host: it says how much work a block is, "
+        f"not what a proof costs. The ZisK ASM backend (<code>cargo-zisk execute --asm</code>) runs "
+        f"the same guests ~2.4× faster still (≈300 M steps/s, measured on the devcore box), so a number "
+        f"quoted from that backend is not comparable to one from here.</p></details>")
     h.append("</div>")
     h.append(f"<script>{_HIST_JS}</script>")
+    h.append(f"<script>{_AXBAR_JS}</script>")
     open(path, 'w').write("\n".join(h))
     print(f"\nwrote {path}")
+
+# ────────────────────────────────── summary page ────────────────────────────────────────
+# The one-page synthesis of the report above — same numbers, none recomputed: everything here
+# is read from the summaries write_html renders, so the two cannot disagree. It exists because
+# the full report is a methods document as much as a dashboard, and a reader who only wants the
+# answer has to dig for it. Design rule: one number per question, and ONE caveat inline — the
+# one that changes a conclusion when ignored. Every methodological defence stays in the full
+# report, linked, rather than being restated smaller here.
+#
+# Four questions, one line each:  how much more? (median ratio + prover-work ratio) ·
+# is it stable? (spread + small-vs-large split) · where? (top work families by A−B delta) ·
+# anything off? (regime split + outlier count, pointing at the full report).
+
+def _fam_delta(s, sign=1, top=3):
+    """Top work families by (A−B)×sign instructions/block — where the gap sits, read in the
+    direction of the headline: sign=+1 lists where the dearer guest spends more, sign=−1
+    (A cheaper overall) where the saving comes from.
+
+    Families, not gap_split's cost categories: 'EVM interpreter' answers the reader's
+    question, 'Opcodes' restates the cost model's bucketing."""
+    fams = s.get('families')
+    if not fams: return []
+    sa, sb = fams[0], fams[1]
+    d = sorted(((k, (sa.get(k, 0) - sb.get(k, 0)) * sign, sa.get(k, 0), sb.get(k, 0))
+                for k in set(sa) | set(sb)), key=lambda t: -t[1])
+    return [t for t in d[:top] if t[1] > 0]
+
+def _summary_lines(s, rows):
+    """The per-axis synthesis, as data — rendered twice (HTML + markdown) below.
+
+    No lead sentence restating the ratios: the cards carry the percentages themselves
+    (team feedback — the prose duplicated the numbers sitting right above it)."""
+    A, B, u = s['a_name'], s['b_name'], s['unit']
+    bs = sorted(int(b) for b in rows)
+    pct = (s['ratio_median'] - 1) * 100
+    pw = s.get('pw_ratio_median')
+    # Whether the instruction and prover-work ratios agree is a finding, but only when they
+    # clearly do not (>2% apart on the ratio scale; at 0.5% the full report says "too close
+    # to call" and this page must not contradict it). Direction phrased on the ratio, so it
+    # reads correctly whether A is the dearer or the cheaper guest.
+    mix = None
+    if pw and abs(pw / s['ratio_median'] - 1) > .02:
+        mix = (f"The two ratios disagree: relative to <b class=cB>{B}</b>, "
+               f"<b class=cA>{A}</b>'s work mix is "
+               f"<b>{'dearer' if pw > s['ratio_median'] else 'cheaper'} to prove</b> than its "
+               f"instruction count suggests.")
+    # Stable = a property of the guests; block-dependent = of what the block does. 8% is the
+    # bar the full report's histogram prose implies (its own axes sit at ~5%), not a standard.
+    stable = s['cv'] <= 8
+    stab = (f"The gap is <b>{'stable' if stable else 'block-dependent'}</b>: it swings "
+            f"±{s['cv']:.1f}% block to block")
+    if s.get('ratio_small') and s.get('ratio_large'):
+        grow = abs(s['ratio_large'] - s['ratio_small']) / s['ratio_small'] > .05
+        stab += (f", and <b>grows with block size</b> ({x(s['ratio_small'])} on the smaller "
+                 f"half vs {x(s['ratio_large'])} on the larger)" if grow else
+                 f" and is the same on small and large blocks ({x(s['ratio_small'])} vs "
+                 f"{x(s['ratio_large'])})")
+    stab += "."
+    sign = 1 if pct > 0 else -1
+    fams = [f"<b>{k}</b> ({'+' if sign > 0 else '−'}{d/1e6:,.0f}M/block"
+            + (f", {x(a/b)}" if b else "") + ")"
+            for k, d, a, b in _fam_delta(s, sign)]
+    fam_lead = ("The extra work sits mostly in" if sign > 0 else
+                "The saving comes mostly from")
+    extra = []
+    if s.get('curve'):
+        c = s['curve']
+        # This count is a property of the PAIR, not of the blocks: the detector flags a block
+        # whose 256-bit multiplication intensity sits above 2.5× THIS axis's median for either
+        # guest. So the same block is flagged against a guest that lacks the BN254 precompile
+        # and not against one that has it — which is why 79/373 (vs `rsp`) and 3/504 (two Monad
+        # guests, both accelerated) are different questions rather than a contradiction. Saying
+        # "runs curve arithmetic in software" on every axis asserted the wrong thing on the
+        # axis where neither guest does; name the unaccelerated guest instead, when there is one.
+        who = {'a': A, 'b': B}
+        soft = [who[k] for k in 'ab'
+                if (s.get('bn254_path') or {}).get(k)
+                and s['bn254_path'][k][0] is not None and not s['bn254_path'][k][2]]
+        if soft:
+            extra.append(f"<b>{' and '.join(soft)}</b> has no precompile-backed BN254 and runs "
+                         f"that curve arithmetic in software, which sets {c['n']} of {s['n']} "
+                         f"blocks apart; excluding them the median is {x(c['med_clean'])}.")
+        else:
+            extra.append(f"{c['n']} of {s['n']} blocks are far more multiplication-heavy than the "
+                         f"rest on one side — both guests here do have the BN254 precompile; "
+                         f"excluding them the median is {x(c['med_clean'])}.")
+    return {'A': A, 'B': B, 'u': u, 'bs': bs, 'pct': pct, 'mix': mix, 'stab': stab,
+            'fams': fams, 'fam_lead': fam_lead, 'extra': extra}
+
+# The caveat that survives into the summary: the one whose omission misquotes the result.
+_SUMMARY_CAVEAT = ("Ratios compare two guests <b>within one zkVM</b> — never quote a number "
+                   "across backends. These are execution and prover-work figures, "
+                   "<b>not proving time</b>.")
+
+def write_summary(path, md_path, summaries, allrows, full_href):
+    pairs = " · ".join(f"{s['a_name']} vs {s['b_name']}" for s in summaries)
+    ts = time.strftime('%Y-%m-%d %H:%M %Z')
+    h = [f"<title>summary — {pairs}</title>", f"<style>{_CSS}</style>", "<div class=wrap>",
+         "<p class=eyebrow>zkvm-bench · comparison summary</p>",
+         "<h1>The short version</h1>",
+         f"<p class=sub>{_SUMMARY_CAVEAT} Methodology, per-block detail and every defence of "
+         f"these numbers: <a href='{full_href}' style='color:var(--accent)'>the full report</a>. "
+         f"Generated by <code>profiling/compare.py</code> · {ts}.</p>"]
+    md = [f"# zkvm-bench — comparison summary · {ts}", ""]
+    for s in summaries:
+        d = _summary_lines(s, allrows[s['axis']])
+        A, B, u, bs = d['A'], d['B'], d['u'], d['bs']
+        h.append("<section>")
+        bk = AXES[s['axis']]['backend'].upper() if s['axis'] in AXES else ''
+        h.append(f"<div class=axhead><span class=nm>{s['axis'].upper()}</span>"
+                 f"<span class=vs>{A} &nbsp;vs&nbsp; {B} · on {bk} · {s['n']} blocks "
+                 f"{bs[0]}–{bs[-1]}</span></div>")
+        # The percentage is the ONLY notation here: "+19.1%" and "1.191×" are the same figure,
+        # and showing both made the reader look for a second fact that does not exist. The ×
+        # notation stays in the full report, which is where a cross-page reader lands anyway.
+        # Coloured by direction — dearer red, cheaper green, the report's own
+        # above/below-parity palette (NOT the guest gold/blue) — lightened so the tone signals
+        # without shouting.
+        gp = lambda r: ('+' if r > 1 else '−') + f"{abs(r - 1) * 100:.1f}%"
+        gc = lambda r: '#ec8279' if r > 1 else '#78d1a7'   # --red / --green, lightened
+        h.append("<div class=cards>")
+        h.append(f"<div class='card hero'><div class=k>median gap</div>"
+                 f"<div class=v style='color:{gc(s['ratio_median'])}'>{gp(s['ratio_median'])}</div>"
+                 f"<div class='u blk'>{u} of <span class=cA>{A}</span> vs "
+                 f"<span class=cB>{B}</span>, middle block</div></div>")
+        if s.get('pw_ratio_median'):
+            h.append(f"<div class='card hero'><div class=k>prover work</div>"
+                     f"<div class=v style='color:{gc(s['pw_ratio_median'])}'>"
+                     f"{gp(s['pw_ratio_median'])}</div>"
+                     f"<div class='u blk'>same, in {s['pw_unit']} (trace area) — what proving "
+                     f"will cost</div></div>")
+        h.append(f"<div class=card><div class=k>median {u}</div>"
+                 f"<div class=duo><span class=cA>{s['a_median']/1e6:,.0f}M</span>"
+                 f"<span class=sep>vs</span><span class=cB>{s['b_median']/1e6:,.0f}M</span></div>"
+                 f"<div class='u blk'>deterministic — same on any machine</div></div>")
+        # nsecs (SP1's --no-gas pass) is the honest timing when it exists — same rule as the
+        # full report's card.
+        ta, tb = ((s.get('a_nsecs_median'), s.get('b_nsecs_median'))
+                  if s.get('a_nsecs_median') else
+                  (s.get('a_secs_median'), s.get('b_secs_median')))
+        if ta and tb:
+            h.append(f"<div class=card><div class=k>median exec time</div>"
+                     f"<div class=duo><span class=cA>{ta:.2f}s</span>"
+                     f"<span class=sep>vs</span><span class=cB>{tb:.2f}s</span></div>"
+                     f"<div class='u blk'>pure execution: work ÷ this guest's measured emulator "
+                     f"throughput on the reference host — not proving time</div></div>")
+        h.append(f"<div class=card><div class=k>spread</div><div class=v>±{s['cv']:.1f}"
+                 f"<span class=u>%</span></div><div class='u blk'>block-to-block swing of "
+                 f"the ratio</div></div>")
+        h.append("</div>")
+        h.append(f"<div class=insight>{d['stab']}"
+                 + (f"<br>{d['mix']}" if d['mix'] else "")
+                 + (f"<br>{d['fam_lead']} {', '.join(d['fams'])}."
+                    if d['fams'] else "")
+                 + "".join(f"<br><span style='color:var(--muted)'>{e}</span>"
+                           for e in d['extra'])
+                 + "</div>")
+        h.append("</section>")
+        # the same synthesis, paste-able (Slack / Notion) — plain text, no HTML markup
+        strip = _plain
+        head = f"**{gp(s['ratio_median'])} {u}** on the median block"
+        if s.get('pw_ratio_median'):
+            head += f" · prover work: **{gp(s['pw_ratio_median'])}** ({s['pw_unit']})"
+        head += f" · median {s['a_median']/1e6:,.0f}M vs {s['b_median']/1e6:,.0f}M {u}"
+        if ta and tb:
+            head += f" · exec {ta:.2f}s vs {tb:.2f}s"
+        md += [f"## {s['axis'].upper()} — {A} vs {B} (on {bk} · {s['n']} blocks {bs[0]}–{bs[-1]})",
+               f"- {head}",
+               f"- {strip(d['stab'])}"]
+        if d['mix']:
+            md.append(f"- {strip(d['mix'])}")
+        if d['fams']:
+            md.append(f"- {strip(d['fam_lead']).lower()}: {strip(', '.join(d['fams']))}")
+        md += [f"- {strip(e)}" for e in d['extra']]
+        md.append("")
+    h.append(f"<p class=sub style='margin-top:30px;border-top:1px solid var(--line);"
+             f"padding-top:14px'>{_SUMMARY_CAVEAT}</p>")
+    h.append("</div>")
+    md += [f"_{_plain(_SUMMARY_CAVEAT)}_",
+           f"_Full report (methodology, per-block detail, outliers): {full_href}_"]
+    open(path, 'w').write("\n".join(h))
+    open(md_path, 'w').write("\n".join(md) + "\n")
+    print(f"wrote {path}\nwrote {md_path}")
 
 # ────────────────────────────────── deep pass ───────────────────────────────────────────
 
@@ -2186,7 +3293,7 @@ def deep(axis, blocks, args):
                    '--out', out, '--aggregate', '--tab-prefix', side['name']]
             for b in blocks:
                 p = resolve_input(side, b)
-                if side['src'] == 'monad-framed':
+                if needs_framing(ax['backend'], side):
                     t = tempfile.NamedTemporaryFile(suffix=f'.{b}.bin', delete=False).name
                     frame_ziskos(p, t); tmps.append(t); p = t
                 cmd += ['-i', p]
@@ -2212,7 +3319,7 @@ def spread(axis, s, side_k='a'):
             p = resolve_input(side, b)
             if not p:
                 print(f"[spread {axis}] no input for block {b}"); return
-            if side['src'] == 'monad-framed':
+            if needs_framing(ax['backend'], side):
                 t = tempfile.NamedTemporaryFile(suffix=f'.{b}.bin', delete=False).name
                 frame_ziskos(p, t); tmps.append(t); p = t
             out = os.path.join(HERE, 'results', f'spread-{axis}-{tag}')
@@ -2245,7 +3352,8 @@ def parse_blocks(spec):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--axis', action='append', choices=sorted(AXES),
-                    help='which same-zkVM pair (default: all)')
+                    help='which same-zkVM pair; repeatable. Default: cur-zisk + cur-sp1 — NOT every '
+                         'axis. See profiling/RUNBOOK.md for the canonical four.')
     ap.add_argument('--block-min', type=int, metavar='N', help='ignore blocks below N')
     ap.add_argument('--block-max', type=int, metavar='N', help='ignore blocks above N')
     ap.add_argument('--blocks', help='explicit set, e.g. 25552005-25552088 and/or a comma list; '
@@ -2290,6 +3398,10 @@ def main():
                          'execution each — ~13s on ZisK, ~24s on SP1 — cached PER BLOCK, so raising N '
                          'only profiles the new ones. Sample size matters: 10 -> 50 moved the C++ '
                          'family from 13.6x to 5.11x on SP1, so a small sample was not settled')
+    ap.add_argument('--summary-from', metavar='JSON',
+                    help='rebuild the one-page summary from an existing --json payload and exit. '
+                         'Measures nothing and never loads the run cache, so it is instant. '
+                         '--axis then selects and orders the sections')
     ap.add_argument('--no-report', action='store_true',
                     help='terminal summary only: skip the HTML and JSON files')
     ap.add_argument('--emu', default='~/.zisk/bin/ziskemu')
@@ -2300,23 +3412,75 @@ def main():
     try: sys.stdout.reconfigure(line_buffering=True)
     except Exception: pass
 
+    # Re-render only. The --json payload already carries every summary and every per-block row,
+    # which is all the summary page reads — so this path returns before load_cache(). That
+    # matters: the cache is ~155 MB on disk and ~1.3 GB resident, and loading it IS the entire
+    # cost of a run that has nothing left to measure (4 s and 1.3 GB per axis, enough to get a
+    # multi-axis re-render OOM-killed). Nothing here can measure, so nothing here can disagree
+    # with the report the payload came from.
+    if args.summary_from:
+        payload = json.load(open(args.summary_from))
+        # --axis both SELECTS and ORDERS the sections here, so the page can be arranged for a
+        # reader (baseline pair first, reference pair second) rather than in the order the run
+        # happened to measure them. Without it, the payload's own order is kept.
+        if args.axis:
+            order = [a for a in args.axis if a in payload]
+            missing = [a for a in args.axis if a not in payload]
+            if missing:
+                print(f"not in {os.path.basename(args.summary_from)}: {', '.join(missing)}")
+            if not order:
+                print(f"none of the requested axes are in {args.summary_from}"); return 1
+        else:
+            order = list(payload)
+        base = os.path.splitext(args.summary_from)[0]
+        write_summary(base + '-summary.html', base + '-summary.md',
+                      [payload[a]['summary'] for a in order],
+                      {a: payload[a]['blocks'] for a in order},
+                      full_href=os.path.basename(base + '.html'))
+        return 0
+
     tools ={'zisk': os.path.expanduser(args.emu), 'sp1': os.path.expanduser(args.runner)}
-    axes = args.axis or sorted(AXES)
+    # Not `sorted(AXES)`: that would pull the levers axes into a bare `./compare.py` and change
+    # what the default report says without anyone asking for it.
+    axes = args.axis or list(DEFAULT_AXES)
     want = parse_blocks(args.blocks) if args.blocks else None
     cache = load_cache()
+    skipped = []           # axes dropped for a missing ELF — recapped at the end,
+                           # because a warning printed before a two-hour run scrolls away
     summaries, allrows, payload = [], {}, {}
 
     collected = []
     for axis in axes:                                    # 1) run everything first…
         if not os.path.exists(tools[AXES[axis]['backend']]):
-            print(f"skip {axis}: {AXES[axis]['backend']} tool not found ({tools[AXES[axis]['backend']]})")
+            print(f"skip {axis}: {AXES[axis]['backend']} tool not found ({tools[AXES[axis]['backend']]})\n"
+                  f"      install it — profiling/RUNBOOK.md § Prerequisites")
             continue
         # Guest ELFs, checked here rather than deep inside collect() — a missing one used to surface
         # as a raw FileNotFoundError from the cache's mtime stamp.
         missing = [rp(AXES[axis][k]['elf']) for k in ('a', 'b')
                    if not os.path.exists(rp(AXES[axis][k]['elf']))]
         if missing:
-            print(f"skip {axis}: guest ELF not built — {', '.join(missing)}")
+            # Two very different situations look identical on disk, and only one of them is safe to
+            # skip. The cache tells them apart: measurements recorded HERE under this build's name mean
+            # the build existed and was deleted — the axis outlived its guest, and skipping it quietly
+            # leaves a stale declaration to rot in compare.py. A name with no local measurements is
+            # almost always a build this checkout never received, which IS a skip.
+            names = [AXES[axis][k]['name'] for k in ('a', 'b')
+                     if not os.path.exists(rp(AXES[axis][k]['elf']))]
+            measured = {n: sum(len(cache.profiles_for(i_)) for i_, _mt in cache.builds_by_name(n))
+                        for n in names}
+            orphaned = {n: c for n, c in measured.items() if c}
+            if orphaned:
+                det = ', '.join(f"{n} ({c} cached measurement(s))" for n, c in orphaned.items())
+                sys.exit(f"axis {axis}: its guest is gone, but the axis is still declared — {det}.\n"
+                         f"      That build was measured on this machine, so the ELF was deleted rather\n"
+                         f"      than never received: the axis has outlived its guest and would report\n"
+                         f"      coverage it cannot produce.\n"
+                         f"      Remove it:  ./axis.py rm {axis}      Find every such axis:  ./axis.py gc")
+            print(f"warning: skipping {axis} — guest ELF not built: {', '.join(missing)}\n"
+                  f"      a fresh clone has no ELF: they are built per branch and are git-ignored.\n"
+                  f"      profiling/RUNBOOK.md § Compare two versions of the guest, A to Z")
+            skipped.append((axis, missing))
             continue
         blocks = blocks_for(axis)
         if want is not None:
@@ -2336,16 +3500,17 @@ def main():
             print(f"skip {axis}: every run failed (see --force / tool paths)"); continue
         collected.append((axis, blocks, rows))
 
-    # 2) …pool EVM gas. It's a property of the BLOCK, and only the reth ZisK guest prints it, so
-    # read it from the whole CACHE — otherwise an --axis sp1 run shows no gas even though a past
-    # zisk run already measured it.
+    # 2) …pool EVM gas and tx count. Both are properties of the BLOCK, and only the reth ZisK guest
+    # prints them, so an `--axis sp1` run must still see what a past zisk run measured. They live in
+    # each block file's `chain`, written by whichever guest recorded them — so this reads the blocks
+    # in play instead of scanning every entry ever cached, as it had to when one flat dict held
+    # everything.
     gas_map, tx_map = {}, {}
-    for k, v in cache.items():
-        if not isinstance(v, dict): continue
-        try: blk = int(k.split('/')[2])
-        except (IndexError, ValueError): continue
-        if v.get('gas'): gas_map[blk] = v['gas']
-        if v.get('txs'): tx_map[blk] = v['txs']          # tx count is a block property too
+    for _axis, blocks, _rows in collected:
+        for b in blocks:
+            ch = cache.chain(b)
+            if ch.get('gas'): gas_map[int(b)] = ch['gas']
+            if ch.get('txs'): tx_map[int(b)] = ch['txs']
 
     for axis, blocks, rows in collected:                 # 3) …then summarise
         s = summarize(axis, rows, gas_map)
@@ -2436,6 +3601,20 @@ def main():
         if args.spread: spread(axis, s, args.spread_side)
 
     if not summaries: return 1
+    # One binary under two labels. `zisk`/`sp1` follow use-gen (see AXES), so after a generation
+    # switch they can be the very build another axis names — two sections of one report describing
+    # the same thing. Derived from a_ident/b_ident, i.e. from what ran, so it cannot be talked out of.
+    _by_ident = {}
+    for _s in summaries:
+        for _k in 'ab':
+            if _s[f'{_k}_ident']:
+                _by_ident.setdefault(_s[f'{_k}_ident'], []).append((_s['axis'], _s[f'{_k}_name']))
+    for _id, _uses in _by_ident.items():
+        if len({n for _, n in _uses}) > 1:
+            print(f"\nWARNING: one build, several labels — {_id[:12]} ran as "
+                  + ", ".join(f"{n} (axis {a})" for a, n in _uses) + ".\n"
+                  f"         Those sections describe the SAME binary. If one of them is monad-zisk or\n"
+                  f"         monad-sp1, `use-gen` moved it onto the generation you selected.")
     # Cross-axis control, computed once both axes are summarised. "This block runs BN254 in software"
     # is a property of the BLOCK, not of the backend, so the axis that HAS a per-block mul counter
     # can label blocks for the axis that does not. Without this the control compared 37.8% on
@@ -2455,14 +3634,67 @@ def main():
             s['bn254_borrowed'] = True                   # labelled: the flag came from the other axis
 
     # One command = one full run: the report is produced unless explicitly declined.
+    chose_paths = bool(args.html_out or args.json_out)      # did the caller name them?
     if not args.no_report:
         args.html_out = args.html_out or os.path.join(HERE, 'results', 'compare.html')
         args.json_out = args.json_out or os.path.join(HERE, 'results', 'compare.json')
+
+    # A run capped with --limit or pinned to --blocks measures a SAMPLE, and its summary statistics
+    # describe that sample only. Writing it to the canonical path replaces a whole-set report with a
+    # handful of blocks, under the same filename, with nothing to show that it happened — it was done
+    # twice while building this, and the only reason it surfaced is that levers.py refuses an n below
+    # its threshold. Consumers should not have to defend themselves one by one, so a sampled run
+    # writes beside the canonical file instead of over it. Naming the path explicitly still wins.
+    if (args.limit or args.blocks) and not chose_paths and not args.no_report:
+        args.json_out = os.path.join(HERE, 'results', 'compare-partial.json')
+        args.html_out = os.path.join(HERE, 'results', 'compare-partial.html')
+        print(f"\nnote: --{'limit' if args.limit else 'blocks'} makes this a sample, not the block "
+              f"set the canonical report covers — writing compare-partial.* instead of compare.*.\n"
+              f"      Pass --json/--html to choose the path yourself.")
+
     if args.json_out:
+        # An --axis subset measures FEWER axes, not fewer blocks: its numbers are canonical, they
+        # just do not cover everything. Merge rather than replace, so running one axis stops dropping
+        # the others from the file — the failure that sent a levers.py build looking for axes a
+        # two-axis sweep had just deleted.
+        if os.path.exists(args.json_out) and set(payload) != set(AXES):
+            try:
+                prev = json.load(open(args.json_out))
+                kept = [a for a in prev if a not in payload]
+                if kept:
+                    payload = {**prev, **payload}
+                    print(f"\nmerged into {os.path.basename(args.json_out)}: kept "
+                          f"{', '.join(sorted(kept))} from the previous run")
+            except Exception:
+                pass                                        # unreadable/absent: write ours
         json.dump(payload, open(args.json_out, 'w'), indent=1); print(f"\nwrote {args.json_out}")
     if args.html_out:
         os.makedirs(os.path.dirname(args.html_out), exist_ok=True)
-        write_html(args.html_out, summaries, allrows, gas_map, tx_map)
+        # The summary rides along with the report — same numbers, so they are written together
+        # or not at all. Named after the report (compare.html -> compare-summary.{html,md}), so a
+        # report written to another path gets its own summary instead of overwriting the default.
+        base, _ = os.path.splitext(args.html_out)
+        sum_html, sum_md = base + '-summary.html', base + '-summary.md'
+        write_html(args.html_out, summaries, allrows, gas_map, tx_map,
+                   summary_href=os.path.basename(sum_html))
+        write_summary(sum_html, sum_md, summaries, allrows,
+                      full_href=os.path.basename(args.html_out))
+        # The JSON may now hold axes this render does not: it merges, the HTML is a view of the run.
+        # Say so, rather than let the two disagree silently under matching filenames.
+        _extra = sorted(set(payload) - {s['axis'] for s in summaries})
+        if _extra:
+            print(f"      note: {os.path.basename(args.html_out)} shows the {len(summaries)} axis/axes "
+                  f"just run; {os.path.basename(args.json_out)} also holds {', '.join(_extra)}. "
+                  f"Re-run those axes to refresh the report.")
+    # Recap the skips LAST. The warning is printed before a run that can take hours, so by the time
+    # the reports land it has long scrolled off — and a report quietly covering fewer axes than were
+    # asked for is exactly the kind of thing nobody notices until a number looks wrong.
+    if skipped:
+        print(f"\n  {len(skipped)} axis/axes were SKIPPED and are absent from these reports:")
+        for _ax, _miss in skipped:
+            print(f"      {_ax}  (missing: {', '.join(os.path.basename(m) for m in _miss)})")
+        print("      Build or copy the ELF to include them; ./axis.py gc removes any whose build was\n"
+              "      deleted rather than never received.")
     return 0
 
 if __name__ == '__main__':

@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+# cli/bench-pairs — one command from "these are the comparisons I want" to compare.html.
+#
+# The plumbing between a branch and a published ratio is six tools deep (build the guest, generate a
+# witness corpus, select the generation, mint the reference guest's inputs, declare the axes, measure,
+# render). Each is documented and each is easy to get subtly wrong in a way that costs hours: a corpus
+# generated from the wrong branch, a generation left unselected so the axes read the previous format, a
+# reference side with no inputs so an axis reports coverage over zero blocks. This drives them in the
+# right order and, above all, SKIPS every step whose output already exists.
+#
+#   ./bench-pairs --host <box> --pair A:B:BACKEND [--pair …]        plan (default): decide, do nothing
+#   ./bench-pairs --host <box> --pair … run                         do it
+#
+#   A and B are each either
+#     a BRANCH  (anything containing '/', e.g. al/zkvm-r3, sam/zkvm-zisk-sp1)
+#               -> needs a Monad guest build, and a witness corpus generated from it
+#     a GUEST   (a name under guests/, e.g. zisk-reth, rsp, monad-zisk, monad-variants/r3/monad-r3-zisk)
+#               -> used as it is
+#   BACKEND is zisk or sp1. It must match both sides: an axis compares two builds of ONE zkVM, and a
+#   cross-backend ratio is meaningless (different units, different emulator).
+#
+# Example — the three comparisons that make up a full report:
+#   ./bench-pairs --host nyc-003 \
+#       --pair monad-zisk:zisk-reth:zisk \
+#       --pair al/zkvm-r3:sam/zkvm-zisk-sp1:zisk \
+#       --pair monad-sp1:rsp:sp1
+#
+# What it will NOT do without being asked twice: generate a corpus (hours, and it can reset a 350 GB
+# trie on the box) or destroy anything. `plan` is the default for that reason — read it, then add `run`.
+#
+# Reuse, which is the whole point. Each check is read-only and costs seconds:
+#   guest build     a branch whose ELF pair is already staged in a generation is not rebuilt —
+#                   witness-backfill's own sha256 comparison decides, not a name or a date
+#   witness corpus  a generation holding a complete corpus for the range is reused as-is
+#   generation      use-gen is invoked only when `current` points somewhere else
+#   reference input a reth-side .bin present for every block in the range is not re-minted
+#   measurements    nothing to do: the profile cache is keyed by ELF CONTENT, so a build measured
+#                   under any axis, at any path, is already known (profiling/cache-format.md)
+#   axes            an axis whose two sides already match is left alone, never re-declared
+#
+# Env: BLOCKS (range or dir, default the current generation's corpus) · REPORT (html out) ·
+#      EPHEMERAL=1 (mark declared axes ephemeral — see axis.py prune) · FORCE=1 (pass through)
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+PROF="$ROOT/profiling"
+BACKFILL="$ROOT/infra/monad-witness/witness-backfill"
+USEGEN="$ROOT/guests/monad/use-gen"
+
+HOST="${HOST:-}"
+BLOCKS="${BLOCKS:-}"
+REPORT="${REPORT:-$PROF/results/compare.html}"
+PAIRS=()
+cmd=plan
+
+die()  { echo "bench-pairs: $*" >&2; exit 2; }
+say()  { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
+note() { printf '  %s\n' "$*"; }
+todo() { printf '  \033[1;33mTODO\033[0m  %s\n' "$*"; }
+have() { printf '  \033[1;32mhave\033[0m  %s\n' "$*"; }
+
+usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; /^set -euo/d'; exit "${1:-0}"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --host)  HOST="$2"; shift 2 ;;
+    --pair)  PAIRS+=("$2"); shift 2 ;;
+    --blocks) BLOCKS="$2"; shift 2 ;;
+    --report) REPORT="$2"; shift 2 ;;
+    plan|run) cmd="$1"; shift ;;
+    -h|--help) usage 0 ;;
+    *) die "unknown argument: $1 (see --help)" ;;
+  esac
+done
+[ "${#PAIRS[@]}" -gt 0 ] || usage 2
+
+# ------------------------------------------------------------------ resolving a side
+# A side resolves to: kind (branch|guest), an ELF path, a src, and a build name. `src` is derived, never
+# asked for: getting it wrong parses as garbage instead of failing, so it is not a decision to leave to
+# whoever types the pair.
+side_kind() { case "$1" in */*) echo branch ;; *) echo guest ;; esac; }
+
+# Guest name -> ELF path. Accepts a bare guest dir (guests/<n>/<n>.elf) and an explicit relative path.
+guest_elf() {
+  local g="$1"
+  if [ -f "$ROOT/$g" ]; then echo "$g"; return; fi                        # explicit path
+  if [ -f "$ROOT/guests/$g/$g.elf" ]; then echo "guests/$g/$g.elf"; return; fi
+  # monad-zisk / monad-sp1 are symlinks to the selected generation's pair
+  if [ -L "$ROOT/guests/$g/$g.elf" ]; then echo "guests/$g/$g.elf"; return; fi
+  echo ""
+}
+
+# `src` says where a side's input comes from, and the vocabulary is just two words: `monad` (a witness
+# from the selected generation) or `bin` (a reference guest's own pre-generated 1-<block>.bin). The
+# ziskos framing is derived from the BACKEND downstream, not spelled here — see compare.py's AXES note.
+guest_src() {
+  case "$1" in
+    *monad*) echo monad ;;
+    *) echo bin ;;
+  esac
+}
+
+# Branch -> an ELF for that branch and backend, or "" if there is none yet.
+#
+# Two places hold builds, and a branch can only be in one of them:
+#   guests/monad-variants/<leaf>/monad-<leaf>-<bk>.elf   a build that is no generation's canonical pair
+#   guests/monad/gen/<G>/elf/monad-zkvm-guest-<bk>.elf   the ONE pair a generation was created from
+#
+# The variants dir is tried FIRST and matched on the branch's leaf, which is exact. The generation is
+# tried second and ONLY against its canonical-pair table — never against the prose. An earlier version
+# grepped the whole PROVENANCE.md for the branch name, and since a generation's notes legitimately name
+# the OTHER lineages that read the same witnesses, `al/zkvm-r3` and `sam/zkvm-zisk-sp1` both matched the
+# same generation and resolved to the SAME ELF: a comparison of a build against itself, reported as a
+# clean 1.000x. Prose is not an index.
+branch_build() {
+  local br="$1" bk="$2" leaf d f
+  leaf="${br##*/}"                       # al/zkvm-r3 -> zkvm-r3
+  for d in "$ROOT"/guests/monad-variants/*/; do
+    [ -d "$d" ] || continue
+    for f in "$d"monad-*-"$bk".elf; do
+      [ -f "$f" ] || continue
+      # the variant's own token (monad-r3-zisk.elf -> r3) must end the branch leaf: zkvm-r3 -> r3
+      local tok; tok="$(basename "$f" | sed "s/^monad-//; s/-$bk\.elf\$//")"
+      case "$leaf" in *"$tok") echo "${f#$ROOT/}"; return ;; esac
+    done
+  done
+  for d in "$ROOT"/guests/monad/gen/*/; do
+    f="${d%/}/elf/monad-zkvm-guest-$bk.elf"
+    [ -f "$f" ] || continue
+    # Only the sha table's own line, which pairs a filename with the build name it IS.
+    grep -qE "^\|[^|]*monad-zkvm-guest-$bk\.elf[^|]*\|" "$d/PROVENANCE.md" 2>/dev/null || continue
+    grep -qF "$br" "$d/PROVENANCE.md" 2>/dev/null || continue
+    # ...and that branch must be the one the canonical pair came FROM, not merely mentioned.
+    grep -qE "(=|is) .?(origin/)?$br.? (rebased|—|-)" "$d/PROVENANCE.md" 2>/dev/null || continue
+    echo "${f#$ROOT/}"; return
+  done
+  echo ""
+}
+
+# The build NAME for a resolved ELF. Derived from the file, never from the branch string, because a
+# name is an identity this repo shares across tools: compare.py's throughput table, levers.py's
+# by-name lookups and cache/builds.json all key on it. bench-pairs first coined its own
+# (al-zkvm-r3-zisk from al/zkvm-r3), which measured fine — the cache is content-addressed — but left a
+# second name on one build and silently emptied the pure-time column, whose table knew only the first.
+build_name() {
+  local elf="$1" bk="$2" base gen alias
+  base="$(basename "$elf" .elf)"
+  case "$base" in
+    monad-zkvm-guest-*)
+      # A generation's canonical pair. Its PROVENANCE sha table names the build it IS:
+      #   | `monad-zkvm-guest-zisk.elf` (= `monad-sam-zisk`) | <sha> |
+      gen="$(dirname "$(dirname "$elf")")"
+      alias="$(grep -oE "monad-zkvm-guest-$bk\.elf\`? \(= \`?[a-z0-9-]+" "$ROOT/$gen/PROVENANCE.md" 2>/dev/null \
+               | sed 's/.*(= `\{0,1\}//' | head -1)"
+      echo "${alias:-$base}" ;;
+    *) echo "$base" ;;
+  esac
+}
+
+# Which generation holds the corpus a branch's build reads. Independent of WHERE the build lives: a
+# variant reads the selected generation's witnesses, which is the whole reason generations exist.
+branch_corpus_gen() {
+  local br="$1" d
+  for d in "$ROOT"/guests/monad/gen/*/; do
+    [ -f "$d/PROVENANCE.md" ] || continue
+    grep -qF "$br" "$d/PROVENANCE.md" 2>/dev/null || continue
+    basename "${d%/}"; return
+  done
+  echo ""
+}
+
+# How many blocks of the range does this directory of witnesses cover?
+corpus_count() {
+  local d="$1"
+  [ -d "$d" ] || { echo 0; return; }
+  ls "$d"/*.witness 2>/dev/null | wc -l | tr -d ' '
+}
+
+reth_missing() {
+  # Reference guests carry 1-<block>.bin. Report how many of the range's blocks have none.
+  local g="$1" n=0 b
+  for b in $RANGE_BLOCKS; do
+    [ -f "$ROOT/guests/$g/fixtures/1-$b.bin" ] || n=$((n + 1))
+  done
+  echo "$n"
+}
+
+# ------------------------------------------------------------------ the range
+CURGEN="$(readlink "$ROOT/guests/monad/current" 2>/dev/null | sed 's|.*/||')"
+CORPUS="$ROOT/guests/monad/current/witnesses"
+if [ -z "$BLOCKS" ]; then
+  [ -d "$CORPUS" ] || die "no current generation to take a range from — pass --blocks FIRST-LAST"
+  RANGE_BLOCKS="$(ls "$CORPUS"/*.witness 2>/dev/null | sed 's|.*/||;s|\.witness||' | sort -n)"
+else
+  case "$BLOCKS" in
+    # NOT `seq`: on macOS it prints 2.5552e+07 for a 8-digit block number, and every downstream
+    # file check then looks for a witness that cannot exist. Bitten three times before this comment.
+    *-*) RANGE_BLOCKS="$(python3 -c 'import sys; a,b=sys.argv[1:3]; print("\n".join(str(x) for x in range(int(a), int(b)+1)))' "${BLOCKS%%-*}" "${BLOCKS##*-}")" ;;
+    *)   die "--blocks wants FIRST-LAST" ;;
+  esac
+fi
+FIRST="$(echo "$RANGE_BLOCKS" | head -1)"
+LAST="$(echo "$RANGE_BLOCKS" | tail -1)"
+NBLOCKS="$(echo "$RANGE_BLOCKS" | wc -l | tr -d ' ')"
+
+say "range"
+note "$NBLOCKS blocks, $FIRST..$LAST"
+note "current generation: ${CURGEN:-<none selected>}"
+
+# ------------------------------------------------------------------ plan each pair
+say "pairs"
+NEED_CORPUS=()          # branches with no corpus yet
+NEED_SELECT=""          # generation to select, if any
+AXES=()                 # name:a_name:a_elf:a_src:b_name:b_elf:b_src:backend
+PROBLEMS=0
+
+for spec in "${PAIRS[@]}"; do
+  IFS=: read -r A B BK <<<"$spec"
+  [ -n "${BK:-}" ] || die "pair '$spec' — want A:B:BACKEND"
+  case "$BK" in zisk|sp1) ;; *) die "pair '$spec' — backend must be zisk or sp1" ;; esac
+  printf '\n  \033[1m%s  vs  %s\033[0m   (%s)\n' "$A" "$B" "$BK"
+
+  # Plain per-role variables rather than an associative array: the Mac ships bash 3.2, which has no
+  # `declare -A`, and this driver has to run where compare.py runs.
+  a_elf=; a_name=; a_src=; b_elf=; b_name=; b_src=
+  for role in a b; do
+    s=$([ "$role" = a ] && echo "$A" || echo "$B")
+    k="$(side_kind "$s")"
+    if [ "$k" = branch ]; then
+      e="$(branch_build "$s" "$BK")"
+      g="$(branch_corpus_gen "$s")"
+      eval "${role}_src='monad'"
+      if [ -n "$e" ]; then
+        bn="$(build_name "$e" "$BK")"
+        have "$s: built — $e  (build name: $bn)"
+        eval "${role}_elf='$e'"
+        eval "${role}_name='$bn'"
+        n="$(corpus_count "$ROOT/guests/monad/gen/$g/witnesses")"
+        if [ -n "$g" ] && [ "$n" -ge "$NBLOCKS" ]; then
+          have "$s: reads the $n-witness corpus in $g"
+          [ "$CURGEN" = "$g" ] || NEED_SELECT="$g"
+        else
+          todo "$s: no corpus covering $NBLOCKS blocks (${g:-no generation} has $n) — regenerate"
+          NEED_CORPUS+=("$s")
+        fi
+      else
+        todo "$s: no build for $BK — witness-backfill run (hours; may reset the trie on the box)"
+        NEED_CORPUS+=("$s")
+        eval "${role}_elf='guests/monad/gen/<new>/elf/monad-zkvm-guest-$BK.elf'"
+        eval "${role}_name='$(echo "$s" | tr '/' '-')-$BK'"
+      fi
+    else
+      e="$(guest_elf "$s")"
+      if [ -n "$e" ]; then
+        have "$s: $e"
+      else
+        todo "$s: no ELF — cli/gen-elf --guest $s"
+        PROBLEMS=$((PROBLEMS + 1))
+      fi
+      eval "${role}_elf='${e:-guests/$s/$s.elf}'"
+      eval "${role}_name='$s'"
+      eval "${role}_src='$(guest_src "$s" "$BK")'"
+      # A reference guest needs its own inputs for these blocks, or the axis silently covers fewer.
+      if [ "$(guest_src "$s" "$BK")" = bin ]; then
+        m="$(reth_missing "$s")"
+        if [ "$m" -eq 0 ]; then
+          have "$s: inputs present for all $NBLOCKS blocks"
+        else
+          # NOT a fault. A reference corpus is minted from a public archive RPC and the provider does
+          # not serve every block, so gaps are the normal state — this is why a report on 504 blocks
+          # says n=365. The axis simply covers the intersection; it is stated here so the n in the
+          # report is expected rather than investigated.
+          have "$s: inputs for $((NBLOCKS - m)) of $NBLOCKS blocks — the axis will cover those"
+          note "     ($m gaps: normal for a corpus minted through a public RPC. cli/witness-farm can"
+          note "      retry them, but a provider that refused a block once usually refuses it again.)"
+        fi
+      fi
+    fi
+  done
+
+  # Last line of defence, whatever the resolver did: two sides that are the same FILE are not a
+  # comparison. compare.py would run it and report 1.000x with a "one build, several labels" note —
+  # true, and useless. Catch it here, where the two names still say which pair was asked for.
+  if [ "$a_elf" = "$b_elf" ]; then
+    printf '  \033[1;31mBAD\033[0m   both sides resolve to the same ELF: %s\n' "$a_elf"
+    note "     '$A' and '$B' are not two builds here — a pair like this measures a build against"
+    note "     itself. Name the two builds explicitly (a path under guests/monad-variants/ works)."
+    PROBLEMS=$((PROBLEMS + 1))
+  fi
+  axis="$(echo "$a_name-vs-$b_name" | tr -cd 'a-zA-Z0-9-' | tr 'A-Z' 'a-z')"
+  AXES+=("$axis:$a_name:$a_elf:$a_src:$b_name:$b_elf:$b_src:$BK")
+  note "axis: $axis"
+done
+
+# ------------------------------------------------------------------ axes already declared?
+say "axes"
+declared="$("$PROF/axis.py" list 2>/dev/null | awk 'NF>3 && $1 !~ /^(axis|EPH|\*|[0-9]+)/ {print $1}' || true)"
+AXES_TO_ADD=()
+for a in "${AXES[@]}"; do
+  name="${a%%:*}"
+  if echo "$declared" | grep -qx "$name"; then
+    have "$name already declared"
+  else
+    todo "$name to declare (axis.py add)"
+    AXES_TO_ADD+=("$a")
+  fi
+done
+
+# ------------------------------------------------------------------ verdict
+say "what running would do"
+[ "${#NEED_CORPUS[@]}" -eq 0 ] \
+  && note "no corpus to generate — every branch already has one" \
+  || note "generate a corpus for: ${NEED_CORPUS[*]}   (witness-backfill, hours each)"
+[ -n "$NEED_SELECT" ] && note "select generation $NEED_SELECT (use-gen) — it changes what EVERY axis reads"
+[ "${#AXES_TO_ADD[@]}" -eq 0 ] && note "no axis to declare" || note "declare ${#AXES_TO_ADD[@]} axis/axes"
+note "measure + render: compare.py --block-min $FIRST --block-max $LAST -> $(basename "$REPORT")"
+note "measurements already in the cache are reused automatically (keyed by ELF content)"
+
+if [ "$cmd" = plan ]; then
+  printf '\n  plan only — nothing was started. Re-run with `run` to execute.\n'
+  [ "$PROBLEMS" -gt 0 ] && printf '  %d side(s) cannot resolve an ELF; fix those first.\n' "$PROBLEMS"
+  exit 0
+fi
+
+# ------------------------------------------------------------------ run
+[ "$PROBLEMS" -eq 0 ] || die "$PROBLEMS unresolved side(s) — see the plan above"
+
+if [ "${#NEED_CORPUS[@]}" -gt 0 ]; then
+  [ -n "$HOST" ] || die "corpus generation needs --host (the devcore box)"
+  for br in "${NEED_CORPUS[@]}"; do
+    say "corpus for $br"
+    note "delegating to witness-backfill — it probes the trie and rewinds rather than reloading"
+    HOST="$HOST" BLOCKS="$FIRST-$LAST" "$BACKFILL" run "$br" \
+      || die "witness-backfill failed for $br — nothing further attempted"
+  done
+  # A fresh corpus lands in a new generation; re-resolve rather than trusting the pre-run reading.
+  CURGEN="$(readlink "$ROOT/guests/monad/current" 2>/dev/null | sed 's|.*/||')"
+fi
+
+if [ -n "$NEED_SELECT" ] && [ "$CURGEN" != "$NEED_SELECT" ]; then
+  say "select generation $NEED_SELECT"
+  (cd "$ROOT/guests/monad" && ./use-gen "$NEED_SELECT")
+fi
+
+for a in "${AXES_TO_ADD[@]}"; do
+  IFS=: read -r name an ae asrc bn be bsrc bk <<<"$a"
+  say "declare $name"
+  # bash 3.2 + `set -u`: expanding an EMPTY array as "${a[@]}" is an unbound-variable error, so the
+  # expansion below is guarded. The first run of this script passed only because EPHEMERAL=1 happened
+  # to make the array non-empty.
+  extra=()
+  [ "${EPHEMERAL:-0}" = 1 ] && extra+=(--ephemeral "declared by bench-pairs for the $FIRST..$LAST run")
+  "$PROF/axis.py" add "$name" --backend "$bk" \
+      --a-name "$an" --a-elf "$ae" --a-src "$asrc" \
+      --b-name "$bn" --b-elf "$be" --b-src "$bsrc" ${extra[@]+"${extra[@]}"} \
+    || die "axis.py refused $name — see its message"
+done
+
+say "measure + render"
+axis_args=()
+for a in "${AXES[@]}"; do axis_args+=(--axis "${a%%:*}"); done
+"$PROF/compare.py" "${axis_args[@]}" --block-min "$FIRST" --block-max "$LAST" \
+    --html "$REPORT" --json "${REPORT%.html}.json"
+
+say "done"
+note "report: $REPORT"
+note "axes declared for one campaign? ./profiling/axis.py prune removes them when it is over"

@@ -11,6 +11,11 @@ Three tools to analyze the guests' **execution** (no proving) — pick by the qu
 Both read the per-guest artifacts in [`../guests/`](../guests/) and write self-contained HTML;
 neither proves anything.
 
+**Looking for the command to type? → [`RUNBOOK.md`](RUNBOOK.md).** It lists every workflow — the
+canonical report, a one-block profile, the levers document, the latency table — with what each one
+writes. This file explains *which* tool answers *which* question, and the framing rules behind the
+numbers.
+
 ## Which tool for what — and what these are NOT
 
 **Execution/profiling and proving are separate paths**; conflating them is the classic trap.
@@ -18,10 +23,36 @@ neither proves anything.
 | Tool | Purpose | Reads | Produces |
 |------|---------|-------|----------|
 | `compare.py` | **aggregate A-vs-B over a block set** (median/mean/spread + optional module diff) | ELFs + inputs, per axis | terminal summary, `results/compare.html`, `--json` |
-| `hotspots.py` | **execute + profile + compare** any guest, either backend (`zisk`/`sp1`) | an ELF + an input | per-run `profile.json` + HTML; `diff` / `compare` / `--aggregate` |
+| `hotspots.py` | **execute + profile + compare** any guest, either backend (`zisk`/`sp1`) | an ELF + an input, **cache first** | per-run `profile.json` + HTML; `diff` / `compare` / `--aggregate` |
 | `results.py` | cross-guest "how much" table | `../guests/<name>/inputs/*.exec-report.json` | `results/results.html` |
 | `../guests/monad/ev.sh` | batch **execute + state-root verify**, **ZisK only** | `../guests/monad/inputs/*.witness` | `exec-verified.csv` (steps) + `execute-out/<tag>.bin` (framed input) |
 | `../guests/monad-*/gen-inputs` | **proving only** — persist per-zkVM inputs for `cli/prove-farm` | Monad witnesses | `../guests/monad-*/inputs/1-<block>.bin` |
+| `levers.py` | **what to fix in the Monad guest, ranked**, with a re-measure protocol per item | the profile cache + the ELF symbol table | its own report — *not* compare.py's, and it has a shelf life |
+| `rtp-latency.py` | end-to-end **latency** of the RTP pipeline, joined per block | witness manifest + run records + mock submissions | latency table (`--csv`) |
+| `axis.py` | **list, add, remove and retire** compare.py's axes (`prune` drops a campaign's ephemeral ones, `gc` drops those whose build was deleted), with the checks that catch a bad one before it measures | `compare.py`'s `AXES` + the inputs on disk | edits `AXES` in place; `list` / `show` print |
+
+Three more produce an artifact that another tool reads, rather than a report of their own. They are
+easy to mistake for optional extras, so: if the file they write is missing, the consumer silently
+drops a column or a series — it does not fail.
+
+| Tool | Writes | Read by |
+|------|--------|---------|
+| `inline-robust.py` | `results/inline-verdict.json` — how much of a family's cross-guest ratio is real vs. an inlining artefact | `compare.py`, `levers.py` (optional column) |
+| `optimized.py` | `results/optimized-{zisk,sp1}.json`, derived from a **frozen measurement set** (below) | `compare-optimized.py` |
+| `compare-optimized.py` | `results/compare-optimized.html` — the levers branch next to what ships | — (a deliverable) |
+
+> ⚠️ Those two read a **frozen measurement set**, not a cache: nothing can regenerate it — there is no
+> `levers-*` axis and no ELF left to run (see
+> [`../guests/monad-variants/README.md`](../guests/monad-variants/README.md) § `levers/`). It lands
+> under `results/`, which is git-ignored, so **a fresh clone has nothing for them to read and they
+> cannot run there at all**. Everything downstream inherits that.
+
+Two axes running the same build share its measurements, with nothing to prime by hand: a slot is keyed
+by the sha256 of the ELF, so the axis never enters the key (see [`cache-format.md`](cache-format.md)).
+
+Anything under [`studies/`](studies/README.md) is a **one-shot**: a question that was asked once and
+answered. They are kept because they are the method behind a number, not because they are meant to be
+run again.
 
 Things that bit us and are easy to forget:
 - **To profile/compare a guest you do NOT need `gen-inputs`.** That is a `prove-farm` concern; `hotspots.py`
@@ -37,15 +68,17 @@ Things that bit us and are easy to forget:
 
 ## compare.py — how much more, over a whole block set
 
-The one-command answer to *"is Monad's EVM more expensive than reth, and by how much?"* — run it
-with no arguments and it does every axis over every block both sides can run:
+The one-command answer to *"is Monad's EVM more expensive than reth, and by how much?"*:
 
 ```sh
-./compare.py                              # every axis, every common block
-./compare.py --axis zisk --limit 20       # one axis, first 20 common blocks
+./compare.py                              # the default pair of axes, every common block
+./compare.py --axis zisk --axis sp1       # name others explicitly
 ./compare.py --blocks 25552005-25552088   # an explicit range (or a comma list)
 ./compare.py --deep 5                     # + a per-module diff (hotspots.py)
 ```
+
+A bare run does **`cur-zisk` + `cur-sp1`** — not every axis. Naming axes is how you get the others,
+and the canonical report needs four of them; [`RUNBOOK.md`](RUNBOOK.md) has that command.
 
 **Axes** are same-zkVM guest pairs (work-units only compare within a VM):
 `zisk` = monad-zisk vs zisk-reth · `sp1` = monad-sp1 vs rsp. Input framing is handled per backend
@@ -53,9 +86,45 @@ with no arguments and it does every axis over every block both sides can run:
 
 What the summary gives, per axis: median / mean / total work with the **ratio**, work **per Mgas**
 (normalises for block size; EVM gas comes from the reth ZisK guest and is pooled across axes), median
-exec seconds, then the **per-block ratio distribution** (median, p10, p90, cv) with the min/max blocks
-named, and a **small-vs-large-block** split to show whether the gap grows with block size. `--deep N`
-appends a per-module `hotspots.py diff` so you see *which* modules carry the delta.
+exec seconds, then the **per-block ratio distribution** (median, geometric mean, arithmetic mean, p10,
+p90, cv) with the min/max blocks named, and a **small-vs-large-block** split to show whether the gap
+grows with block size. `--deep N` appends a per-module `hotspots.py diff` so you see *which* modules
+carry the delta.
+
+**Which average of the per-block ratios** — the report gives four, because they answer different
+questions, and the HTML has a table (*which average of the per-block ratios*) laying them side by side
+with the measured spread between them:
+
+| statistic | what it answers |
+| --- | --- |
+| **geometric mean** | the average to quote for a *set of ratios*. Multiplicative, so 2× cancels 0.5× and A÷B is the exact reciprocal of B÷A. Its dispersion is `ratio_gsd`, read **×/÷**, not ± |
+| **median** | the headline in the report's cards — robust to the off-pattern blocks the page lists by name |
+| **arithmetic mean** | kept for continuity only. It depends on which guest you divide by: `ratio_mean` × `ratio_mean_inv` comes to 1.0026 (ZisK) and 1.0307 (SP1) where an average of ratios owes exactly 1. Far enough out, both directions read above 1 and each names the other guest as the dearer one — that does *not* happen on this data, so quote the product, not the warning |
+| **total ÷ total** (pooled) | how much more work over the whole set — weighted by block size, so the largest blocks dominate |
+
+Every one of them is in `results/compare.json` under `<axis>.summary` (`ratio_gmean`, `ratio_median`,
+`ratio_mean`, `ratio_mean_inv`, `ratio_pooled`, `ratio_gsd`), and the same file carries the **per-block
+raw values** under
+`<axis>.blocks.<block>.{a,b}.work` — so any other statistic can be recomputed without re-running
+anything. The rule of thumb: **geometric mean** when a single average of ratios is wanted, **median**
+when robustness matters (it is the headline here because a minority of blocks run 256-bit curve
+arithmetic in software and are not from the same population), and **never the arithmetic mean alone**.
+
+The two rows that matter are the two sides of a settled argument, which is why the page carries both.
+Fleming & Wallace (*How not to lie with statistics*, CACM 29(3), 1986) showed that averaging
+**normalised** results arithmetically is invalid — the answer depends on which side you divide by —
+and that the geometric mean is the one invariant to that choice. Smith (*Characterizing computer
+performance with a single number*, CACM 31(10), 1988) answered that the geometric mean preserves no
+**total**, so where the quantity of interest is total time or total work, the figure must be
+proportional to the total consumed. Both are right about different questions: the geometric mean is
+the `ratio` row, Smith's is the `total ÷ total` row.
+
+Being the *correct* average does not make the geometric mean a *robust* one — it is the arithmetic
+mean in log space, so an extreme ratio still moves it. Measured on this data: letting the two one-off
+blocks `25229951` / `25229957` into the set (ratios **0.099×** and **0.164×** against a ~1.23× body)
+moves the ZisK geometric mean **1.235× → 1.220×** and its `ratio_gsd` **1.052 → 1.192**, while the
+median does not move at all. That is the case for keeping both on the page, and for bounding the range
+(next section) rather than trusting whatever the fixtures happen to contain.
 
 **Which blocks** — every block both sides can run, unless you bound it with `--block-min` / `--block-max`
 (or name an explicit set with `--blocks`). Bound it deliberately: the fixtures mix a **contiguous run**
@@ -68,6 +137,16 @@ trusting that range:
 ./compare.py --axis zisk --block-min 25551991 --block-max 25552607
 ```
 
+This is not optional for a report meant to sit beside an existing one. Every published report — the canonical
+one (365 ZisK / 373 SP1 blocks) and the levers-branch one (504 / 365 / 373 / 504) — was produced with **`--block-min 25551991 --block-max 25552607`**. A bare `./compare.py` is a
+*different run*: it also admits `25229951` and `25229957`, one-offs from ~322k blocks earlier that
+still sit in `guests/monad/**`, so the block set silently stops matching the report next to it (see
+the geometric-mean figures above for what that costs).
+
+The **max** matters for the opposite reason: the RTP pipeline keeps minting witnesses at the tip, so
+without it a re-run quietly widens the set and the report stops describing the same population as the
+one beside it. Today the corpus ends below that max and it changes nothing — which is the point.
+
 **One command does the whole thing.** A single run collects and reports work-units, prover work and its
 category split, precompile counts, gas and tx counts, and the honest execution time:
 
@@ -76,8 +155,41 @@ category split, precompile counts, gas and tx counts, and the honest execution t
 ```
 
 That writes the terminal summary **and** `results/compare.html` + `results/compare.json` — the report is
-the deliverable, so it needs no flag (`--no-report` skips it). `--quick` is the only other opt-out, and it drops just the expensive piece (ZisK's instrumented COST pass);
+the deliverable, so it needs no flag (`--no-report` skips it).
+
+**A restricted run does not write the canonical report:**
+
+- `--limit` / `--blocks` measure a **sample**, so the summary statistics describe that sample and
+  nothing else. Those runs write `compare-partial.*` instead, and say so.
+- `--axis` measures **fewer axes**, not fewer blocks: the numbers are canonical, they just do not
+  cover everything. `compare.json` is therefore **merged**: running one axis leaves the others in the
+  file. The HTML still shows only the axes just run, and prints which axes the JSON
+  holds beyond it.
+
+Naming `--json` / `--html` yourself overrides all of this. `--quick` is the only other opt-out, and it drops just the expensive piece (ZisK's instrumented COST pass);
 anything already cached is still reported.
+
+Alongside the full report it also writes **`compare-summary.html` + `compare-summary.md`** — the
+**one-page synthesis** (median gap in %, prover-work gap, stability, which work families carry the
+delta), same numbers rendered from the same run so the two cannot disagree. The `.md` is made for
+pasting into Slack/Notion; the full report stays the reference for methodology and per-block detail,
+and each page links to the other.
+
+To rebuild that synthesis from a run you already have — including an older one — point it at the
+run's `--json` payload; it measures nothing, never loads the cache, and takes under a second:
+
+```sh
+./compare.py --summary-from results/compare.json          # -> compare-summary.{html,md}
+# --axis then selects AND orders the sections (here: each backend's baseline pair, then its reference)
+./compare.py --summary-from results/compare.json \
+    --axis opt-self --axis opt-self-sp1 --axis opt-zisk --axis opt-sp1
+```
+
+The summary is named after the report it comes from, so pointing this at another run's payload writes
+beside that run rather than over this one.
+
+Re-renders a report from `--json` output without touching the measurements. A plain re-run is cheap
+too: the cache is read per block, on demand, so a fully-cached sweep is sub-second.
 
 **Prover work** — beyond raw steps/cycles, each backend can report what a block costs
 the *prover*: **ZisK `COST`** and **SP1 `PGU`**. Both are **trace area** — the polynomial area the prover
@@ -156,9 +268,12 @@ inflate stdev and hide themselves). Default bar `|z| ≥ 3.5` (`--outlier-z`), 8
 all land in `--json`, and the HTML flags them ⚠ with their z). Each line carries the block's gas and
 both work counts, plus the `hotspots.py` command to open one — they're the blocks worth a deep dive.
 
-Runs are **cached** (`results/compare-cache.json`, keyed by axis/guest/block + ELF mtime), so re-runs
-are instant and block sets grow incrementally; `--force` re-runs. The cache is written **as results
-arrive**, so an interrupted sweep keeps everything it already computed.
+Runs are **cached** per block, keyed by the sha256 of the ELF and of the input
+([`cache-format.md`](cache-format.md)), so re-runs are instant and block sets grow incrementally;
+`--force` re-runs. `hotspots.py` reads and writes the same cache, and writes the projection
+`compare.py` reads — so a block profiled by one is never re-executed by the other. The cache is written **as results arrive**, so an interrupted sweep keeps
+everything it already computed. A rebuilt guest or a re-minted witness changes its hash and is
+re-measured on its own — nothing has to be invalidated by hand.
 
 > ⏱ **The SP1 startup cost, and how it's amortised.** The SP1 runner pays a **fixed ~6.3 s startup per
 > process** — building the `ProverClient`, before its own timer even starts. Measured with a
@@ -208,8 +323,13 @@ Work-units compare **only within a zkVM** (SP1 cycles ≠ ZisK steps), so compar
     -i ../guests/rsp/fixtures/1-<block>.bin       --out results/rsp-sp1 --tab-prefix rsp
 ./hotspots.py diff --json results/mon-sp1/*.json --json results/rsp-sp1/*.json
 ```
-Requires `sp1-runner` built `--features profiling` (hotspots.py tells you if it's missing):
-`cd ../infra/sp1-infra/sp1-runner && cargo build --release --features profiling --target-dir target-prof`.
+Requires `sp1-runner` built `--features profiling` (hotspots.py tells you if it's missing) — a *second*
+build of the crate, and `--no-default-features` is part of it:
+```sh
+cd ../infra/sp1-infra/sp1-runner
+cargo build --release --no-default-features --features profiling --target-dir target-prof
+```
+Every prerequisite, with its install command: [`RUNBOOK.md`](RUNBOOK.md#prerequisites).
 
 **ZisK axis** — ZisK needs the **framed** input `LE64(len)+witness+pad8`. Frame it once (or reuse
 `../guests/monad-zisk/gen-inputs` output, or `ev.sh`'s `execute-out/<tag>.bin`):
@@ -246,17 +366,20 @@ a warning — work-units only compare within one ELF version. `--baseline` uses 
 an expected ELF-bump change from a real determinism regression (exit 1 only on the latter → CI-friendly).
 
 ## Also here
-- [FINDINGS.md](FINDINGS.md) — **internal**, not a deliverable and never linked from one: the
-  Monad-vs-reth results, and the
-  62 traps that each produced a plausible wrong answer (gas-pass reordering the guests, taxonomy
-  asymmetry inflating a ratio 9×, endpoint sampling, sampled-vs-counted profilers, silent cache misses,
-  two unlabelled ratio statistics shown side by side, a non-contiguous span described as contiguous…).
-  **The one that changes a conclusion:** the 68 SP1 blocks where Monad looks cheaper are blocks where
-  `rsp` runs BN254 in software — Monad is flat there and `rsp` costs 1.5× more. Engine-to-engine the
-  SP1 median is **1.263×**, not 1.221×. `rsp` is the only one of the four guests with **no**
-  precompile-backed BN254 crate (0 % vs `monad-sp1`'s `zkvm_bn254_g1_mul`, same emulator) — a missing
-  patch, not a limit of SP1.
-- [CALLGRAPH-NOTES.md](CALLGRAPH-NOTES.md) — why the zisk profile is **flat** (a heuristic limit, not
-  a frame-pointer issue) + the experimental `ziskemu-callstack.patch`.
+- [RUNBOOK.md](RUNBOOK.md) — every workflow as a command, and what it writes.
+- `axis.py` — declare an axis without editing `compare.py` by hand. It refuses an ELF that is not
+  there, a name already taken and an unknown `src`, and it prints how many blocks the axis resolves
+  on **before** you measure — the difference between an expected `n` and an empty one nobody noticed.
+  It still rewrites `compare.py`, which is **tracked**: an axis is a source change and lands in
+  `git status` ([RUNBOOK.md](RUNBOOK.md#3-declare-the-axis) says what to do with that diff).
+- [cache-format.md](cache-format.md) — the profile cache: layout, identity, what is not stored in it.
+- **The correction that changes a conclusion**, kept here because it belongs to the numbers this
+  directory produces: the 68 SP1 blocks where Monad looks cheaper are blocks where `rsp` runs BN254 in
+  software — Monad is flat there and `rsp` costs 1.5× more. Engine-to-engine the SP1 median is
+  **1.263×**, not 1.221×. `rsp` is the only one of the four guests with **no** precompile-backed BN254
+  crate (0 % vs `monad-sp1`'s `zkvm_bn254_g1_mul`, same emulator) — a missing patch, not a limit of SP1.
+- The ZisK profile is **flat** by a heuristic limit, not a frame-pointer issue; the experimental way
+  out is `ziskemu-callstack.patch`, tracked here. See [hotspots.md](hotspots.md).
+- [studies/](studies/README.md) — one-shot methodology checks, kept as the method behind a number.
 - `template.html` — the shared hotspots renderer. **All generated output goes under `results/`**
   (git-ignored): the aggregated `results.html`, per-guest hotspots profiles (`results/<name>/`), and sample runs.

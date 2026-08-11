@@ -26,7 +26,75 @@ Common JSON schema (what a backend must produce, per input tag):
 To add a backend: write `profile_<name>(args) -> dict` in that schema and register it in BACKENDS.
 The renderer, module extraction, --meta/--labels and CLI are already shared.
 """
-import argparse, glob, json, os, re, statistics, subprocess, tempfile, time
+import argparse, functools, glob, json, os, re, statistics, subprocess, tempfile, time
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+# `cache` is a sibling module, not a package — see the same note in compare.py.
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import cache as _cachemod          # noqa: E402
+_CACHE = _cachemod.Cache()
+
+
+def _elf_abs(args):
+    """The ELF as an absolute path. `--elf` is whatever the user typed, so it is relative to the CWD;
+    the cache resolves a relative path against the REPO root, which is a different place. compare.py
+    never hit this because it always passes an already-resolved path."""
+    return os.path.abspath(os.path.expanduser(args.elf))
+
+
+def _block_of(path):
+    """Block number named by an input file, or None. Only a block-named input is cacheable: the cache
+    is keyed by block, and nothing else in a filename identifies a run."""
+    m = re.search(r'(\d{6,})', os.path.basename(path))
+    return int(m.group(1)) if m else None
+
+
+def _cache_get(args, inp):
+    """A cached run for this (build, input), or None.
+
+    Three things make a stored entry unusable even when it exists, and each is a silent
+    under-report rather than an error if ignored:
+      • it was truncated shorter than this run asks for (`--top`);
+      • SP1 sampled it at a different rate, so the counts are not comparable;
+      • it carries no root verdict while `--verify-roots` wants one.
+    A shorter `--top` is served by truncating the cached list, which is exact."""
+    b = _block_of(inp)
+    if b is None or getattr(args, 'force', False):
+        return None
+    e = _CACHE.get(_elf_abs(args), b, _cachemod.PROFILE_FULL, inp=inp)
+    if not e or e.get('trunc', 0) < args.top:
+        return None
+    if e.get('rate') != getattr(args, 'sample_rate', None):
+        return None
+    run = e['run']
+    if getattr(args, 'verify_roots', None) and 'root_ok' not in run.get('meta', {}):
+        return None
+    if e['trunc'] > args.top:
+        run = dict(run, functions=run.get('functions', [])[:args.top])
+    return run
+
+
+def _cache_put(args, inp, run):
+    """Store the full run, and the 120-symbol projection compare.py reads.
+
+    Writing both is the point of sharing a cache: one execution, two consumers. Without the
+    projection, compare.py would re-execute a block hotspots has just profiled."""
+    b = _block_of(inp)
+    if b is None:
+        return
+    elf = _elf_abs(args)
+    _CACHE.put(elf, b, _cachemod.PROFILE_FULL,
+               {'run': run, 'trunc': args.top, 'rate': getattr(args, 'sample_rate', None)},
+               backend=args.backend, inp=inp)
+    fns = sorted(((f"{f.get('module','')}::{f.get('name','')}", f.get('count') or 0)
+                  for f in run.get('functions', [])), key=lambda t: -t[1])[:120]
+    _CACHE.put(elf, b, _cachemod.PROFILE,
+               {'fns': fns, 'trunc': 120,
+                'total': sum(f.get('count') or 0 for f in run.get('functions', []))},
+               backend=args.backend, inp=inp)
+    _CACHE.save()
 
 # ─────────────────────────── common (prover-agnostic) ───────────────────────────
 
@@ -51,15 +119,21 @@ FAMILIES = [
     # reth's pairing precompile — apples to oranges, and it produced a 0.63x that meant nothing.
     ('elliptic-curve crypto',  r'secp256k1|ecrecover|ecdsa|(?<![a-z0-9])k256|recover_?block'
                                r'|compute_sender|substrate_bn|bn254|bls12_?381|pairing|modexp|modpow'
-                               r'|num_bigint|monty|EvmCrypto|crypto_bigint'),
+                               r'|num_bigint|monty|EvmCrypto|crypto_bigint'
+                               r'|zisklib.*bigint|bigint::|p256|elliptic_curve'),
     # Byte/bit manipulation is NOT arithmetic: `__bswapdi2` was 41-47% of the arithmetic family on
     # the Monad side, so counting it there inflated that ratio by roughly its share.
     # ⚠️ NOT COMPARABLE BETWEEN GUESTS. `__bswapdi2` is an OUTLINED libgcc function that C++ calls;
     # Rust's `swap_bytes`/`to_be_bytes` are inlined intrinsics attributed to their callers. Both zkVMs
     # are RISC-V, whose base ISA has no byte-swap instruction, so the work is a shift sequence either
     # way — reth converts too (big-endian words vs little-endian ruint limbs), it just never appears
-    # as a symbol. Measured: ZERO byte-order symbols in either reth guest. Read Monad's absolute
-    # figure (~22M instructions/block), never the ratio.
+    # as a symbol. Measured: ZERO byte-order symbols in either reth guest, and still zero when that
+    # guest is rebuilt with --inline-threshold=0 across 193 blocks — swap_bytes is an LLVM intrinsic,
+    # so no build of it will ever populate this family.
+    # WHERE THE WORK BELONGS, also measured: rebuilding the MONAD guest with every byte swap inlined
+    # makes this symbol vanish, and the families that absorb it are the EVM interpreter (59%),
+    # state/trie (23%) and containers (5%). So the row is a
+    # relocation of work that reth already spreads, not a cost reth avoids.
     ('byte/bit manipulation',  r'bswap|to_be_bytes|from_be_bytes|byteswap|htonl|ntohl|popcount'
                                r'|count_ones|leading_zeros|trailing_zeros|clz|ctz'),
     ('256-bit arithmetic',     r'mulmod|addmod|submod|div_rem|div_result|udivti3|umodti3|uint256'
@@ -76,18 +150,29 @@ FAMILIES = [
     ('state / trie',           r'trie|mpt|SparseState|PartialTrieDb|PartialNode|nibble|proof'
                                r'|account_state|current_account|StateDelta|storage_at|BlockState'
                                r'|AccountState|get_storage|read_storage|read_code|access_storage'
-                               r'|pop_accept|can_merge|State::merge|BranchData|LeafValue|sload|sstore'),
+                               r'|pop_accept|can_merge|State::merge|BranchData|LeafValue|sload|sstore'
+                                 r'|set_storage|State::~State|destruct_touched|destruct_suicides'
+                                 r'|copy_code|State::push|sender_has_balance|transfer_balances'),
     # `evmc` must not be bare: `std::basic_string<unsigned char, evmc::byte_traits<…>>` is a
     # C++ string type, and it was 26.5% of Monad's EVM family while reth's equivalent buffer
     # (Vec<u8>/Bytes) sat in containers — an asymmetry worth ~0.24x on the interpreter ratio.
     # Block-level logic: fees, calldata accounting, consensus validation, receipts, the guest's
     # own driver. Real work, present in both guests, and it was the bulk of what remained in `other`.
     ('block / consensus logic', r'tokens_in_calldata|base_fee|blob_gas|validate_block|validation'
-                                r'|Receipt|BlockExecutor|run::run|client::main|envelope|bloom'),
+                                # `client::main` alone missed rsp's `rsp_client[<hash>]::main`: the
+                                # mangled name carries a hash between the module and the function.
+                                # Matching the crate name is simpler than matching around the hash,
+                                # and a bracket class here also tripped a nested-set warning.
+                                r'|Receipt|BlockExecutor|run::run|envelope|bloom|rsp_client'
+                                r'|client::main|execute_witness|ExecuteTransaction'
+                                r'|get_tx_context|alloy_consensus|EthPrimitives'),
     # Runtime plumbing with no domain meaning: locks, drop glue, sorting.
-    ('runtime plumbing',       r'critical_section|drop_in_place|quicksort|sort::|panic|fmt::'),
+    ('runtime plumbing',       r'critical_section|drop_in_place|quicksort|sort::|panic|fmt::'
+                               r'|__float(?:un)?[sd]i|__fix(?:uns)?[sd]f|float::(?:mul|add|div|sub)'
+                               r'|__(?:mul|add|div|sub)[sd]f3|__cxa_guard|black_box|sys_rand|memchr'),
     ('EVM interpreter',        r'interpreter|revm|Intercode|opcode|execute_block|push<|swap<'
-                               r'|dup<|evmc::(?!byte_traits)|alloy_evm|MainnetHandler'),
+                               r'|dup<|evmc::(?!byte_traits)|alloy_evm|MainnetHandler'
+                               r'|runtime::(?:codecopy|calldatacopy|call|Context::from)|resolve_delegation'),
     # SYMMETRY MATTERS HERE. This family first carried only C++ vocabulary (std::/boost::/unordered),
     # so Rust's equivalent machinery — RawVec growth, Vec/Box/iterator adapters, bytes:: — fell into
     # "memory" or "other" instead. That asymmetry alone inflated the Monad/reth ratio ~9x (60.3x vs
@@ -96,11 +181,19 @@ FAMILIES = [
     ('containers / abstraction', r'std::|boost::|ankerl|hashbrown|immer|unordered|vector|map|hash'
                                  r'|raw_vec|RawVec|::vec::|Vec<|smallvec|arrayvec|bytes::|Box<'
                                  r'|iter::|indexmap'),
-    ('memory / allocation',    r'memcpy|memmove|memset|memcmp|alloc|dealloc|Heap|free|malloc|tlsf'),
+    ('memory / allocation',    r'memcpy|memmove|memset|memcmp|alloc|dealloc|Heap|free|malloc|tlsf'
+                               r'|operator new|operator delete'),
 ]
 
+@functools.lru_cache(maxsize=None)
 def family(name):
-    """Which kind of work a symbol represents — see FAMILIES."""
+    """Which kind of work a symbol represents — see FAMILIES.
+
+    Memoised because it is pure (FAMILIES is a module constant, never mutated) and because the same
+    symbols recur in every block: folding the whole profile cache classifies ~1.3 M names drawn from
+    only ~860 distinct ones. Uncached that is ~58 s of regex — up to one `re.search` per family per
+    call, over demangled C++ names — against ~0.2 s memoised. That 290x is why family counts do not
+    need a cache of their own: the fold was never the cost, the classifier was."""
     for fam, pat in FAMILIES:
         if re.search(pat, name, re.I): return fam
     return 'other'
@@ -260,6 +353,11 @@ def profile_zisk(args):
     data = {}
     for inp in args.input:
         tag = os.path.splitext(os.path.basename(inp))[0]
+        hit = _cache_get(args, inp)
+        if hit is not None:
+            data[tag] = hit
+            print(f"[{tag}] cached", flush=True)
+            continue
         print(f"[{tag}] profiling…", flush=True)
         t0 = time.time()                                    # 1) fast pass: emu time + steps
         mtxt = _zisk_run(emu, args.elf, inp, ['-m']).stdout
@@ -287,6 +385,7 @@ def profile_zisk(args):
         os.remove(dpath)
         data[tag] = {'meta': meta, 'total_count': tot, 'functions': funcs,
                      'modules': modtot, 'categories': cats, 'opcodes': ops}
+        _cache_put(args, inp, data[tag])
         _n = lambda v: f"{v:,}" if isinstance(v, (int, float)) else "?"
         _top = f"{funcs[0]['module']}/{funcs[0]['count']*100//max(tot,1)}%" if funcs else "(none)"
         print(f"  steps={_n(meta.get('steps'))} cost={_n(meta.get('cost'))} emu={emu_s}s top={_top}", flush=True)
@@ -460,6 +559,11 @@ def profile_sp1(args):
     data = {}
     for inp in args.input:
         tag = re.sub(r'^1-', '', os.path.splitext(os.path.basename(inp))[0])
+        hit = _cache_get(args, inp)
+        if hit is not None:
+            data[tag] = hit
+            print(f"[{tag}] cached", flush=True)
+            continue
         print(f"[{tag}] profiling…", flush=True)
         with tempfile.TemporaryDirectory() as td:
             gecko = os.path.join(td, 'trace.json'); rep = os.path.join(td, 'report.json')
@@ -491,6 +595,7 @@ def profile_sp1(args):
             tot, funcs, modtot, tree = _sp1_gecko(gecko, args.top)
         data[tag] = {'meta': meta, 'total_count': tot, 'functions': funcs,
                      'modules': modtot, 'categories': cats, 'opcodes': ops, 'tree': tree}
+        _cache_put(args, inp, data[tag])
         _top = f"{funcs[0]['module']}/{funcs[0]['count']*100//max(tot,1)}%" if funcs else "(none)"
         print(f"  cycles={meta['steps']:,} cost={cost:,} emu={meta['emu']}s top={_top}", flush=True)
     return data
@@ -623,6 +728,8 @@ def main():
             sp.add_argument('--costs', default=_SP1_DEFAULT_COSTS, help='[sp1] rv64im_costs.json path')
             sp.add_argument('--top', type=int, default=200, help='top-N functions named individually in the icicle; the rest of each module aggregates into a hatched tail (default 200 keeps per-module "rest" well under 1%%)')
             sp.add_argument('--verify-roots', help='dir with <tag>.post_state_root to verify output[:32]')
+            sp.add_argument('--force', action='store_true',
+                            help='ignore the profile cache and re-run (same meaning as compare.py)')
             sp.add_argument('--tab-prefix', dest='tab_prefix', default='',
                             help='prefix every tab/tag key — namespaces a guest so profiles merge cleanly '
                                  '(e.g. --tab-prefix rsp- , then: render --json a --json b)')

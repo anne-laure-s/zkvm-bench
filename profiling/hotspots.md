@@ -184,8 +184,8 @@ reconstructs frames with an **`ra`-based heuristic** that (1) hard-disables at t
 call/return mismatch and (2) — even with that removed — does **not nest** for optimized guests
 (reth/Monad come out depth-1). It is **not** a frame-pointer problem, and a guest rebuild with
 frame pointers alone does nothing (ziskemu has no FP unwinder). A genuine deep call graph is real
-profiler work, not a quick patch. Full investigation, the measured result, a starter patch
-(`ziskemu-callstack.patch`), and the options are in **[CALLGRAPH-NOTES.md](CALLGRAPH-NOTES.md)**.
+profiler work, not a quick patch. What came out of the investigation is
+kept here as a starter patch, `ziskemu-callstack.patch`; anything past it is profiler work.
 
 ## Adding a backend (e.g. SP1)
 Write `profile_<name>(args) -> dict` producing the common schema below, and register it in

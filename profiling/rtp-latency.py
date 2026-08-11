@@ -24,7 +24,7 @@ allowed to invent is its own duration. Mock rows are therefore shown (the plumbi
 proving) but excluded from every summary statistic, and the summary states both limits.
 
   profiling/rtp-latency.py --manifest ~/witness-manifest.csv --results infra/zisk-infra/results
-  profiling/rtp-latency.py --manifest … --results … --submissions ethproofs-mock-data/submissions.jsonl
+  profiling/rtp-latency.py --manifest … --results … --submissions run-data/ethproofs-mock-data/submissions.jsonl
                            [--guest monad-zisk] [--chain-id 1] [--csv rtp-latency.csv] [--cross-clock]
 """
 import argparse, csv, glob, json, os, statistics, sys

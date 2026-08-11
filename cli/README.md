@@ -7,6 +7,7 @@ resolve against it.
 
 | CLI | Does | Errors clearly on |
 |-----|------|-------------------|
+| `cli/bench-pairs --host <box> --pair A:B:BACKEND …` | **the whole pipeline**: build, witnesses, generation, axes, `compare.html` — skipping every step whose output exists. `plan` by default, `run` to execute | a side whose ELF cannot be resolved |
 | `cli/gen-elf   --guest <name>` | build the guest ELF → `guests/<dir>/<dir>.elf` | `monad-*` (ELF pre-supplied) |
 | `cli/gen-witness --guest <name> --block <n> [--rpc <url>]` | generate a block witness → `guests/<dir>/inputs/` | `zisk` (needs a debug node), `monad-*` (pre-supplied), `fibonacci` (toy) |
 | `cli/execute  --guest <name> --input <path>` *(or `--block <n>`)* | run locally, no proof → the deterministic cycle/step count | `monad-*` (batch → run `guests/monad/ev.sh`) |
