@@ -551,6 +551,38 @@ def sp1_batches(todo, runner, jobs, with_nogas=False):
 # The campaign's own per-block `duration=` values are collected under 4-way parallelism and run
 # ~35 % slow (89 vs 136 M steps/s on the same block), which is why the reported column is modelled
 # from these sequential rates instead of averaged from the cache.
+# The rates above are a PROPERTY OF THE HOST THAT MEASURED THEM, not of the guests. Work and cost
+# are deterministic and travel anywhere; seconds do not. Named here so that running this on another
+# machine reports a mismatch instead of silently publishing this laptop's seconds as that machine's
+# — the failure mode is a plausible number, which no reader would question.
+CALIBRATION_CPU = 'Apple M5 Max'
+
+
+def _host_cpu():
+    """This machine's CPU brand, or '' when it cannot be read."""
+    try:
+        if sys.platform == 'darwin':
+            return subprocess.run(['sysctl', '-n', 'machdep.cpu.brand_string'],
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+        with open('/proc/cpuinfo') as fh:
+            for line in fh:
+                if line.startswith('model name'):
+                    return line.split(':', 1)[1].strip()
+    except Exception:
+        pass
+    return ''
+
+
+def calibration_warning():
+    """A one-line warning when the time column would not describe THIS machine, else ''."""
+    cpu = _host_cpu()
+    if not cpu or cpu == CALIBRATION_CPU:
+        return ''
+    return (f"pure-time column was calibrated on {CALIBRATION_CPU}, this host is {cpu} — the "
+            f"seconds are the calibration host's, the RATIOS still hold. Recalibrate with the "
+            f"ziskemu/sp1-runner protocol in RUNBOOK.md to publish seconds from here.")
+
+
 PURE_MSTEPS_PER_S = {
     'monad-r3-zisk':         126.5,   # ziskemu duration=, sequential, this host
     'monad-sam-zisk':     148.5,
@@ -1263,6 +1295,7 @@ section{margin-top:38px;border-top:1px solid var(--line);padding-top:26px}
 .env em{color:var(--muted);font-style:normal}
 .env code{font-family:var(--mono);font-size:11px;color:var(--accent)}
 table.cv{width:100%;border-collapse:collapse;margin:8px 0 0;font-size:12.5px}
+p.warn{background:#fff4e5;border-left:3px solid #d97706;padding:8px 10px;margin:10px 0 0}
 table.cv th{text-align:left;font-weight:500;color:var(--muted);font-size:11px;
  text-transform:uppercase;letter-spacing:.08em;padding:4px 8px;border-bottom:1px solid var(--line)}
 table.cv td{padding:5px 8px;border-bottom:1px solid var(--line)}
@@ -3154,7 +3187,10 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None, summary_href
         f"nothing. And this is <b>emulation</b> time on one host: it says how much work a block is, "
         f"not what a proof costs. The ZisK ASM backend (<code>cargo-zisk execute --asm</code>) runs "
         f"the same guests ~2.4× faster still (≈300 M steps/s, measured on the devcore box), so a number "
-        f"quoted from that backend is not comparable to one from here.</p></details>")
+        f"quoted from that backend is not comparable to one from here.</p>"
+        + (f"<p class=warn><b>This report was not rendered on the calibration host.</b> "
+           f"{calibration_warning()}</p>" if calibration_warning() else "")
+        + f"</details>")
     h.append("</div>")
     h.append(f"<script>{_HIST_JS}</script>")
     h.append(f"<script>{_AXBAR_JS}</script>")
@@ -3475,6 +3511,12 @@ def main():
     # with theirs when stdout is a pipe, or the --deep sections land out of order.
     try: sys.stdout.reconfigure(line_buffering=True)
     except Exception: pass
+
+    # Said once, up front, not only inside the rendered report: whoever runs this on a new machine
+    # reads the terminal, and every other number here IS portable, so nothing else hints at it.
+    _cw = calibration_warning()
+    if _cw:
+        print(f"NOTE: {_cw}", file=sys.stderr)
 
     # Re-render only. The --json payload already carries every summary and every per-block row,
     # which is all the summary page reads — so this path returns before load_cache(). That

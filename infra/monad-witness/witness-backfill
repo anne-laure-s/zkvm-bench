@@ -242,6 +242,20 @@ exactly FIRST-1. Available: $(sshq "ls $SNAPSHOTS 2>/dev/null | tr '\n' ' '")"
   local py_ok; py_ok=$(sshq "test -x $PY && echo yes")
   [ "$py_ok" = yes ] || die "no python at $PY on $HOST (pyenv is not on a fresh tmux PATH)"
 
+  # run_replay.py and fetch_blocks.py are UNTRACKED files in $MONAD_DIR — they are not in the monad
+  # repo, so a fresh checkout on a fresh box does not have them however correct everything else is.
+  # Checked HERE and not at their first use, because their first use is phase 6 of 8: by then the
+  # reset has destroyed the triedb and the load has spent ~66 minutes. This is the one precondition
+  # whose absence costs an hour and a trie rather than a retry.
+  local missing="" f
+  for f in run_replay.py fetch_blocks.py; do
+    sshq "test -f $MONAD_DIR/$f" || missing="$missing $f"
+  done
+  [ -z "$missing" ] || die "missing in $MONAD_DIR on $HOST:$missing
+  These are not tracked by the monad repo — they live only where someone put them. Copy them from a
+  box that has them (nyc-003) before running: the replay phase cannot start without them, and it
+  runs AFTER the reset has destroyed the triedb."
+
   # The reset destroys the triedb. Anything mid-replay is holding it, and would also fight us for
   # the disk. fuser is not installed on this box, so match on the process names instead.
   local busy; busy=$(sshq "pgrep -af 'cmd/monad|run_replay\.py|fetch_blocks\.py' | grep -v pgrep" 2>/dev/null)
