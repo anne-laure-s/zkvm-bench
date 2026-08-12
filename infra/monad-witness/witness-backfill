@@ -235,9 +235,35 @@ sam/* branches are force-pushed, so: git fetch origin --force 'refs/heads/sam/*:
 exactly FIRST-1. Available: $(sshq "ls $SNAPSHOTS 2>/dev/null | tr '\n' ' '")"
 
   # memlock: monad hard-asserts !mlock() in HugeMem. The default 8 MB means the DB will not open.
+  #
+  # Fatal or a warning depending on whether a triedb already exists, because that is exactly what
+  # decides whether proceeding can possibly work:
+  #   DB present -- the box mlock'd successfully at least once to create it, so a low `ulimit -Hl`
+  #     here is more likely to be this shell's view than the box's real ceiling. Warn: the run may
+  #     also only need a rewind, and you may want the build going while an admin is found.
+  #   DB absent  -- reset + load is CERTAIN (there is nothing to rewind to), the load cannot open
+  #     the DB without mlock, and there is no evidence the box ever could. Starting means spending a
+  #     guest build to arrive at a guaranteed failure. Die now.
+  # Raising it needs root either way (limits.conf, or setcap cap_ipc_lock+ep on the binaries), so
+  # this is never something the script can fix.
+  local db_present=no
+  sshq "test -f $DB" 2>/dev/null && db_present=yes
   local ml; ml=$(sshq 'ulimit -Hl' 2>/dev/null)
-  [ "$ml" = "unlimited" ] || [ "${ml:-0}" -gt 1048576 ] 2>/dev/null \
-    || echo "  WARNING memlock hard limit is '$ml' — monad asserts on mlock(); an admin must raise it"
+  if [ "$ml" = "unlimited" ] || { [ -n "$ml" ] && [ "$ml" -gt 1048576 ] 2>/dev/null; }; then
+    :
+  elif [ "$db_present" = yes ]; then
+    echo "  WARNING memlock hard limit is '$ml' — monad asserts on mlock(); an admin must raise it."
+    echo "          Not fatal: $DB exists, so this box mlock'd at least once. It will bite at the"
+    echo "          triedb reset if this run needs one."
+  else
+    die "memlock hard limit is '$ml' on $HOST and there is no triedb at $DB.
+  With no trie there is nothing to rewind to, so this run MUST reset + load — and monad hard-asserts
+  !mlock() in HugeMem, so the load cannot even open the DB. Every minute after this point would be
+  spent to reach a guaranteed failure.
+  An admin must raise it first (limits.conf 'memlock unlimited', or setcap cap_ipc_lock+ep on
+  build/cmd/monad, build/cmd/monad-cli and build/category/mpt/monad-mpt), and hugepages must be
+  configured too — see infra/monad-witness/README.md."
+  fi
 
   local py_ok; py_ok=$(sshq "test -x $PY && echo yes")
   [ "$py_ok" = yes ] || die "no python at $PY on $HOST (pyenv is not on a fresh tmux PATH)"

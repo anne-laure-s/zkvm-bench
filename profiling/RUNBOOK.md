@@ -112,7 +112,9 @@ different ranges are not comparable to each other.
 **A devcore box that has never done this needs an afternoon of setup, not just a `--host`.** A
 *missing triedb* is the easy part — `witness-backfill` probes it and `DBSTATE=absent` just means it
 creates and loads instead of rewinding, which is the ~66 min the snapshot load always costs. What
-stops a fresh box is everything around it: memlock and hugepages (**both need an admin**), a
+stops a fresh box is everything around it: memlock and hugepages (**both need an admin**, and memlock
+is a hard stop when there is no triedb — with nothing to rewind to, the load is certain and cannot
+open the DB without `mlock`), a
 configured cmake build dir, the gitignored `zkvm/.cargo/config.toml`, the zisk rustup toolchain, and
 `run_replay.py`/`fetch_blocks.py` — which are **untracked files in `$MONAD_DIR`**, absent from the
 monad repo, so a fresh checkout does not have them however correct everything else is. Preflight

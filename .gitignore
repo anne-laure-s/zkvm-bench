@@ -2,9 +2,9 @@
 # Per-stack build artifacts (target/, proofs/, runs/, extracted images, …) are covered by each
 # infra/<stack>-infra/.gitignore — git honors those nested files, so they are not repeated here.
 
-# Upstream clones — external code, tens of GB, not this project's (see README). Contient les sources
-# witness/guest (rsp, openvm-eth, zisk-eth-client, zisk-ethproofs) ET l'arbre client monad, qui est un
-# clone de travail sur une branche, pas un vendor épinglé : cli/install-vendors ne le gère pas.
+# Upstream clones — external code, tens of GB, not this project's (see README). Holds the witness/guest
+# sources (rsp, openvm-eth, zisk-eth-client, zisk-ethproofs) AND the monad client tree, which is a
+# working clone on a branch rather than a pinned vendor: cli/install-vendors does not manage it.
 /vendor/
 
 # ── guests/ : ignore build outputs + large/regenerable inputs; keep the small data ───────────
@@ -13,11 +13,11 @@ guests/rsp/*.elf
 guests/zisk-reth/*.elf
 guests/openvm-reth/*.elf
 guests/fibonacci/*.elf
-# Builds du guest Monad qui n'existent QUE pour être mesurés (axes de compare.py) : ni guests au sens
-# du registre, ni pre-supplied — des artefacts de build comme les autres, construits sur la devcore box.
-# ~68 MB qui traînaient en `??` sans être ni ignorés ni committés. Ce qui doit survivre à un clone,
-# c'est quel build a produit quel chiffre : guests/monad-variants/README.md EST versionné et porte
-# les sha256, même contrat que le PROVENANCE.md d'une génération.
+# Monad guest builds that exist ONLY to be measured (compare.py axes): neither guests in the registry
+# sense nor pre-supplied — build artifacts like any other, produced on the devcore box. ~68 MB that sat
+# in `??`, neither ignored nor committed. What must survive a clone is WHICH BUILD produced which
+# number: guests/monad-variants/README.md IS tracked and carries the sha256s, the same contract as a
+# generation's PROVENANCE.md.
 guests/monad-variants/*/*.elf
 
 # Block witnesses / inputs — large; regenerate with `cli/gen-witness` (or mint on the box).
@@ -38,9 +38,9 @@ guests/*/fixtures/
 # Execute reports — regenerable locally via `./run execute`. They feed profiling/results.html
 # (itself regenerated, not shipped), so they are NOT committed; re-run `./run execute` then results.py.
 guests/*/inputs/*.exec-report.json
-# RSP écrit un rapport d'exécution à ./report.csv (son --report-path par défaut) quand on le lance
-# depuis la racine sans le flag. Aucun appel du repo ne fait ça (infra/sp1-infra/scripts/block-cycles.py
-# passe toujours --report-path), donc c'est une retombée de run manuel : ignorée là où elle tombe.
+# RSP writes an execution report to ./report.csv (its default --report-path) when run from the root
+# without the flag. No call in this repo does that (infra/sp1-infra/scripts/block-cycles.py always
+# passes --report-path), so it is fallout from a manual run: ignored where it lands.
 /report.csv
 
 # Monad guest is pre-supplied and NOT regenerable. The whole inputs/ dir (witnesses ~79 MB + their
@@ -62,38 +62,37 @@ guests/monad/gen/*/elf/
 # symlink: a trailing-slash pattern matches directories, and git treats a symlink as a file.
 guests/monad/current
 guests/monad/fixtures
-# (`fixtures-v2` avait sa règle ici : un set posé À CÔTÉ du layout au lieu dedans, que compare.py
-# consultait AVANT `fixtures` et qui gagnait donc silencieusement, pendant que use-gen désignait
-# encore l'autre génération. Il est devenu gen/offsettriedb-rework-2026-08 le 2026-08-10. Si un set
-# doit atterrir hors d'une génération, c'est le signe qu'il en manque une — pas qu'il faut une règle.)
+# (`fixtures-v2` used to have its own rule here: a set dropped BESIDE the layout instead of inside it,
+# which compare.py consulted BEFORE `fixtures` and therefore won silently, while use-gen still selected
+# the other generation. It became gen/offsettriedb-rework-2026-08 on 2026-08-10. A set landing outside a
+# generation is the sign that one is missing — not that a rule is needed.)
 
 # ── profiling/ : all generated output (regenerate: `profiling/results.py`, `profiling/hotspots.py`) ─
 profiling/results/
-# Le cache de profils, dans sa forme par bloc (profiling/cache-format.md). Il vivait sous results/ et
-# était donc ignoré par ricochet ; en sortant de ce dossier il perdait sa couverture. Un cache est
-# régénérable par construction — s'il faut une info du cache dans un fichier versionné, c'est le signe
-# qu'elle n'est pas au bon endroit : les chiffres se rapportent par `migrate-cache.py`, pas se figent
-# dans la doc.
+# The profile cache, in its per-block form (profiling/cache-format.md). It used to live under results/
+# and was therefore ignored by ricochet; moving out of that directory lost it that cover. A cache is
+# regenerable by construction — needing a fact FROM the cache inside a tracked file is the sign that the
+# fact is in the wrong place: numbers are re-reported through `migrate-cache.py`, not frozen into docs.
 profiling/cache/
 
-# ── run-data/ : TOUTE la sortie runtime des drivers cli/ (les drivers sont versionnés, ce qu'ils
-# produisent ne l'est pas). Une seule règle plutôt qu'une par producteur : la racine ne se salit plus
-# quand un driver gagne une sortie, et un nouveau fichier ne peut pas apparaître en `??` en attendant
-# qu'on pense à l'ignorer. Chaque script y accède par $RUNDATA (surchargeable → run d'essai jetable).
+# ── run-data/ : ALL runtime output of the cli/ drivers (the drivers are tracked, what they produce is
+# not). One rule rather than one per producer: the root no longer gets dirty when a driver gains an
+# output, and a new file cannot show up as `??` while waiting for someone to remember to ignore it.
+# Every script reaches it through $RUNDATA (overridable → throwaway trial run).
 #   witness-farm      → wcache/ · witness-farm.csv · witness-farm-logs/ · witness-farm-parallel-logs/
 #   prove-farm        → prove-farm.csv · prove-farm-logs/ · prove-runs/
 #   ethproofs / -mock → ethproofs-logs/ · ethproofs-mock-data/
-# ATTENTION : prove-farm.csv et prove-farm-logs/ existent AUSSI sur la devcore box, lus par
-# infra/monad-witness/{witness-tap,reorg-recover,archive-logs}. Les deux côtés doivent bouger ensemble.
+# CAREFUL: prove-farm.csv and prove-farm-logs/ ALSO exist on the devcore box, read by
+# infra/monad-witness/{witness-tap,reorg-recover,archive-logs}. Both sides must move together.
 /run-data/
 
-# ── Carnets de découvertes partagés nous ↔ agents. Volontairement HORS de git : ce sont des notes
-# de travail et de pièges, pas de la doc — la doc versionnée vit dans infra/*/docs/ et dans le
-# README.md de chaque sous-projet. Convention : FINDINGS.md = le carnet d'un sous-projet,
-# <SUJET>-FINDINGS.md = un carnet focalisé. Matchés à n'importe quelle profondeur, pour que le
-# prochain soit couvert d'office au lieu d'attendre qu'on le remarque dans `git status`.
-# AGENT-NOTES est à part (mémoire transverse, pas un carnet de sujet) et ancré à la racine pour ne
-# pas avaler un fichier du même nom qu'un sous-projet voudrait, lui, committer.
+# ── Findings notebooks, shared between us and the agents. Deliberately OUT of git: they are working
+# notes and traps, not documentation — tracked documentation lives in infra/*/docs/ and in each
+# sub-project's README.md. Convention: FINDINGS.md = a sub-project's notebook,
+# <TOPIC>-FINDINGS.md = a focused one. Matched at ANY depth, so the next one is covered by default
+# instead of waiting to be noticed in `git status`.
+# AGENT-NOTES stands apart (cross-cutting memory, not a topic notebook) and is anchored at the root so
+# it cannot swallow a same-named file a sub-project might actually want to commit.
 /AGENT-NOTES.md
 *FINDINGS.md
 
@@ -102,8 +101,8 @@ __pycache__/
 *.pyc
 .DS_Store
 
-# (L'arbre client monad vit maintenant sous vendor/monad — couvert par /vendor/ ci-dessus, plus
-# besoin d'une règle à lui. Il avait la sienne quand il était à la racine, et elle DEVAIT être
-# ancrée : écrite `monad/`, elle matchait un dossier de ce nom à N'IMPORTE QUELLE profondeur et
-# avalait donc aussi `guests/monad/`, cachant les artefacts du guest de `git status`. Si un jour un
-# clone revient à la racine, se souvenir du slash.)
+# (The monad client tree now lives under vendor/monad — covered by /vendor/ above, so it no longer
+# needs a rule of its own. It had one when it sat at the root, and that rule HAD to be anchored:
+# written `monad/`, it matched a directory of that name at ANY depth and therefore swallowed
+# `guests/monad/` too, hiding the guest's artifacts from `git status`. If a clone ever returns to the
+# root, remember the slash.)

@@ -76,7 +76,7 @@ afternoon, and note that **two of them need an admin**:
 
 | needed | why it is not just a knob | preflight |
 |---|---|---|
-| **memlock** raised (`ulimit -Hl` in GBs) | monad hard-asserts `!mlock()`; the DB will not open. Needs root — limits.conf or `setcap cap_ipc_lock+ep` | **warns only** |
+| **memlock** raised (`ulimit -Hl` in GBs) | monad hard-asserts `!mlock()`; the DB will not open. Needs root — limits.conf or `setcap cap_ipc_lock+ep` | **dies if there is no triedb**, warns if there is (see below) |
 | **hugepages** configured | same layer, same blocker. Needs root | not checked |
 | `$MONAD_DIR` — a monad clone with the branch fetched | `sam/*` are force-pushed; a plain `git fetch` is rejected non-fast-forward | dies |
 | `$MONAD_DIR/build` **configured by cmake** | the build phase is `ninja -C build`; a fresh clone has no `build.ninja` | dies |
@@ -93,9 +93,20 @@ afternoon, and note that **two of them need an admin**:
 include your `FIRST-1` cannot produce that corpus at all — and measurements over two different ranges
 are not comparable to each other, so "just use another range" changes what the numbers mean.
 
-The memlock line is a warning rather than a fatal on purpose: raising it needs someone else, and you
-may want to start the build while you wait. It will bite at the triedb reset — early, and long before
-the 66-minute load.
+**Why memlock is fatal on a box with no triedb, and only a warning on one that has it.** The
+distinction is not caution, it is whether proceeding can work at all:
+
+- **No triedb** → there is nothing to rewind to, so the run *must* reset + load, the load cannot open
+  the DB without `mlock`, and nothing on the box is evidence it ever could. Everything after that
+  point would be spent to reach a guaranteed failure, so preflight dies.
+- **A triedb exists** → the box mlock'd successfully at least once to create it, so a low `ulimit -Hl`
+  read here is more likely this shell's view than the box's real ceiling. And the run may only need a
+  rewind. Warn, and let you start the guest build while an admin is found. It will bite at the reset,
+  early, and long before the 66-minute load.
+
+Raising it needs root either way, so the script can never fix it: limits.conf `memlock unlimited`, or
+`setcap cap_ipc_lock+ep` on `build/cmd/monad`, `build/cmd/monad-cli` and
+`build/category/mpt/monad-mpt`. Hugepages must be configured in the same pass.
 
 ## The two phases
 
