@@ -402,7 +402,12 @@ rm -rf zkvm/zisk/target/riscv64ima-zisk-zkvm-elf/release/build
      CARGO_BUILD_TARGET=riscv64ima-zisk-zkvm-elf \\
      cargo build --release )
 
-rm -rf zkvm/sp1/target/release/build/monad-zkvm-sp1-script-*/out
+# The WHOLE build dir, not just its out/: cargo keys the build script on a fingerprint, so
+# removing only the output leaves the fingerprint intact, cargo skips the script that would
+# recreate it, and the link fails on a missing monad-zkvm-guest-sp1.elf. Invisible until you
+# rebuild the SAME branch twice -- a branch switch invalidates the fingerprint by itself, which
+# is why this survived every run until the campaign was restarted on the same commit.
+rm -rf zkvm/sp1/target/release/build/monad-zkvm-sp1-script-*
 ( cd zkvm/sp1/script \\
   && PATH="\$HOME/.cargo/bin:\$HOME/.sp1/bin:\$PATH" cargo build --release )
 
