@@ -196,11 +196,24 @@ sync_branch() {
     sshq "git -C $MONAD_DIR fetch --force origin 'refs/heads/$BRANCH:refs/remotes/origin/$BRANCH'" \
       || die "fetch of $BRANCH failed on $HOST"
     after=$(sshq "git -C $MONAD_DIR rev-parse --short 'origin/$BRANCH'")
-    REF="origin/$BRANCH"
+    # Which of the two to build. Taking origin unconditionally is how this built a commit nobody
+    # asked for: the branch on origin was BEHIND the one on the box, so the run silently compiled
+    # older code while reporting the branch name you typed. Decide by ancestry and say which won.
     if [ "$before" = "$after" ]; then
+      REF="origin/$BRANCH"
       echo "  origin/$BRANCH at $after (unchanged)"
+    elif sshq "git -C $MONAD_DIR merge-base --is-ancestor 'origin/$BRANCH' '$BRANCH'" 2>/dev/null; then
+      REF="$BRANCH"
+      echo "  $BRANCH ($before) is AHEAD of origin/$BRANCH ($after) — building the local one."
+      echo "  Push it when you want origin to agree; nothing here needs that."
+    elif sshq "git -C $MONAD_DIR merge-base --is-ancestor '$BRANCH' 'origin/$BRANCH'" 2>/dev/null; then
+      REF="origin/$BRANCH"
+      echo "  origin/$BRANCH  $before -> $after   (local is behind; building the remote one)"
     else
-      echo "  origin/$BRANCH  $before -> $after   (local ref left alone; building the remote one)"
+      die "'$BRANCH' on $HOST ($before) and origin/$BRANCH ($after) have DIVERGED — neither contains
+  the other, so there is no defensible choice between them. Pick one:
+      REF=$BRANCH $0 <verb> $BRANCH             build what is on the box
+      REF=origin/$BRANCH $0 <verb> $BRANCH      build what is on origin"
     fi
   else
     REF="$BRANCH"
