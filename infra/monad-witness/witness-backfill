@@ -241,6 +241,16 @@ ensure_replay_scripts() {
   echo "  copied run_replay.py and fetch_blocks.py to $MONAD_DIR"
 }
 
+# Send patch-fixed-history.py to the box and arrange for the build phase to apply it. The node only
+# accepts --fixed-history-length with it, and `run` always passes that flag.
+ensure_node_patch() {
+  [ -n "$HISTORY" ] || return 0
+  [ -f "$HERE/patch-fixed-history.py" ] || die "$HERE/patch-fixed-history.py is missing — it is tracked"
+  sshin "cat > /tmp/wb-patch-fixed-history.py" < "$HERE/patch-fixed-history.py" \
+    || die "could not copy patch-fixed-history.py to $HOST"
+  sshq "test -s /tmp/wb-patch-fixed-history.py" || die "patch-fixed-history.py arrived empty on $HOST"
+}
+
 # ---------------------------------------------------------------- preflight
 # Every one of these has cost someone a rebuild or a 66-minute load. They are cheap; the failures
 # they catch are not.
@@ -341,6 +351,14 @@ git rev-parse HEAD
 # like a broken branch. Verify: the status line must start with a space, not +/-.
 git submodule update --init --recursive
 git submodule status third_party/quill
+# The node only accepts --fixed-history-length with this patch, and `run` ALWAYS passes that flag
+# (it pins the history so the next run over this range can rewind instead of reloading). A fresh
+# checkout does not carry it, so without this the node rejects its own driver's argv:
+#   The following arguments were not expected: --fixed-history-length 600
+# Applied here, on the checkout, before the build that has to contain it. Idempotent, and it refuses
+# to guess if upstream moved -- in which case the build stops rather than producing a node that will
+# fail at replay, six phases later.
+${HISTORY:+$PY /tmp/wb-patch-fixed-history.py --file cmd/monad/main.cpp}
 ninja -C build -k 0 cmd/monad cmd/monad-cli category/mpt/monad-mpt
 EOF
 }
@@ -791,6 +809,9 @@ infrastructure, not part of this repo.  e.g.  HOST=<box> $0 $cmd ${2:-<branch>}"
 case "$cmd" in
   plan)
     resolve_blocks
+    # Same default as run/again: the plan has to show the build that will actually run, and pinning
+    # the history is what puts the node patch in it.
+    [ -n "$HISTORY" ] || HISTORY=$((LAST - FIRST + 1 + 96))
     resolve_gen
     say "plan — nothing will be started"
     cat <<EOF
@@ -803,7 +824,7 @@ case "$cmd" in
   witnesses   $WITNESS_DIR -> $OUT/witnesses
   guest elf   built on $HOST from $BRANCH -> $OUT/elf/monad-zkvm-guest-{zisk,sp1}.elf
   generation  $GEN   (use-gen-ready: witnesses + both ELFs + PROVENANCE.md)
-  history     ${HISTORY:-<unset — dynamic; the again verb pins it to span+96>}
+  history     $HISTORY versions (span+96) — the node is patched in the build phase to accept it
 EOF
     # `rewind` is listed too: it belongs to `again`, not to `run`, but plan promises every command and
     # a phase that destroys history is not one to discover at execution time.
@@ -835,6 +856,7 @@ EOF
     echo "  is $DB destroyed and reloaded (~66 min), and you are asked again at that point."
     read -r -p "  proceed? [y/N] " a; [ "$a" = y ] || die "aborted"
 
+    ensure_node_patch
     step "node build";        tmux_run build "$(p_build)"
     wait_window build "node build" 20 "tail -1 /tmp/wb-build.log"
     step "guest ELF build";   tmux_run guest "$(p_guest)"
@@ -938,6 +960,7 @@ corpus. Prune it and retry; stopped before it could fill the disk."; }
     say "again — replay $COUNT blocks ($FIRST..$LAST) with branch $BRANCH, reusing the loaded trie"
     echo "  history pinned at $HISTORY versions (span $((LAST - FIRST + 1)) + margin)"
 
+    ensure_node_patch
     step "node build";        tmux_run build "$(p_build)"
     wait_window build "node build" 20 "tail -1 /tmp/wb-build.log"
     step "guest ELF build";   tmux_run guest "$(p_guest)"
