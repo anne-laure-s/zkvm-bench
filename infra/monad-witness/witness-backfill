@@ -96,7 +96,12 @@ STEP=0; STEPS=8       # `run` re-pins this once the trie probe says which path i
 step(){ STEP=$((STEP + 1)); printf '\n\033[1m[%d/%d] %s\033[0m  (%s)\n' "$STEP" "$STEPS" "$1" "$(date +%H:%M:%S)"; }
 hms(){ printf '%02d:%02d:%02d' $(($1/3600)) $(($1%3600/60)) $(($1%60)); }
 say(){ printf '\n\033[1m== %s\033[0m\n' "$1"; }
+# -n is deliberate: without it ssh swallows the driver's own stdin, which breaks every read/loop that
+# calls it. The cost is that sshq can NEVER be the right side of a pipe -- stdin comes from /dev/null,
+# so `cat > file` writes an empty file and the failure is silent. Use sshin for that.
 sshq(){ ssh -n -o ConnectTimeout=10 -o BatchMode=yes "$HOST" "$@"; }
+# The one shape sshq cannot serve: sending data in over stdin.
+sshin(){ ssh -o ConnectTimeout=10 -o BatchMode=yes "$HOST" "$@"; }
 
 # ---------------------------------------------------------------- the block set
 # Derived from what we already have, so "the same blocks" is a fact, not a promise. A gap is fatal
@@ -555,7 +560,12 @@ probe_witnesses() {   # -> 0 if the first $PROBE witnesses are byte-identical to
 tmux_run() {   # $1 window, $2 script
   local w="$1"; shift
   sshq "tmux has-session -t $SESSION 2>/dev/null || tmux new-session -d -s $SESSION -n idle"
-  printf '%s\n' "$1" | sshq "cat > /tmp/wb-$w.sh && chmod +x /tmp/wb-$w.sh"
+  # sshin, NOT sshq: sshq passes -n, so the phase script arrived as an EMPTY file and every phase
+  # then "succeeded" instantly having done nothing -- builds that never built, a rewind that never
+  # rewound, all reporting done with an EXIT=0 log and no output at all.
+  printf '%s\n' "$1" | sshin "cat > /tmp/wb-$w.sh && chmod +x /tmp/wb-$w.sh"
+  # A phase script that arrives empty must not look like a phase that had nothing to do.
+  sshq "test -s /tmp/wb-$w.sh" || die "the $w phase script arrived empty on $HOST — refusing to run it"
   sshq "tmux new-window -t $SESSION -n $w 'bash /tmp/wb-$w.sh 2>&1 | tee /tmp/wb-$w.log; echo EXIT=\$? >> /tmp/wb-$w.log; sleep infinity'"
 }
 
