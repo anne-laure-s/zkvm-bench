@@ -388,10 +388,9 @@ prefetch_next(){
   src="$WDIR/$CHAIN_ID-$nxt.bin"
   [ -f "$src" ] || return 0
   local ws="${REMOTE_WS:-/workspace}" dst="$CHAIN_ID-$nxt.bin" err rc
-  # SAY SO WHEN IT FAILS. This used to log only on success — `… 2>/dev/null && log "(prefetched …)"` — so a
-  # prefetch that could not even connect produced NO line at all, and the farm log looked exactly like a farm
-  # with nothing to prefetch. It stayed broken for 12 minutes in plain sight, reading as "transport is slow"
-  # while the real cause was that the box had lost its key and every fresh ssh was refused. The proving path
+  # SAY SO WHEN IT FAILS. Logging only on success — `… 2>/dev/null && log "(prefetched …)"` — gives a prefetch
+  # that cannot even connect NO line at all, and the farm log then looks exactly like a farm with nothing to
+  # prefetch: a box that has lost its key, refusing every fresh ssh, reads as "transport is slow". The proving path
   # never noticed because it rides a multiplexed master authenticated once at startup; the prefetcher is the
   # only component that opens a NEW connection per block, which makes it the canary — but only if it speaks.
   # Best-effort still means best-effort: this never fails the block, it just stops being silent about it.

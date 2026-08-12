@@ -88,8 +88,8 @@ REPLAY_POLL="${REPLAY_POLL:-0.3}"
 # showed up whole in wit->queue; monad writes a witness in one pass, so 0.5 s is enough margin.
 SETTLE_SECS="${SETTLE_SECS:-0.5}"
 # PROVE EVERY N BLOCKS. N counts BLOCKS, not seconds — every other knob up to here is a duration, so the unit
-# is worth stating twice. The mechanism was always in witness-tap (`is_cadence = b % PROVE_EVERY == 0`) and
-# witness-follow always forwarded it; rtp-up simply never exposed it.
+# is worth stating twice. The selection itself lives in witness-tap (`is_cadence = b % PROVE_EVERY == 0`), and
+# witness-follow forwards the value to it.
 #
 # WHY IT IS NOT A RETREAT — measured on 300 consecutive live blocks (25697053..25697390), not estimated:
 #   producer  t_block -> t_queued   median  8.34 s   p90 11.55 s    (of which 6.90 s is chain visibility)
@@ -170,12 +170,21 @@ if [ -z "$PROVER" ]; then PULL_VIA="${PULL_VIA:-$BOX}"; else PULL_VIA="${PULL_VI
 # chain->witness, and no polling interval reaches it.
 # TIP_DIRECT=0 restores the run_replay.py path so the two can be measured rather than argued about.
 #
-# OFF BY DEFAULT, and not for lack of trying: monad rejects it with
-#     --block-db-timeout requires --as-eth-blocks
-# and --as-eth-blocks means "ingest monad blocks in evm format" — the Monad-chain ingestion path, not the
-# Ethereum-mainnet block_db we fetch from an RPC. So the wait-for-blocks capability exists but is unreachable
-# for an ethereum chain in this build, and the ~3 s per-block startup (measured: 1 block per 3 s at the tip,
-# almost entirely db open) is a floor no setting removes. The code stays for the day that restriction lifts.
+# OFF BY DEFAULT because the gain is unproven, not because the flag is unavailable. What TIP_DIRECT removes is
+# the per-block process start, and that sits in `t_avail -> t_witness`: 0.19 s median over 300 production blocks
+# at the tip, against the 6.90 s of chain visibility that dominates the producer and that TIP_DIRECT cannot
+# touch. There is little there to win, so the measurement has to come before the default moves.
+#
+# It needs a monad whose ETHEREUM runloop takes the flag. `cmd/monad/main.cpp:204` drops the
+# `->needs(as_eth_blocks_flag)` constraint, and `case CHAIN_CONFIG_ETHEREUM_MAINNET:` passes both the witness
+# dump (473) and block_db_timeout (478) to runloop_ethereum — the call site `--chain ethereum_mainnet` selects.
+# Without that, `--block-db-timeout` requires `--as-eth-blocks`, which is the Monad-chain ingestion path and not
+# the Ethereum-mainnet block_db an RPC feeds; on such a binary the flag is accepted and silently does nothing.
+#
+# Two figures describe this leg and they measure different things: 0.19 s is a per-block LATENCY at the tip,
+# where blocks arrive every 12 s and the replay is never saturated, while "~3 s per block, almost entirely db
+# open" is a THROUGHPUT while draining a backlog. Neither substitutes for the other. `TIP_DIRECT=1` against `0`
+# on one run is what settles which path the tip should use, and that is why both paths exist.
 TIP_DIRECT="${TIP_DIRECT:-0}"
 # Seconds, as a bare integer — the parser rejects "30s" ("Could not convert"), despite --help printing its
 # default as "0s". Only meaningful once the box runs a monad with the runloop_ethereum retry patch; on an

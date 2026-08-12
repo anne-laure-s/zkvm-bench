@@ -151,30 +151,30 @@ prove_remote() {
   echo "Run dir   : $run_dir"
 
   # Create the workspace, resolve it to an absolute path, AND read the remote ELF's hash — all in ONE round
-  # trip. The hash used to be its own ssh call, paid on every block to learn something that changes almost
-  # never. Folding it in here beats caching it locally: one fewer exchange and no stale-cache failure mode.
+  # trip. Folding the hash in here beats both a separate call and a local cache: one exchange instead of two,
+  # and no stale-cache failure mode at an ELF swap — the one moment the hash actually matters.
   # Line 1 is the path, line 2 the hash (empty if the ELF is not there yet, which correctly forces an upload).
   # Timed from HERE, before the first exchange with the prover: the workspace call is part of what `input`
   # costs, and starting the clock after it would flatter the very change being measured.
   # %N (Linux — core.sh runs on the producer box): tenths, because at ~2 s whole seconds hide real gains.
-  # THE FETCH RIDES THIS ROUND TRIP TOO. Once the pump made the transfer itself fast, the fixed cost around it
-  # became the biggest remaining term: at 90-135 ms RTT every separate box->prover exchange is ~0.19 s, and
-  # asking the pump for the block used to be its own. The prover already knows everything needed to decide —
+  # THE FETCH RIDES THIS ROUND TRIP TOO. With the transfer itself fast, the fixed cost around it is the biggest
+  # remaining term: at 90-135 ms RTT every separate box->prover exchange is ~0.19 s, and asking the pump for the
+  # block is otherwise an exchange of its own. The prover already knows everything needed to decide —
   # it has just stat'd the input — so it decides and fetches in the same shell, and reports the verdict on a
   # fourth line. One exchange instead of two, on every block.
   #
-  # This also fixes a latent gate: the pump attempt used to live inside the `PULL_VIA` branch although the pump
-  # does not use PULL_VIA at all (it has its own PUMP_BOX). With PULL_VIA unset and WITNESS_PUMP set, the pump
-  # would silently never be tried.
+  # The pump attempt belongs HERE and not in the `PULL_VIA` branch further down: the pump does not use PULL_VIA
+  # at all (it has its own PUMP_BOX), so gating it on PULL_VIA leaves it silently untried on exactly the
+  # configuration that wants it — PULL_VIA unset, WITNESS_PUMP set.
   local abs_input; abs_input="$(cd "$(dirname "$INPUT")" && pwd)/$(basename "$INPUT")"
   local lin_size; lin_size="$(stat -c %s "$INPUT" 2>/dev/null || stat -f %z "$INPUT" 2>/dev/null || echo 0)"
   local pump_cmd=""
   [[ -n "${WITNESS_PUMP:-}" ]] && pump_cmd="${PUMP_SOCK:+PUMP_SOCK=$PUMP_SOCK }$WITNESS_PUMP"
   local t_start; t_start="$(date +%s.%N)"
   # AND THE SWEEP RIDES IT TOO — the safety net behind the per-block deletions further down. Those cover the
-  # normal path; this covers what no per-block rule can: a killed prover, a failed submit that never reached its
+  # normal path; this covers what no per-block rule can: a killed prover, a failed submit that never reaches its
   # own cleanup, a run interrupted between the prove and the retrieve. Without it the workspace only trends to
-  # empty, and "only leaks on failure" is how 26.8 GB accumulated in the first place.
+  # empty, and a leak that needs a failure to appear is one that reaches tens of GB before anyone looks.
   #
   # Age, not block number, is the criterion, and that is deliberate. A number-based rule ("delete anything below
   # the current block") looks tighter but breaks prefetch: prove-farm ships the NEXT block ahead of time, so a
@@ -209,9 +209,10 @@ echo '--- gpu ---'; nvidia-smi --query-gpu=name,memory.total,driver_version --fo
   # Line 4: PREFETCHED (already there) | PUMP (streamed over the persistent channel) | NOFETCH (fall through
   # to scp). NOFETCH is not an error — it is the designed fallback, and it must stay cheap to reach.
   fetched="$(printf '%s\n' "$ws_meta" | sed -n 4p)"
-  # Lines 5+: the remote environment for the run record. This used to be its OWN exchange, per block, for data
-  # that is constant across a run — host, cpu count, zisk version, GPU model — plus two process spawns that
-  # simply fail on a Mac prover (`cargo-zisk`, `nvidia-smi`). Only `date` varies, and it is stamped here anyway.
+  # Lines 5+: the remote environment for the run record. It rides these lines rather than an exchange of its own,
+  # because it is constant across a run — host, cpu count, zisk version, GPU model — and a per-block snapshot of
+  # unchanging facts costs a round trip plus two process spawns that simply fail on a Mac prover (`cargo-zisk`,
+  # `nvidia-smi`). Only `date` varies, and it is stamped here anyway.
   # A round trip is ~0.19 s at this RTT; that is what a per-block snapshot of unchanging facts was costing.
   local rem_env; rem_env="$(printf '%s\n' "$ws_meta" | sed -n '5,$p')"
   [[ -n "$ws_abs" ]] || { echo "ERROR: remote workspace '$ws' did not resolve" >&2; return 1; }
@@ -248,14 +249,12 @@ echo '--- gpu ---'; nvidia-smi --query-gpu=name,memory.total,driver_version --fo
   # failure we say so loudly and fall back to pushing: a slow pipeline beats a stopped one, but a silent
   # fallback would let a broken config masquerade as a working optimisation.
   local pulled=0 prefetched=0
-  # Declared at function scope, never inside a branch — even though only the scp fallback uses it now that the
-  # artifact push-back is gone. It used to be declared inside the `elif` that pulls the input, so a PREFETCHED
-  # input took the first branch, left pull_opts unset, and `set -u` killed the
-  # retrieve step at the tar: "pull_opts: unbound variable". Every block the prefetcher successfully
-  # shipped therefore FAILED — and failed again on every retry, because the input was still sitting on the
-  # prover and matched on size again. 31 blocks poisoned, 0 recovered, while the feature looked like it was
-  # working: `(prefetched N …)` in the farm log, `<< N FAIL (rc=1 no-report no-proof)` eight seconds later.
-  # The prefetch measured as 0 % effective for exactly as long as it was 100 % fatal.
+  # Declared at FUNCTION SCOPE, never inside a branch, even though only the scp fallback reads it. Inside the
+  # `elif` that pulls the input it is unreachable for a PREFETCHED input — that takes the first branch — and
+  # `set -u` then kills the retrieve step at the tar with "pull_opts: unbound variable". The failure lands on
+  # exactly the blocks the prefetcher SUCCEEDED on, survives every retry (the input still sits on the prover and
+  # matches on size again), and reads as a working feature in the log: `(prefetched N …)`, then
+  # `<< N FAIL (rc=1 no-report no-proof)` eight seconds later — 0 % effective while 100 % fatal.
   local pull_opts="${PULL_SSH_OPTS:--C -o BatchMode=yes -o StrictHostKeyChecking=accept-new}"
   # Already there, byte-for-byte the same size? Then a prefetcher shipped it while the previous block was being
   # proved, and the transfer has already happened off the critical path. Size, not hash: a hash would cost the
@@ -355,10 +354,10 @@ ${ZISK_MOCK_JITTER:+ZISK_MOCK_JITTER=$ZISK_MOCK_JITTER }\
 ${ZISK_MOCK_DIST:+ZISK_MOCK_DIST=$ZISK_MOCK_DIST }\
 ${ZISK_MOCK_PROOF_BYTES:+ZISK_MOCK_PROOF_BYTES=$ZISK_MOCK_PROOF_BYTES }"
   fi
-  # THE ARTIFACTS COME BACK ON THIS SAME EXCHANGE. They used to be fetched by a second call after the run
-  # returned, which cost a full round trip (~0.19 s at this RTT) to ask for something the prover had already
-  # finished writing. The split is only in the code: the runner's own output goes to STDERR (so it still streams
-  # live, and prove-farm captures both anyway), leaving STDOUT free to carry the tar. One exchange, both jobs.
+  # THE ARTIFACTS COME BACK ON THIS SAME EXCHANGE. Fetching them with a second call after the run returns costs a
+  # full round trip (~0.19 s at this RTT) to ask for something the prover has already finished writing. The split
+  # is only in the code: the runner's own output goes to STDERR (so it still streams live, and prove-farm captures
+  # both anyway), leaving STDOUT free to carry the tar. One exchange, both jobs.
   #
   # Note what this does NOT fix, because it is worth knowing: the proof still travels prover -> box, and in the
   # mock topology it then travels back through the tunnel when ethproofs-submit POSTs it to the mock running on
@@ -385,8 +384,8 @@ ${ZISK_MOCK_PROOF_BYTES:+ZISK_MOCK_PROOF_BYTES=$ZISK_MOCK_PROOF_BYTES }"
   # exchange that last needed it, so the workspace returns to elfs/ + the zkVM setup after every block. No extra
   # round trip pays for this: the deletions ride exchanges that already happen.
   #
-  # What it cost when nothing was deleted: 26.8 GB for 3594 blocks = 7.46 MB/block, i.e. 54 GB/day at
-  # PROVE_EVERY=1. The witness is 7.4 of those 7.46 MB, so the input below is 99 % of the problem.
+  # The scale this is worth: a block leaves 7.46 MB behind it, of which the witness is 7.4 — so the input below
+  # is 99 % of it — and at PROVE_EVERY=1 that is 54 GB/day.
   #
   # The INPUT is unconditionally dead here: the prove has run, and nothing reads it again. A retry re-fetches it,
   # which costs one transfer on a rare path — the right trade against carrying every witness forever.
@@ -440,7 +439,7 @@ cd $ws && tar cf - $members 2>/dev/null > $ws/art.tar; $push_cmd; rm -rf $ws/art
   # PRODUCER (Linux), so date +%N is available — the prover's macOS bash never sees these.
   # bash has no float arithmetic, so every subtraction goes through awk. One call, not four.
   # `remote` CHANGED MEANING when the run and the artifact fetch became one exchange, and the change is worth
-  # stating because it makes historical numbers in RTP-FINDINGS shift by ~0.2 s:
+  # stating because it makes numbers recorded before it shift by ~0.2 s:
   #   before — remote = wall time of the run exchange (so it included the ssh round trip that launched it)
   #   now    — remote = the PROVER'S OWN reported duration, read from the report.json it just sent back
   #            retrieve = the rest of that exchange (the launch round trip, the tar, the artifact bytes)

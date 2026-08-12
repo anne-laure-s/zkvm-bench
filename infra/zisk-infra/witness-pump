@@ -33,7 +33,7 @@ it for a block over the short control connection it already holds.
   prover:  witness-pump put SRC DEST     push artifacts UP the same channel, so they skip the tunnel
 
 ONE TRANSFER AT A TIME, deliberately. Requests are served serially. Two concurrent bulk streams on this link
-is the failure mode that took inputs from 4 s to 24-34 s while the queue grew — see RTP-FINDINGS. A serial
+is the failure mode that took inputs from 4 s to 24-34 s while the queue grew. A serial
 pump cannot reproduce it.
 
 FAILURE IS SLOW, NEVER FATAL. Anything that goes wrong — pump not running, socket stale, ssh dead, short read —
