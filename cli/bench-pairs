@@ -167,7 +167,12 @@ build_name() {
       gen="$(dirname "$(dirname "$elf")")"
       alias="$(grep -oE "monad-zkvm-guest-$bk\.elf\`? \(= \`?[a-z0-9-]+" "$ROOT/$gen/PROVENANCE.md" 2>/dev/null \
                | sed 's/.*(= `\{0,1\}//' | head -1)"
-      echo "${alias:-$base}" ;;
+      # No alias in the PROVENANCE -- which is the case for everything witness-backfill writes -- and
+      # the bare basename is the SAME for every generation's canonical pair. Two different guests then
+      # share one build name, and an axis between them names one build twice: it compared a build
+      # against itself and reported 1.000x. Fall back to the generation, which is what distinguishes
+      # them.
+      echo "${alias:-monad-$(basename "$gen" | tr -cd 'a-zA-Z0-9-')-$bk}" ;;
     *) echo "$base" ;;
   esac
 }
@@ -381,8 +386,16 @@ if [ "${#NEED_CORPUS[@]}" -gt 0 ]; then
       note "delegating to witness-backfill — it probes the trie and rewinds rather than reloading"
       HOST="$HOST" BLOCKS="$FIRST-$LAST" GEN="$GEN" "$BACKFILL" run "$br" \
         || die "witness-backfill failed for $br — nothing further attempted"
-      base_gen="$(readlink "$ROOT/guests/monad/current" 2>/dev/null | sed 's|.*/||')"
-      [ -n "$base_gen" ] || die "witness-backfill ran for $br but no generation is selected"
+      # witness-backfill FILES a generation, it does not select one -- `current` still points at
+      # whatever it did before. Reading it here took the OLD generation as the corpus: the axes then
+      # measured a new ELF against old-format witnesses (a guest that aborts early and reports a
+      # ratio of 0.12), and the probe compared the second branch against the wrong reference.
+      base_gen="${GEN:-$(ls -td "$ROOT"/guests/monad/gen/*/ | head -1 | sed 's|/$||;s|.*/||')}"
+      [ -d "$ROOT/guests/monad/gen/$base_gen" ] || die "witness-backfill ran for $br but no \
+generation $base_gen exists"
+      say "select generation $base_gen"
+      ( cd "$ROOT/guests/monad" && ./use-gen "$base_gen" ) || die "use-gen $base_gen failed"
+      CURGEN="$base_gen"; NEED_SELECT=""
       continue
     fi
     say "guest for $br (reusing the $base_gen corpus if the bytes agree)"
