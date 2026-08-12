@@ -39,7 +39,9 @@
 #   axes            an axis whose two sides already match is left alone, never re-declared
 #
 # Env: BLOCKS (range or dir, default the current generation's corpus) · REPORT (html out) ·
-#      EPHEMERAL=1 (mark declared axes ephemeral — see axis.py prune) · FORCE=1 (pass through)
+#      EPHEMERAL=1 (mark declared axes ephemeral — see axis.py prune) · FORCE=1 (pass through) ·
+#      --gen NAME (name the generation a new corpus lands in; default is witness-backfill's
+#      <branch-leaf>-<yyyy-mm>-<commit>)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,6 +52,9 @@ USEGEN="$ROOT/guests/monad/use-gen"
 
 HOST="${HOST:-}"
 BLOCKS="${BLOCKS:-}"
+# Name for the generation a corpus lands in. Empty lets witness-backfill coin its default,
+# <branch-leaf>-<yyyy-mm>-<commit> -- correct and traceable, but not a name anyone reads twice.
+GEN="${GEN:-}"
 REPORT="${REPORT:-$PROF/results/compare.html}"
 PAIRS=()
 cmd=plan
@@ -67,6 +72,7 @@ while [ $# -gt 0 ]; do
     --host)  HOST="$2"; shift 2 ;;
     --pair)  PAIRS+=("$2"); shift 2 ;;
     --blocks) BLOCKS="$2"; shift 2 ;;
+    --gen)   GEN="$2"; shift 2 ;;
     --report) REPORT="$2"; shift 2 ;;
     plan|run) cmd="$1"; shift ;;
     -h|--help) usage 0 ;;
@@ -351,7 +357,7 @@ if [ "${#NEED_CORPUS[@]}" -gt 0 ]; then
     if [ -z "$base_gen" ]; then
       say "corpus for $br"
       note "delegating to witness-backfill — it probes the trie and rewinds rather than reloading"
-      HOST="$HOST" BLOCKS="$FIRST-$LAST" "$BACKFILL" run "$br" \
+      HOST="$HOST" BLOCKS="$FIRST-$LAST" GEN="$GEN" "$BACKFILL" run "$br" \
         || die "witness-backfill failed for $br — nothing further attempted"
       base_gen="$(readlink "$ROOT/guests/monad/current" 2>/dev/null | sed 's|.*/||')"
       [ -n "$base_gen" ] || die "witness-backfill ran for $br but no generation is selected"

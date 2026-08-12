@@ -89,6 +89,9 @@ guest crates (`zkvm/{zisk,sp1}`) live on different branches upstream, so name a 
 both. And the branch must be present on the box — `--host` reaches it over ssh, it is not pushed
 there for you.
 
+`--gen NAME` names the generation a new corpus lands in; without it `witness-backfill` coins
+`<branch-leaf>-<yyyy-mm>-<commit>`, which is traceable but not a name you want to type again.
+
 `EPHEMERAL=1` marks the axes it declares, so `./axis.py prune` clears them when the campaign is over.
 `--blocks FIRST-LAST` overrides the range (default: the current generation's whole corpus), and
 `--report` the output path.
