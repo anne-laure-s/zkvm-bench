@@ -574,7 +574,10 @@ PROBE="${PROBE:-20}"        # blocks to compare before committing to a full repl
 probe_witnesses() {   # -> 0 if the first $PROBE witnesses are byte-identical to $OUT/witnesses
   local ref="$1" n=0 same=0 diff=0 b
   [ -d "$ref" ] || { echo "  no reference corpus at $ref — cannot probe"; return 2; }
-  for b in $(seq "$FIRST" $((FIRST + PROBE - 1))); do
+  # NOT seq: on macOS it prints 2.5552e+07 for an 8-digit block number, so every file check below
+  # missed, n stayed 0, and "cannot compare" reached a caller that reads any non-zero as "they
+  # differ" -- which sent a 504-block replay after a corpus already on disk.
+  for b in $(python3 -c 'import sys; a,n=int(sys.argv[1]),int(sys.argv[2]); print("\n".join(str(x) for x in range(a, a+n)))' "$FIRST" "$PROBE"); do
     [ -f "$ref/$b.witness" ] || continue
     local remote_sha local_sha
     remote_sha=$(sshq "sha256sum $WITNESS_DIR/$b.witness 2>/dev/null | cut -d' ' -f1")
@@ -584,7 +587,9 @@ probe_witnesses() {   # -> 0 if the first $PROBE witnesses are byte-identical to
     if [ "$remote_sha" = "$local_sha" ]; then same=$((same + 1)); else diff=$((diff + 1)); fi
   done
   echo "  compared $n block(s): $same identical, $diff different"
-  [ "$n" -gt 0 ] || { echo "  nothing to compare"; return 2; }
+  # Comparing nothing is not evidence of anything, and the caller can only read a return code --
+  # every non-zero one means "they differ" to it. So say it here instead of letting it be guessed.
+  [ "$n" -gt 0 ] || die "probe compared 0 blocks against $ref — refusing to call that a difference"
   [ "$diff" -eq 0 ]
 }
 

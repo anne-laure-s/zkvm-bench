@@ -266,10 +266,12 @@ for spec in "${PAIRS[@]}"; do
         # comparison per backend) got queued twice, and the second witness-backfill run repeats hours
         # of replay or dies on its own already-exists guard.
         case " ${NEED_CORPUS[*]-} " in *" $s "*) ;; *) NEED_CORPUS+=("$s") ;; esac
+        # '@' and not ':' -- the AXES records below are colon-delimited, so a colon here shifts every
+        # field after it and axis.py received --backend 'monad:zisk'.
         # The placeholder carries the BRANCH, because two not-yet-built branches compared against
         # each other would otherwise get the same string and trip the same-ELF guard below -- a false
         # positive on the most important pair there is, optimised vs baseline.
-        eval "${role}_elf='guests/monad/gen/<new:${s##*/}>/elf/monad-zkvm-guest-$BK.elf'"
+        eval "${role}_elf='guests/monad/gen/<new@${s##*/}>/elf/monad-zkvm-guest-$BK.elf'"
         eval "${role}_name='$(echo "$s" | tr '/' '-')-$BK'"
       fi
     else
@@ -415,10 +417,10 @@ did 'again' get as far as the guest build? Its output says."
   i=0
   for a in ${AXES[@]+"${AXES[@]}"}; do
     IFS=: read -r _nm an ae asrc bn be bsrc bk <<<"$a"
-    case "$ae$be" in *"<new:"*) ;; *) i=$((i + 1)); continue ;; esac
+    case "$ae$be" in *"<new@"*) ;; *) i=$((i + 1)); continue ;; esac
     for role in a b; do
       eval "elf=\$${role}e"
-      case "$elf" in *"<new:"*) ;; *) continue ;; esac
+      case "$elf" in *"<new@"*) ;; *) continue ;; esac
       # The branch that produced this side is the one we just generated for; its build now resolves.
       for br in ${NEED_CORPUS[@]+"${NEED_CORPUS[@]}"}; do
         new_elf="$(branch_build "$br" "$bk")"
@@ -428,7 +430,7 @@ did 'again' get as far as the guest build? Its output says."
         break
       done
       eval "elf=\$${role}e"
-      case "$elf" in *"<new:"*)
+      case "$elf" in *"<new@"*)
         die "the corpus for $bk ran, but no build resolves for it — cannot declare an axis on a \
 placeholder path. Look at guests/monad/gen/*/PROVENANCE.md and declare the axis by hand." ;;
       esac
