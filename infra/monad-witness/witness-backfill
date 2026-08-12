@@ -226,7 +226,11 @@ ensure_replay_scripts() {
   local f
   for f in run_replay.py fetch_blocks.py; do
     [ -f "$REPLAY_DIR/$f" ] || die "$REPLAY_DIR/$f is missing from this checkout — it is tracked"
-    scp -q -o ConnectTimeout=10 -o BatchMode=yes "$REPLAY_DIR/$f" "$HOST:$MONAD_DIR/$f" \
+    # Piped through ssh, NOT scp. MONAD_DIR is `$HOME/monad` -- a string the REMOTE shell has to
+    # expand, and modern scp speaks SFTP, which has no shell on the far end: the destination stayed
+    # literal and the copy failed on `dest open "$HOME/monad/run_replay.py"`. Every other remote path
+    # in this script goes through sshq for exactly this reason.
+    ssh -o ConnectTimeout=10 -o BatchMode=yes "$HOST" "cat > $MONAD_DIR/$f" < "$REPLAY_DIR/$f" \
       || die "could not copy $f to $HOST:$MONAD_DIR"
   done
   echo "  copied run_replay.py and fetch_blocks.py to $MONAD_DIR"
