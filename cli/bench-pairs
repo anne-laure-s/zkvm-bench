@@ -242,11 +242,14 @@ for spec in "${PAIRS[@]}"; do
           [ "$CURGEN" = "$g" ] || NEED_SELECT="$g"
         else
           todo "$s: no corpus covering $NBLOCKS blocks (${g:-no generation} has $n) — regenerate"
-          NEED_CORPUS+=("$s")
+          case " ${NEED_CORPUS[*]-} " in *" $s "*) ;; *) NEED_CORPUS+=("$s") ;; esac
         fi
       else
         todo "$s: no build for $BK — witness-backfill run (hours; may reset the trie on the box)"
-        NEED_CORPUS+=("$s")
+        # Once per BRANCH, not once per pair. A branch named in two pairs (the usual shape: one
+        # comparison per backend) got queued twice, and the second witness-backfill run repeats hours
+        # of replay or dies on its own already-exists guard.
+        case " ${NEED_CORPUS[*]-} " in *" $s "*) ;; *) NEED_CORPUS+=("$s") ;; esac
         eval "${role}_elf='guests/monad/gen/<new>/elf/monad-zkvm-guest-$BK.elf'"
         eval "${role}_name='$(echo "$s" | tr '/' '-')-$BK'"
       fi
@@ -336,6 +339,46 @@ if [ "${#NEED_CORPUS[@]}" -gt 0 ]; then
   done
   # A fresh corpus lands in a new generation; re-resolve rather than trusting the pre-run reading.
   CURGEN="$(readlink "$ROOT/guests/monad/current" 2>/dev/null | sed 's|.*/||')"
+
+  # And re-resolve the AXES themselves. Before the corpus existed there was nothing to resolve, so a
+  # not-yet-built branch got a PLACEHOLDER elf path (literally `gen/<new>/elf/...`) and a name coined
+  # from the branch string. Declaring those verbatim is how you get a report with an axis pointing at
+  # a path that does not exist and a build name nothing ever measures -- the empty-column failure,
+  # arriving after the hours the generation cost. Now that the ELFs are staged, ask the same resolvers
+  # the plan used and rewrite the entries in place.
+  i=0
+  for a in ${AXES[@]+"${AXES[@]}"}; do
+    IFS=: read -r _nm an ae asrc bn be bsrc bk <<<"$a"
+    case "$ae$be" in *"<new>"*) ;; *) i=$((i + 1)); continue ;; esac
+    for role in a b; do
+      eval "elf=\$${role}e"
+      case "$elf" in *"<new>"*) ;; *) continue ;; esac
+      # The branch that produced this side is the one we just generated for; its build now resolves.
+      for br in ${NEED_CORPUS[@]+"${NEED_CORPUS[@]}"}; do
+        new_elf="$(branch_build "$br" "$bk")"
+        [ -n "$new_elf" ] || continue
+        eval "${role}e='$new_elf'"
+        eval "${role}n='$(build_name "$new_elf" "$bk")'"
+        break
+      done
+      eval "elf=\$${role}e"
+      case "$elf" in *"<new>"*)
+        die "the corpus for $bk ran, but no build resolves for it — cannot declare an axis on a \
+placeholder path. Look at guests/monad/gen/*/PROVENANCE.md and declare the axis by hand." ;;
+      esac
+    done
+    nm="$(echo "$an-vs-$bn" | tr -cd 'a-zA-Z0-9-' | tr 'A-Z' 'a-z')"
+    AXES[$i]="$nm:$an:$ae:$asrc:$bn:$be:$bsrc:$bk"
+    note "axis re-resolved after generation: $nm"
+    i=$((i + 1))
+  done
+  # AXES_TO_ADD holds pre-generation copies; rebuild it against the corrected AXES.
+  AXES_TO_ADD=()
+  declared="$("$PROF/axis.py" list 2>/dev/null | awk 'NF>3 && $1 !~ /^(axis|EPH|\*|[0-9]+)/ {print $1}' || true)"
+  for a in ${AXES[@]+"${AXES[@]}"}; do
+    nm="${a%%:*}"
+    echo "$declared" | grep -qx "$nm" || AXES_TO_ADD+=("$a")
+  done
 fi
 
 if [ -n "$NEED_SELECT" ] && [ "$CURGEN" != "$NEED_SELECT" ]; then

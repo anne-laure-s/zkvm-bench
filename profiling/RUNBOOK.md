@@ -74,6 +74,11 @@ What it skips, because a full run is hours and almost none of it is usually nece
 | the measurements | nothing to skip — the cache is keyed by ELF **content**, so any build measured before is known wherever it now sits |
 | the axes | an axis with these two sides is already declared |
 
+A branch with no witness corpus is generated for, once per branch however many pairs name it, by
+delegating to `witness-backfill` — so `bench-pairs` covers the whole path from a branch to a report.
+Two caveats it cannot remove: generation needs the branch present on the box (`--host`), and a branch
+that dumps witnesses must also be able to build the guest, since one checkout serves both.
+
 `EPHEMERAL=1` marks the axes it declares, so `./axis.py prune` clears them when the campaign is over.
 `--blocks FIRST-LAST` overrides the range (default: the current generation's whole corpus), and
 `--report` the output path.
