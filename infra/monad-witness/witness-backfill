@@ -81,7 +81,11 @@ BLOCK_DB="${BLOCK_DB:-\$HOME/block_db_backfill}"
 WITNESS_DIR="${WITNESS_DIR:-\$HOME/witnesses-backfill}"
 SNAPSHOTS="${SNAPSHOTS:-/home/refdata/ETH/mainnet/snapshots}"
 RPC="${RPC:-http://chi-001.devcore4.com:8545}"
-PY="${PY:-\$HOME/.pyenv/versions/3.12.13/bin/python3}"   # a fresh tmux has no pyenv in PATH
+PY="${PY:-\$HOME/.pyenv/versions/3.12.13/bin/python3}"
+# This repo, checked out ON THE BOX. Everything this script needs from it -- the replay scripts, the
+# node patch -- arrives there by `git pull`, not by being copied from here: one source of truth, and
+# the box states which commit it is on.
+BOX_REPO="${BOX_REPO:-\$HOME/zkvm-bench}"   # a fresh tmux has no pyenv in PATH
 NTHREADS="${NTHREADS:-8}"
 MAX_BATCH="${MAX_BATCH:-2000}"
 SESSION="${SESSION:-wbackfill}"
@@ -100,7 +104,8 @@ say(){ printf '\n\033[1m== %s\033[0m\n' "$1"; }
 # calls it. The cost is that sshq can NEVER be the right side of a pipe -- stdin comes from /dev/null,
 # so `cat > file` writes an empty file and the failure is silent. Use sshin for that.
 sshq(){ ssh -n -o ConnectTimeout=10 -o BatchMode=yes "$HOST" "$@"; }
-# The one shape sshq cannot serve: sending data in over stdin.
+# The one shape sshq cannot serve: sending data in over stdin. Used only for the phase script, which
+# is generated text and has no file to pull from git.
 sshin(){ ssh -o ConnectTimeout=10 -o BatchMode=yes "$HOST" "$@"; }
 
 # ---------------------------------------------------------------- the block set
@@ -228,27 +233,23 @@ REPLAY_DIR="$HERE/replay"
 # artifacts and this checkout is where they live, so there is nothing to reconcile. Done in preflight
 # rather than at first use, which is phase 6 of 8 -- by then the reset has destroyed the triedb.
 ensure_replay_scripts() {
-  local f
-  for f in run_replay.py fetch_blocks.py; do
-    [ -f "$REPLAY_DIR/$f" ] || die "$REPLAY_DIR/$f is missing from this checkout — it is tracked"
-    # Piped through ssh, NOT scp. MONAD_DIR is `$HOME/monad` -- a string the REMOTE shell has to
-    # expand, and modern scp speaks SFTP, which has no shell on the far end: the destination stayed
-    # literal and the copy failed on `dest open "$HOME/monad/run_replay.py"`. Every other remote path
-    # in this script goes through sshq for exactly this reason.
-    ssh -o ConnectTimeout=10 -o BatchMode=yes "$HOST" "cat > $MONAD_DIR/$f" < "$REPLAY_DIR/$f" \
-      || die "could not copy $f to $HOST:$MONAD_DIR"
-  done
-  echo "  copied run_replay.py and fetch_blocks.py to $MONAD_DIR"
+  sshq "test -d $BOX_REPO/.git" \
+    || die "no zkvm-bench checkout at $BOX_REPO on $HOST — this script's inputs travel by git, \
+not by copy. Clone it there, or set BOX_REPO."
+  sshq "test -f $BOX_REPO/infra/monad-witness/replay/run_replay.py" \
+    || die "$BOX_REPO on $HOST predates infra/monad-witness/replay/ — git pull it there first."
+  sshq "cp $BOX_REPO/infra/monad-witness/replay/run_replay.py \
+           $BOX_REPO/infra/monad-witness/replay/fetch_blocks.py $MONAD_DIR/" \
+    || die "could not place the replay scripts into $MONAD_DIR on $HOST"
+  echo "  replay scripts from $BOX_REPO @ $(sshq "git -C $BOX_REPO rev-parse --short HEAD" 2>/dev/null)"
 }
 
 # Send patch-fixed-history.py to the box and arrange for the build phase to apply it. The node only
 # accepts --fixed-history-length with it, and `run` always passes that flag.
 ensure_node_patch() {
   [ -n "$HISTORY" ] || return 0
-  [ -f "$HERE/patch-fixed-history.py" ] || die "$HERE/patch-fixed-history.py is missing — it is tracked"
-  sshin "cat > /tmp/wb-patch-fixed-history.py" < "$HERE/patch-fixed-history.py" \
-    || die "could not copy patch-fixed-history.py to $HOST"
-  sshq "test -s /tmp/wb-patch-fixed-history.py" || die "patch-fixed-history.py arrived empty on $HOST"
+  sshq "test -x $BOX_REPO/infra/monad-witness/patch-fixed-history.py" \
+    || die "no patch-fixed-history.py in $BOX_REPO on $HOST — git pull it there."
 }
 
 # ---------------------------------------------------------------- preflight
@@ -358,7 +359,7 @@ git submodule status third_party/quill
 # Applied here, on the checkout, before the build that has to contain it. Idempotent, and it refuses
 # to guess if upstream moved -- in which case the build stops rather than producing a node that will
 # fail at replay, six phases later.
-${HISTORY:+$PY /tmp/wb-patch-fixed-history.py --file cmd/monad/main.cpp}
+${HISTORY:+$PY $BOX_REPO/infra/monad-witness/patch-fixed-history.py --file cmd/monad/main.cpp}
 ninja -C build -k 0 cmd/monad cmd/monad-cli category/mpt/monad-mpt
 EOF
 }
