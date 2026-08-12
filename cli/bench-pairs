@@ -250,7 +250,10 @@ for spec in "${PAIRS[@]}"; do
         # comparison per backend) got queued twice, and the second witness-backfill run repeats hours
         # of replay or dies on its own already-exists guard.
         case " ${NEED_CORPUS[*]-} " in *" $s "*) ;; *) NEED_CORPUS+=("$s") ;; esac
-        eval "${role}_elf='guests/monad/gen/<new>/elf/monad-zkvm-guest-$BK.elf'"
+        # The placeholder carries the BRANCH, because two not-yet-built branches compared against
+        # each other would otherwise get the same string and trip the same-ELF guard below -- a false
+        # positive on the most important pair there is, optimised vs baseline.
+        eval "${role}_elf='guests/monad/gen/<new:${s##*/}>/elf/monad-zkvm-guest-$BK.elf'"
         eval "${role}_name='$(echo "$s" | tr '/' '-')-$BK'"
       fi
     else
@@ -314,7 +317,11 @@ done
 say "what running would do"
 [ "${#NEED_CORPUS[@]}" -eq 0 ] \
   && note "no corpus to generate — every branch already has one" \
-  || note "generate a corpus for: ${NEED_CORPUS[*]}   (witness-backfill, hours each)"
+  || { set -- ${NEED_CORPUS[@]+"${NEED_CORPUS[@]}"}
+       note "generate ONE corpus, from $1   (witness-backfill run — hours)"
+       shift
+       [ $# -eq 0 ] || note "then build the guest for: $*   (witness-backfill again — minutes, \
+reuses that corpus when the witness bytes agree, and is filed as a variant)"; }
 [ -n "$NEED_SELECT" ] && note "select generation $NEED_SELECT (use-gen) — it changes what EVERY axis reads"
 [ "${#AXES_TO_ADD[@]}" -eq 0 ] && note "no axis to declare" || note "declare ${#AXES_TO_ADD[@]} axis/axes"
 note "measure + render: compare.py --block-min $FIRST --block-max $LAST -> $(basename "$REPORT")"
@@ -331,11 +338,44 @@ fi
 
 if [ "${#NEED_CORPUS[@]}" -gt 0 ]; then
   [ -n "$HOST" ] || die "corpus generation needs --host (the devcore box)"
+  # ONE corpus for however many branches read the same witness format. Two branches whose generator
+  # code is identical emit identical bytes, so replaying twice buys nothing and costs the whole replay
+  # again. The first branch gets the full `run` and its pair becomes the generation's canonical ELFs;
+  # every later one gets `again`, which builds its guest, replays only PROBE blocks and stops the
+  # moment the bytes match -- then its ELFs are filed as a variant reading the shared corpus. If the
+  # bytes DIFFER, `again` carries on and files its own generation, which is the right answer too: a
+  # different format genuinely needs its own corpus.
+  base_gen=""
   for br in "${NEED_CORPUS[@]}"; do
-    say "corpus for $br"
-    note "delegating to witness-backfill — it probes the trie and rewinds rather than reloading"
-    HOST="$HOST" BLOCKS="$FIRST-$LAST" "$BACKFILL" run "$br" \
-      || die "witness-backfill failed for $br — nothing further attempted"
+    leaf="$(echo "${br##*/}" | tr -cd 'a-zA-Z0-9-')"
+    if [ -z "$base_gen" ]; then
+      say "corpus for $br"
+      note "delegating to witness-backfill — it probes the trie and rewinds rather than reloading"
+      HOST="$HOST" BLOCKS="$FIRST-$LAST" "$BACKFILL" run "$br" \
+        || die "witness-backfill failed for $br — nothing further attempted"
+      base_gen="$(readlink "$ROOT/guests/monad/current" 2>/dev/null | sed 's|.*/||')"
+      [ -n "$base_gen" ] || die "witness-backfill ran for $br but no generation is selected"
+      continue
+    fi
+    say "guest for $br (reusing the $base_gen corpus if the bytes agree)"
+    HOST="$HOST" BLOCKS="$FIRST-$LAST" AGAINST="$base_gen" PROBE="${PROBE:-8}" \
+      "$BACKFILL" again "$br" \
+      || die "witness-backfill again failed for $br — nothing further attempted"
+    # `again` stops on a byte match WITHOUT filing a generation, leaving the pair staged on the box.
+    # Whether it stopped is therefore readable from whether a build now resolves.
+    if [ -z "$(branch_build "$br" zisk)$(branch_build "$br" sp1)" ]; then
+      vdir="$ROOT/guests/monad-variants/$leaf"
+      mkdir -p "$vdir"
+      for bk in zisk sp1; do
+        scp -q -o ConnectTimeout=10 -o BatchMode=yes \
+            "$HOST:/tmp/wb-elf/monad-zkvm-guest-$bk.elf" "$vdir/monad-$leaf-$bk.elf" \
+          || die "could not fetch $br's $bk ELF from $HOST:/tmp/wb-elf — \
+did 'again' get as far as the guest build? Its output says."
+      done
+      note "filed as a variant: guests/monad-variants/$leaf/ (reads the $base_gen corpus)"
+      note "record the sha256s in guests/monad-variants/README.md — that file is the registry"
+      ( cd "$vdir" && shasum -a 256 ./*.elf | sed 's|  \./|  |' ) | sed 's/^/    /'
+    fi
   done
   # A fresh corpus lands in a new generation; re-resolve rather than trusting the pre-run reading.
   CURGEN="$(readlink "$ROOT/guests/monad/current" 2>/dev/null | sed 's|.*/||')"
@@ -349,10 +389,10 @@ if [ "${#NEED_CORPUS[@]}" -gt 0 ]; then
   i=0
   for a in ${AXES[@]+"${AXES[@]}"}; do
     IFS=: read -r _nm an ae asrc bn be bsrc bk <<<"$a"
-    case "$ae$be" in *"<new>"*) ;; *) i=$((i + 1)); continue ;; esac
+    case "$ae$be" in *"<new:"*) ;; *) i=$((i + 1)); continue ;; esac
     for role in a b; do
       eval "elf=\$${role}e"
-      case "$elf" in *"<new>"*) ;; *) continue ;; esac
+      case "$elf" in *"<new:"*) ;; *) continue ;; esac
       # The branch that produced this side is the one we just generated for; its build now resolves.
       for br in ${NEED_CORPUS[@]+"${NEED_CORPUS[@]}"}; do
         new_elf="$(branch_build "$br" "$bk")"
@@ -362,7 +402,7 @@ if [ "${#NEED_CORPUS[@]}" -gt 0 ]; then
         break
       done
       eval "elf=\$${role}e"
-      case "$elf" in *"<new>"*)
+      case "$elf" in *"<new:"*)
         die "the corpus for $bk ran, but no build resolves for it — cannot declare an axis on a \
 placeholder path. Look at guests/monad/gen/*/PROVENANCE.md and declare the axis by hand." ;;
       esac

@@ -74,10 +74,20 @@ What it skips, because a full run is hours and almost none of it is usually nece
 | the measurements | nothing to skip — the cache is keyed by ELF **content**, so any build measured before is known wherever it now sits |
 | the axes | an axis with these two sides is already declared |
 
-A branch with no witness corpus is generated for, once per branch however many pairs name it, by
-delegating to `witness-backfill` — so `bench-pairs` covers the whole path from a branch to a report.
-Two caveats it cannot remove: generation needs the branch present on the box (`--host`), and a branch
-that dumps witnesses must also be able to build the guest, since one checkout serves both.
+**Branches with no corpus are generated for, and only once.** `bench-pairs` covers the whole path
+from a branch to a report: the first branch that needs a corpus gets the full `witness-backfill run`
+and its pair becomes the generation's canonical ELFs; every other one gets `witness-backfill again`,
+which builds its guest, replays only `PROBE` blocks (8 by default) and stops as soon as the witness
+bytes match — then its ELFs are filed under `guests/monad-variants/<leaf>/` and read the shared
+corpus. Two branches with identical generator code emit identical witnesses, so replaying twice buys
+nothing; if the bytes *differ*, `again` carries on and files its own generation, which is the right
+answer for a real format change.
+
+One thing it cannot do for you: a branch that dumps witnesses must also be able to build the guest,
+because one checkout serves both. The generator (`witness_generator.cpp`, `--zkvm-witness`) and the
+guest crates (`zkvm/{zisk,sp1}`) live on different branches upstream, so name a branch that carries
+both. And the branch must be present on the box — `--host` reaches it over ssh, it is not pushed
+there for you.
 
 `EPHEMERAL=1` marks the axes it declares, so `./axis.py prune` clears them when the campaign is over.
 `--blocks FIRST-LAST` overrides the range (default: the current generation's whole corpus), and
