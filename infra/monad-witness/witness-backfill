@@ -539,7 +539,10 @@ check_elf_seen() {
   echo "  both guest ELFs are byte-identical to $hit"
   echo "  it already holds $nw witnesses"
   if [ -n "$prev_commit" ] && [ "$prev_commit" = "$cur_commit" ]; then
-    echo "  and its provenance names the same commit ($cur_commit) — this run would reproduce it exactly."
+    echo "  and its provenance names the same commit ($cur_commit) — this run would produce an"
+    echo "  EQUIVALENT set, not an identical one: replaying the same range twice from the same"
+    echo "  binary gives a different witness for ~3% of blocks (measured 16/504, a different 16"
+    echo "  each run; roots agree, bytes do not). Reuse this set rather than mix two in a campaign."
   elif [ -n "$prev_commit" ]; then
     echo "  BUT its provenance names commit $prev_commit, not $cur_commit."
     echo "  Same guest, different tree: dump_witness lives in cmd/monad, not in the guest, so the"
