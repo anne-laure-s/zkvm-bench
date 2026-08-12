@@ -584,7 +584,11 @@ tmux_run() {   # $1 window, $2 script
   printf '%s\n' "$1" | sshin "cat > /tmp/wb-$w.sh && chmod +x /tmp/wb-$w.sh"
   # A phase script that arrives empty must not look like a phase that had nothing to do.
   sshq "test -s /tmp/wb-$w.sh" || die "the $w phase script arrived empty on $HOST — refusing to run it"
-  sshq "tmux new-window -t $SESSION -n $w 'bash /tmp/wb-$w.sh 2>&1 | tee /tmp/wb-$w.log; echo EXIT=\$? >> /tmp/wb-$w.log; sleep infinity'"
+  # Redirect, do NOT pipe through tee. `cmd | tee log; echo EXIT=$?` records TEE's status, which is
+  # 0 whatever the phase did -- so a build that stopped on a compile error, and a phase script that
+  # arrived empty, both reported EXIT=0 and the run carried on with a stale binary. Nothing reads the
+  # pane (wait_window polls the log), so there is nothing to lose by writing straight to the file.
+  sshq "tmux new-window -t $SESSION -n $w 'bash /tmp/wb-$w.sh > /tmp/wb-$w.log 2>&1; echo EXIT=\$? >> /tmp/wb-$w.log; sleep infinity'"
 }
 
 wait_window() {  # $1 window, $2 label, $3 poll secs, $4 optional remote progress probe
