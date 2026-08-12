@@ -352,7 +352,7 @@ git rev-parse HEAD
 # like a broken branch. Verify: the status line must start with a space, not +/-.
 git submodule update --init --recursive
 git submodule status third_party/quill
-# The node only accepts --fixed-history-length with this patch, and `run` ALWAYS passes that flag
+# The node only accepts --fixed-history-length with this patch, and the run verb ALWAYS sends it
 # (it pins the history so the next run over this range can rewind instead of reloading). A fresh
 # checkout does not carry it, so without this the node rejects its own driver's argv:
 #   The following arguments were not expected: --fixed-history-length 600
