@@ -137,8 +137,16 @@ branch_build() {
     # Only the sha table's own line, which pairs a filename with the build name it IS.
     grep -qE "^\|[^|]*monad-zkvm-guest-$bk\.elf[^|]*\|" "$d/PROVENANCE.md" 2>/dev/null || continue
     grep -qF "$br" "$d/PROVENANCE.md" 2>/dev/null || continue
-    # ...and that branch must be the one the canonical pair came FROM, not merely mentioned.
-    grep -qE "(=|is) .?(origin/)?$br.? (rebased|—|-)" "$d/PROVENANCE.md" 2>/dev/null || continue
+    # ...and that branch must be the one the canonical pair came FROM, not merely mentioned. Two
+    # shapes qualify, and prose is the weaker one:
+    #   - **branch** `al/zkvm-sam-gen`     what witness-backfill writes, and calls machine-read
+    #   = origin/al/zkvm-r3 rebased        hand-written, in the generations that predate that field
+    # Matching only the prose left a freshly generated corpus unrecognised, so bench-pairs queued a
+    # second full generation of a set it had just made -- which the already-exists guard then refused,
+    # after the hours it cost.
+    grep -qE "^- \*\*branch\*\* .?(origin/)?$br.?$" "$d/PROVENANCE.md" 2>/dev/null \
+      || grep -qE "(=|is) .?(origin/)?$br.? (rebased|—|-)" "$d/PROVENANCE.md" 2>/dev/null \
+      || continue
     echo "${f#$ROOT/}"; return
   done
   echo ""
@@ -218,6 +226,7 @@ note "current generation: ${CURGEN:-<none selected>}"
 say "pairs"
 NEED_CORPUS=()          # branches with no corpus yet
 NEED_SELECT=""          # generation to select, if any
+HAVE_GEN=""             # a generation already covering the range, if any side resolves to one
 AXES=()                 # name:a_name:a_elf:a_src:b_name:b_elf:b_src:backend
 PROBLEMS=0
 
@@ -245,6 +254,7 @@ for spec in "${PAIRS[@]}"; do
         n="$(corpus_count "$ROOT/guests/monad/gen/$g/witnesses")"
         if [ -n "$g" ] && [ "$n" -ge "$NBLOCKS" ]; then
           have "$s: reads the $n-witness corpus in $g"
+          HAVE_GEN="$g"
           [ "$CURGEN" = "$g" ] || NEED_SELECT="$g"
         else
           todo "$s: no corpus covering $NBLOCKS blocks (${g:-no generation} has $n) — regenerate"
@@ -324,10 +334,15 @@ say "what running would do"
 [ "${#NEED_CORPUS[@]}" -eq 0 ] \
   && note "no corpus to generate — every branch already has one" \
   || { set -- ${NEED_CORPUS[@]+"${NEED_CORPUS[@]}"}
-       note "generate ONE corpus, from $1   (witness-backfill run — hours)"
-       shift
-       [ $# -eq 0 ] || note "then build the guest for: $*   (witness-backfill again — minutes, \
-reuses that corpus when the witness bytes agree, and is filed as a variant)"; }
+       if [ -n "$HAVE_GEN" ]; then
+         note "corpus $HAVE_GEN already covers this range — no corpus to generate"
+         note "build the guest for: $*   (witness-backfill again — minutes, filed as a variant)"
+       else
+         note "generate ONE corpus, from $1   (witness-backfill run — hours)"
+         shift
+         [ $# -eq 0 ] || note "then build the guest for: $*   (witness-backfill again — minutes, \
+reuses that corpus when the witness bytes agree, and is filed as a variant)"
+       fi; }
 [ -n "$NEED_SELECT" ] && note "select generation $NEED_SELECT (use-gen) — it changes what EVERY axis reads"
 [ "${#AXES_TO_ADD[@]}" -eq 0 ] && note "no axis to declare" || note "declare ${#AXES_TO_ADD[@]} axis/axes"
 note "measure + render: compare.py --block-min $FIRST --block-max $LAST -> $(basename "$REPORT")"
@@ -351,7 +366,12 @@ if [ "${#NEED_CORPUS[@]}" -gt 0 ]; then
   # moment the bytes match -- then its ELFs are filed as a variant reading the shared corpus. If the
   # bytes DIFFER, `again` carries on and files its own generation, which is the right answer too: a
   # different format genuinely needs its own corpus.
-  base_gen=""
+  # Seed from a generation that already covers this range: when one pair side resolved to it, the
+  # corpus exists and every branch still missing a build needs only ITS GUEST built against it. Not
+  # seeding meant the first such branch got a full `run` -- regenerating, from a different branch, a
+  # corpus that was already on disk.
+  base_gen="$HAVE_GEN"
+  [ -z "$base_gen" ] || note "corpus $base_gen already covers this range — only guests to build"
   for br in "${NEED_CORPUS[@]}"; do
     leaf="$(echo "${br##*/}" | tr -cd 'a-zA-Z0-9-')"
     if [ -z "$base_gen" ]; then
