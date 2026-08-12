@@ -92,6 +92,11 @@ def main():
         "to monad; forces the interpreter, ~7 MB per block)",
     )
     ap.add_argument(
+        "--nfibers", type=int, default=None,
+        help="fibers in the execution pool (passed through to monad). 1 serialises transaction "
+        "execution, which removes the speculative reads that make a dumped witness vary run to run.",
+    )
+    ap.add_argument(
         "--fixed-history-length", type=int, default=None,
         help="pin the trie history to N versions (passed through to monad). Needed for "
         "`monad-mpt --rewind-to` to reach the start of a bounded replay afterwards; must exceed "
@@ -178,6 +183,8 @@ def main():
             cmd += ["--zkvm-witness", args.zkvm_witness]
         if args.fixed_history_length is not None:
             cmd += ["--fixed-history-length", str(args.fixed_history_length)]
+        if args.nfibers is not None:
+            cmd += ["--nfibers", str(args.nfibers)]
         with open(log_path, "w") as logf:
             child = subprocess.Popen(
                 cmd,
