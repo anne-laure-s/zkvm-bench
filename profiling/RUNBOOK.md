@@ -98,29 +98,14 @@ wrong does not produce an error — it produces a number.
 | witness generation (`witness-backfill`) | a **devcore box** | **no**, see below |
 | the pure-time calibration | the host that measured it | **no** — the seconds are that host's |
 
-**Witness generation needs a devcore box, and the reason is the snapshot.** Every path in
-`witness-backfill` is an env knob (`SNAPSHOTS`, `RPC`, `DB`, `MONAD_DIR`, `PY`…), but
-`/home/refdata/ETH/mainnet/snapshots/<V>` only exists on those boxes, and `<V>` must be **exactly**
-`FIRST-1` of your range. Without it there is no way to bring the state to the range at all —
-rebuilding it from elsewhere costs far more than moving the job to a box that has it. Preflight fails
-on this and lists the snapshots it did find.
-
-That also means **the block range and the box travel together**: `25551991..25552494` is anchored to
-the `25551990` snapshot. A different machine usually means a different range, and measurements on two
-different ranges are not comparable to each other.
-
-**A devcore box that has never done this needs an afternoon of setup, not just a `--host`.** A
-*missing triedb* is the easy part — `witness-backfill` probes it and `DBSTATE=absent` just means it
-creates and loads instead of rewinding, which is the ~66 min the snapshot load always costs. What
-stops a fresh box is everything around it: memlock and hugepages (**both need an admin**, and memlock
-is a hard stop when there is no triedb — with nothing to rewind to, the load is certain and cannot
-open the DB without `mlock`), a
-configured cmake build dir, the gitignored `zkvm/.cargo/config.toml`, the zisk rustup toolchain, and
-`run_replay.py`/`fetch_blocks.py` — which are **untracked files in `$MONAD_DIR`**, absent from the
-monad repo, so a fresh checkout does not have them however correct everything else is. Preflight
-checks every one of these and fails *before* anything destructive; the full table, with what is
-fatal and what only warns, is in
+**Witness generation is tied to a box by the snapshot** — the state at `FIRST-1` — and not by
+anything else: the RPC is publicly reachable and the snapshot is copyable or re-dumpable, so any
+Linux box with root, ~700 GB and the toolchains will do. A box that has never done this needs a
+half-day of setup on top. Both are in
 [`infra/monad-witness/README.md`](../infra/monad-witness/README.md#moving-to-a-devcore-box-that-has-never-done-this).
+The consequence for a report: **the block range travels with the box** — `25551991..25552494` needs
+the `25551990` snapshot — so a different machine usually means a different range, and two ranges are
+not comparable to each other.
 
 **The pure-time column belongs to one host.** Work (steps/cycles) and prover cost (COST/PGU) are
 deterministic and mean the same thing anywhere. Seconds do not: they are modelled from
@@ -222,10 +207,9 @@ reloading the snapshot — ~66 min becomes seconds:
 AGAINST=offsettriedb-rework-2026-08 ./witness-backfill again al/zkvm-r4
 ```
 
-`again` needs both node patches — [`patch-fixed-history.py`](../infra/monad-witness/patch-fixed-history.py)
-pins the trie history so the rewind can reach the start, and
-[`patch-run-replay-history.py`](../infra/monad-witness/patch-run-replay-history.py) forwards the flag,
-which `run_replay.py` will not do on its own. Both or neither.
+`again` needs [`patch-fixed-history.py`](../infra/monad-witness/patch-fixed-history.py) applied on the
+node: it pins the trie history so the rewind can reach the start of the range. `run_replay.py` already
+forwards the flag, but an unpatched node ignores it.
 
 Three guards fire, in this order:
 

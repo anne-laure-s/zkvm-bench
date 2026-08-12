@@ -16,10 +16,9 @@ set -eu
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-# Delegated to ./witness-fmt — the detector now has a second caller (rtp-up's compatibility guard) and two
-# copies of an RLP walk would be two things to keep in step. It also handles the framed shape, which this
-# inline version could not: the same witness reaches the prover with an LE64 length prefix, and a detector
-# blind to that would have left the whole RTP path unchecked.
+# Delegated to ./witness-fmt, which rtp-up's compatibility guard also calls: one RLP walk, one place to keep it
+# right. It reads the framed shape too — the same witness reaches the prover behind an LE64 length prefix — so
+# both ends of the pipeline are checked by the same detector.
 fmt() { ./witness-fmt "$1" | awk '{print $1, $2}'; }
 
 if [ $# -eq 0 ]; then

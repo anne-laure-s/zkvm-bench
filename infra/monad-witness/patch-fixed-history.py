@@ -118,7 +118,12 @@ def main():
         print("patch-fixed-history: already applied — nothing to do")
         return
 
-    pairs = [(n, o) for o, n in EDITS] if a.revert else list(EDITS)
+        # Reversed: undoing in forward order is only correct when no edit extends what an earlier
+        # one inserted. It silently is not, otherwise -- every `new` string is still found in the
+        # ORIGINAL text, so the loop reports success and leaves part of the patch behind, giving a
+        # file that is neither patched nor pristine. Reverse order costs nothing when the edits are
+        # independent, so it is simply the correct default.
+    pairs = [(n, o) for o, n in reversed(EDITS)] if a.revert else list(EDITS)
     probe, missing = src, []
     for i, (o, n) in enumerate(pairs, 1):
         if o in probe:

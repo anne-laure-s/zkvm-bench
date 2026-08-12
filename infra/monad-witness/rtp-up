@@ -522,7 +522,7 @@ fi
 # Continuing with a silently unpatched fetcher would mean none of this has any effect and nothing says so.
 step "Fetcher: newHeads over WebSocket"
 if [ "$DRY" = 1 ]; then
-  say "[dry-run] would install websocket-client if missing and apply patch-fetch-blocks.py"
+  say "[dry-run] would install websocket-client if missing and copy replay/fetch_blocks.py"
 else
   changed=0
   PYBOX="\$HOME/.pyenv/versions/3.12.13/bin/python3"
@@ -536,9 +536,10 @@ else
       || say "install failed — the fetcher will fall back to polling (harmless, just slower)"
   fi
   if onbox_q "grep -q '_head_watcher' ~/monad/fetch_blocks.py"; then
-    say "fetch_blocks.py already patched"
+    say "fetch_blocks.py already supports newHeads"
   else
-    onbox "cd $BOX_REPO/infra/monad-witness && ./patch-fetch-blocks.py 2>&1 | sed 's/^/   /'" && changed=1
+    onbox "cp $BOX_REPO/infra/monad-witness/replay/fetch_blocks.py ~/monad/fetch_blocks.py \
+           && echo '   copied replay/fetch_blocks.py'" && changed=1
   fi
   if [ "$changed" = 1 ]; then
     say "restarting the fetcher so it picks this up"

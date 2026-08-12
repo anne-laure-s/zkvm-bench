@@ -59,39 +59,29 @@ clone commands + box setup are in each `infra/<stack>-infra/README.md`.
 
 ### What a fresh clone cannot give you
 
-Most of what `.gitignore` excludes is regenerable by a command — that is why it is excluded. This
-section is the short list of what is **not**: files with no source in either repo. Nothing here is an
-oversight; each is either too large to track, machine-specific, or produced only on a devcore box. The
-point of the list is that none of them announce themselves — you find out when a run fails or, worse,
-when a number comes out wrong.
+Most of what `.gitignore` excludes comes back from a command. This is the short list of what does
+not, because none of it announces itself — you find out when a run fails, or when a number comes out
+wrong.
 
-**Must be copied from a machine that has them.** No clone, no command, produces these:
+**Must be copied from a machine that has them:**
 
 | what | where | why not in git |
 |---|---|---|
-| `run_replay.py`, `fetch_blocks.py` | `$MONAD_DIR` on the box | **untracked in the monad repo** — they exist only where someone put them. See the trap below |
 | `guests/monad/gen/*/witnesses/` | ~7 GB, 504 per generation | only a devcore box can mint them (snapshot + hours). `PROVENANCE.md` **is** tracked, so the *record* of which branch produced which numbers survives — the bytes do not |
 | `guests/monad/gen/*/elf/` | 2 per generation | built on the box (rv64 toolchain). The sha256s are in that generation's `PROVENANCE.md` |
 | `guests/monad-variants/*/*.elf` | ~55 MB | ablation builds, same story; sha256s in [`guests/monad-variants/README.md`](guests/monad-variants/README.md) |
 | `guests/monad/inputs/` | 92 MB, 34 files | pre-supplied witnesses for an older range, not regenerable here |
-| `AGENT-NOTES.md`, `profiling/FINDINGS.md`, `profiling/CALLGRAPH-FINDINGS.md`, `infra/monad-witness/RTP-FINDINGS.md` | ~380 KB total | working notebooks, deliberately out of git. Irreplaceable in a different way from the rest: they hold the traps and the refuted levers, i.e. the reasons not to redo work |
+| `AGENT-NOTES.md`, `profiling/FINDINGS.md`, `profiling/CALLGRAPH-FINDINGS.md`, `infra/monad-witness/RTP-FINDINGS.md` | ~370 KB total | working notebooks, deliberately out of git. Irreplaceable in a different way from the rest: they hold the traps and the refuted levers, i.e. the reasons not to redo work |
 
-**The `run_replay.py` trap.** The copies running on the box are **patched** — by this repo's own
-tracked scripts (`infra/monad-witness/patch-{run-replay,run-replay-history,fetch-blocks}.py`), which is
-why `.orig` files sit beside them. So there are two ways to land them on a new box, and only one is
-reproducible: take the **`.orig`** (Sam's pristine versions) and re-apply the tracked patches. Copying
-the patched files works but leaves you unable to say which patches are in them.
+**Must be created, not copied:**
 
-**Must be created, not copied** — a few lines each, and per-machine on purpose:
-
-- **`$MONAD_DIR/zkvm/.cargo/config.toml`** (55 bytes) — carries `RISCV_TOOLCHAIN_DIR`; gitignored
-  because the path differs per box.
-- **`$MONAD_DIR/build/`** — a configured cmake dir. Run cmake once; the backfill's build phase is
-  `ninja -C build`.
 - **`ALCHEMY_URL`** in the environment — an archive-RPC key for minting reth-side witnesses
   (`cli/witness-farm`, `cli/gen-witness`). Never stored in the repo.
 - **`vendor/monad`** — a working clone on a branch, so `cli/install-vendors` does **not** manage it
-  (it handles the other four). Recoverable with a plain `git clone`, just not automatically.
+  (it handles the other four). A plain `git clone`, just not automatic.
+
+The devcore box has its own per-machine set (toolchain config, cmake dir, memlock):
+[`infra/monad-witness/README.md`](infra/monad-witness/README.md#moving-to-a-devcore-box-that-has-never-done-this).
 
 Everything else that is ignored comes back from a command: reth ELFs (`cli/gen-elf`), reth witnesses
 (`cli/gen-witness`, needs `ALCHEMY_URL`), `.expected_pv` files

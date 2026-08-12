@@ -30,7 +30,7 @@
 #
 # Config (env): MONAD_DIR REPO WITNESS_DIR BLOCK_DB DB RPC NTHREADS MAX_BATCH MIN_FOLLOW_BATCH
 #               PY ETHPROOFS_URL CLUSTER PROVE_EVERY KEEP_RECENT
-#               HEAD_TAG CONFIRMATIONS   (block-by-block; needs ./patch-fetch-blocks.py — see README)
+#               HEAD_TAG CONFIRMATIONS   (block-by-block — see README)
 #               SUPERVISE_MAX_CRASHES SUPERVISE_BACKOFF SUPERVISE_HEALTHY_SECS
 #                                          the tip supervisor restarts a crash that left no ALERT (20 tries,
 #                                          10 s apart, budget reset after 300 s of healthy running). A
@@ -57,9 +57,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 die(){ echo "witness-follow: $1" >&2; exit 1; }
 
-# HEAD_TAG/CONFIRMATIONS need ./patch-fetch-blocks.py applied to the monad tree's fetch_blocks.py.
-# Unpatched, the fetcher only knows `finalized` — which advances 32 blocks at a time, so witnesses arrive
-# in epoch bursts ~13-19 min behind the head. `latest` + 2 confirmations makes it one block per slot.
+# HEAD_TAG/CONFIRMATIONS need the fetch_blocks.py from replay/ on the box. An older one only knows
+# `finalized` — which advances 32 blocks at a time, so witnesses arrive in epoch bursts ~13-19 min behind
+# the head. `latest` + 2 confirmations makes it one block per slot.
 fetch_cmd() {
   local extra=""
   [ -n "${HEAD_TAG:-}" ]      && extra="$extra --head-tag $HEAD_TAG"
@@ -168,8 +168,8 @@ cmd_supervise() {
       # orchestrator itself falling over, because ALERT is only written when the monad CHILD fails.
       # run_replay.py catches no exception anywhere, and its per-iteration finalized lookup is a
       # 30 s-timeout HTTP call — so one RPC blip took the producer down with nothing to explain
-      # it. patch-run-replay.py fixes that specific cause; this handles the class,
-      # including the boxes where the patch has not been applied.
+      # it. replay/run_replay.py treats that lookup as advisory, which fixes that specific cause;
+      # this handles the class, including boxes still running an older copy.
       if [ -f "$MONAD_DIR/logs/STOP" ]; then
         echo "supervise: STOP present — deliberate stop (rc=$rc). Not restarting."
         return 0
@@ -181,7 +181,8 @@ cmd_supervise() {
       crashes=$((crashes + 1))
       if [ "$crashes" -gt "${SUPERVISE_MAX_CRASHES:-20}" ]; then
         echo "supervise: crashed $crashes times with no ALERT — giving up. Look at the newest \
-$MONAD_DIR/logs/*.log; if it is a requests/RPC traceback, apply ./patch-run-replay.py." >&2
+$MONAD_DIR/logs/*.log; if it is a requests/RPC traceback, the box is running an older run_replay.py \
+than replay/." >&2
         return "$rc"
       fi
       echo "supervise: exited rc=$rc after ${ran}s with no ALERT and no STOP — that is a crash, \

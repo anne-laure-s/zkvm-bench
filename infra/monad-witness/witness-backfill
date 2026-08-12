@@ -74,8 +74,8 @@ DB="${DB:-\$HOME/triedb.db}"
 DB_SIZE="${DB_SIZE:-600G}"           # 0.8 x capacity must still fit the fs — see README
 # Pin the trie history so the DB can be REWOUND to the start of the range and replayed by another
 # branch's node, instead of paying the ~66 min snapshot load again (see `again` below). Empty = the
-# node's own dynamic behaviour, i.e. exactly what this script did before. Needs BOTH patches:
-# ./patch-fixed-history.py (the node) and ./patch-run-replay-history.py (the orchestrator).
+# node's own dynamic behaviour. Needs ./patch-fixed-history.py on the node — run_replay.py already
+# forwards the flag, but the node ignores it unpatched.
 HISTORY="${HISTORY:-}"
 BLOCK_DB="${BLOCK_DB:-\$HOME/block_db_backfill}"
 WITNESS_DIR="${WITNESS_DIR:-\$HOME/witnesses-backfill}"
@@ -216,6 +216,22 @@ resolve_gen() {
   OUT="${OUT:-$REPO/guests/monad/gen/$GEN}"
 }
 
+# ---------------------------------------------------------------- the replay scripts
+REPLAY_DIR="$HERE/replay"
+
+# Copy this repo's run_replay.py / fetch_blocks.py to the box. Unconditional: they are deployment
+# artifacts and this checkout is where they live, so there is nothing to reconcile. Done in preflight
+# rather than at first use, which is phase 6 of 8 -- by then the reset has destroyed the triedb.
+ensure_replay_scripts() {
+  local f
+  for f in run_replay.py fetch_blocks.py; do
+    [ -f "$REPLAY_DIR/$f" ] || die "$REPLAY_DIR/$f is missing from this checkout — it is tracked"
+    scp -q -o ConnectTimeout=10 -o BatchMode=yes "$REPLAY_DIR/$f" "$HOST:$MONAD_DIR/$f" \
+      || die "could not copy $f to $HOST:$MONAD_DIR"
+  done
+  echo "  copied run_replay.py and fetch_blocks.py to $MONAD_DIR"
+}
+
 # ---------------------------------------------------------------- preflight
 # Every one of these has cost someone a rebuild or a 66-minute load. They are cheap; the failures
 # they catch are not.
@@ -268,19 +284,7 @@ exactly FIRST-1. Available: $(sshq "ls $SNAPSHOTS 2>/dev/null | tr '\n' ' '")"
   local py_ok; py_ok=$(sshq "test -x $PY && echo yes")
   [ "$py_ok" = yes ] || die "no python at $PY on $HOST (pyenv is not on a fresh tmux PATH)"
 
-  # run_replay.py and fetch_blocks.py are UNTRACKED files in $MONAD_DIR — they are not in the monad
-  # repo, so a fresh checkout on a fresh box does not have them however correct everything else is.
-  # Checked HERE and not at their first use, because their first use is phase 6 of 8: by then the
-  # reset has destroyed the triedb and the load has spent ~66 minutes. This is the one precondition
-  # whose absence costs an hour and a trie rather than a retry.
-  local missing="" f
-  for f in run_replay.py fetch_blocks.py; do
-    sshq "test -f $MONAD_DIR/$f" || missing="$missing $f"
-  done
-  [ -z "$missing" ] || die "missing in $MONAD_DIR on $HOST:$missing
-  These are not tracked by the monad repo — they live only where someone put them. Copy them from a
-  box that has them (nyc-003) before running: the replay phase cannot start without them, and it
-  runs AFTER the reset has destroyed the triedb."
+  ensure_replay_scripts
 
   # The reset destroys the triedb. Anything mid-replay is holding it, and would also fight us for
   # the disk. fuser is not installed on this box, so match on the process names instead.
@@ -593,8 +597,8 @@ wait_window() {  # $1 window, $2 label, $3 poll secs, $4 optional remote progres
 # And the RPC result feeds only `gap`, whose sole decision use is
 # `n_ready < max(1, min(min_follow_batch, gap))` — with --min-follow-batch 1 that threshold is 1
 # whatever gap is. In this bounded mode the RPC call is pure liability: it can end the run and
-# changes nothing. The real fix is a try/except in run_replay.py (untracked, Sam's); this is the
-# part we can own from here.
+# changes nothing. replay/run_replay.py makes that lookup advisory, which is the direct fix; this
+# restart loop covers the class, including a box still running an older copy.
 start_replay() {
   sshq "tmux kill-window -t $SESSION:replay 2>/dev/null; true"
   tmux_run replay "$(p_replay)"
@@ -796,8 +800,7 @@ EOF
 
   run it:      BRANCH=$BRANCH $0 run          (probes the trie: rewinds if it can, else reset + load)
   the same range from another branch, skipping even the block_db check:
-               $0 again $BRANCH               (needs both patches:
-                                               ./patch-fixed-history.py + ./patch-run-replay-history.py)
+               $0 again $BRANCH               (needs ./patch-fixed-history.py on the node)
   add AGAINST=<generation> to stop early when the first \$PROBE blocks come out byte-identical.
 EOF
     ;;

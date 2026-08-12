@@ -5,25 +5,19 @@ and dumping, per block, the zkVM witness the Monad guest consumes. It is the hom
 "co-located reth node" seam of [`cli/ethproofs-pipeline.md`](../../cli/ethproofs-pipeline.md) — except it
 feeds the **Monad** guest, not reth, so there is no other way to get these witnesses.
 
-Everything here runs on the devcore box. Two of the three long-running pieces are **not** in
-this repo and are driven, not reimplemented. Be precise about where they are, because it has cost time:
-they are **untracked files in `~/monad/`** — in no branch at all, so their interfaces cannot be read from
-a checkout, and `origin` no longer carries the `sam/*` branches they were first written on. Read them on
-the box.
+Everything here runs on the devcore box. The two replay scripts are driven, not reimplemented — they
+live in [`replay/`](replay/) and `witness-backfill` copies them to `$MONAD_DIR`.
 
-| piece | what | whose |
-|---|---|---|
-| `fetch_blocks.py` | RPC → `block_db` (raw blocks, verified against the canonical hash), follows forever | monad tree |
-| `run_replay.py` | `block_db` → triedb, `--zkvm-witness <dir>` dumps a witness + post-state root per block | monad tree |
-| **`witness-tap`** | witnesses → **queue + manifest + heartbeat**, and prunes what is proved | here |
-| `witness-profile` | benchmark-only: a block's deterministic work-unit (steps). **Not part of the RTP pipeline** — see below | here |
-| **`witness-follow`** | brings them up per phase, and reports where they are | here |
-| **`witness-sim`** | rehearse the whole pipeline from an existing witness corpus, no node, no GPU | here |
-| **`patch-fetch-blocks.py`** | teaches the fetcher `--head-tag latest --confirmations N` → block-by-block instead of epoch bursts | here |
-| **`patch-run-replay.py`** | stops `run_replay.py` dying on an RPC blip (see Known gaps). Per box, not per repo | here |
-| **`patch-fixed-history.py`** | exposes `--fixed-history-length` on the node, so a bounded replay can be rewound instead of reloaded | here |
-| **`patch-run-replay-history.py`** | forwards that flag from `run_replay.py`, which has no passthrough. Both patches or neither | here |
-| **`witness-backfill`** | the **bounded** counterpart of `witness-follow`: regenerate a FIXED block set from a given monad branch, build both guest ELFs from the same checkout, and file them home as a `guests/monad/gen/<name>/` generation. It ends | here |
+| piece | what |
+|---|---|
+| [`replay/fetch_blocks.py`](replay/fetch_blocks.py) | RPC → `block_db` (raw blocks, verified against the canonical hash), follows forever |
+| [`replay/run_replay.py`](replay/run_replay.py) | `block_db` → triedb, `--zkvm-witness <dir>` dumps a witness + post-state root per block |
+| **`witness-tap`** | witnesses → **queue + manifest + heartbeat**, and prunes what is proved |
+| `witness-profile` | benchmark-only: a block's deterministic work-unit (steps). **Not part of the RTP pipeline** — see below |
+| **`witness-follow`** | brings them up per phase, and reports where they are |
+| **`witness-sim`** | rehearse the whole pipeline from an existing witness corpus, no node, no GPU |
+| **`patch-fixed-history.py`** | exposes `--fixed-history-length` on the node, so a bounded replay can be rewound instead of reloaded. Applied per box, not per repo |
+| **`witness-backfill`** | the **bounded** counterpart of `witness-follow`: regenerate a FIXED block set from a given monad branch, build both guest ELFs from the same checkout, and file them home as a `guests/monad/gen/<name>/` generation. It ends |
 
 ```
 chi-001 RPC ─► block_db ─► [monad replay + triedb] ─► ~/witnesses/<block>.witness
@@ -59,7 +53,8 @@ Validated 2026-07-29 on the devcore box. The first three are hard blockers — t
   `MIN_HISTORY_LENGTH` is 300, comfortably above the 256-block BLOCKHASH window, so witness dumping
   survives maximum history pressure.
 - **snapshot** — `monad-cli --db ~/triedb.db --version <V> --load-binary-snapshot <parent-dir>` (the tool
-  appends `/<V>`, which must exist). ~66 min for ~350 GB; it lands the state for `V-255 .. V`.
+  appends `/<V>`, which must exist). The snapshot directory is ~109 GB on disk and loads in ~66 min
+  into a ~350 GB triedb; it lands the state for `V-255 .. V`.
 - **block_db, including the 256-block ancestor window** — `dump_witness` reads ancestor headers and
   crashes without them (`Could not query ancestor header N-1 from blockdb`). Fetch from `snapshot-255`,
   not from `snapshot+1`. A non-archive RPC is fine here: only *state* was pruned, raw blocks are always
@@ -80,18 +75,30 @@ afternoon, and note that **two of them need an admin**:
 | **hugepages** configured | same layer, same blocker. Needs root | not checked |
 | `$MONAD_DIR` — a monad clone with the branch fetched | `sam/*` are force-pushed; a plain `git fetch` is rejected non-fast-forward | dies |
 | `$MONAD_DIR/build` **configured by cmake** | the build phase is `ninja -C build`; a fresh clone has no `build.ninja` | dies |
-| `run_replay.py`, `fetch_blocks.py` in `$MONAD_DIR` | **untracked — not in the monad repo.** Copy them from a box that has them | dies |
+| `run_replay.py`, `fetch_blocks.py` in `$MONAD_DIR` | they live in [`replay/`](replay/) | **copied automatically** |
 | `$MONAD_DIR/zkvm/.cargo/config.toml` | carries `RISCV_TOOLCHAIN_DIR`, gitignored, so per-machine | dies |
 | cargo + the `zisk` rustup toolchain | builds the guest ELFs | dies |
 | python 3.12 at `$PY` | the replay scripts; pyenv is absent from a fresh tmux `PATH` | dies |
 | the **snapshot** at `$SNAPSHOTS/<FIRST-1>` | see below — this is the one that decides *which box* | dies, listing what it found |
 | ~`0.8 × DB_SIZE + 60` G free | the DB self-regulates as a fraction of its own capacity | dies |
 
-**The snapshot is what ties a range to a box.** `$SNAPSHOTS` is overridable, but
-`/home/refdata/ETH/mainnet/snapshots/<V>` only exists on devcore boxes, and `<V>` must be **exactly**
-`FIRST-1`. Our range `25551991..25552494` is anchored to `25551990`. A box whose snapshots do not
-include your `FIRST-1` cannot produce that corpus at all — and measurements over two different ranges
-are not comparable to each other, so "just use another range" changes what the numbers mean.
+**The snapshot is what ties a range to a box** — and it is the only thing that does. `<V>` must be
+**exactly** `FIRST-1`: our range `25551991..25552494` needs `25551990`. A box without that snapshot
+cannot produce that corpus, and two ranges are not comparable to each other, so "use another range"
+changes what the numbers mean.
+
+Nothing else here is devcore-specific. `chi-001.devcore4.com:8545` has a public address and answers
+from anywhere; `/home/refdata` is ordinary local disk, not a share. So **any Linux box with root,
+~700 GB free and the toolchains can do this**, given the state — and there are two ways to get it:
+
+- **copy the snapshot directory** (~109 GB, plain files, `rsync`), or
+- **dump a fresh one**: `monad-cli --db <db> --version <N> --dump-binary-snapshot <dir>` writes one
+  from any triedb holding `N` (`--total-shards`/`--shard-number` split it across nodes). nyc-003's
+  triedb currently retains `25551735..25571494`, so it can dump anywhere in that window.
+
+Dumping at a recent version gives a *different* range, and therefore numbers that do not compare with
+the published corpus. The real cost of a second box is the transfer and the root-level setup
+(memlock, hugepages), not access to anything.
 
 **Why memlock is fatal on a box with no triedb, and only a warning on one that has it.** The
 distinction is not caution, it is whether proceeding can work at all:
@@ -161,8 +168,8 @@ instead of reloading the snapshot:
 AGAINST=offsettriedb-rework-2026-08 ./witness-backfill again al/zkvm-r4
 ```
 
-Needs both patches above: `--fixed-history-length` pins the history so `monad-mpt --rewind-to` can
-still reach the start, and the node cannot see the flag unless `run_replay.py` forwards it.
+Needs `patch-fixed-history.py` on the node: `--fixed-history-length` pins the history so
+`monad-mpt --rewind-to` can still reach the start. An unpatched node ignores the flag.
 
 Three guards, in the order they fire:
 
@@ -279,10 +286,8 @@ happily read those reports for its `work` column if they exist, and leave it bla
   block on every start (the script's own docstring says so), so a restart re-enters where it
   stopped. **Fixed in three places, 2026-08-10:**
 
-  - `./patch-run-replay.py` wraps the lookup so a failure means "gap unknown" instead of fatal —
-    three exact-string edits, idempotent, revertible, refusing to apply if upstream moved.
-    `--host <box>` applies it remotely. Applied on the devcore box. It is applied **per box, not per repo**,
-    so a new machine starts out with the defect.
+  - `replay/run_replay.py` treats the lookup as advisory: a failure means "gap unknown" instead of
+    fatal. `witness-backfill` copies it to the box, so a new machine does not start out with the defect.
   - `./witness-backfill` restarts a replay that vanished with no ALERT, up to `MAX_RESTARTS` (10).
   - `./witness-follow`'s supervisor used to read "no ALERT" as "a clean stop" and return — so the
     one failure that most needed a restart was the one it refused. A stop and a crash are genuinely
@@ -300,9 +305,9 @@ happily read those reports for its `work` column if they exist, and leave it bla
   `run_replay.py` executes `contiguous_head(block_db)`, i.e. whatever has been written, so it needs no
   change at all.
 
-  `./patch-fetch-blocks.py` adds `--head-tag latest --confirmations 2` to the monad tree's fetcher
-  (idempotent, revertible, refuses to apply if upstream moved), which gives **one block per slot at a
-  ~24 s lag** instead of ~18 min. `witness-follow` passes it through as `HEAD_TAG` / `CONFIRMATIONS`.
+  `replay/fetch_blocks.py` takes `--head-tag latest --confirmations 2`, which gives **one block per
+  slot at a ~24 s lag** instead of ~18 min. `witness-follow` passes it through as `HEAD_TAG` /
+  `CONFIRMATIONS`.
 
   What is **not** done is reorg recovery. Off `finalized`, a fetched block can leave the canonical chain;
   the fetcher hash-verifies at fetch time so nothing wrong is written silently, but the next block's parent
