@@ -58,7 +58,10 @@
 #               CATCHUP_TARGET=10 (blocks)  CATCHUP_POLL=30 (s)
 #                   Catch-up ends when the gap closes or when the replay stops advancing — never on a clock, so
 #                   a multi-hour backlog runs to completion.
-#               FETCH_POLL=1  TAP_INTERVAL=1  REPLAY_POLL=1  SETTLE_SECS=0.5   (polling latency)
+#               FETCH_POLL=1  TAP_INTERVAL=1  REPLAY_POLL=0.3  SETTLE_SECS=0.5   (polling latency)
+#               TIP_DIRECT=0  BLOCK_DB_TIMEOUT=30   TIP_DIRECT=1 runs ONE long-lived monad at the tip
+#                   instead of a fresh process per block. Off by default: with the KZG setup loaded lazily
+#                   there is ~0.19 s left in that leg. See the block above TIP_DIRECT= before turning it on.
 #               PROVE_REAL / PROVE_GPUS=1        --real, and how many GPUs the cluster has (naming + cadence)
 #               EP_URL / EP_TOKEN / EP_CLUSTER   where proofs are submitted (default: the local mock)
 #               COORDINATOR_URL=http://127.0.0.1:7000  COORDINATOR_HEALTH=http://127.0.0.1:9090/health
@@ -66,6 +69,8 @@
 #                   liveness check only; cluster/start.sh on that box is what configures it.
 #               RUNNER_DIR / PROVER_WS           paths ON THE PROVER. With --real they default under the
 #                   prover's own $HOME (resolved from the box); unset them unless you mean something else.
+#               KZG_STRICT=0    make step 5b's lazy-trusted-setup check fatal instead of a warning. Off by
+#                   default: an unpatched binary still produces correct witnesses, just ~2 s/block slower.
 #               SKIP_AFTER      how far behind the tip an un-proved block is abandoned, in BLOCKS.
 #                   Derived as max(10 x PROVE_EVERY, 100) so the window always holds ~10 SAMPLED blocks.
 #               PROVE_EVERY=1   prove every Nth BLOCK (not seconds — N counts blocks). 1 = every block.
@@ -134,10 +139,11 @@ CONFIRMATIONS="${CONFIRMATIONS:-0}"
 FETCH_POLL="${FETCH_POLL:-1}"
 TAP_INTERVAL="${TAP_INTERVAL:-1}"
 # run_replay.py's own idle poll. Was 12 s by default — the biggest single polling delay in the pipeline.
-# 0.3 rather than 1: avail->witness is now fully decomposed and the poll is the ONLY part of it left that a
-# setting can touch (2.3 s is monad's own CPU-bound startup, 0.36 s the db open, 0.38 s the actual work), so
-# the ~0.5 s the poll averages is worth taking. Each loop also spawns monad-cli (~0.14 s) and one RPC call,
-# so the real cadence is ~0.5 s and going lower would only burn CPU on the producer.
+# 0.3 rather than 1: avail->witness is fully decomposed and the poll is the ONLY part of it left that a
+# setting can touch (with the trusted setup loaded lazily, monad's start is ~0.3 s, the db open 0.36 s, the
+# actual work 0.38 s — all of it code, none of it configuration), so the ~0.5 s the poll averages is worth
+# taking. Each loop also spawns monad-cli (~0.14 s) and one RPC call, so the real cadence is ~0.5 s and going
+# lower would only burn CPU on the producer — RTP-FINDINGS says to time `monad-cli --db` before trying.
 REPLAY_POLL="${REPLAY_POLL:-0.3}"
 # The tap skips a witness younger than this so it never frames a half-written one. 2 s was cautious and
 # showed up whole in wit->queue; monad writes a witness in one pass, so 0.5 s is enough margin.
@@ -306,6 +312,13 @@ if [ -z "$PROVER" ]; then PULL_VIA="${PULL_VIA:-$BOX}"; else PULL_VIA="${PULL_VI
 # the per-block process start, and that sits in `t_avail -> t_witness`: 0.19 s median over 300 production blocks
 # at the tip, against the 6.90 s of chain visibility that dominates the producer and that TIP_DIRECT cannot
 # touch. There is little there to win, so the measurement has to come before the default moves.
+#
+# THE 2-3 s FIGURE YOU MAY FIND FOR THIS LEG IS THE KZG TRUSTED SETUP, AND IT IS NOT WHAT TIP_DIRECT FIXES.
+# ~2 s of every monad startup was `init_trusted_setup()` called unconditionally from main() — blst subgroup
+# checks over 4096 G1 + 65 G2 points, needed only by the point_evaluation precompile (0x0a) that most blocks
+# never touch. `al/rtp` loads it on first use instead (`9d5676438 kzg: load the trusted setup on first use`),
+# which is a code fix and leaves nothing for a process-lifetime setting to win. If this leg reads 2-3 s,
+# check that the box's binary carries that commit (step 5b does) BEFORE reaching for TIP_DIRECT.
 #
 # It needs a monad whose ETHEREUM runloop takes the flag. `cmd/monad/main.cpp:204` drops the
 # `->needs(as_eth_blocks_flag)` constraint, and `case CHAIN_CONFIG_ETHEREUM_MAINNET:` passes both the witness
@@ -634,6 +647,51 @@ checkout where that constraint no longer exists. Rebuild:
     ssh $BOX 'cd monad && cmake --build build --target monad -j\$(nproc)'
   (Incremental, but ~251 files differ across branches here — allow 10-40 min on 16 cores.)"
   fi
+
+  # ── 5b-bis. CONTENT, not just provenance ─────────────────────────────────────────────────────────
+  # The two checks above prove where the binary came from. They cannot prove what it contains, and that is
+  # not a nuance: the lazy-KZG fix lived as an uncommitted working-tree edit once, so a binary built with it
+  # and a binary built without it matched the checkout identically while differing by 2 s PER BLOCK.
+  #
+  # ~2 s of every monad startup is `init_trusted_setup()` called from main(): blst subgroup checks over
+  # 4096 G1 + 65 G2 points, needed only by the point_evaluation precompile (0x0a), which most blocks never
+  # touch. With --min-follow-batch 1 that is 2 s per block — over half of chain->witness. `al/rtp` loads it
+  # on first use as of `9d5676438`, and after that commit main.cpp names the function nowhere — which is
+  # exactly the property this check reads.
+  #
+  # So: grep the SOURCE for the call site. Cheap, and it is the property that matters rather than a proxy.
+  # A warning, not fatal: an unpatched box still produces correct witnesses, only slowly, and blocking a run
+  # over a latency regression would be worse than saying so. KZG_STRICT=1 makes it fatal.
+  kzg_calls="$(onbox_q "grep -c init_trusted_setup $MONAD_DIR_BOX/cmd/monad/main.cpp 2>/dev/null" | tr -d ' ')"
+  if [ "${kzg_calls:-0}" != 0 ]; then
+    msg="$BOX's monad still calls init_trusted_setup() from main() ($kzg_calls occurrence(s) in
+   cmd/monad/main.cpp). That is ~2 s of KZG trusted-setup load on EVERY process start, and with
+   --min-follow-batch 1 the producer starts one process per block. Expect chain->witness at 2-3 s
+   instead of ~0.2 s.
+   The fix is upstream on $MONAD_BRANCH, commit 9d5676438 (kzg: load the trusted setup on first use), so
+   the box is simply behind. Pull and rebuild:
+     ssh $BOX 'cd monad && git pull --ff-only && cmake --build build --target monad -j\$(nproc)'
+   Verify: \`time ./build/cmd/monad --nblocks 0 --db <db>\` — ~2 s of user time means it is still eager.
+   (A pull that brings nothing means the checkout does not contain that commit at all — check with
+   \`git merge-base --is-ancestor 9d5676438 HEAD\`.)"
+    if [ "${KZG_STRICT:-0}" = 1 ]; then die "$msg"; else say "⚠️  $msg"; fi
+  elif [ -n "$kzg_calls" ]; then
+    say "trusted setup is lazy (main.cpp does not call init_trusted_setup) — no per-block KZG load"
+  else
+    # grep printed nothing at all: the file is not there. Saying so beats skipping in silence, which is how
+    # a check that never ran gets mistaken for a check that passed.
+    say "⚠️  could not read $MONAD_DIR_BOX/cmd/monad/main.cpp — the lazy-trusted-setup check did NOT run."
+    say "    Set MONAD_DIR_BOX if monad lives elsewhere on $BOX."
+  fi
+elif [ "$DRY" != 1 ] && [ "$TIP_DIRECT" = 1 ]; then
+  # 5b above is the whole reason TIP_DIRECT=1 is a safe default: it proves the binary embeds a commit from
+  # al/rtp, the branch whose ethereum runloop waits for a block instead of asserting. MONAD_BRANCH= disables
+  # 5b, so on this path nothing has verified that — and on a binary that still enforces
+  # ->needs(as_eth_blocks_flag), --block-db-timeout alone exits 107 and writes an ALERT that reorg-recover
+  # correctly refuses, because it is not a reorg.
+  say "⚠️  MONAD_BRANCH= skipped the branch/binary checks, and TIP_DIRECT=1 depends on them."
+  say "    If the binary was not built from al/rtp, monad will exit 107 and write logs/ALERT."
+  say "    Either drop MONAD_BRANCH= or run with TIP_DIRECT=0."
 fi
 
 step "Updating the box's clone"
