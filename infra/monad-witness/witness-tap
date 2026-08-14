@@ -386,9 +386,9 @@ def cycle(seen, dry):
         except OSError:
             pass
 
-        # Never touch a witness the replay may still be writing. Framing a truncated one used to be
-        # recoverable from the raw copy; it no longer is, because the raw is deleted as soon as it is
-        # framed. Anything younger than SETTLE_SECS is simply left for the next cycle.
+        # Never touch a witness the replay may still be writing. Framing a truncated one is UNRECOVERABLE:
+        # the raw copy that could be re-framed from is deleted as soon as the block is framed, so there is
+        # nothing to fall back on. Anything younger than SETTLE_SECS is simply left for the next cycle.
         try:
             if time.time() - os.path.getmtime(wit) < SETTLE_SECS:
                 continue

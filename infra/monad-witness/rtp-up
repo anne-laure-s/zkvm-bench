@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# rtp-up — bring the whole RTP mock pipeline up, end to end, from the Mac.
+# rtp-up — bring the whole RTP pipeline up, end to end, from the Mac.
+#
+# TWO PROVERS. By default the prover is a MODEL (zisk-runner's mock branch: emulate the block for its step
+# count, apply the 16x5090 fit, sleep). `--real` swaps in a ZisK cluster on a GPU box instead. Everything
+# around the prover — fetch, replay, witness, both transfers, submission, verification — is real in both.
 #
 # Topology it wires (the one we settled on):
 #
@@ -8,21 +12,31 @@
 #   fetch_blocks.py  (latest-N, block by block)
 #   run_replay.py    (--zkvm-witness)
 #   witness-tap      (queue · manifest · heartbeat · purge)
-#   cli/prove-farm   ──7 MB witness──►         zisk-runner in MOCK mode: emulates the block to
-#                    ◄──380 KB proof──          measure its steps, derives the proving time, sleeps
+#   cli/prove-farm   ──7 MB witness──►         default: zisk-runner in MOCK mode — emulate the block to
+#                    ◄──380 KB proof──           measure its steps, derive the proving time, sleep
 #                    ──submission────►         cli/ethproofs-mock  (verifies, leaderboard, /status)
 #
+#   with --real, the middle column moves to PROVER=<gpu box>: prove-farm drops --mock, so
+#   `infra/zisk-infra/run prove-cluster` drives the ZisK coordinator there and returns a real proof.
+#
 # The Mac reaches the box directly; the box reaches the Mac through a reverse tunnel this script
-# supervises (2222 -> the Mac's sshd, 8547 -> the mock). Only the prover's SLEEP is fiction: the block
-# fetch, the execution, the witness, both transfers, the submission and the verification are all real.
+# supervises (2222 -> the Mac's sshd, 8547 -> the mock). In mock mode only the prover's SLEEP is fiction:
+# the block fetch, the execution, the witness, both transfers, the submission and the verification are all
+# real. With --real nothing is.
 #
 # WHAT IT WILL NOT DO, on purpose:
 #   * enable Remote Login (a security setting — turn it on yourself in System Settings > Sharing)
 #   * commit or push your code (it warns; the box's own clone is verified at step 6 instead)
 #   * install a toolchain
 #
-#   ./rtp-up [--dry-run] [--purge] [--keep-mock] [--cron] [--stop]
+#   ./rtp-up [--real] [--dry-run] [--purge] [--keep-mock] [--cron] [--stop]
 #
+#     --real       prove on a REAL ZisK cluster instead of the model. REQUIRES PROVER=<gpu box>.
+#                  Also: runs the per-ELF `cargo-zisk remote setup` (without --hints — the Monad guest
+#                  has none), checks the coordinator is answering before starting, prints the projected
+#                  service times and the cadence they suggest (PROVE_EVERY stays yours), and gives the
+#                  deployment its own runner dir, workspace, socket, log and ethproofs cluster id so it
+#                  cannot collide with a mock one on the same host.
 #     --dry-run    print every command, run none of them
 #     --purge      empty the prover queue and the witness dump first, for a clean coverage measurement
 #     --keep-mock  do not restart ethproofs-mock (default: restart it, so it can never run stale code —
@@ -40,10 +54,24 @@
 #
 # Config (env): BOX=<box> (required)  MAC_USER=$USER  TUN_SSH_PORT=2222  MOCK_PORT=8547
 #               MOCK_STORE=/tmp/ethproofs-rtp  MOCK_SECS=2.12  MOCK_PER_MSTEP=0.0364  MOCK_SPEED=2.5  MOCK_JITTER=0.5
-#               HEAD_TAG=latest  CONFIRMATIONS=0 (the head — real time)  MOCK_RUNNER_DIR=$HOME/zisk-mock
-#               CATCHUP_TARGET=10 (blocks)  CATCHUP_POLL=30 (s)  CATCHUP_MAX_MIN=240
+#               HEAD_TAG=latest  CONFIRMATIONS=0 (the head — real time)  RUNNER_DIR=$HOME/zisk-mock
+#               CATCHUP_TARGET=10 (blocks)  CATCHUP_POLL=30 (s)
+#                   Catch-up ends when the gap closes or when the replay stops advancing — never on a clock, so
+#                   a multi-hour backlog runs to completion.
 #               FETCH_POLL=1  TAP_INTERVAL=1  REPLAY_POLL=1  SETTLE_SECS=0.5   (polling latency)
+#               PROVE_REAL / PROVE_GPUS=1        --real, and how many GPUs the cluster has (naming + cadence)
+#               EP_URL / EP_TOKEN / EP_CLUSTER   where proofs are submitted (default: the local mock)
+#               COORDINATOR_URL=http://127.0.0.1:7000  COORDINATOR_HEALTH=http://127.0.0.1:9090/health
+#                   the ZisK coordinator as the PROVER sees it — used for the per-ELF setup and the
+#                   liveness check only; cluster/start.sh on that box is what configures it.
+#               RUNNER_DIR / PROVER_WS           paths ON THE PROVER. With --real they default under the
+#                   prover's own $HOME (resolved from the box); unset them unless you mean something else.
+#               SKIP_AFTER      how far behind the tip an un-proved block is abandoned, in BLOCKS.
+#                   Derived as max(10 x PROVE_EVERY, 100) so the window always holds ~10 SAMPLED blocks.
 #               PROVE_EVERY=1   prove every Nth BLOCK (not seconds — N counts blocks). 1 = every block.
+#                   NEVER derived. With --real the projected service times and a suggested N are printed;
+#                   the value stays yours. A cadence faster than the prover's throughput gives a queue that
+#                   cannot drain — the script says so rather than deciding for you.
 #                   Raise it when the prover cannot hold the 12 s slot. N=2 is the first value that fits;
 #                   100 = ethproofs sampling. Selection is `block % N == 0`, so the same blocks are picked
 #                   across runs and across zkVMs. Coverage then reports 1/N as its CEILING, not a shortfall.
@@ -68,6 +96,33 @@ MOCK_PER_MSTEP="${MOCK_PER_MSTEP:-0.0364}"  #   secs = 2.12 + 0.0364 x Msteps  (
 # smallest factor putting even the heaviest observed block under the slot. Recorded in every report.json.
 MOCK_SPEED="${MOCK_SPEED:-2.5}"
 MOCK_JITTER="${MOCK_JITTER:-0.5}"
+
+# Declared HERE, ahead of PROVE_EVERY, because the right default cadence depends on which prover runs. The
+# full rationale for the two modes is at the RUNNER_DIR block below; these two lines only have to exist early.
+PROVE_REAL="${PROVE_REAL:-0}"
+# Pre-scan for --real. The mode decides RUNNER_DIR, PROVER_WS, PUMP_SOCK, the log name, the ethproofs cluster
+# id and the default cadence — all of which are resolved in this config block, well before the real argument
+# parser runs. Without this pre-pass the flag would be accepted and silently apply to none of them, which is
+# the worst of the three possible behaviours. The parser below still owns validation and every other flag.
+for _a in "$@"; do [ "$_a" = "--real" ] && PROVE_REAL=1; done; unset _a
+PROVE_GPUS="${PROVE_GPUS:-1}"
+
+# ── the CURRENT guest's step distribution, in Msteps ────────────────────────────────────────────────
+# Measured with ziskemu on the generation `guests/monad/current` points at. Source:
+# profiling/results/compare-jd.json, axis `jd-vs-r4`, side `a` (monad-jd-zisk), 504 blocks.
+# KEEP THESE IN STEP WITH THE GUEST. r4+jd is 0.79x zisk-reth on steps, where the generation before it
+# was 1.46x — the guest got ~1.8x cheaper (median 333 -> 186 Msteps). A stale value here does not fail,
+# it silently costs coverage: carried at the old max of 896 the derived cadence was 1:44 where 1:26 fits.
+GUEST_MS_MEAN="${GUEST_MS_MEAN:-196}"
+GUEST_MS_MED="${GUEST_MS_MED:-186}"
+GUEST_MS_P90="${GUEST_MS_P90:-303}"
+GUEST_MS_MAX="${GUEST_MS_MAX:-527}"
+# Margin on the derived cadence. The fit is in STEPS, but ZisK's own work unit is COST, and the two do
+# not move together across guests: r4 is 0.795x zisk-reth on steps and 0.861x on COST, i.e. this guest
+# carries ~8 % more COST per step than the guest the fit was measured on (attestation added keccak,
+# which COST prices heavily). If proving time tracks COST rather than steps, every figure below is ~8 %
+# low. 1.15 covers that plus headroom; drop it to 1.0 once real timings exist.
+PROVE_MARGIN="${PROVE_MARGIN:-1.15}"
 HEAD_TAG="${HEAD_TAG:-latest}"
 # 0 = prove the HEAD, the block as it comes out. That is what real-time proving means, and confirmations
 # are its direct opposite: each one is 12 s of deliberate waiting on a 12 s slot budget. The cost is reorg
@@ -110,8 +165,35 @@ SETTLE_SECS="${SETTLE_SECS:-0.5}"
 # ONE INTERACTION TO KNOW ABOUT. witness-tap abandons a block once it falls outside `b > last - SKIP_AFTER`,
 # and SKIP_AFTER counts BLOCKS (100), not sampled blocks. At N=2 or 4 that window still holds 50 or 25 sampled
 # blocks, so it never binds. At N >= 100 it holds at most one, and a tap that lags will drop sampled blocks
-# outright — raise SKIP_AFTER alongside N if you ever go that high.
+# outright — so this script now DERIVES it from N instead of leaving it to be remembered.
+#
+# Until 2026-08-13 neither witness-follow nor rtp-up forwarded SKIP_AFTER at all: it was a witness-tap knob
+# (default 100) that nothing upstream could set, so `SKIP_AFTER=… ./rtp-up` was silently a no-op. Both
+# forward it now.
+# THE CADENCE IS NEVER DERIVED. Default 1, in both modes, and yours to change.
+#
+# It is tempting to derive it in real mode — the model below yields a number, and a cadence faster than the
+# prover's throughput provably cannot drain ('unproved' climbs without bound and witness-tap starts
+# abandoning blocks at its SKIP_AFTER window). We do not, on purpose: that model is a fit measured on the
+# zisk-reth guest, rescaled by a step ratio, and no real proof of the Monad guest has ever been timed
+# (`profiling/FINDINGS.md`: "None of this is GPU proving time, which is still unmeasured"). A derived default
+# would read as authoritative and put a guess where a decision belongs — and coverage is the one number this
+# pipeline is honest about.
+#
+# So the arithmetic is PRINTED as advice at start-up, beside the projected service times, and the value stays
+# an explicit choice:
+#
+#   secs_worst  = MOCK_SECS + MOCK_PER_MSTEP x 16/PROVE_GPUS x GUEST_MS_MAX   (the fit is per 16 GPUs)
+#   suggested N = ceil(secs_worst x PROVE_MARGIN / 12)          -> 30 on 1 GPU with r4+jd
 PROVE_EVERY="${PROVE_EVERY:-1}"
+
+# SKIP_AFTER — how far behind the tip an un-proved block may fall before witness-tap abandons it. It counts
+# BLOCKS, so the window holds SKIP_AFTER/PROVE_EVERY SAMPLED blocks, and THAT is the number that matters: it
+# is the tap's tolerance to the prover lagging, measured in blocks the prover actually gets. At the default
+# 100 with N=30 it is 3.3 — a prover three sampled blocks behind starts losing work it will never get back.
+# Derived to keep ~10 sampled blocks in the window, floored at witness-tap's own default so a small N never
+# makes the window tighter than it is today.
+SKIP_AFTER="${SKIP_AFTER:-$(( PROVE_EVERY * 10 > 100 ? PROVE_EVERY * 10 : 100 ))}"
 # Validated here because there is no `set -e`: a non-numeric value would make `[ -gt ]` complain and carry on,
 # and 0 would reach witness-tap as `b % 0` — a ZeroDivisionError that kills the tap one block into the run.
 # `die` is defined further down, so this reports the failure itself. The numeric test is second on purpose:
@@ -121,13 +203,63 @@ if ! printf '%s' "$PROVE_EVERY" | grep -Eq '^[0-9]+$' || [ "$PROVE_EVERY" -lt 1 
     "$PROVE_EVERY" >&2
   exit 1
 fi
+# ── REAL vs MOCK prover ─────────────────────────────────────────────────────────────────────────────
+# The pipeline's prover has always been a MODEL: zisk-runner's mock branch emulates the block to get its step
+# count, applies `secs = MOCK_SECS + MOCK_PER_MSTEP x Msteps` / MOCK_SPEED, and sleeps. Every transfer, every
+# submission and every latency number around it is real; only the proving is simulated. That was the right
+# trade while no box existed — 1011 of the run records in this repo are `mode=mock backend=mock-cluster`.
+#
+# `--real` (PROVE_REAL=1) swaps that model for a ZisK cluster. What changes:
+#   * prove-farm drops `--mock` and the four `--mock-*` flags, so `prove_remote` drives the coordinator
+#   * the per-ELF `cargo-zisk remote setup` gets run — WITHOUT `--hints`, because the Monad guest has none
+#     (core.sh already proves hint-less witnesses; it is only the setup call that hardcoded the flag)
+#   * the prover's identity, workspace, socket and log all get separate names, so a real deployment and a
+#     mock one can sit on the same host without overwriting each other's records
+#   * PROVE_EVERY stops defaulting to 1: a real prover has a throughput, and a cadence below it produces a
+#     queue that cannot drain (see the default computed below)
+#
+# It REQUIRES PROVER= — a real prover is a GPU box, never this laptop.
+# PROVE_REAL and PROVE_GPUS are set further up, ahead of PROVE_EVERY, which needs them.
+# PROVE_GPUS is used only to pick that starting cadence and to name the ethproofs cluster; nothing here
+# configures the cluster itself (cluster/start.sh does, on the box).
+
 # The runner must live OUTSIDE ~/Documents: macOS TCC protects it, and a process started by sshd cannot
 # execute anything there ("Operation not permitted"). This is why the script copies it at all.
-MOCK_RUNNER_DIR="${MOCK_RUNNER_DIR:-$HOME/zisk-mock}"
-# witness-pump's unix socket, on the PROVER. Deliberately in /tmp and deliberately short: ~104 bytes is the
-# hard cap for a unix socket path on macOS, and $HOME can already be half of it.
-PUMP_SOCK="${PUMP_SOCK:-/tmp/zisk-pump.sock}"
-MOCK_WS="${MOCK_WS:-$HOME/zisk-mock-ws}"
+# Separate defaults per mode: the two deployments share a host in practice, and a shared workspace would mean
+# a real proof landing in the same reports/ a mock run then overwrites.
+# ⚠️ These are paths ON THE PROVER, but `$HOME` here expands on the MAC. That is correct only when the prover
+# IS the Mac (PROVER unset). With a remote prover the two homes differ — on a vast.ai GPU box it is /root —
+# and today's mock path papers over it by using the Mac's absolute path on the remote host: it "works" because
+# mkdir creates it, but the runner then lives at /Users/<you>/zisk-mock on a Linux box, and every `~/...`
+# instruction printed about that host is wrong. Real mode resolves the prover's own $HOME instead (6d).
+# The mock path is deliberately LEFT AS IS: it is a working deployment, and changing where it stages files is
+# not part of making real proving work. The same fix applies there whenever someone wants it.
+if [ "$PROVE_REAL" = 1 ]; then
+  # Empty = "resolve against the prover's $HOME in 6d". A value passed in by the user is used verbatim.
+  RUNNER_DIR="${RUNNER_DIR:-}"
+  PROVER_WS="${PROVER_WS:-}"
+  PUMP_SOCK="${PUMP_SOCK:-/tmp/zisk-pump-real.sock}"
+  PROVE_LOG="${PROVE_LOG:-~/prove-real.log}"
+  EP_CLUSTER="${EP_CLUSTER:-${PROVE_GPUS}gpu-ZisK-monad}"
+else
+  RUNNER_DIR="${RUNNER_DIR:-$HOME/zisk-mock}"
+  PROVER_WS="${PROVER_WS:-$HOME/zisk-mock-ws}"
+  # witness-pump's unix socket, on the PROVER. Deliberately in /tmp and deliberately short: ~104 bytes is the
+  # hard cap for a unix socket path on macOS, and $HOME can already be half of it.
+  PUMP_SOCK="${PUMP_SOCK:-/tmp/zisk-pump.sock}"
+  PROVE_LOG="${PROVE_LOG:-~/prove-mock.log}"
+  EP_CLUSTER="${EP_CLUSTER:-local-ZisK-monad}"
+fi
+# Where the proofs get submitted. Defaults to the local ethproofs-mock through the tunnel, which is what every
+# run so far has used; point it at ethproofs.org (with a real token and the cluster id they assign) when the
+# prover is meant to appear on the leaderboard.
+EP_URL="${EP_URL:-http://localhost:$MOCK_PORT}"
+EP_TOKEN="${EP_TOKEN:-}"
+# ZisK coordinator on the prover, as the PROVER itself sees it. Only used for the per-ELF setup and the
+# liveness check — prove_remote reads its own default from the runner's env.
+COORDINATOR_URL="${COORDINATOR_URL:-http://127.0.0.1:7000}"
+# Metrics/health port of that coordinator, for the liveness check (`/health` returns 200 with an empty body).
+COORDINATOR_HEALTH="${COORDINATOR_HEALTH:-http://127.0.0.1:9090/health}"
 
 # WHERE THE PROVER RUNS — the single largest remaining term in the end-to-end latency.
 #
@@ -198,6 +330,7 @@ while [ $# -gt 0 ]; do
     --dry-run)   DRY=1; shift ;;
     --purge)     PURGE=1; shift ;;
     --keep-mock) KEEP_MOCK=1; shift ;;
+    --real)      PROVE_REAL=1; shift ;;
     --cron)      CRON=1; shift ;;
     --stop)      STOP=1; shift ;;
     -h|--help)   sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
@@ -218,6 +351,15 @@ onbox_q(){ ssh -o BatchMode=yes "$BOX" "$*" 2>/dev/null; }
 # Checked here rather than at assignment: --help must answer without a box.
 [ -n "$BOX" ] || die "BOX is required — the devcore box the producer runs on. There is no default: it \
 is infrastructure, not part of this repo.  e.g.  BOX=<box> $0"
+
+# A real prover is a GPU box the producer can reach. It cannot be this laptop: PROVER unset means the witness
+# crosses the reverse tunnel to the Mac, and there is no ZisK cluster here to receive it. Refuse rather than
+# let the run reach the first block and fail there, which is the same error 40 minutes later.
+if [ "$PROVE_REAL" = 1 ] && [ -z "$PROVER" ]; then
+  die "--real needs PROVER=<ssh target the box can reach>, the GPU box running the ZisK cluster.
+   Without it the prover is this Mac through the tunnel, which has no cluster.
+   e.g.  BOX=<box> PROVER=<gpu-box> PROVE_GPUS=1 $0 --real"
+fi
 
 # ── teardown ────────────────────────────────────────────────────────────────────────────────────────
 if [ "$STOP" = 1 ]; then
@@ -259,25 +401,25 @@ esac
 # Only when the prover IS this Mac. For a remote prover the staging needs the box's clone, which is not
 # updated until step 7 — so it happens there instead (7c), over the same box->prover path the run will use.
 if [ -z "$PROVER" ]; then
-  step "Staging the mock prover's runner in $MOCK_RUNNER_DIR"
-  run "mkdir -p '$MOCK_RUNNER_DIR'"
-  run "cp '$MAC_REPO/infra/zisk-infra/zisk-runner' '$MOCK_RUNNER_DIR/'"
-  run "chmod +x '$MOCK_RUNNER_DIR/zisk-runner'"
+  step "Staging the mock prover's runner in $RUNNER_DIR"
+  run "mkdir -p '$RUNNER_DIR'"
+  run "cp '$MAC_REPO/infra/zisk-infra/zisk-runner' '$RUNNER_DIR/'"
+  run "chmod +x '$RUNNER_DIR/zisk-runner'"
   if [ "$DRY" != 1 ]; then
-    grep -q 'MOCK PROVER] emulating' "$MOCK_RUNNER_DIR/zisk-runner" \
+    grep -q 'MOCK PROVER] emulating' "$RUNNER_DIR/zisk-runner" \
       || die "the staged runner has no emulating mock branch — is $MAC_REPO up to date?"
     say "staged, and it carries the emulating mock branch"
   fi
   # witness-pump — the persistent transfer channel. It lives on the PROVER because only the prover can open a
   # connection (the box is reachable, a laptop behind NAT is not), and it saves the ~2 s of ssh setup that every
   # per-block scp repays: measured 4.05 -> 2.66 s per witness, +34 %, byte-verified over 10 interleaved rounds.
-  run "cp '$MAC_REPO/infra/zisk-infra/witness-pump' '$MOCK_RUNNER_DIR/'"
+  run "cp '$MAC_REPO/infra/zisk-infra/witness-pump' '$RUNNER_DIR/'"
   # ethproofs-submit too, so the POST can happen HERE, where the proof already is. Posting it from the box means
   # sending a 508 KB base64 body back through the tunnel at 3.8 Mbit/s — ~1.10 s per block for bytes that never
   # left this machine. The box still decides: it invokes, reads the status, logs the verdict, writes the CSV.
-  run "cp '$MAC_REPO/cli/ethproofs-submit' '$MOCK_RUNNER_DIR/'"
-  run "chmod +x '$MOCK_RUNNER_DIR/ethproofs-submit'"
-  run "chmod +x '$MOCK_RUNNER_DIR/witness-pump'"
+  run "cp '$MAC_REPO/cli/ethproofs-submit' '$RUNNER_DIR/'"
+  run "chmod +x '$RUNNER_DIR/ethproofs-submit'"
+  run "chmod +x '$RUNNER_DIR/witness-pump'"
   # Restart it, never reuse: like the prover session, a live pump holds the code and env it started with.
   # PUMP_SOCK stays SHORT — a unix socket path is capped at ~104 bytes on macOS, the same limit that bit the
   # ssh ControlPath, and the pump refuses to start rather than emit a bare "AF_UNIX path too long".
@@ -312,7 +454,7 @@ if [ -z "$PROVER" ]; then
     fi
   fi
   PUMP_CHANNELS="${PUMP_CHANNELS:-1}"
-  run "PUMP_SOCK='$PUMP_SOCK' PUMP_BOX='$BOX' PUMP_CHANNELS='$PUMP_CHANNELS' nohup '$MOCK_RUNNER_DIR/witness-pump' serve >> ~/witness-pump.log 2>&1 &"
+  run "PUMP_SOCK='$PUMP_SOCK' PUMP_BOX='$BOX' PUMP_CHANNELS='$PUMP_CHANNELS' nohup '$RUNNER_DIR/witness-pump' serve >> ~/witness-pump.log 2>&1 &"
   if [ "$DRY" != 1 ]; then
     # Give it a moment to bind and open the channel, then check BOTH: a socket with no channel behind it
     # would fail every block silently into the scp fallback, which is exactly the "deployed but not working"
@@ -329,7 +471,7 @@ if [ -z "$PROVER" ]; then
     && say "ziskemu found: the prover will measure real step counts" \
     || say "WARNING: no ziskemu on this Mac — the model will fall back to its fixed term only"
 else
-  step "Mock prover on $PROVER (not this Mac) — staging deferred to after the box's clone is updated"
+  step "$([ "$PROVE_REAL" = 1 ] && echo "Real prover" || echo "Mock prover") on $PROVER (not this Mac) — staging deferred to after the box's clone is updated"
 fi
 
 # ── 2. the box must be able to ssh back here, without a password ────────────────────────────────────
@@ -499,21 +641,51 @@ onbox "cd $BOX_REPO && git pull --ff-only 2>&1 | tail -2"
 if [ "$DRY" != 1 ]; then
   # Two plain greps rather than arithmetic over `grep -c`: summing with cut/paste/bc needs bc on the box and,
   # worse, an empty result from a failed pipeline would compare unequal to "0" and PASS the check.
-  onbox_q "grep -q 'MOCK PROVER] emulating' $BOX_REPO/infra/zisk-infra/zisk-runner" \
-    || die "the box's runner has no emulating mock branch — did the pull work?"
-  onbox_q "grep -q ZISK_MOCK_PER_MSTEP $BOX_REPO/cli/prove-farm" \
-    || die "the box's prove-farm cannot drive a remote mock prover — did the pull work?"
-  say "the box's clone has the mock prover"
+  if [ "$PROVE_REAL" = 1 ]; then
+    # Real mode does not use the mock branch, so asserting on it would be checking the wrong thing. What has to
+    # be in the box's clone is the guest ELF it will ship to the prover, and the prove-cluster verb that routes
+    # monad-zisk to the ZisK stack.
+    onbox_q "test -s $BOX_REPO/guests/monad-zisk/monad-zisk.elf" \
+      || die "the box's clone has no guests/monad-zisk/monad-zisk.elf. It is a symlink to
+   guests/monad/monad-zkvm-guest-zisk.elf, which IS committed — so this means the ELF was
+   modified locally and never pushed (step 0 warns about exactly that), or the pull failed."
+    onbox_q "grep -q 'prove-cluster)' $BOX_REPO/infra/zisk-infra/run" \
+      || die "the box's infra/zisk-infra/run has no prove-cluster verb — did the pull work?"
+    say "the box's clone has the guest ELF and the prove-cluster verb"
+  else
+    onbox_q "grep -q 'MOCK PROVER] emulating' $BOX_REPO/infra/zisk-infra/zisk-runner" \
+      || die "the box's runner has no emulating mock branch — did the pull work?"
+    onbox_q "grep -q ZISK_MOCK_PER_MSTEP $BOX_REPO/cli/prove-farm" \
+      || die "the box's prove-farm cannot drive a remote mock prover — did the pull work?"
+    say "the box's clone has the mock prover"
+  fi
 fi
 
 # ── 6c. a remote prover's runner, pushed from the box's freshly-pulled clone ────────────────────────
 if [ -n "$PROVER" ]; then
-  step "Staging the runner on $PROVER_TARGET:$MOCK_RUNNER_DIR (from the box)"
-  onbox "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET 'mkdir -p $MOCK_RUNNER_DIR $MOCK_WS'"
-  onbox "scp -q -o BatchMode=yes -P $PROVER_PORT $BOX_REPO/infra/zisk-infra/zisk-runner $PROVER_TARGET:$MOCK_RUNNER_DIR/"
-  onbox "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET 'chmod +x $MOCK_RUNNER_DIR/zisk-runner'"
-  if [ "$DRY" != 1 ]; then
-    onbox_q "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET \"grep -q 'MOCK PROVER] emulating' $MOCK_RUNNER_DIR/zisk-runner\"" \
+  # Resolve the PROVER's own $HOME before anything is written there. Asked FROM THE BOX, over the same
+  # box->prover hop the staging uses, so a failure here is the same failure the staging would hit — and it
+  # surfaces now, with a message, instead of as a scp into a surprising path.
+  if [ -z "$RUNNER_DIR" ] || [ -z "$PROVER_WS" ]; then
+    PROVER_HOME="$(onbox_q "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET 'printf %s \"\$HOME\"'")"
+    if [ -z "$PROVER_HOME" ]; then
+      # Dry runs have no round trip to make; a real run that cannot ask has a broken box->prover hop.
+      if [ "$DRY" = 1 ]; then PROVER_HOME='$HOME'
+      else die "cannot read \$HOME on $PROVER_TARGET from $BOX. The box must be able to
+   ssh -p $PROVER_PORT $PROVER_TARGET  without a password — that hop is a precondition, not
+   something this script sets up. Test it from the box, then re-run."
+      fi
+    fi
+    RUNNER_DIR="${RUNNER_DIR:-$PROVER_HOME/zisk-prover}"
+    PROVER_WS="${PROVER_WS:-$PROVER_HOME/zisk-prover-ws}"
+    say "prover \$HOME is $PROVER_HOME → runner $RUNNER_DIR, workspace $PROVER_WS"
+  fi
+  step "Staging the runner on $PROVER_TARGET:$RUNNER_DIR (from the box)"
+  onbox "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET 'mkdir -p $RUNNER_DIR $PROVER_WS'"
+  onbox "scp -q -o BatchMode=yes -P $PROVER_PORT $BOX_REPO/infra/zisk-infra/zisk-runner $PROVER_TARGET:$RUNNER_DIR/"
+  onbox "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET 'chmod +x $RUNNER_DIR/zisk-runner'"
+  if [ "$DRY" != 1 ] && [ "$PROVE_REAL" != 1 ]; then
+    onbox_q "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET \"grep -q 'MOCK PROVER] emulating' $RUNNER_DIR/zisk-runner\"" \
       && say "staged, and it carries the emulating mock branch" \
       || die "the runner on $PROVER_TARGET has no emulating mock branch — the copy did not land"
     # Without ziskemu the model loses its only per-block input and every simulated duration becomes the same
@@ -522,6 +694,38 @@ if [ -n "$PROVER" ]; then
       && say "ziskemu found on the prover: it will measure real step counts" \
       || say "WARNING: no ziskemu on $PROVER_TARGET — every mock duration will be the SAME fixed term, \
 unrelated to the block. Install ZisK there, or keep the prover on the Mac."
+  fi
+
+  # ── 6d. real mode: the cluster must be up, and the ELF must be SET UP on it ────────────────────────
+  # This is the step that did not exist. core.sh only WARNS when it uploads a changed ELF ("re-run the
+  # per-ELF setup"), so a real run against a fresh ELF would fail block after block with nothing saying why.
+  if [ "$PROVE_REAL" = 1 ]; then
+    step "Real prover on $PROVER_TARGET: cluster liveness + per-ELF setup"
+    onprover(){ onbox "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET '$*'"; }
+    onprover_q(){ onbox_q "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET '$*'"; }
+    if [ "$DRY" != 1 ]; then
+      onprover_q "PATH=\$HOME/.zisk/bin:\$PATH command -v cargo-zisk >/dev/null 2>&1" \
+        || die "no cargo-zisk on $PROVER_TARGET — run infra/zisk-infra/cluster/00-install-once.sh there first."
+      # The coordinator, not just the host. A dead coordinator makes every block fail one at a time, ~40 s
+      # apart, with a transport error that reads like a network problem.
+      onprover_q "curl -sf -m 5 -o /dev/null $COORDINATOR_HEALTH" \
+        || die "the ZisK coordinator on $PROVER_TARGET is not answering at $COORDINATOR_HEALTH.
+   Start it there:  cd ~/zisk-infra/cluster && ./start.sh
+   Then wait for the worker to register (4-12 min: ~30 GB allocated per GPU)."
+      say "coordinator answering at $COORDINATOR_HEALTH"
+    fi
+    # Ship the ELF ahead of the first block, from the box's clone, into the SAME workspace path prove_remote
+    # uses. It then finds the checksum matching and skips the upload — and, more to the point, the setup below
+    # has something to act on. `scp` follows the symlink, so what lands is the real ELF.
+    onbox "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET 'mkdir -p $PROVER_WS/elfs'"
+    onbox "scp -q -o BatchMode=yes -P $PROVER_PORT $BOX_REPO/guests/monad-zisk/monad-zisk.elf $PROVER_TARGET:$PROVER_WS/elfs/"
+    # NO --hints. The Monad guest has no reth-style hints-gen, and `remote setup -e <elf>` without the flag is
+    # the documented form for a hint-less guest (infra/zisk-infra/cluster/README.md). Passing --hints here is
+    # what every other setup call in the repo does, and it is wrong for this guest.
+    # Idempotent: the coordinator caches per-ELF keys, so a re-run costs a hash comparison.
+    step "cargo-zisk remote setup (no --hints: the Monad guest has none)"
+    onprover "PATH=\$HOME/.zisk/bin:\$PATH cargo-zisk remote setup -e $PROVER_WS/elfs/monad-zisk.elf \
+--coordinator $COORDINATOR_URL 2>&1 | tail -5"
   fi
 fi
 
@@ -621,8 +825,12 @@ if [ "$DRY" = 1 ]; then
   say "[dry-run] would start the catch-up replay and poll until the gap is <= ${CATCHUP_TARGET:-10} blocks"
 else
   onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL REPLAY_POLL=$REPLAY_POLL ./witness-follow start catchup 2>&1 | sed 's/^/   /'"
-  target="${CATCHUP_TARGET:-10}"; poll="${CATCHUP_POLL:-30}"; maxmin="${CATCHUP_MAX_MIN:-240}"
-  deadline=$(( $(date +%s) + maxmin * 60 )); stall=0; prev=""
+  # NO WALL-CLOCK DEADLINE. What must stop this loop is a replay that is not advancing, and `stall` below is that
+  # test: three polls without progress, escalated to reading logs/ALERT so the cause is named rather than hunted.
+  # A duration cannot distinguish a stuck replay from a healthy long one, and the only runs it ends are the
+  # healthy slow ones — a backlog of 154 k blocks is ~6 h of legitimate work at the measured batch rate.
+  target="${CATCHUP_TARGET:-10}"; poll="${CATCHUP_POLL:-30}"
+  stall=0; prev=""
   while :; do
     read -r avail last tip <<<"$(box_gap)"
     [ -n "${tip:-}" ] || die "cannot read the box's progress (is ~/monad/status.json there?)"
@@ -674,7 +882,6 @@ ready. The session probably died another way. Check: ssh $BOX 'tmux ls; tail -20
       say "gap=$gap — catching up"
     fi
     prev="$last"
-    [ "$(date +%s)" -lt "$deadline" ] || die "still $gap blocks behind after ${maxmin} min — giving up"
     sleep "$poll"
   done
   onbox "cd $BOX_REPO/infra/monad-witness && ./witness-follow stop >/dev/null 2>&1; echo '   catch-up replay stopped'"
@@ -691,8 +898,27 @@ step "Starting the producer (fetch · replay+witnesses · tap)"
 # as a pipeline dropping blocks. Announce it with the slot arithmetic that justifies it.
 if [ "$PROVE_EVERY" -gt 1 ]; then
   say "cadence: proving every $PROVE_EVERY blocks (those where block % $PROVE_EVERY == 0)"
-  say "  the prover gets $((PROVE_EVERY * 12)) s per sampled block instead of 12 s — measured service is 12.0 s median, 15.0 s p90"
+  say "  the prover gets $((PROVE_EVERY * 12)) s per sampled block instead of 12 s"
   say "  coverage will read ~$((100 / PROVE_EVERY))% and that is the CEILING, not a shortfall"
+  if [ "$PROVE_REAL" = 1 ]; then
+    # The service figures quoted in mock mode are the MOCK's (model / MOCK_SPEED). In real mode nothing has been
+    # measured yet, so quote the projection and label it as one rather than reuse a number from another prover.
+    say "  PROJECTED on $PROVE_GPUS GPU (fit x 16/$PROVE_GPUS, never measured on this guest):"
+    say "$(awk -v f="$MOCK_SECS" -v p="$MOCK_PER_MSTEP" -v g="$PROVE_GPUS" \
+      -v md="$GUEST_MS_MED" -v mn="$GUEST_MS_MEAN" -v p9="$GUEST_MS_P90" -v mx="$GUEST_MS_MAX" 'BEGIN{
+      s=p*16/g; printf "    median %d Ms -> %.0f s · mean %d -> %.0f s · p90 %d -> %.0f s · worst %d -> %.0f s",
+      md, f+s*md, mn, f+s*mn, p9, f+s*p9, mx, f+s*mx }')"
+    say "  the first real blocks REPLACE these. If the worst case exceeds $((PROVE_EVERY * 12)) s, raise PROVE_EVERY."
+  else
+    say "  measured mock service is 12.0 s median, 15.0 s p90"
+  fi
+elif [ "$PROVE_REAL" = 1 ]; then
+  say "⚠️  cadence: EVERY block (PROVE_EVERY=1) with a REAL prover on $PROVE_GPUS GPU."
+  say "$(awk -v f="$MOCK_SECS" -v p="$MOCK_PER_MSTEP" -v g="$PROVE_GPUS" -v mx="$GUEST_MS_MAX" -v m="$PROVE_MARGIN" 'BEGIN{
+    w = f + p*16/g*mx; n = int(w*m/12); if (w*m/12 > n) n++
+    printf "    Projected worst case %.0f s against a 12 s slot — PROVE_EVERY=%d would cover it.", w, n }')"
+  say "    At N=1 the queue cannot drain: the tap's 'unproved' counter climbs without bound, and witness-tap"
+  say "    starts abandoning blocks at its SKIP_AFTER window."
 else
   say "cadence: every block (PROVE_EVERY=1). Measured service is 12.0 s median / 15.0 s p90 on a 12 s slot,"
   say "  so 38% of blocks overrun it and --newest-first drops the stragglers: coverage lands near 89%, at random."
@@ -713,7 +939,7 @@ fi
 # how the long-lived-monad path stayed undeployed while the logs showed a perfectly healthy producer — twice in
 # one day, on two different components. Restarting costs one block; not restarting costs the whole change.
 onbox "tmux kill-session -t replay-tip 2>/dev/null; tmux kill-session -t tap 2>/dev/null; pkill -f '[r]un_replay.py' 2>/dev/null; pkill -f '[w]itness-tap' 2>/dev/null; sleep 2; echo '   · tip sessions cleared (they would keep the old code and env)'"
-onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL TAP_INTERVAL=$TAP_INTERVAL REPLAY_POLL=$REPLAY_POLL SETTLE_SECS=$SETTLE_SECS TIP_DIRECT=$TIP_DIRECT BLOCK_DB_TIMEOUT=$BLOCK_DB_TIMEOUT PROVE_EVERY=$PROVE_EVERY ETHPROOFS_URL=http://localhost:$MOCK_PORT CLUSTER=local-ZisK-monad ./witness-follow start tip"
+onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL TAP_INTERVAL=$TAP_INTERVAL REPLAY_POLL=$REPLAY_POLL SETTLE_SECS=$SETTLE_SECS TIP_DIRECT=$TIP_DIRECT BLOCK_DB_TIMEOUT=$BLOCK_DB_TIMEOUT PROVE_EVERY=$PROVE_EVERY SKIP_AFTER=$SKIP_AFTER ETHPROOFS_URL=$EP_URL CLUSTER=$EP_CLUSTER ./witness-follow start tip"
 # The cadence is only meaningful in the tip phase: phase_sessions() starts the tap for `tip` and not for
 # `catchup`, so catch-up keeps advancing the replay at full speed and sampling never slows the backlog drain.
 
@@ -793,7 +1019,11 @@ else
   fi
 fi
 
-step "Starting the prover (mock on $PROVER_WHERE, transfers real)"
+if [ "$PROVE_REAL" = 1 ]; then
+  step "Starting the prover (REAL ZisK cluster on $PROVER_WHERE, ${PROVE_GPUS} GPU)"
+else
+  step "Starting the prover (mock on $PROVER_WHERE, transfers real)"
+fi
 # ALWAYS restarted, never "already running". A live session carries the environment and the code it was
 # started with: after a git pull or a config change, leaving it alone means the new behaviour is deployed but
 # not running — which is exactly how PULL_VIA sat unused for a full session while the logs looked healthy.
@@ -810,7 +1040,18 @@ step "Starting the prover (mock on $PROVER_WHERE, transfers real)"
 # in the tap — two different implementations hitting the same arithmetic ceiling, because the ceiling is not
 # in either of them. The lever that works is making the transfer itself cheaper (scp -O in prove_remote),
 # which helps every block instead of a third of them.
-onbox "tmux kill-session -t prove 2>/dev/null && echo '   · restarting prove (a live session would keep the old code and env)'; tmux new-session -d -s prove \"cd $BOX_REPO && REMOTE_WS=$MOCK_WS REMOTE_RUNNER=$MOCK_RUNNER_DIR/zisk-runner ${PULL_VIA:+PULL_VIA=$PULL_VIA }WITNESS_PUMP=$MOCK_RUNNER_DIR/witness-pump PUMP_SOCK=$PUMP_SOCK REMOTE_SUBMIT=$MOCK_RUNNER_DIR/ethproofs-submit WITNESS_MANIFEST=\$HOME/witness-manifest.csv cli/prove-farm --guest monad-zisk --mock --remote $PROVER_TARGET --port $PROVER_PORT --mock-secs $MOCK_SECS --mock-per-mstep $MOCK_PER_MSTEP --mock-speed $MOCK_SPEED --mock-jitter $MOCK_JITTER --interval 1 --watch --newest-first --no-prefetch --ethproofs-url http://localhost:$MOCK_PORT --ethproofs-cluster local-ZisK-monad 2>&1 | tee -a ~/prove-mock.log\""
+# The mode's whole footprint on the command line, built in ONE place. Everything else — the transfer channel,
+# the manifest, the submission path, the queue policy — is identical between the two, which is the point: the
+# mock rehearsed the real thing, so switching should touch the prover flags and nothing else.
+if [ "$PROVE_REAL" = 1 ]; then
+  # No --mock: prove-farm then calls `infra/zisk-infra/run prove-cluster`, which resolves the guest's ELF and
+  # witness and hands them to prove_remote → the coordinator. --num-gpus only records the GPU count in the
+  # report and in the cluster label.
+  PROVE_MODE_FLAGS="--num-gpus $PROVE_GPUS"
+else
+  PROVE_MODE_FLAGS="--mock --mock-secs $MOCK_SECS --mock-per-mstep $MOCK_PER_MSTEP --mock-speed $MOCK_SPEED --mock-jitter $MOCK_JITTER"
+fi
+onbox "tmux kill-session -t prove 2>/dev/null && echo '   · restarting prove (a live session would keep the old code and env)'; tmux new-session -d -s prove \"cd $BOX_REPO && REMOTE_WS=$PROVER_WS REMOTE_RUNNER=$RUNNER_DIR/zisk-runner ${PULL_VIA:+PULL_VIA=$PULL_VIA }WITNESS_PUMP=$RUNNER_DIR/witness-pump PUMP_SOCK=$PUMP_SOCK REMOTE_SUBMIT=$RUNNER_DIR/ethproofs-submit WITNESS_MANIFEST=\$HOME/witness-manifest.csv cli/prove-farm --guest monad-zisk $PROVE_MODE_FLAGS --remote $PROVER_TARGET --port $PROVER_PORT --interval 1 --watch --newest-first --no-prefetch --ethproofs-url $EP_URL${EP_TOKEN:+ --ethproofs-token $EP_TOKEN} --ethproofs-cluster $EP_CLUSTER 2>&1 | tee -a $PROVE_LOG\""
 
 [ "$CRON" = 1 ] && { step "Installing the daily log archiver on the box"
   onbox "(crontab -l 2>/dev/null | grep -v archive-logs; echo '17 4 * * * \$HOME/zkvm-bench/infra/monad-witness/archive-logs >> \$HOME/archive-logs.log 2>&1') | crontab - && crontab -l | tail -1"; }
@@ -820,13 +1061,37 @@ step "Up. What to watch"
 cat <<EOF
    on $BOX:
      tail -2 ~/witness-tap.log            lag (2-3 blocks) · raw (0-1) · unproved (must not climb)
-     tail -6 ~/prove-mock.log             per block: prove=X wall=Z  ->  Z-X IS the transport
+     tail -6 $PROVE_LOG             per block: prove=X wall=Z  ->  Z-X IS the transport
      cd \$HOME/zkvm-bench && profiling/rtp-latency.py --manifest ~/witness-manifest.csv \\
         --results infra/zisk-infra/results --guest monad-zisk | tail -15
+EOF
+if [ "$PROVE_REAL" = 1 ]; then
+  # The prover is the GPU box, so its own logs are there, not here. And the FIRST number to read is the one
+  # nothing in this repo has ever had: a measured proving time for this guest.
+  cat <<EOF
+   on $PROVER_TARGET (the prover):
+     tail -f ~/zisk-infra/cluster/logs/worker.log
+                                          phases: EXECUTE · CALCULATING_CONTRIBUTIONS · GENERATING_INNER_PROOFS
+     cat $PROVER_WS/reports/\$(ls -t $PROVER_WS/reports 2>/dev/null | grep '\.log\$' | head -1)
+                                          the per-block prove log
+     nvidia-smi                           the GPU must actually be busy during a proof
    on this Mac:
-     cat $MOCK_WS/reports/\$(ls -t $MOCK_WS/reports | grep '\.log\$' | head -1)
+     open ${EP_URL#http*://}              leaderboard; a REAL proof must read ✓ (⊘ means a mock slipped in)
+     tail -f ~/tunnel.log                 link drops and retries
+
+   FIRST THING TO DO once a few blocks have landed — the number that does not exist yet:
+     grep -o 'prove=[0-9.]*' $PROVE_LOG | tail -20
+   Projected was $(awk -v f="$MOCK_SECS" -v p="$MOCK_PER_MSTEP" -v g="$PROVE_GPUS" -v mn="$GUEST_MS_MEAN" 'BEGIN{printf "%.0f", f+p*16/g*mn}') s on the mean block ($PROVE_GPUS GPU). If the real figure differs, the
+   cadence derived above is wrong: re-derive PROVE_EVERY from it, and record it in AGENT-NOTES.md.
+   tear down:  $0 --stop
+EOF
+else
+  cat <<EOF
+   on this Mac:
+     cat $PROVER_WS/reports/\$(ls -t $PROVER_WS/reports | grep '\.log\$' | head -1)
                                           Steps: <9 digits> · model - emulation -> sleep
      open http://127.0.0.1:$MOCK_PORT     leaderboard; a mock proof must read ⊘, never ✗
      tail -f ~/tunnel.log                 link drops and retries
    tear down:  $0 --stop
 EOF
+fi

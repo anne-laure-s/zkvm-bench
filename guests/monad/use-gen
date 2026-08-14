@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # use-gen — select which Monad guest GENERATION the tooling sees.
 #
-# A generation is a guest lineage plus the witness wire format it reads; the two change together
-# (PartialTrieDb + RLP node list -> OffsetTrieDb + offset blob). Witness FILENAMES are identical
-# across formats, so mixing two sets is undetectable by inspection — hence one directory per
-# generation, and this script as the only way to switch.
+# A generation is a guest ELF pair together with a witness set it is known to read: two artefacts that are only
+# valid AS A PAIR, which is why they live in one directory and why this script is the only way to switch.
+# Witness FILENAMES carry no format marker, so a mismatched pair is undetectable by inspection and fails by
+# producing a wrong post-state root with a zero exit — never by refusing to run.
+#
+# The two halves do not have to move together, and the layout should not imply they do. A change of WIRE FORMAT
+# moves both (PartialTrieDb + RLP node list -> OffsetTrieDb + offset blob, one witness set per format), while a
+# change of GUEST LINEAGE on an unchanged format moves only the ELFs — an optimised build of the same reader.
+# That second case shares its witness set rather than copying gigabytes: point the generation's `witnesses` at
+# the one it reads, and the format checks below still see the real bytes through the link.
 #
 #   ./use-gen                 list generations, mark the current one
 #   ./use-gen <generation>    point `current` at it and install its ELFs

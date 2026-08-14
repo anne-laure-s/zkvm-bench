@@ -54,7 +54,11 @@ guests/monad/exec-verified.csv
 # reads, which change together (PartialTrieDb + RLP node list → OffsetTrieDb + offset blob). Bulk is
 # regenerable and stays out; the per-generation PROVENANCE.md is small, is the only record of which
 # branch and which ELF produced a set of numbers, and IS meant to be committed.
-guests/monad/gen/*/witnesses/
+# No trailing slash on `witnesses`: a generation whose guest lineage moved while the wire format did not
+# points it at the corpus it shares instead of copying gigabytes, and git treats a symlink as a FILE — the
+# same reason `guests/*/fixtures/` cannot cover `fixtures` below. Committed, the link would dangle in every
+# clone, since what it points at is ignored. The sharing is recorded in that generation's PROVENANCE.md.
+guests/monad/gen/*/witnesses
 guests/monad/gen/*/elf/
 # `current` selects the generation and `fixtures` is the stable path the tooling globs
 # (profiling/compare.py, infra/monad-openvm/segments.sh). Both are local state — a clone has no

@@ -3,7 +3,7 @@
 #
 # The seam has three long-running pieces. Two are Sam's and are NOT reimplemented here — this only
 # orchestrates them and adds the third. They are UNTRACKED files in ~/monad/ (in no branch at all, and
-# origin no longer carries the sam/* branches they began on), so read them on the box, not in a checkout:
+# origin does not carry the sam/* branches they began on), so read them on the box, not in a checkout:
 #
 #   fetch     fetch_blocks.py   raw blocks from an RPC -> block_db          (follows the chain, forever)
 #   replay    run_replay.py     block_db -> triedb, dumping zkVM witnesses  (follows block_db, forever)
@@ -29,7 +29,7 @@
 #   ./witness-follow stop                    SIGTERM the replay/tap (leaves the fetcher alone)
 #
 # Config (env): MONAD_DIR REPO WITNESS_DIR BLOCK_DB DB RPC NTHREADS MAX_BATCH MIN_FOLLOW_BATCH
-#               PY ETHPROOFS_URL CLUSTER PROVE_EVERY KEEP_RECENT
+#               PY ETHPROOFS_URL CLUSTER PROVE_EVERY KEEP_RECENT SKIP_AFTER
 #               HEAD_TAG CONFIRMATIONS   (block-by-block — see README)
 #               SUPERVISE_MAX_CRASHES SUPERVISE_BACKOFF SUPERVISE_HEALTHY_SECS
 #                                          the tip supervisor restarts a crash that left no ALERT (20 tries,
@@ -108,6 +108,7 @@ tap_cmd() {
   echo "cd $HERE && WITNESS_DIR=$WITNESS_DIR REPO=$REPO BLOCK_DB=$BLOCK_DB RPC=$RPC \
 ${ETHPROOFS_URL:+ETHPROOFS_URL=$ETHPROOFS_URL }${CLUSTER:+CLUSTER=$CLUSTER }\
 ${PROVE_EVERY:+PROVE_EVERY=$PROVE_EVERY }${KEEP_RECENT:+KEEP_RECENT=$KEEP_RECENT }\
+${SKIP_AFTER:+SKIP_AFTER=$SKIP_AFTER }\
 ${TAP_INTERVAL:+INTERVAL=$TAP_INTERVAL }${SETTLE_SECS:+SETTLE_SECS=$SETTLE_SECS }\
 ./witness-tap 2>&1 | tee -a ~/witness-tap.log"
 }
@@ -124,10 +125,11 @@ phase_sessions() { [ "$1" = tip ] && echo "fetch replay-tip tap" || echo "fetch 
 # once its margin is exhausted, so a genuine fault (disk full, corruption) stops the loop instead of grinding
 # the database.
 #
-# An exit without an ALERT used to be read as "a clean stop", so `witness-follow stop` would not be fought.
-# That was wrong in one direction: it is also how the ORCHESTRATOR dies (no try/except in
-# run_replay.py, and a 30 s HTTP call every iteration), and those crashes went unrestarted. The two are now
-# told apart by an explicit logs/STOP marker that cmd_stop writes, because both exit rc=1 with no ALERT.
+# An exit without an ALERT is NOT enough to mean "a clean stop", even though reading it that way is what keeps
+# `witness-follow stop` from being fought. It is equally the signature of the ORCHESTRATOR dying — run_replay.py
+# has no try/except anywhere and makes a 30 s HTTP call every iteration — and those crashes are the ones that
+# must be restarted. Both exit rc=1 with no ALERT, so the two are told apart by the logs/STOP marker cmd_stop
+# writes, and by nothing else.
 # run_tip_once — one run of the tip producer, on whichever path TIP_DIRECT selects.
 #
 # TIP_DIRECT=1: monad directly, long-lived. TIP_DIRECT=0 (the default): the old run_replay.py path, kept so the
@@ -172,7 +174,7 @@ cmd_supervise() {
     local t0; t0=$(date +%s)
     run_tip_once; rc=$?
     if [ ! -f "$MONAD_DIR/logs/ALERT" ]; then
-      # "No ALERT" used to be read as "a clean stop". It is not: it is ALSO the signature of the
+      # "No ALERT" does not mean "a clean stop": it is ALSO the signature of the
       # orchestrator itself falling over, because ALERT is only written when the monad CHILD fails.
       # run_replay.py catches no exception anywhere, and its per-iteration finalized lookup is a
       # 30 s-timeout HTTP call — so one RPC blip took the producer down with nothing to explain
@@ -261,8 +263,8 @@ cmd_stop() {
   local s
   # Tell the supervisor this was deliberate. A stop and a crash are otherwise indistinguishable:
   # run_replay.py's SIGTERM handler does sys.exit(1), and an unhandled exception exits 1 too, and
-  # NEITHER writes an ALERT. Without this marker the supervisor must either fight `stop` or ignore
-  # crashes — it used to do the latter (see cmd_supervise).
+  # NEITHER writes an ALERT. Without this marker the supervisor can only either fight `stop` or ignore
+  # crashes; with it, it distinguishes them (see cmd_supervise).
   mkdir -p "$MONAD_DIR/logs" && : > "$MONAD_DIR/logs/STOP"
   for s in replay-catchup replay-tip tap profile; do
     tmux has-session -t "$s" 2>/dev/null || continue
