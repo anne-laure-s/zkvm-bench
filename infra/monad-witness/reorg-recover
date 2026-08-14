@@ -46,7 +46,10 @@ BLOCK_DB="${BLOCK_DB:-$HOME/block_db}"
 DB="${DB:-$HOME/triedb.db}"
 MPT="${MPT:-$MONAD_DIR/build/category/mpt/monad-mpt}"
 CLI="${CLI:-$MONAD_DIR/build/cmd/monad-cli}"
-FARM_CSV="${FARM_CSV:-$HOME/zkvm-bench/run-data/prove-farm.csv}"
+FARM_CSV="${FARM_CSV:-$HOME/zkvm-bench/prove-farm.csv}"
+# Step 4 reports "nothing to invalidate" when this file is absent, so a WRONG path here reads as a clean pass.
+# That is the failure mode to watch: the guard cannot tell "no proofs to drop" from "looking in the wrong place",
+# and it stayed silent for exactly that reason until the path above was corrected.
 MARGIN="${MARGIN:-64}"
 MAX_MARGIN="${MAX_MARGIN:-4096}"
 ALERT="$MONAD_DIR/logs/ALERT"
@@ -68,8 +71,23 @@ failing="$(grep -oE 'block [0-9]+ failed with: [a-z ]+' "$ALERT" | tail -1)"
 [ -n "$failing" ] || die "the ALERT does not name a failing block — read it yourself, this is not a reorg:
 $(head -3 "$ALERT")"
 fblock="$(printf '%s' "$failing" | grep -oE '[0-9]+' | head -1)"
+# `excess blob gas` belongs here for the same reason `parent` does: EIP-4844 derives a block's excess blob gas
+# from its PARENT's header (excess + blob_gas_used, against the active blob schedule), so a non-canonical parent
+# sitting in block_db makes the canonical child fail validation on this field. Observed at block 25699795, where
+# block_db held a 354-transaction 25699794 while the canonical one has 51 — a replaced block the fetcher wrote
+# at CONFIRMATIONS=0 and the replay then applied.
+#
+# It is the one signature here that a rewind might NOT fix, because the same message is what a wrong blob
+# schedule produces — and then rewinding discards good state for nothing. The two are told apart from outside
+# this script, by asking the chain whether the block the client executed is the canonical one:
+#   curl -s -X POST -H 'content-type: application/json' --data \
+#     '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x<parent-hex>",false]}' "$RPC"
+# Compare its transaction count against the replay log's `__exec_block,bl=<parent>,...,tx=N`. Different counts
+# mean a reorg and this recovery is right; identical means the client disagrees with a block it holds correctly,
+# which is a consensus bug upstream of here and no rewind will help.
 case "$failing" in
-  *"bad nonce"*|*"root"*|*"parent"*|*"mismatch"*) log "reorg-shaped failure: $failing" ;;
+  *"bad nonce"*|*"root"*|*"parent"*|*"mismatch"*|*"excess blob gas"*)
+    log "reorg-shaped failure: $failing" ;;
   *) die "'$failing' is not a reorg signature. A rewind will not fix it, and would discard good state." ;;
 esac
 
@@ -96,7 +114,16 @@ The history window cannot undo this — rebuild from a snapshot."
 fi
 
 log "failing block $fblock · triedb head $last · rewinding to $target (margin $margin, history from $earliest)"
-printf '%s %s\n' "$fblock" "$margin" > "${STATE}.tmp" && mv "${STATE}.tmp" "$STATE"
+# NOT under --dry-run. The escalation counter records that a recovery was ATTEMPTED and did not hold; a preview
+# attempts nothing, so writing here would let repeated previews double the margin toward MAX_MARGIN until the
+# script refuses outright and demands a snapshot rebuild. It also inflates the very next real run: each unspent
+# doubling discards hundreds of good blocks and re-fetches the whole backlog for a divergence that is usually
+# one block deep. A dry run has one contract, which is to change nothing, and this line was the exception.
+if [ "$DRY" = 1 ]; then
+  log "    (dry run — the escalation counter is left at $(cut -d' ' -f2 "$STATE" 2>/dev/null || echo unset))"
+else
+  printf '%s %s\n' "$fblock" "$margin" > "${STATE}.tmp" && mv "${STATE}.tmp" "$STATE"
+fi
 
 log "1/5 stopping the fetcher (it must not write while block_db is trimmed)"
 run "pkill -f '[f]etch_blocks.py' 2>/dev/null; tmux kill-session -t fetch 2>/dev/null; true"
@@ -113,6 +140,13 @@ if [ "$DRY" != 1 ]; then
   log "    head is now $now"
 fi
 
+# EVERYTHING above $target goes, and the cost of that is the point rather than an oversight: it can be tens of
+# thousands of files and hours of re-fetching to undo a divergence one block deep. A bounded window looks like
+# the obvious saving and does not work. fetch_blocks.py resumes at `existing_max_block(block_db) + 1` and that
+# is a MAX over the directory, so leaving the settled backlog in place puts a HOLE between the trimmed range
+# and it: the fetcher restarts above the hole, never fills it, and the replay sits at `available ==
+# last_executed` with thousands of unreachable blocks stacked above a gap it cannot cross. Contiguity is what
+# makes block_db usable at all, so the trim keeps it contiguous even when that is expensive.
 log "3/5 trimming block_db above $target (they may be the non-canonical ones)"
 if [ "$DRY" = 1 ]; then
   printf '   $ %s\n' "ls $BLOCK_DB | awk '\$1+0 > $target' | xargs rm -f   ($(ls "$BLOCK_DB" 2>/dev/null | awk -v t="$target" '$1+0 > t' | wc -l | tr -d ' ') file(s))"
