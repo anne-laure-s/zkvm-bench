@@ -187,6 +187,30 @@ REMAIN = [
     },
 ]
 
+# ── the ablation sweep ───────────────────────────────────────────────────────────────────────────
+# One ELF per lever with that lever alone removed, each measured against r4 over the same 504 blocks.
+# Read at render time from the sweep's own JSON; the only thing written by hand is the commentary.
+ABLATION_JSON = ['results/compare-ablations.json', 'results/compare-ablations2.json']
+TRIM_JSON = 'results/compare-trim.json'
+
+# Removing arena, clz and hashinline TOGETHER. The control that decides how to read the small numbers.
+TRIM_MEMBERS = ('arena', 'clz', 'hashinline')
+
+ABL_NOTE = {
+    'keccak': "The word-wise entry into the permutation precompile. Removing it costs more than the "
+              "next nine levers combined.",
+    'keyhash': "Address and bytes32_t keys hashed by fold+fmix64 instead of wyhash. It was +1.24 % on "
+               "the r3 base and is worth more here — a guest with 27 % of its work removed spends a "
+               "larger share of what is left in map lookups.",
+    'div': "The 128/64 division step specialised. +3.07 % when it landed, +2.84 % now: the closest "
+           "agreement across a rebase in this table.",
+    'arena': "ZisK only. It stays on SP1, where it was measured at +7.3 % against TLSF and has NOT "
+             "been re-verdicted — that figure is too large to discard on a ZisK measurement.",
+    'mulmod': "Its case was never the median: +11.2 % on math-heavy blocks. A median over 504 ordinary "
+              "blocks cannot see a lever whose value is in the tail.",
+    'addmod': "Same shape as mulmod — +0.71 % was claimed on math-heavy blocks, not on the median.",
+}
+
 PRIOR = (
     "Two of the three levers tried on r4 failed with <b>the same shape</b>: a probe that avoids work, "
     "sitting on a hotter path than the work it avoids. Treat that as a prior for this guest — its hot "
@@ -257,6 +281,71 @@ def s(d, key):
 
 def x(v):
     return '—' if v is None else f"{v:.3f}×"
+
+
+def _load(rel):
+    p = os.path.join(HERE, rel)
+    return json.load(open(p)) if os.path.exists(p) else None
+
+
+def ablation_section():
+    """The sweep, read from its own JSON. Returns '' if it has not been run."""
+    rows = []
+    for rel in ABLATION_JSON:
+        d = _load(rel)
+        if not d:
+            continue
+        for ax, v in d.items():
+            sm = v['summary']
+            r, c = sm['ratio_median'], sm.get('cost_ratio_median')
+            rows.append({'id': ax.replace('abl-', ''), 'n': sm['n'],
+                         'without': sm['a_median'], 'r4': sm['b_median'],
+                         'w': (r - 1) * 100, 'c': ((c - 1) * 100) if c else None})
+    if not rows:
+        return ""
+    rows.sort(key=lambda t: -t['w'])
+    trim = _load(TRIM_JSON)
+    tsum = trim['trim-vs-r4']['summary'] if trim else None
+
+    h = ["<h2>The ablation sweep</h2>",
+         "<p class=note>One ELF per lever with that lever <i>alone</i> removed, each measured against "
+         "r4 over the same 504 blocks. A lever is worth having when removing it makes the guest do "
+         "<b>more</b> work.</p>",
+         "<table><tr><th>lever removed</th><th class=n>without</th><th class=n>r4</th>"
+         "<th class=n>work</th><th class=n>cost</th><th>note</th></tr>"]
+    for r in rows:
+        # One row, built in one place. The ternary-across-the-whole-append shape swallowed the <tr>
+        # whenever cost was absent, which is the second time it has bitten in this file.
+        cost = f"{r['c']:+.2f}%" if r['c'] is not None else "—"
+        h.append(f"<tr><td><code>{r['id']}</code></td>"
+                 f"<td class=n>{r['without']/1e6:.2f} M</td>"
+                 f"<td class=n>{r['r4']/1e6:.2f} M</td>"
+                 f"<td class=n>{r['w']:+.2f}%</td>"
+                 f"<td class=n>{cost}</td>"
+                 f"<td class=note>{ABL_NOTE.get(r['id'], '')}</td></tr>")
+    h.append("</table>")
+
+    if tsum:
+        tr = (1 - tsum['ratio_median']) * 100
+        tc = (1 - tsum.get('cost_ratio_median', 1)) * 100
+        summed = sum(-r['w'] for r in rows if r['id'] in TRIM_MEMBERS)
+        h.append("<div class=item>"
+                 "<h3><span class='tag no'>CONTROL</span>Removing the three smallest “costs” together "
+                 "returns nothing</h3>"
+                 f"<p class=num>{tr:+.2f} % work · {tc:+.2f} % cost · n={tsum['n']} — "
+                 f"against {summed:+.2f} % predicted by summing them</p>"
+                 "<p>Individually <code>" + "</code>, <code>".join(TRIM_MEMBERS) + "</code> each "
+                 "measured as costing 0.6–0.8 %. Removed together they return "
+                 f"{tr:+.2f} %.</p>"
+                 "<p><b>So those per-lever numbers are not the levers.</b> They are what moving code "
+                 "does to layout and inlining — three removals that each “win” 0.7 % cancel when "
+                 "combined, which they could not do if the 0.7 % lived in the levers. The noise floor "
+                 "of this method on this guest is about ±1 %.</p>"
+                 "<p>Read the table accordingly: <code>keccak</code>, <code>keyhash</code> and "
+                 "<code>div</code> clear that floor and carry 20.6 % of the guest's work between them. "
+                 "The other seven are indistinguishable from zero, and treating them as costs would be "
+                 "reading noise as signal.</p></div>")
+    return "\n".join(h)
 
 
 def render(d, out):
@@ -336,6 +425,8 @@ def render(d, out):
         h.append(f"<div class=item>{head}"
                  f"<div class=lbl>what</div><p>{r['w']}</p>"
                  f"<div class=lbl>where that leaves it</div><p>{r['fix']}</p></div>")
+
+    h.append(ablation_section())
 
     h.append("<h2>A prior worth carrying</h2>")
     h.append(f"<div class=item><p>{PRIOR}</p></div>")

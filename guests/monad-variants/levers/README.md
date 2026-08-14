@@ -61,3 +61,42 @@ of a block. The arithmetic was written down before building and it held.
 Third lever in a row where a "skip the work" probe sits on a hotter path than the work it skips
 (see `br` above). Worth treating as a prior: in this guest, the hot paths are close enough to their
 floor that conditional avoidance loses unless the avoided work is large *and* the check is rare.
+
+## The r4 ablation sweep — ten verdicts, and a control that changes how to read them (2026-08-13)
+
+One ELF per lever with that lever alone removed, each measured against `al/zkvm-r4` over the same 504
+blocks of `storageroot-det-2026-08`. A lever is worth having when removing it makes the guest do MORE
+work.
+
+| lever removed | work | cost |
+|---|---|---|
+| `keccak` | **+14.52 %** | **+9.76 %** |
+| `keyhash` | +3.24 % | +2.12 % |
+| `div` | +2.84 % | +1.81 % |
+| `calldata` | −0.12 % | −0.33 % |
+| `fmix` | −0.36 % | −0.55 % |
+| `hashinline` | −0.62 % | −0.63 % |
+| `arena` | −0.65 % | −0.66 % |
+| `mulmod` | −0.74 % | −0.67 % |
+| `clz` | −0.76 % | −0.77 % |
+| `addmod` | −1.00 % | −0.89 % |
+
+**The control.** Removing `arena`, `clz` and `hashinline` together — summing to +2.03 % by the table —
+returns **−0.01 % work, +0.26 % cost** over the same 504 blocks (`al/zkvm-r4-trim`, public values
+identical). Three removals that each "win" 0.7 % cancel when combined, which they could not do if that
+0.7 % lived in the levers. **The per-lever figures below ~1 % are measuring what moving code does to
+layout and inlining, not the lever.** The noise floor of this method on this guest is about ±1 %.
+
+So: `keccak`, `keyhash` and `div` clear it and carry 20.6 % of the guest's work between them. The other
+seven are indistinguishable from zero and **nothing was removed from `al/zkvm-r4`** on the strength of
+them — treating a −0.7 % as a cost would be reading noise as signal, which is what the control exists
+to prevent.
+
+Two figures the sweep cannot speak to. `arena` is +7.3 % on **SP1** against TLSF and was not
+re-verdicted here, so its ZisK negativity says nothing about that backend. `mulmod` and `addmod` were
+claimed on math-heavy blocks (+11.2 % and +0.71 %), and a median over 504 ordinary blocks cannot see a
+lever whose value is in the tail.
+
+Three levers have no entry: `scanidx` (subsumed by `jd`, which replaced the loop it widened),
+`bswap` (its revert does not compile — later commits depend on it), and `popcount` (its ablation ELF is
+byte-identical to r4, so there was nothing to measure).
