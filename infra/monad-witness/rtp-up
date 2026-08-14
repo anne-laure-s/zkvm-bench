@@ -28,6 +28,9 @@
 #   * enable Remote Login (a security setting — turn it on yourself in System Settings > Sharing)
 #   * commit or push your code (it warns; the box's own clone is verified at step 6 instead)
 #   * install a toolchain
+#   * switch your monad branch (it checks, and stops if it is wrong — a checkout is a decision)
+#  It DOES rebuild monad's binary when it does not match the checkout: BUILD_MONAD=1 is the default, and
+#  that repair is one deterministic command. BUILD_MONAD=0 turns it back into an error with instructions.
 #
 #   ./rtp-up [--real] [--dry-run] [--purge] [--keep-mock] [--cron] [--stop]
 #
@@ -622,6 +625,17 @@ fi
 # MONAD_BRANCH= (empty) skips both checks.
 MONAD_BRANCH="${MONAD_BRANCH:-al/rtp}"
 MONAD_DIR_BOX="${MONAD_DIR_BOX:-\$HOME/monad}"
+# A STALE BINARY IS REBUILT, NOT REPORTED. The fix was one deterministic command that this script already
+# knew and printed for you to copy — which is the definition of something it should just run.
+#
+# It is a 10-40 min incremental build (~251 files differ across the branches here), so it is announced and
+# its output is streamed rather than swallowed: a rebuild that fails on a compiler error after a rebase, or
+# on OOM from -j$(nproc), has to be readable. The result is re-verified afterwards, so a build that "worked"
+# without producing a matching binary still stops the run.
+#
+# BUILD_MONAD=0 restores the old behaviour (die with the command). A WRONG BRANCH stays fatal either way:
+# `git checkout` in your monad tree is a decision, not a repair.
+BUILD_MONAD="${BUILD_MONAD:-1}"
 if [ "$DRY" != 1 ] && [ -n "$MONAD_BRANCH" ]; then
   step "monad: branch $MONAD_BRANCH, and a binary built from it"
   mb="$(onbox_q "cd $MONAD_DIR_BOX && git rev-parse --abbrev-ref HEAD")"
@@ -637,15 +651,46 @@ the branch where the ethereum runloop WAITS for a block instead of asserting. Sw
   # than the commit it should contain is stale beyond doubt.
   if onbox_q "strings -a $MONAD_DIR_BOX/build/cmd/monad 2>/dev/null | grep -qF '$mhead' && echo yes" | grep -q yes; then
     say "binary built from ${mhead:0:12} — matches the checkout"
-  elif onbox_q "test \$(stat -c %Y $MONAD_DIR_BOX/build/cmd/monad) -lt \$(cd $MONAD_DIR_BOX && git log -1 --format=%ct) && echo old" | grep -q old; then
-    die "$BOX's monad binary is OLDER than the commit checked out on $MONAD_BRANCH — it cannot contain it. Rebuild:
-    ssh $BOX 'cd monad && cmake --build build --target monad -j\$(nproc)'"
   else
-    die "$BOX's monad binary does not contain the checked-out commit ${mhead:0:12} — it was built from another
-branch or another revision. That is what makes --block-db-timeout fail with 'requires --as-eth-blocks' on a
-checkout where that constraint no longer exists. Rebuild:
+    # Why it is stale, for the log — the two cases need different words even though the repair is identical.
+    if onbox_q "test \$(stat -c %Y $MONAD_DIR_BOX/build/cmd/monad) -lt \$(cd $MONAD_DIR_BOX && git log -1 --format=%ct) && echo old" | grep -q old; then
+      say "binary is OLDER than the commit checked out on $MONAD_BRANCH — it cannot contain it"
+    else
+      say "binary does not contain ${mhead:0:12} — it was built from another branch or revision"
+    fi
+    if [ "$BUILD_MONAD" != 1 ]; then
+      die "$BOX's monad binary does not match the checkout on $MONAD_BRANCH. Rebuild:
     ssh $BOX 'cd monad && cmake --build build --target monad -j\$(nproc)'
-  (Incremental, but ~251 files differ across branches here — allow 10-40 min on 16 cores.)"
+  (Incremental, but ~251 files differ across branches here — allow 10-40 min on 16 cores.)
+  (BUILD_MONAD=1 — the default — rebuilds it here instead.)"
+    fi
+    step "Rebuilding monad on $BOX (10-40 min; BUILD_MONAD=0 to do it yourself)"
+    # SUBMODULES FIRST. `git checkout` does not move them, and the branches pin different ones —
+    # third_party/fiber is dbab7e10 on al/zkvm-r4 and a0764ba7 on al/rtp. Building al/rtp against r4's fiber
+    # fails with `PriorityAlgorithm` abstract, because that fiber's `algorithm` base declares a pure virtual
+    # the client does not override. A branch switch is exactly when the automatic rebuild runs, so without
+    # this the rebuild reliably fails on the one occasion it exists for.
+    say "syncing submodules (a branch switch does not move them)"
+    onbox "cd $MONAD_DIR_BOX && git submodule update --init --recursive 2>&1 | tail -5" || true
+    # `set -o pipefail` on the REMOTE side, and NO truncation. Both were bugs:
+    #   * without pipefail the pipeline's status is `tail`'s, so a failed cmake reported SUCCESS and the run
+    #     fell through to the re-verify, which then blamed the build directory for a compiler error;
+    #   * `tail -25` kept the ninja progress lines and cut the diagnostic above them — the opposite of useful.
+    # This is the one long step in the script and the place a human has to read the output, so it all comes.
+    if ! onbox "set -o pipefail; cd $MONAD_DIR_BOX && cmake --build build --target monad -j\$(nproc) 2>&1"; then
+      die "the rebuild failed on $BOX — the compiler output is above. Nothing else was started.
+   If it is a missing override on a boost::fibers base class, the submodules are out of step with the
+   branch: \`ssh $BOX 'cd monad && git submodule status'\` against \`git ls-tree HEAD third_party/fiber\`."
+    fi
+    # Re-verify rather than trust the exit code: a build can succeed and still not produce a binary carrying
+    # this commit (wrong build dir, a target that was already up to date against different sources).
+    if onbox_q "strings -a $MONAD_DIR_BOX/build/cmd/monad 2>/dev/null | grep -qF '$mhead' && echo yes" | grep -q yes; then
+      say "rebuilt, and the binary now carries ${mhead:0:12}"
+    else
+      die "the rebuild reported success but $BOX's binary still does not carry ${mhead:0:12}.
+   Check that $MONAD_DIR_BOX/build is the build directory this checkout uses:
+     ssh $BOX 'cd monad && cmake --build build --target monad -j\$(nproc) && strings -a build/cmd/monad | grep -c $mhead'"
+    fi
   fi
 
   # ── 5b-bis. CONTENT, not just provenance ─────────────────────────────────────────────────────────
