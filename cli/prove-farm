@@ -527,9 +527,35 @@ submit_one(){  # $1=block  $2=run_dir
          rc=\$?; rm -rf \"\$d\" '$rws/proofs/$rbase.proof.bin' '$rws/proofs/$rbase.pv.bin' \
               '$rws/reports/$rbase.json' '$rws/reports/$rbase.log'; exit \$rc" > "$slog" 2>&1; then
       log "<< submit $b ok  ($(tail -n1 "$slog"))"
+      # Reset HERE, on a real success, so the counter measures a RUN of consecutive failures. Resetting
+      # anywhere else understates it: an intermittent failure must not accumulate into "not intermittent",
+      # and a genuine run must not be broken by a block that simply never attempted the prover path.
+      SUBMIT_VIA_PROVER_FAILS=0
       return 0
     fi
-    log "   (prover-side submit failed — falling back to posting from here; see $slog)"
+    # A PATH THAT FAILS EVERY TIME MUST NOT READ AS A PER-BLOCK HICCUP. This line used to be the whole
+    # report: one scrolling notice per block, while the fallback succeeded and every summary stayed green.
+    # Measured consequence: 355 consecutive failures across 507 blocks went unnoticed, and the 508 KB proof
+    # crossed the slow link on every one of them — which is exactly what posting from the prover exists to
+    # avoid. So count them, and escalate the wording once the count proves it is not intermittent.
+    SUBMIT_VIA_PROVER_FAILS=$((${SUBMIT_VIA_PROVER_FAILS:-0} + 1))
+    if [ "$SUBMIT_VIA_PROVER_FAILS" = 1 ]; then
+      log "   (prover-side submit failed — falling back to posting from here; see $slog)"
+    elif [ "$SUBMIT_VIA_PROVER_FAILS" = 3 ]; then
+      # Three in a row is no longer chance. Name the two causes that produce it and how to tell them apart:
+      # both are box->Mac ssh, the one direction nothing else in the pipeline uses (the prover always opens
+      # the connection to the box), which is why everything else keeps working while this rots.
+      log "   ⚠️  prover-side submit has now failed $SUBMIT_VIA_PROVER_FAILS times IN A ROW — this is not intermittent."
+      log "       Every proof is crossing the slow link from here instead of being posted by the prover."
+      log "       It is box->Mac ssh, and there are two usual causes:"
+      log "         · the box's private key was deleted (an hourly cron on the devcore box does exactly that:"
+      log "           0 * * * * find ~/.ssh -type f -name 'id_*' -delete) — check: ssh $REMOTE 'ls ~/.ssh'"
+      log "         · the reverse tunnel is down — check: ssh $REMOTE 'ss -ltn | grep :2222' and ~/tunnel.log"
+      log "       Look for 'Permission denied (publickey' vs 'Connection refused' in $slog to tell which."
+      log "       Re-running rtp-up resets both; the key comes back only until the cron next fires."
+    elif [ $((SUBMIT_VIA_PROVER_FAILS % 50)) = 0 ]; then
+      log "   ⚠️  prover-side submit still failing ($SUBMIT_VIA_PROVER_FAILS in a row) — see the note above."
+    fi
   fi
   log ">> submit $b → $ETHPROOFS_URL"
   if "$HERE/ethproofs-submit" --run-dir "$rd" --block "$b" ${VM:+--vm "$VM"} --guest "$GUEST" \

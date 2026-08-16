@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# rtp-watchdog — bring the tip pipeline back when the thing that was supposed to bring it back is gone too.
+#
+#   ./rtp-watchdog            check once, act if needed  (this is what cron runs)
+#   ./rtp-watchdog --dry-run  say what it would do, touch nothing
+#   ./rtp-watchdog --install  write the crontab entry (every 5 minutes) and exit
+#
+# WHY THIS EXISTS, and why `witness-follow supervise` is not enough. The supervisor recovers from a reorg
+# perfectly well — it detects logs/ALERT, runs reorg-recover, restarts the producer. But it runs INSIDE the
+# `replay-tip` tmux session, which means it is a peer of what it supervises rather than above it. When the tmux
+# server itself goes away, the supervisor goes with it: no session, nobody watching, and the pipeline stays
+# down until a human notices. Seen 2026-08-16: the supervisor had reached `reorg-recover: 1/5 stopping the
+# fetcher` when the whole server vanished, and the pipeline sat idle for fourteen hours with the ALERT still in
+# place and the rewind never performed.
+#
+# So this is deliberately OUT of process, out of tmux, and stateless: cron starts it, it looks, it acts, it
+# exits. The only mechanism on this box that survives everything else is cron.
+#
+# WHAT IT REFUSES TO DO
+#   * fight a deliberate stop — logs/STOP means a human stopped this on purpose, and it is left alone
+#   * race a recovery — a reorg-recover already running holds a lock, and this exits rather than interleave
+#     a second rewind with the first one's block_db trim
+#   * loop on a hard failure — restarts are rate-limited, and past the budget it goes quiet rather than
+#     restarting every five minutes forever against a cause it cannot fix
+#   * touch the catch-up phase — this watches the TIP. A backlog drain is a deliberate, supervised operation.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MONAD_DIR="${MONAD_DIR:-$HOME/monad}"
+STATE="${WATCHDOG_STATE:-$HOME/.rtp-watchdog-state}"
+LOG="${WATCHDOG_LOG:-$HOME/rtp-watchdog.log}"
+LOCK="${WATCHDOG_LOCK:-$HOME/.rtp-watchdog.lock}"
+# Sessions the tip phase owns. `prove` is the farm and is started by rtp-up, not by witness-follow, so its
+# absence is reported but not repaired from here — restarting a prover needs the Mac's environment.
+TIP_SESSIONS="${TIP_SESSIONS:-fetch replay-tip tap}"
+MAX_RESTARTS="${WATCHDOG_MAX_RESTARTS:-6}"      # inside the window below
+WINDOW_SECS="${WATCHDOG_WINDOW_SECS:-3600}"
+DRY=0
+case "${1:-}" in
+  --dry-run) DRY=1 ;;
+  --install) INSTALL=1 ;;
+  "") ;;
+  *) echo "usage: rtp-watchdog [--dry-run|--install]" >&2; exit 2 ;;
+esac
+
+say(){ printf '%s rtp-watchdog: %s\n' "$(date +%FT%T)" "$*" | tee -a "$LOG"; }
+
+if [ "${INSTALL:-0}" = 1 ]; then
+  # Every 5 minutes: a tip block is 12 s, so five minutes of downtime is ~25 missed blocks — small against the
+  # fourteen hours this exists to prevent, and infrequent enough that a flapping cause cannot spin.
+  line="*/5 * * * * $HERE/rtp-watchdog >> $LOG 2>&1"
+  if crontab -l 2>/dev/null | grep -qF "rtp-watchdog"; then
+    echo "already installed:"; crontab -l | grep -F "rtp-watchdog"; exit 0
+  fi
+  { crontab -l 2>/dev/null; echo "$line"; } | crontab -
+  echo "installed: $line"; exit 0
+fi
+
+# One watchdog at a time. Without this, a restart that takes longer than the cron interval gets a second
+# watchdog starting the same sessions underneath it.
+exec 9>"$LOCK" || exit 0
+flock -n 9 || { [ "$DRY" = 1 ] && say "another watchdog holds the lock — would exit"; exit 0; }
+
+# A recovery in flight is NOT a dead pipeline. reorg-recover stops the fetcher as its first step, so half of
+# what this checks is legitimately absent while it runs, and restarting on top of it would interleave a session
+# start with a block_db trim.
+if pgrep -f '[r]eorg-recover' >/dev/null 2>&1; then
+  say "reorg-recover is running — leaving it alone"; exit 0
+fi
+if [ -f "$MONAD_DIR/logs/STOP" ]; then
+  say "logs/STOP present — a deliberate stop, not restarting"; exit 0
+fi
+
+missing=""
+for s in $TIP_SESSIONS; do
+  tmux has-session -t "$s" 2>/dev/null || missing="$missing $s"
+done
+prove_down=0
+tmux has-session -t prove 2>/dev/null || prove_down=1
+
+if [ -z "$missing" ]; then
+  # Everything up. Say nothing on the happy path: this runs 288 times a day and a quiet log is a readable one.
+  [ "$DRY" = 1 ] && say "all of$TIP_SESSIONS up$([ $prove_down = 1 ] && echo ' (prove is down — rtp-up territory)')"
+  exit 0
+fi
+
+# Rate limit, in a window. Each restart appends its epoch; only those inside the window count.
+now=$(date +%s)
+recent=0
+if [ -f "$STATE" ]; then
+  while read -r t; do
+    case "$t" in ''|*[!0-9]*) continue ;; esac
+    [ $(( now - t )) -lt "$WINDOW_SECS" ] && recent=$((recent + 1))
+  done < "$STATE"
+fi
+if [ "$recent" -ge "$MAX_RESTARTS" ]; then
+  say "sessions down ($missing) but $recent restart(s) already in the last $((WINDOW_SECS / 60)) min — \
+NOT restarting. Something is failing that a restart does not fix: read $MONAD_DIR/logs/ALERT and the newest \
+$MONAD_DIR/logs/*.log. Clear $STATE once the cause is fixed."
+  exit 1
+fi
+
+# An ALERT with no supervisor left to act on it: recover first, or the restart dies on the same block.
+if [ -f "$MONAD_DIR/logs/ALERT" ]; then
+  say "sessions down ($missing) AND logs/ALERT present — recovering before restarting"
+  if [ "$DRY" = 1 ]; then
+    say "  would run: $HERE/reorg-recover"
+  elif ! MONAD_DIR="$MONAD_DIR" "$HERE/reorg-recover" >>"$LOG" 2>&1; then
+    say "  reorg-recover refused (see $LOG) — leaving the ALERT and NOT restarting"
+    exit 1
+  fi
+fi
+
+say "restarting the tip phase (missing:$missing)"
+if [ "$DRY" = 1 ]; then
+  say "  would run: witness-follow start tip"
+  exit 0
+fi
+# The env that rtp-up passes for the tip phase. Kept here rather than sourced, because a watchdog that depends
+# on the Mac being reachable is a watchdog that stops working exactly when the link is the problem.
+if (cd "$HERE" && HEAD_TAG="${HEAD_TAG:-latest}" CONFIRMATIONS="${CONFIRMATIONS:-0}" \
+      FETCH_POLL="${FETCH_POLL:-1}" TAP_INTERVAL="${TAP_INTERVAL:-1}" REPLAY_POLL="${REPLAY_POLL:-0.3}" \
+      SETTLE_SECS="${SETTLE_SECS:-0.5}" TIP_DIRECT="${TIP_DIRECT:-0}" \
+      BLOCK_DB_TIMEOUT="${BLOCK_DB_TIMEOUT:-30}" PROVE_EVERY="${PROVE_EVERY:-2}" \
+      ./witness-follow start tip >>"$LOG" 2>&1); then
+  echo "$now" >> "$STATE"
+  say "restarted. $((recent + 1))/$MAX_RESTARTS in the last $((WINDOW_SECS / 60)) min."
+  [ "$prove_down" = 1 ] && say "NOTE: the prove session is also down. That one is rtp-up's — the prover needs \
+the Mac's tunnel and environment, so witnesses will queue until you re-run rtp-up."
+else
+  say "witness-follow start tip FAILED (see $LOG)"
+  exit 1
+fi

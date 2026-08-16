@@ -121,9 +121,12 @@ log "failing block $fblock · triedb head $last · rewinding to $target (margin 
 # one block deep. A dry run has one contract, which is to change nothing, and this line was the exception.
 if [ "$DRY" = 1 ]; then
   log "    (dry run — the escalation counter is left at $(cut -d' ' -f2 "$STATE" 2>/dev/null || echo unset))"
-else
-  printf '%s %s\n' "$fblock" "$margin" > "${STATE}.tmp" && mv "${STATE}.tmp" "$STATE"
 fi
+# The counter is written at the END, not here. It records "a recovery RAN at this margin and the replay still
+# failed on this block", and only a run that reaches step 5 has earned that claim. Written up front, any death
+# mid-recovery — the supervisor's tmux server going away during step 1, seen once — inflates the margin without
+# having rewound anything, so the next attempt discards hundreds of extra good blocks and re-fetches the whole
+# backlog to undo a divergence that is usually one block deep.
 
 log "1/5 stopping the fetcher (it must not write while block_db is trimmed)"
 run "pkill -f '[f]etch_blocks.py' 2>/dev/null; tmux kill-session -t fetch 2>/dev/null; true"
@@ -184,5 +187,12 @@ fi
 
 log "5/5 removing the ALERT"
 run "rm -f '$ALERT'"
+
+# Now that all five steps are through, record the margin this attempt used. If the replay fails on the SAME
+# block again, the next run reads this and doubles — which is the only evidence that the fork predates what the
+# failure reported. A run that died before here leaves no trace, so it is retried at the same margin.
+if [ "$DRY" != 1 ]; then
+  printf '%s %s\n' "$fblock" "$margin" > "${STATE}.tmp" && mv "${STATE}.tmp" "$STATE"
+fi
 
 log "repaired. The caller must now restart the fetcher (it was stopped in step 1) and the replay."

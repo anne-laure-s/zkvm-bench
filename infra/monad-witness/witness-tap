@@ -96,6 +96,17 @@ INTERVAL      = float(env("INTERVAL", 6))        # half a slot: never more than 
 # Retention policy (see the header): what makes a witness still worth its 7 MB.
 KEEP_RECENT   = int(env("KEEP_RECENT", 10))      # newest N always kept — nothing in flight is removed
 SKIP_AFTER    = int(env("SKIP_AFTER", 100))      # un-proved and this far behind -> abandoned, dropped
+# WARM-UP: the first block a fresh producer emits is slower than the rest — it pays the one-time per-process
+# costs (the KZG trusted setup on first use, a cold page cache, the db's first reads). With TIP_DIRECT=1 that
+# is paid ONCE per producer, not per block, so it is a warm-up and not a cost of the block. Proving it anyway
+# spends a prover slot on the slowest block of the run and, when the margin is thin, that lag never comes back.
+# So the first WARMUP_BLOCKS selected blocks are produced (which is what warms the producer) and NOT queued.
+# 0 disables it.
+WARMUP_BLOCKS = int(env("WARMUP_BLOCKS", 1))
+# Module level, so it survives every sweep of the loop: the budget is per PROCESS, not per cycle.
+# A list because the sweep mutates it and rebinding a module global from inside would need `global`.
+warmup_left = [WARMUP_BLOCKS]
+STARTED_AT = time.time()   # anything older than this was produced by a previous, already-warm producer
 KEEP_SAMPLE   = int(env("KEEP_SAMPLE", 1000))    # block % this == 0 -> kept forever (benchmark corpus)
 # Calibrated on 191 real mainnet witnesses (2026-07-29): median 7.2 MB, p90 10.9, p99 13.9, max 15.6.
 # A "keep forever" rule must stay near the p99 — at 12 MB it caught 7% of blocks, i.e. ~150 MB/h piling up.
@@ -111,7 +122,9 @@ CHAIN_ID      = env("CHAIN_ID", "1")
 
 QUEUE     = os.path.join(REPO, "guests", GUEST, "fixtures")
 GEN_INPUT = os.path.join(REPO, "guests", GUEST, "gen-inputs")
-FIELDS    = ["block", "t_block", "t_avail", "t_witness", "t_queued", "bytes", "post_state_root", "promoted"]
+FIELDS    = ["block", "t_block", "t_avail", "t_witness", "t_queued", "bytes", "post_state_root", "promoted",
+             "warmup"]
+_manifest_fields = None      # the header the FILE actually has; resolved once per process
 
 def log(msg):
     print(f"{time.strftime('%H:%M:%S')} witness-tap: {msg}", flush=True)
@@ -166,9 +179,33 @@ def seen_blocks():
     return out
 
 def append_manifest(row):
+    """Append against the header the file ACTUALLY has, not the one this version of the script wants.
+
+    A manifest written before a column existed has no place for it, and csv.DictWriter RAISES on a key it
+    does not know — which kills the tap outright rather than dropping a field. That is not hypothetical:
+    adding `warmup` to the row without adding it here left the tap dead with
+        ValueError: dict contains fields not in fieldnames: 'warmup'
+    228 witnesses piled up in the dump, the prover idled for hours and the leaderboard stayed empty, all
+    from one missing list entry. A row must never be able to kill the producer.
+
+    Two guards, because either alone still loses something:
+      * the header is read from the file, so a manifest from before the column keeps working unchanged;
+      * extrasaction="ignore" drops any key that header lacks, so the NEXT column added here cannot
+        repeat this even if someone forgets the file-header case.
+    A new manifest gets FIELDS, so the column appears on the next rotation."""
+    global _manifest_fields
     new = not os.path.exists(MANIFEST)
+    if new:
+        _manifest_fields = list(FIELDS)
+    elif _manifest_fields is None:
+        try:
+            with open(MANIFEST, newline="") as f:
+                hdr = next(csv.reader(f), None)
+            _manifest_fields = hdr if hdr else list(FIELDS)
+        except OSError:
+            _manifest_fields = list(FIELDS)
     with open(MANIFEST, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=FIELDS)
+        w = csv.DictWriter(f, fieldnames=_manifest_fields, extrasaction="ignore", restval="")
         if new:
             w.writeheader()
         w.writerow(row)
@@ -381,6 +418,34 @@ def cycle(seen, dry):
         wit  = os.path.join(WITNESS_DIR, f"{b}.witness")
         rootf = os.path.join(WITNESS_DIR, f"{b}.post_state_root")
         is_cadence = (b % PROVE_EVERY == 0)
+        # Consume the warm-up budget only on a witness written AFTER this process started. A backlog from the
+        # previous producer is already warm, so burning coverage on it would warm nothing — the whole point is
+        # to absorb the first block of the CURRENT producer. Restarting the tap alone (a supervisor restart,
+        # say) against an already-warm producer therefore costs one block; that is the price of not needing
+        # the tap and the producer to agree on who started when.
+        # Consumed by the FIRST post-start block, cadence or not. The one-time cost lands on whichever
+        # block the producer emits first; if that block is off-cadence it was never going to be queued, so
+        # the warm-up already happened for free and the budget must be spent there rather than held. Holding
+        # it would burn the next real candidate for a producer that is warm by then: at PROVE_EVERY=5 from
+        # block 12 that cost block 15 and bought nothing.
+        # THE CADENCE IS NEVER SHIFTED. Selection stays `b % PROVE_EVERY == 0` on the absolute block number,
+        # so a warm-up at 10 resumes at 15, not at 11 — the same blocks are picked across runs and zkVMs,
+        # which is what makes a cross-prover comparison possible at all.
+        warmup = False
+        if warmup_left[0] > 0:
+            try:
+                if os.path.getmtime(wit) >= STARTED_AT:
+                    warmup_left[0] -= 1
+                    warmup = is_cadence          # only a cadence block had something to suppress
+                    if is_cadence:
+                        is_cadence = False
+                        log(f"block {b}: warm-up, produced but NOT queued "
+                            f"({warmup_left[0]} left)")
+                    else:
+                        log(f"block {b}: warm-up absorbed by an off-cadence block, no coverage spent "
+                            f"({warmup_left[0]} left)")
+            except OSError:
+                pass
         try:
             sizes[b] = os.path.getsize(wit)
         except OSError:
@@ -424,6 +489,9 @@ def cycle(seen, dry):
                     "bytes": os.path.getsize(wit) if os.path.exists(wit) else "",
                     "post_state_root": read_root(rootf),
                     "promoted": 1 if t_queued != "" else 0,
+                    # Recorded so the coverage denominator stays honest AND a 0 here is explicable: a
+                    # warm-up block was never a candidate, it is not a block the prover missed.
+                    "warmup": 1 if warmup else 0,
                 })
                 seen.add(b)
                 # The raw witness is now redundant, so it goes immediately — this is the whole point: the
@@ -465,6 +533,7 @@ def main():
     if not os.access(GEN_INPUT, os.X_OK):
         sys.exit(f"witness-tap: {GEN_INPUT} not found/executable (is REPO={REPO} the zkvm-bench clone?)")
     log(f"dir={WITNESS_DIR} repo={REPO} prove_every={PROVE_EVERY} keep_recent={KEEP_RECENT} "
+        f"warmup={WARMUP_BLOCKS} "
         f"manifest={MANIFEST}{' [DRY-RUN]' if dry else ''}{' [once]' if once else ''}"
         f"{f' heartbeat={ETHPROOFS_URL}' if ETHPROOFS_URL else ''}")
     seen = seen_blocks()

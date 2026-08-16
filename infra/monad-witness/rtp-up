@@ -62,9 +62,9 @@
 #                   Catch-up ends when the gap closes or when the replay stops advancing — never on a clock, so
 #                   a multi-hour backlog runs to completion.
 #               FETCH_POLL=1  TAP_INTERVAL=1  REPLAY_POLL=0.3  SETTLE_SECS=0.5   (polling latency)
-#               TIP_DIRECT=0  BLOCK_DB_TIMEOUT=30   TIP_DIRECT=1 runs ONE long-lived monad at the tip
-#                   instead of a fresh process per block. Off by default: with the KZG setup loaded lazily
-#                   there is ~0.19 s left in that leg. See the block above TIP_DIRECT= before turning it on.
+#               TIP_DIRECT=1  BLOCK_DB_TIMEOUT=30   ONE long-lived monad at the tip. TIP_DIRECT=0 reverts to
+#                   a fresh monad PER BLOCK, which pays every per-process cost per block — that is what the
+#                   pipeline exists to avoid. Needs a binary from al/rtp; step 5b verifies it.
 #               PROVE_REAL / PROVE_GPUS=1        --real, and how many GPUs the cluster has (naming + cadence)
 #               EP_URL / EP_TOKEN / EP_CLUSTER   where proofs are submitted (default: the local mock)
 #               COORDINATOR_URL=http://127.0.0.1:7000  COORDINATOR_HEALTH=http://127.0.0.1:9090/health
@@ -311,17 +311,18 @@ if [ -z "$PROVER" ]; then PULL_VIA="${PULL_VIA:-$BOX}"; else PULL_VIA="${PULL_VI
 # chain->witness, and no polling interval reaches it.
 # TIP_DIRECT=0 restores the run_replay.py path so the two can be measured rather than argued about.
 #
-# OFF BY DEFAULT because the gain is unproven, not because the flag is unavailable. What TIP_DIRECT removes is
-# the per-block process start, and that sits in `t_avail -> t_witness`: 0.19 s median over 300 production blocks
-# at the tip, against the 6.90 s of chain visibility that dominates the producer and that TIP_DIRECT cannot
-# touch. There is little there to win, so the measurement has to come before the default moves.
+# ON BY DEFAULT, and it is the whole point: real-time proving does not restart a process per block for work
+# that is deterministic. ONE monad waits on --block-db-timeout and executes every block as it lands.
 #
-# THE 2-3 s FIGURE YOU MAY FIND FOR THIS LEG IS THE KZG TRUSTED SETUP, AND IT IS NOT WHAT TIP_DIRECT FIXES.
-# ~2 s of every monad startup was `init_trusted_setup()` called unconditionally from main() — blst subgroup
-# checks over 4096 G1 + 65 G2 points, needed only by the point_evaluation precompile (0x0a) that most blocks
-# never touch. `al/rtp` loads it on first use instead (`9d5676438 kzg: load the trusted setup on first use`),
-# which is a code fix and leaves nothing for a process-lifetime setting to win. If this leg reads 2-3 s,
-# check that the box's binary carries that commit (step 5b does) BEFORE reaching for TIP_DIRECT.
+# TIP_DIRECT=0 starts a fresh monad PER BLOCK (--min-follow-batch 1 forces that), and every per-process cost
+# is then paid per block. Measured on this box, 2026-08-14, 100 blocks at the tip with a lazy trusted setup:
+# 84 % of blocks execute in 0.24 s, and 16 % in 2.28 s — a flat 2.04 s gap, uncorrelated with gas
+# (corr = -0.10) because it is not work. One long-lived process pays that class of cost ONCE, at the first
+# block; per-block processes pay it again on every block that touches it. `0.19 s` for
+# `t_avail -> t_witness` is what this leg reads when the process is already up.
+#
+# It needs a binary from al/rtp, whose ethereum runloop WAITS for a block instead of asserting. Step 5b
+# verifies that fatally, so this default cannot silently land on a binary that would exit 107.
 #
 # It needs a monad whose ETHEREUM runloop takes the flag. `cmd/monad/main.cpp:204` drops the
 # `->needs(as_eth_blocks_flag)` constraint, and `case CHAIN_CONFIG_ETHEREUM_MAINNET:` passes both the witness
@@ -333,7 +334,7 @@ if [ -z "$PROVER" ]; then PULL_VIA="${PULL_VIA:-$BOX}"; else PULL_VIA="${PULL_VI
 # where blocks arrive every 12 s and the replay is never saturated, while "~3 s per block, almost entirely db
 # open" is a THROUGHPUT while draining a backlog. Neither substitutes for the other. `TIP_DIRECT=1` against `0`
 # on one run is what settles which path the tip should use, and that is why both paths exist.
-TIP_DIRECT="${TIP_DIRECT:-0}"
+TIP_DIRECT="${TIP_DIRECT:-1}"
 # Seconds, as a bare integer — the parser rejects "30s" ("Could not convert"), despite --help printing its
 # default as "0s". Only meaningful once the box runs a monad with the runloop_ethereum retry patch; on an
 # unpatched binary the flag is accepted and silently does nothing on this chain.
@@ -363,6 +364,36 @@ onbox(){ if [ "$DRY" = 1 ]; then printf '   [%s] $ %s\n' "$BOX" "$*"; else ssh "
 # onbox_q — read-only query, always executed even in dry-run (it changes nothing and the checks are the
 # point of a dry run).
 onbox_q(){ ssh -o BatchMode=yes "$BOX" "$*" 2>/dev/null; }
+
+# alert_error — the line that says WHY, pulled out of logs/ALERT.
+# The ALERT is a 3-line header plus `tail -40` of the run's log, so the failure is at its END, not its
+# start. Showing `head -3` gives "monad exited 1 / log: … / last lines:" and nothing else — which is how a
+# 1.77 MB log with `block N failed with: invalid excess blob gas` as its final line came to read as empty.
+alert_error(){ onbox_q "grep -oE 'block [0-9]+ failed with: .*' ~/monad/logs/ALERT | tail -1"; }
+
+# recover_reorg — ONE implementation, called from both places an ALERT can appear: at startup (a reorg that
+# landed while we were stopped) and mid-run (one that lands during the catch-up this script is supervising).
+# They used to differ: startup repaired it, the catch-up path printed head -3 and died, pointing at a message
+# the run had never printed. A 13k-block catch-up crosses days of chain and WILL meet a reorg, so the path
+# that matters most was the one without the repair. Two copies of a decision is how they drift — the same
+# lesson as the reorg-signature list, which rtp-up now reads out of reorg-recover instead of restating.
+# Returns 0 if repaired (or nothing to repair), non-zero if it must not be touched. Never clears the ALERT
+# itself: reorg-recover owns that, and a hand-cleared ALERT just fails on the same block.
+recover_reorg(){
+  local where="$1" err sigs
+  err="$(alert_error)"
+  [ -n "$err" ] || { say "an ALERT is present but names no 'block N failed with: …' line — read it by hand:"
+                     onbox_q "tail -20 ~/monad/logs/ALERT" | sed 's/^/   | /'; return 1; }
+  say "ALERT ($where): $err"
+  sigs="$(sed -n 's/^  \*"\(.*\)"\*)$/\1/p' "$HERE/reorg-recover" | head -1 | sed 's/"\*|\*"/|/g')"
+  [ -n "$sigs" ] || { say "cannot read the reorg signatures out of $HERE/reorg-recover"; return 1; }
+  if ! printf '%s' "$err" | grep -qE "$sigs"; then
+    say "not one of the signatures reorg-recover handles ($sigs) — a rewind would discard good state."
+    return 1
+  fi
+  say "reorg-shaped — running reorg-recover on $BOX"
+  onbox "cd $BOX_REPO/infra/monad-witness && ./reorg-recover 2>&1 | sed 's/^/   | /'"
+}
 
 # Checked here rather than at assignment: --help must answer without a box.
 [ -n "$BOX" ] || die "BOX is required — the devcore box the producer runs on. There is no default: it \
@@ -439,7 +470,13 @@ if [ -z "$PROVER" ]; then
   # Restart it, never reuse: like the prover session, a live pump holds the code and env it started with.
   # PUMP_SOCK stays SHORT — a unix socket path is capped at ~104 bytes on macOS, the same limit that bit the
   # ssh ControlPath, and the pump refuses to start rather than emit a bare "AF_UNIX path too long".
-  run "pkill -f 'witness-pump serve' 2>/dev/null; rm -f '$PUMP_SOCK'; true"
+  # KILL THE CHANNELS TOO, not just the server. The children are `ssh -C … exec …/witness-pump send`, which
+  # the pattern 'witness-pump serve' does not match: killing only the server reparents its N channels to
+  # launchd, where they sit holding an ssh connection to the box for as long as the machine is up. Observed:
+  # one 31-minute-old orphan from a previous serve, ppid=1. Harmless in bandwidth (0.45 s of CPU in 35 min,
+  # sleeping — an idle TCP connection costs nothing) but it is an unbounded leak of one connection per
+  # channel per restart, and it makes `ps` unreadable when diagnosing the pump.
+  run "pkill -f 'witness-pump serve' 2>/dev/null; pkill -f 'exec .*witness-pump send' 2>/dev/null; rm -f '$PUMP_SOCK'; true"
 
   # PROFILE THE LINK, now that nothing is transferring on it. This slot is the only valid one: the old pump is
   # dead and the new one is not up, so the probe measures the network instead of measuring itself — the mistake
@@ -570,11 +607,26 @@ fi
 step "Reverse tunnel ($TUN_SSH_PORT -> this Mac's sshd, $MOCK_PORT -> the mock)"
 tun_alive(){ [ -n "$(onbox_q "ss -ltn 2>/dev/null | grep -c ':$TUN_SSH_PORT '")" ] \
              && [ "$(onbox_q "ss -ltn 2>/dev/null | grep -c ':$TUN_SSH_PORT '")" != "0" ]; }
-if [ "$DRY" != 1 ] && tun_alive; then
-  say "already listening on $BOX:$TUN_SSH_PORT"
-else
-  run "nohup bash -c 'while true; do ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o BatchMode=yes -R $TUN_SSH_PORT:127.0.0.1:22 -R $MOCK_PORT:127.0.0.1:$MOCK_PORT $BOX; echo \"rtp-up-tunnel: link down, retrying in 5s\"; sleep 5; done' >> ~/tunnel.log 2>&1 &"
-  run "sleep 3"
+# ALWAYS RESTARTED, never reused — the same rule as the prove session, and for a sharper reason here.
+# `tun_alive` only asks whether SOMETHING listens on the port. Two failure modes hide behind a yes:
+#   * a stale ssh from a previous run holds $TUN_SSH_PORT while its Mac side is gone, so the port is bound
+#     and the tunnel is useless — and this step then says "already listening" and changes nothing;
+#   * a previous supervisor loop is still alive, so the new one cannot bind and BOTH spin on
+#     `ExitOnForwardFailure` every 5 s. Seen verbatim in ~/tunnel.log:
+#         Error: remote port forwarding failed for listen port 2222
+#         rtp-up-tunnel: link down, retrying in 5s
+#     repeated until nothing was up at all, which is how every box->Mac submission came to fail.
+# So: kill the supervisor AND its ssh (the loop's own pkill pattern misses the child, exactly like the pump's
+# did), then start one. Step 5 below verifies the result end to end and dies if it is not usable.
+run "pkill -f 'rtp-up-tunnel' 2>/dev/null; pkill -f 'R $TUN_SSH_PORT:127.0.0.1:22' 2>/dev/null; true"
+# The box side can also be holding the port from a dropped session; a bound port there fails the forward.
+onbox_q "pkill -f 'sshd.*$TUN_SSH_PORT' 2>/dev/null; true" >/dev/null 2>&1 || true
+run "sleep 1"
+run "nohup bash -c 'while true; do ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o BatchMode=yes -R $TUN_SSH_PORT:127.0.0.1:22 -R $MOCK_PORT:127.0.0.1:$MOCK_PORT $BOX; echo \"rtp-up-tunnel: link down, retrying in 5s\"; sleep 5; done' >> ~/tunnel.log 2>&1 &"
+run "sleep 3"
+if [ "$DRY" != 1 ] && ! tun_alive; then
+  say "WARNING: nothing is listening on $BOX:$TUN_SSH_PORT after the restart — see ~/tunnel.log."
+  say "  'remote port forwarding failed' there means the port is still held on the box; step 5 will die on it."
 fi
 
 # ── 5. both directions must actually work, before anything is started ──────────────────────────────
@@ -880,16 +932,26 @@ if [ "$DRY" != 1 ] && onbox_q "test -f ~/monad/logs/ALERT && echo yes" | grep -q
   # Anchored on the FAILURE line, as ./reorg-recover is. A bare grep over the whole file matches monad's
   # routine "state root = 0x..." info line, which the ALERT embeds in its 40-line tail — so a timeout or a
   # bad flag was classified as a reorg, and recovery was attempted on a database that was perfectly fine.
-  if ! onbox_q "grep -oE 'block [0-9]+ failed with: [a-z ]+' ~/monad/logs/ALERT | grep -qE 'bad nonce|state root|parent|mismatch' && echo yes" | grep -q yes; then
-    die "the replay is stopped on the ALERT above, which is NOT a reorg — no rewind, and ./reorg-recover would
-refuse it. Fix the cause it names, then: ssh $BOX 'rm ~/monad/logs/ALERT'"
+  # THE SIGNATURE LIST IS READ FROM reorg-recover, NOT COPIED. It was copied once, `excess blob gas` was added
+  # there and not here, and this check then refused the very case the tool next to it handles — the same defect
+  # RTP-FINDINGS records for reorg-recover itself ("missing from the reorg-signature list, so it REFUSED the
+  # very case it exists for"). Two lists cannot stay in step; one can.
+  # Extraction: reorg-recover's own `case` line, `*"a"*|*"b"*)` -> `a|b`. If its shape ever changes this yields
+  # nothing and the run stops with that said, which is the failure mode to want — silence here means the check
+  # matches nothing and every reorg reads as "not a reorg".
+  reorg_sigs="$(sed -n 's/^  \*"\(.*\)"\*)$/\1/p' "$HERE/reorg-recover" | head -1 | sed 's/"\*|\*"/|/g')"
+  [ -n "$reorg_sigs" ] || die "cannot read the reorg signatures out of $HERE/reorg-recover — its \`case\` line
+   changed shape. Without them this check would call every reorg a non-reorg. Fix the extraction here."
+  if ! onbox_q "grep -oE 'block [0-9]+ failed with: [a-z ]+' ~/monad/logs/ALERT | grep -qE '$reorg_sigs' && echo yes" | grep -q yes; then
+    die "the replay is stopped on the ALERT above, and it is not one of the reorg signatures reorg-recover
+handles ($reorg_sigs) — no rewind, and ./reorg-recover would refuse it. Fix the cause it names, then:
+   ssh $BOX 'rm ~/monad/logs/ALERT'"
   fi
   # Reorg-shaped: repair it here rather than printing a recipe. witness-follow's supervisor only covers reorgs
   # that happen WHILE it runs; one that lands after a stop (overnight, say) left rtp-up refusing to start with
   # a tool sitting right there that handles exactly this case. reorg-recover refuses anything it should not
   # touch and escalates its own margin, so calling it is not a blind retry.
-  say "reorg-shaped ALERT — running reorg-recover on $BOX"
-  if onbox "cd $BOX_REPO/infra/monad-witness && ./reorg-recover 2>&1 | sed 's/^/   | /'"; then
+  if recover_reorg "at startup"; then
     say "recovered — continuing (the fetcher was stopped by the recovery and is restarted below)"
   else
     die "reorg-recover could not repair it (reason above). Do NOT clear the ALERT by hand: the replay would \
@@ -966,10 +1028,15 @@ then re-run rtp-up, which restarts the fetcher from $((last + 1))."
         # operator to look for it — an ALERT is by far the most common, and hunting for it once cost a morning.
         if [ "$stall" -ge 3 ]; then
           if onbox_q "test -f ~/monad/logs/ALERT && echo yes" | grep -q yes; then
-            printf '\n'; onbox_q "head -3 ~/monad/logs/ALERT" | sed 's/^/   | /'
-            die "the replay stopped on a NEW ALERT (above) after $((3 * poll))s with $ready blocks ready to \
-execute. If it is the same block as before, the triedb state is diverged and must be rewound — see the recovery \
-block printed when rtp-up refuses to start on an ALERT."
+            printf '\n'
+            say "the replay stopped on a NEW ALERT after $((3 * poll))s with $ready blocks ready to execute."
+            if recover_reorg "during catch-up"; then
+              say "recovered — resuming the catch-up (the rewind added to the backlog; that is expected)"
+              stall=0; continue
+            fi
+            die "the ALERT above is not repairable from here. Do NOT clear it by hand: the replay would fail \
+on the same block. If reorg-recover exhausted its margin, the divergence is deeper than the history window \
+and the triedb has to be rebuilt from a snapshot."
           fi
           die "the replay has not advanced in $((3 * poll))s and there is no ALERT, though $ready blocks are \
 ready. The session probably died another way. Check: ssh $BOX 'tmux ls; tail -20 ~/replay-catchup.log'"
