@@ -440,10 +440,178 @@ def mode_put(src, dest):
     return _ask(f"put\t{src}\t{dest}\n")
 
 
+
+# ── the reverse channel: the BOX issues, the PROVER executes ────────────────────────────────────────
+# Same connection shape as everything above — the prover dials, so no key is needed on the box — but the roles
+# on this one are reversed. An ssh is bidirectional: the box-side agent WRITES commands to its stdout, which is
+# the prover's stdin, and reads the answer back. So the box keeps driving and keeps its own clock; it simply
+# stops spawning a connection per block.
+#
+#   prover:  witness-pump exec-host        long-lived: holds `ssh box … witness-pump exec-agent`
+#   box:     witness-pump exec-agent       listens on a box-local socket, relays to the prover
+#   box:     witness-pump run '<cmd>'      what prove_remote calls INSTEAD of ssh — same contract
+#
+# `run` is a drop-in for `ssh host CMD`: stdout is stdout, stderr is stderr, the exit status is the command's.
+# That is what lets core.sh change one array and nothing else.
+#
+# FRAMED, because stdout carries a tar and stderr carries a live log, on one pipe. Each frame is
+# tag(1) + LE32(len) + bytes, tag in {C,O,E,X}: Command, Out, Err, eXit. Without framing the tar and the log
+# would interleave into an unparseable stream — the same rule the data path already follows.
+FRM = struct.Struct("<cI")
+
+
+def _send_frame(f, tag, payload=b""):
+    f.write(FRM.pack(tag, len(payload)))
+    if payload:
+        f.write(payload)
+    f.flush()
+
+
+def _read_frame(f):
+    head = f.read(FRM.size)
+    if not head or len(head) < FRM.size:
+        return None, b""
+    tag, n = FRM.unpack(head)
+    buf = b""
+    while len(buf) < n:
+        c = f.read(n - len(buf))
+        if not c:
+            break
+        buf += c
+    return tag, buf
+
+
+def mode_exec_host():
+    """PROVER side. Dials the box, then executes whatever the box asks and streams the result back.
+
+    This runs arbitrary shell from the box, which is only acceptable because the box is the side that already
+    decides everything about a run — it is the same trust as the ssh it replaces, not a new one, and it is the
+    reason this channel is separate from the data one: the data channel answers requests, it does not obey."""
+    if not BOX:
+        print("witness-pump: PUMP_BOX is required for exec-host", file=sys.stderr)
+        return 2
+    cmd = ["ssh", *SSHOPTS, BOX, REMOTE_CMD, "exec-agent"]
+    while True:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+        log("exec channel open to " + BOX)
+        try:
+            while True:
+                tag, payload = _read_frame(p.stdout)
+                if tag is None:
+                    break
+                if tag != b"C":
+                    continue
+                # Streamed, not collected: the runner's log has to appear on the box WHILE the proof runs,
+                # which is how a hung prover stays visible. Collecting it would give that up.
+                r = subprocess.Popen(payload.decode(), shell=True,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+                def pump_stream(src, tag_):
+                    while True:
+                        b = src.read(1 << 16)
+                        if not b:
+                            return
+                        with lock:
+                            _send_frame(p.stdin, tag_, b)
+                lock = threading.Lock()
+                ts = [threading.Thread(target=pump_stream, args=(r.stdout, b"O"), daemon=True),
+                      threading.Thread(target=pump_stream, args=(r.stderr, b"E"), daemon=True)]
+                for t in ts:
+                    t.start()
+                rc = r.wait()
+                for t in ts:
+                    t.join(5)
+                with lock:
+                    _send_frame(p.stdin, b"X", str(rc).encode())
+        except Exception as e:                                  # noqa: BLE001 — never die on one bad command
+            log(f"exec channel: {e}")
+        finally:
+            try:
+                p.kill()
+            except OSError:
+                pass
+        log("exec channel dropped — reconnecting in 5s")
+        time.sleep(5)
+
+
+def mode_exec_agent():
+    """BOX side, running under the prover's ssh. Listens on a box-local socket and relays one command at a
+    time to the prover, streaming the answer back to whoever asked."""
+    sock = os.path.expanduser(os.environ.get("PUMP_EXEC_SOCK") or "~/.zisk-exec.sock")
+    try:
+        os.unlink(sock)
+    except OSError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(sock)
+    os.chmod(sock, 0o600)
+    srv.listen(16)
+    up, down = sys.stdout.buffer, sys.stdin.buffer
+    while True:
+        conn, _ = srv.accept()
+        with conn:
+            f = conn.makefile("rwb")
+            try:
+                tag, cmd = _read_frame(f)
+                if tag != b"C":
+                    continue
+                _send_frame(up, b"C", cmd)                      # up to the prover
+                while True:
+                    t2, body = _read_frame(down)                # back from the prover
+                    if t2 is None:
+                        _send_frame(f, b"X", b"255")
+                        break
+                    _send_frame(f, t2, body)
+                    if t2 == b"X":
+                        break
+            except Exception:                                   # noqa: BLE001 — one caller must not stop the agent
+                try:
+                    _send_frame(f, b"X", b"255")
+                except OSError:
+                    pass
+            finally:
+                try:
+                    f.flush()
+                except OSError:
+                    pass
+
+
+def mode_run(cmd):
+    """BOX side. A drop-in for `ssh <prover> CMD`, over the permanent channel.
+
+    Same contract as ssh so prove_remote changes one array: stdout to stdout, stderr to stderr, exit status of
+    the remote command. Exit 255 is ssh's own "the connection failed" and is reused here, so an absent channel
+    is indistinguishable from an unreachable host — which is what the caller's fallback already handles."""
+    sock = os.path.expanduser(os.environ.get("PUMP_EXEC_SOCK") or "~/.zisk-exec.sock")
+    try:
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(None)
+        c.connect(sock)
+    except OSError as e:
+        print(f"witness-pump: no exec channel at {sock} ({e})", file=sys.stderr)
+        return 255
+    with c:
+        f = c.makefile("rwb")
+        _send_frame(f, b"C", cmd.encode())
+        while True:
+            tag, body = _read_frame(f)
+            if tag is None:
+                return 255
+            if tag == b"O":
+                sys.stdout.buffer.write(body); sys.stdout.buffer.flush()
+            elif tag == b"E":
+                sys.stderr.buffer.write(body); sys.stderr.buffer.flush()
+            elif tag == b"X":
+                try:
+                    return int(body)
+                except ValueError:
+                    return 255
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__.strip().splitlines()[0], file=sys.stderr)
-        print("usage: witness-pump {send|serve|get SRC DST}", file=sys.stderr)
+        print("usage: witness-pump {send|serve|get SRC DST|put SRC DEST|"
+              "exec-host|exec-agent|run CMD}", file=sys.stderr)
         return 2
     m = argv[1]
     if m == "send":
@@ -460,6 +628,15 @@ def main(argv):
             print("usage: witness-pump put SRC DEST_ON_BOX", file=sys.stderr)
             return 2
         return mode_put(argv[2], argv[3])
+    if m == "exec-host":
+        return mode_exec_host()
+    if m == "exec-agent":
+        return mode_exec_agent()
+    if m == "run":
+        if len(argv) != 3:
+            print("usage: witness-pump run '<command>'", file=sys.stderr)
+            return 2
+        return mode_run(argv[2])
     print(f"unknown mode: {m}", file=sys.stderr)
     return 2
 

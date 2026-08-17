@@ -476,7 +476,12 @@ if [ -z "$PROVER" ]; then
   # one 31-minute-old orphan from a previous serve, ppid=1. Harmless in bandwidth (0.45 s of CPU in 35 min,
   # sleeping — an idle TCP connection costs nothing) but it is an unbounded leak of one connection per
   # channel per restart, and it makes `ps` unreadable when diagnosing the pump.
-  run "pkill -f 'witness-pump serve' 2>/dev/null; pkill -f 'exec .*witness-pump send' 2>/dev/null; rm -f '$PUMP_SOCK'; true"
+  # exec-host too, and its channel: same reasoning as the data channels, plus this one holds the connection
+  # that lets the box drive at all. An orphan from a previous run would keep answering commands from a stale
+  # copy of the code — the "deployed but not running" trap, inverted.
+  run "pkill -f 'witness-pump serve' 2>/dev/null; pkill -f 'exec .*witness-pump send' 2>/dev/null; \
+pkill -f 'witness-pump exec-host' 2>/dev/null; pkill -f 'exec .*witness-pump exec-agent' 2>/dev/null; \
+rm -f '$PUMP_SOCK'; true"
 
   # PROFILE THE LINK, now that nothing is transferring on it. This slot is the only valid one: the old pump is
   # dead and the new one is not up, so the probe measures the network instead of measuring itself — the mistake
@@ -518,6 +523,27 @@ if [ -z "$PROVER" ]; then
     else
       say "WARNING: witness-pump did not come up — every block will fall back to scp (~1.4 s slower each)"
       say "  check: tail ~/witness-pump.log"
+    fi
+  fi
+
+  # THE EXEC CHANNEL, which is what takes the box-side key out of the proving path. prove_remote uses it in
+  # place of `ssh <prover> CMD` whenever its socket exists on the box, and falls back to that ssh otherwise.
+  # Started here rather than by hand so it survives a restart like everything else this script owns.
+  #
+  # The PROVER dials it, which is the whole point: the hourly `find ~/.ssh -type f -name 'id_*' -delete` on the
+  # box then has nothing left to take away. Without it, proving keeps going on the multiplexed master already
+  # authenticated and stops for good when that expires — measured at six hours of silence with the producer
+  # perfectly healthy and every session still up.
+  run "PUMP_BOX='$BOX' PUMP_REMOTE_CMD='$BOX_REPO/infra/zisk-infra/witness-pump' \
+nohup '$RUNNER_DIR/witness-pump' exec-host >> ~/witness-exec.log 2>&1 &"
+  if [ "$DRY" != 1 ]; then
+    sleep 4
+    if onbox_q "test -S ~/.zisk-exec.sock && echo yes" | grep -q yes; then
+      say "exec channel up — the box drives the prover without a key of its own"
+    else
+      say "WARNING: the exec channel did not come up. Proving still works, but through the box→Mac ssh, which"
+      say "  needs ~/.ssh/id_ed25519 ON THE BOX — the file the hourly cron deletes. Expect it to stop within"
+      say "  the hour. check: tail ~/witness-exec.log"
     fi
   fi
   command -v ziskemu >/dev/null 2>&1 \

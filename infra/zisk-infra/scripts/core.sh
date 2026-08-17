@@ -130,6 +130,23 @@ prove_remote() {
   fi
   [[ "${ZISK_SSH_COMPRESS:-1}" != 0 ]] && mux+=(-C)
   local ssh=(ssh "${mux[@]}" -p "$port" "$REMOTE")
+  # THE PERMANENT CHANNEL, when it is up. `witness-pump run` is a drop-in for `ssh <prover> CMD` — stdout to
+  # stdout, stderr to stderr, the command's own exit status — so every call site below is untouched and only
+  # this array changes.
+  #
+  # What it buys is not speed. The prover dials that channel, so nothing here needs a private key ON THE BOX,
+  # and the hourly `find ~/.ssh -type f -name 'id_*' -delete` stops taking the prover down with it. The box
+  # still drives and still holds the clock: it sends the command and awaits the reply exactly as before, so
+  # every phase timing below is measured the same way, and the runner's log still streams live on stderr.
+  #
+  # Fallback is the plain ssh above, chosen per call because the channel can drop between blocks. A missing
+  # socket is not an error here — it is the pre-channel behaviour, which works whenever the key does.
+  local exec_sock="${PUMP_EXEC_SOCK:-$HOME/.zisk-exec.sock}"
+  local pump_local="${WITNESS_PUMP_LOCAL:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/witness-pump}"
+  if [[ -S "$exec_sock" && -x "$pump_local" ]]; then
+    ssh=(env "PUMP_EXEC_SOCK=$exec_sock" "$pump_local" run)
+    echo "Control over the persistent exec channel (no box-side key needed)."
+  fi
   # scp takes the same options but spells the port -P.
   local scpo=("${mux[@]}" -P "$port")
 
