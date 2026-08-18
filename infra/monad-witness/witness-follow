@@ -142,6 +142,62 @@ phase_sessions() { [ "$1" = tip ] && echo "fetch replay-tip tap" || echo "fetch 
 #
 # The direct path has to write logs/ALERT itself, because that marker is run_replay.py's job and ./reorg-recover
 # parses it for the failing block number. Same shape, same first lines, so nothing downstream changes.
+# wait_for_start_block — do not launch monad before the block it will start on is actually in block_db.
+#
+# monad builds a 256-block BLOCKHASH buffer at startup and hard-ASSERTS on it: a start block that is missing
+# — or still being written — aborts the process with SIGABRT before a single block is executed. That is not a
+# recoverable error and it is not reorg-shaped, so reorg-recover refuses it, the watchdog stands down, and
+# the producer stays down until a human reads the ALERT. One second of misfortune costs hours of downtime.
+#
+# It happened on 2026-08-18: `start tip` launched the fetcher, slept 3 s, and started monad while the fetcher
+# was still 16 minutes behind. monad asked for block 25782602 at 10:50:05 and the fetcher wrote that exact
+# file at 10:50:05. Nine hours of tip proving were lost to a race with a one-second window.
+#
+# Three seconds of sleep is a hope, not a synchronisation: it is sized for a fetcher that is already caught
+# up, which is precisely the case that never needed it. So wait for the FILE, and wait for it to stop
+# growing — absent and half-written fail identically.
+#
+# The start block is the database's own next block, read read-only. A parse failure skips the wait rather
+# than blocking the producer: this guard exists to prevent a crash, not to become a new way to not start.
+wait_for_start_block() {
+  # `wc -c` rather than `stat -c %s`: the same script is read and edited on a Mac, where `stat -c` is not
+  # an option at all and silently yields nothing — a size check that always reads 0 would wait forever.
+  # `2>/dev/null` goes BEFORE the input redirection: redirections apply left to right, so with it after,
+  # the shell reports "No such file or directory" itself on every poll of a block that has not arrived —
+  # which is the normal case this loop exists to sit through.
+  local cli="$MONAD_DIR/build/cmd/monad-cli" last start waited=0 s1 s2
+  local limit="${TIP_START_WAIT:-600}"
+  [ -x "$cli" ] || { echo "supervise: no monad-cli at $cli — starting without the block_db wait"; return 0; }
+  last="$("$cli" --db "$DB" --version latest_finalized 2>&1 |
+          sed -n 's/.*latest_finalized_block_id=\([0-9][0-9]*\).*/\1/p' | tail -1)"
+  case "$last" in ''|*[!0-9]*)
+    echo "supervise: could not read latest_finalized from $DB — starting without the block_db wait"; return 0 ;;
+  esac
+  start=$((last + 1))
+  while :; do
+    s1=$(wc -c 2>/dev/null < "$BLOCK_DB/$start" || echo 0); s1=${s1// /}
+    if [ "$s1" -gt 0 ]; then
+      # Stable, not merely present: fetch_blocks.py writes the file in place, so a size that is still
+      # changing is a block monad would read half of.
+      sleep 1; waited=$((waited + 1))
+      s2=$(wc -c 2>/dev/null < "$BLOCK_DB/$start" || echo 0); s2=${s2// /}
+      if [ "$s1" = "$s2" ]; then
+        [ "$waited" -gt 1 ] && echo "supervise: block $start is in block_db (waited ${waited}s) — starting the tip producer"
+        return 0
+      fi
+      continue
+    fi
+    if [ "$waited" -ge "$limit" ]; then
+      echo "supervise: block $start is STILL not in $BLOCK_DB after ${limit}s — NOT starting monad, which would"
+      echo "supervise:   abort on its BLOCKHASH buffer and leave an ALERT nothing can recover from."
+      echo "supervise:   The fetcher is behind or stopped: check 'tmux capture-pane -p -t fetch' and ~/fetch.log."
+      return 1
+    fi
+    [ "$waited" = 0 ] && echo "supervise: waiting for block $start to reach block_db (the fetcher is behind)"
+    sleep 2; waited=$((waited + 2))
+  done
+}
+
 run_tip_once() {
   if [ "${TIP_DIRECT:-0}" = 0 ]; then
     echo "supervise: tip replay via run_replay.py (TIP_DIRECT=0 — one monad process per batch)"
@@ -149,6 +205,7 @@ run_tip_once() {
   fi
   local log rc; log="$MONAD_DIR/logs/monad-tip-$(date +%Y%m%d-%H%M%SZ).log"
   mkdir -p "$MONAD_DIR/logs" "$WITNESS_DIR"
+  wait_for_start_block || return 1
   echo "supervise: tip producer direct, one long-lived process -> $log"
   echo "supervise:   $(tip_direct_cmd)"
   eval "$(tip_direct_cmd)" > "$log" 2>&1; rc=$?
