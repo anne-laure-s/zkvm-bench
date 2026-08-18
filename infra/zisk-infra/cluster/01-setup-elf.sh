@@ -21,7 +21,7 @@ PK="${PROVING_KEY:-$HOME/.zisk/provingKey}"
 
 # LOCAL single-process proving needs the ASM + hints setup (the reth guest proves
 # WITH precompile hints, and `cargo-zisk prove --hints` requires `--asm`). Verified
-# against cargo-zisk v1.0.0-alpha: `setup --asm --hints`.
+# against cargo-zisk v1.1.0-alpha: `setup --asm --hints`.
 #
 # -u / --unlock-mapped-memory: REQUIRED on unprivileged Docker boxes (vast.ai).
 # The ASM emulator mmaps the ROM (and RAM/input regions) with MAP_LOCKED by default;

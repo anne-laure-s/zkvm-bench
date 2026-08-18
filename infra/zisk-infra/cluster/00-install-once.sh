@@ -95,22 +95,33 @@ fi
 export PATH="$HOME/.cargo/bin:$HOME/.zisk/bin:$PATH"
 command -v rustup >/dev/null 2>&1 || { echo "ERROR: rustup install failed" >&2; exit 1; }
 
+# The version is PINNED: ziskup defaults to "latest", which moves binaries, proving key
+# and const-trees under a plain re-run — and the version decides whether the worker needs
+# the count_and_plan patch (see below) and which key tarball is fetched. Override with
+# ZISK_VER=<x.y.z> to install another release (e.g. 1.0.0-alpha to reproduce results/).
+ZISK_VER="${ZISK_VER:-1.1.0-alpha}"
+
 # In RAM-key mode, ziskup installs binaries only (--nokey); we fetch the key to RAM below.
 ZK="${ZISK_KEY:-}"
 [[ -z "$ZK" ]] && { [[ -n "$RAM_KEY" ]] && ZK=--nokey || ZK=--provingkey; }
-echo "== ziskup ($ZK), non-interactive =="
+echo "== ziskup $ZISK_VER ($ZK), non-interactive =="
 curl -fsSL https://raw.githubusercontent.com/0xPolygonHermez/zisk/main/ziskup/install.sh \
-  | bash -s -- "$ZK" -y
+  | bash -s -- --version "$ZISK_VER" "$ZK" -y
 export PATH="$HOME/.zisk/bin:$PATH"
 command -v cargo-zisk >/dev/null 2>&1 || { echo "ERROR: cargo-zisk not installed (ziskup failed)" >&2; exit 1; }
 ver="$(cargo-zisk --version 2>/dev/null)"; echo "cargo-zisk: $ver"
+# Installed version drives the key tarball name AND the worker decision below, so read it
+# back from the binary rather than trusting the request.
+ZISK_INSTALLED="$(printf '%s' "$ver" | awk '{print $2}')"   # e.g. 1.1.0-alpha
+[ "$ZISK_INSTALLED" = "$ZISK_VER" ] \
+  || echo "WARN: requested $ZISK_VER but cargo-zisk reports ${ZISK_INSTALLED:-?}" >&2
 case "$ver" in *'[gpu]'*) GPUFLAG=--gpu ;; *) echo "ERROR: cargo-zisk is NOT the GPU build ([gpu] expected) — is the NVIDIA driver present?" >&2; exit 1 ;; esac
 
 # ── RAM-key mode: download+extract the proving key to RAM, symlink, gen const-trees ──
 if [[ -n "$RAM_KEY" ]]; then
-  v="$(printf '%s' "$ver" | awk '{print $2}')"          # e.g. 1.0.0-alpha
+  v="$ZISK_INSTALLED"
   F="zisk-provingkey-${v}.tar.gz"; BUCKET="https://storage.googleapis.com/zisk-setup"
-  echo "== fetching proving key $v into $RAM_KEY (RAM, ~3 GB download) =="
+  echo "== fetching proving key $v into $RAM_KEY (RAM, 3.5 GB download for 1.1.0-alpha) =="
   ( cd "$RAM_KEY" \
       && curl -fL -O "$BUCKET/$F" && curl -fL -O "$BUCKET/$F.md5" \
       && md5sum -c "$F.md5" \
@@ -130,8 +141,9 @@ echo "== patch memlock (unprivileged Docker / vast.ai: memlock hard-capped ~64 K
 # STARTING_ASM_MICROSERVICES with "mmap(rom) errno=11 / Shmem creation for mo failed"
 # — killing BOTH `cargo-zisk setup --asm` and `prove --asm`. The `-u/--unlock-mapped-memory`
 # flag that would fix it does NOT propagate through the SDK to the spawned microservice
-# (verified on v1.0.0-alpha), so we patch the C default map_locked_flag = 0. Pages are
-# never actually swapped on a big-RAM box → zero perf cost. Idempotent. See
+# (verified on v1.0.0-alpha; globals.c still defaults to MAP_LOCKED in v1.1.0-alpha), so we patch
+# the C default map_locked_flag = 0. Pages are never actually swapped on a big-RAM box → zero
+# perf cost. Idempotent. See
 # fix-memlock-patch.sh for the standalone version (+ cache purge when re-patching).
 GLB="$HOME/.zisk/zisk/emulator-asm/src/globals.c"
 if [ -f "$GLB" ] && grep -q '^int map_locked_flag = MAP_LOCKED;' "$GLB"; then
@@ -157,31 +169,63 @@ else
   echo "  WARN: nolock.c missing (looked in cluster/, repo root, \$HOME) — LD_PRELOAD required on a memlock-capped box."
 fi
 
-echo "== patched zisk-worker drop-in (count_and_plan.cu multi-GPU fix) — LOAD-BEARING =="
-# The stock ziskup worker CRASHES at count_and_plan.cu:1586 on multi-GPU. This patched
-# binary (built off-box for sm_120; BuildID 4da61fa8135d1d9ad46d76d6ce260b073a0c45f0) is
-# what lets a worker use ALL GPUs — required for BOTH the MPI path and the NO_MPI
-# single-process path that the benchmark actually used. It is committed in the repo
-# (see .gitignore); rebuild recipe in docs/zisk-bringup-report.md.
-WORKER_PATCHED="$(find_asset zisk-worker.patched || true)"
-if [ -n "$WORKER_PATCHED" ]; then
-  cp "$HOME/.zisk/bin/zisk-worker" "$HOME/.zisk/bin/zisk-worker.stock" 2>/dev/null || true
-  cp "$WORKER_PATCHED" "$HOME/.zisk/bin/zisk-worker"
-  chmod +x "$HOME/.zisk/bin/zisk-worker"
-  bid=$(readelf -n "$HOME/.zisk/bin/zisk-worker" 2>/dev/null | awk '/Build ID/{print $NF}')
-  echo "  installed patched worker from $WORKER_PATCHED — BuildID $bid"
-  echo "  (expected: 4da61fa8135d1d9ad46d76d6ce260b073a0c45f0)"
-  if [ "$bid" != "4da61fa8135d1d9ad46d76d6ce260b073a0c45f0" ]; then
-    echo "  !!! WARNING: zisk-worker BuildID mismatch (got ${bid:-?}, expected 4da61fa8135d1d9ad46d76d6ce260b073a0c45f0) — wrong/corrupt binary?" >&2
-  fi
-else
-  echo "  !!! zisk-worker.patched NOT FOUND (looked in cluster/, repo root, \$HOME) !!!" >&2
-  echo "  !!! The STOCK worker WILL crash in count_and_plan on multi-GPU. Ship the binary" >&2
-  echo "  !!! (it is committed in the repo) or rebuild per docs/zisk-bringup-report.md." >&2
-fi
+echo "== zisk-worker multi-GPU (count_and_plan) =="
+# One worker process driving ALL GPUs needs every CountAndPlan entry point to bind the GPU
+# that owns its buffers. From 1.1.0-alpha upstream does that (a bind_device() call at each
+# entry point, reset() included), so the STOCK worker is the correct binary and the
+# committed zisk-worker.patched — a 1.0.0-alpha build — MUST NOT be dropped in: it would
+# pair a 1.0.0 worker with a 1.1.0 coordinator and proving key.
+case "$ZISK_INSTALLED" in
+  1.0.0-alpha)
+    # Reproducing results/zisk-reth-16gpu-clean. There reset() issues its cudaMemset with
+    # no cudaSetDevice, so the stock worker dies at count_and_plan.cu:1586 on multi-GPU;
+    # the committed binary (off-box sm_120 rebuild, --version identical to stock, so it is
+    # identified by BuildID) is what makes single-process multi-GPU work. Rebuild recipe in
+    # docs/zisk-bringup-report.md §4.6.
+    WORKER_PATCHED="$(find_asset zisk-worker.patched || true)"
+    if [ -n "$WORKER_PATCHED" ]; then
+      cp "$HOME/.zisk/bin/zisk-worker" "$HOME/.zisk/bin/zisk-worker.stock" 2>/dev/null || true
+      cp "$WORKER_PATCHED" "$HOME/.zisk/bin/zisk-worker"
+      chmod +x "$HOME/.zisk/bin/zisk-worker"
+      bid=$(readelf -n "$HOME/.zisk/bin/zisk-worker" 2>/dev/null | awk '/Build ID/{print $NF}')
+      echo "  installed patched worker from $WORKER_PATCHED — BuildID $bid"
+      echo "  (expected: 4da61fa8135d1d9ad46d76d6ce260b073a0c45f0)"
+      if [ "$bid" != "4da61fa8135d1d9ad46d76d6ce260b073a0c45f0" ]; then
+        echo "  !!! WARNING: zisk-worker BuildID mismatch (got ${bid:-?}, expected 4da61fa8135d1d9ad46d76d6ce260b073a0c45f0) — wrong/corrupt binary?" >&2
+      fi
+    else
+      echo "  !!! zisk-worker.patched NOT FOUND (looked in cluster/, repo root, \$HOME) !!!" >&2
+      echo "  !!! On 1.0.0-alpha the STOCK worker WILL crash in count_and_plan on multi-GPU." >&2
+      echo "  !!! Ship the binary (it is committed in the repo) or rebuild per docs/zisk-bringup-report.md." >&2
+    fi
+    ;;
+  *)
+    echo "  stock worker kept (bind_device fix is upstream in $ZISK_INSTALLED)"
+    # A leftover patched worker from an earlier 1.0.0-alpha install on this box would
+    # survive the ziskup upgrade only if ziskup skipped the binary — it does not, but the
+    # BuildID is cheap to assert and the failure mode (silent version mismatch) is not.
+    bid=$(readelf -n "$HOME/.zisk/bin/zisk-worker" 2>/dev/null | awk '/Build ID/{print $NF}')
+    if [ "$bid" = "4da61fa8135d1d9ad46d76d6ce260b073a0c45f0" ]; then
+      echo "  ERROR: ~/.zisk/bin/zisk-worker is the 1.0.0-alpha PATCHED binary, not the $ZISK_INSTALLED stock one." >&2
+      echo "         Reinstall the worker: ziskup --version $ZISK_INSTALLED --nokey -y" >&2
+      exit 1
+    fi
+    ;;
+esac
 
-echo "== clone zisk repo (mpi_params.sh / official deploy scripts) =="
-[ -d "$HOME/zisk/.git" ] || git clone --depth 1 https://github.com/0xPolygonHermez/zisk "$HOME/zisk"
+echo "== zisk repo @ v$ZISK_INSTALLED (mpi_params.sh / official deploy scripts) =="
+# Pinned to the INSTALLED release, not main: mpi_params.sh sizes ranks/streams against the worker
+# it ships with. An existing checkout is moved to the tag too, so a box upgraded in place does not
+# keep sizing the new worker with the old script. Non-fatal: only the opt-in MPI path reads it.
+if [ -d "$HOME/zisk/.git" ]; then
+  git -C "$HOME/zisk" fetch --depth 1 origin "refs/tags/v$ZISK_INSTALLED:refs/tags/v$ZISK_INSTALLED" 2>/dev/null \
+    && git -C "$HOME/zisk" checkout -q "v$ZISK_INSTALLED" \
+    && echo "  ~/zisk moved to v$ZISK_INSTALLED" \
+    || echo "  WARN: could not move ~/zisk to v$ZISK_INSTALLED (USE_MPI=1 would read a stale mpi_params.sh)" >&2
+else
+  git clone --depth 1 --branch "v$ZISK_INSTALLED" https://github.com/0xPolygonHermez/zisk "$HOME/zisk" \
+    || echo "  WARN: clone of v$ZISK_INSTALLED failed" >&2
+fi
 
 echo "== sanity check =="
 command -v mpirun >/dev/null 2>&1 && mpirun --version | head -1 || echo "WARN: mpirun missing (openmpi-bin)"

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # start.sh — bring up the ZisK multi-GPU prover ON THE BOX (coordinator + worker).
 #
-# Multi-GPU: by DEFAULT a single worker process drives ALL GPUs (needs the patched
-# worker from 00-install-once.sh) — the config the 16×5090 benchmark ran. ZisK's official
+# Multi-GPU: by DEFAULT a single worker process drives ALL GPUs (stock worker on
+# 1.1.0-alpha; the patched worker on a 1.0.0-alpha box). ZisK's official
 # path is MPI (`mpirun` MPI_NP ranks, NUMA-bound ~2 GPUs/rank, mirroring
 # `distributed/deploy/scripts/worker/install.sh --no-service --gpu`); opt in with USE_MPI=1.
 # MPI multi-rank segfaults on unprivileged vast.ai containers (NUMA membind), hence the default.
@@ -14,7 +14,7 @@
 #   # each prints the exact foreground command to run.
 #
 #   NUM_GPUS auto-detected.  Env knobs:
-#     (default)                    single-process worker = ALL GPUs (needs patched worker) — benchmark config
+#     (default)                    single-process worker = ALL GPUs — benchmark config
 #     USE_MPI=1                     opt into the MPI multi-rank path (ZISK_SRC needed; segfaults on vast.ai)
 #     NO_MPI=1                      force single-process (redundant now; overrides USE_MPI)
 #     WORKER_BACKEND=asm|emulator   witness backend (default asm; reth needs asm)
@@ -86,13 +86,13 @@ fi
 [[ -n "${COMPUTE_CAPACITY:-}" ]] && wargs+=(--compute-capacity "$COMPUTE_CAPACITY")
 
 # ── worker launch: single-process (ALL GPUs) by DEFAULT; MPI only if USE_MPI=1 ─
-# Single-process is the config the 16×5090 benchmark ran: with the PATCHED worker
-# (count_and_plan.cu fix, installed by 00-install-once.sh) one process drives ALL GPUs
-# (proofman assigns every GPU to the single rank, node_size=1). MPI multi-rank segfaults
-# on unprivileged vast.ai containers (NUMA membind), so it's opt-in. With the STOCK
-# worker, single-process falls back to ~1 GPU.
+# One process drives ALL GPUs (proofman assigns every GPU to the single rank, node_size=1),
+# which is what the 16×5090 benchmark ran. It requires a worker whose count_and_plan binds
+# the GPU owning its buffers: the stock binary on 1.1.0-alpha, zisk-worker.patched on a
+# 1.0.0-alpha box (00-install-once.sh picks per version). MPI multi-rank segfaults on
+# unprivileged vast.ai containers (NUMA membind), so it's opt-in.
 if [[ "${USE_MPI:-}" != 1 || -n "${NO_MPI:-}" ]]; then
-  echo "single-process worker (all GPUs via patched worker; set USE_MPI=1 for the MPI path)."
+  echo "single-process worker (all GPUs; set USE_MPI=1 for the MPI path)."
   # The worker links OpenMPI; launched standalone its singleton MPI_Init otherwise stalls ~4 min
   # waiting for a daemon (see docs/zisk-bringup-report.md). This skips it; harmless if not MPI-linked.
   export OMPI_MCA_ess_singleton_isolated=1

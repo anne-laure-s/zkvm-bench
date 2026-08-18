@@ -6,12 +6,15 @@ Off-box posture: the **Mac builds** the ELF + witness (a committed offline sampl
 this is what the 16×5090 benchmark ran. ZisK's *official* multi-GPU path is MPI (`mpirun`, ~2 GPUs/rank),
 but it **segfaults on unprivileged vast.ai containers** (NUMA membind), so we use the single-process path.
 
-> ⚠️ **The patched `zisk-worker` is load-bearing.** The stock ziskup worker crashes in
-> `count_and_plan.cu` on multi-GPU; the committed `zisk-worker.patched` (installed by
-> `00-install-once.sh`) is what makes *any* all-GPU proving work — MPI **and** NO_MPI. Without it a
-> single process uses ~1 GPU and the cluster crashes. Rebuild recipe: [docs/zisk-bringup-report.md](docs/zisk-bringup-report.md).
+> ⚠️ **The ZisK version is pinned in `00-install-once.sh`** (`ZISK_VER`, default **1.1.0-alpha**).
+> `ziskup` otherwise installs *latest*, and the version decides the proving-key tarball, the
+> const-trees and which `zisk-worker` binary is correct. All-GPU proving runs the **stock** worker:
+> 1.1.0-alpha binds the owning GPU at every `count_and_plan` entry point. The committed
+> `zisk-worker.patched` is a **1.0.0-alpha** build, installed only when `ZISK_VER=1.0.0-alpha`
+> reproduces [results/zisk-reth-16gpu-clean](results/zisk-reth-16gpu-clean); pairing it with a newer
+> coordinator/key does not work.
 
-> ⚠️ ZisK is **v1.0.0-alpha**; commands are verified against the installed CLI. Building `input-gen` /
+> ⚠️ ZisK is **v1.1.0-alpha**; commands are verified against the installed CLI. Building `input-gen` /
 > `hints-gen` on macOS needs a couple of fixes — see [docs/design.md](docs/design.md).
 
 ## Setup (once, on the Mac)
@@ -40,11 +43,11 @@ export BLOCK=24626900           # a committed offline sample block (list + why i
 #   (gen-input deduces the committed sample from $BLOCK; pass SAMPLE=<path> to override)
 ```
 
-### 2 · Mac — ship the harness (incl. the patched worker), ELF + witness
+### 2 · Mac — ship the harness, ELF + witness
 ```sh
-# zisk-worker.patched (76 MB, committed) MUST travel to the box — 00-install-once.sh
-# installs it and the cluster crashes on multi-GPU without it. nolock.c rides along in cluster/.
-scp -P $PORT -r cluster zisk-runner zisk-worker.patched $REMOTE:~/zisk-infra/
+# nolock.c rides along in cluster/. Add zisk-worker.patched to the scp only for a
+# ZISK_VER=1.0.0-alpha box (that release needs the patched worker for multi-GPU).
+scp -P $PORT -r cluster zisk-runner $REMOTE:~/zisk-infra/
 scp -P $PORT ../../guests/zisk-reth/zisk-reth.elf $REMOTE:~/zisk-reth.elf
 scp -P $PORT ../../guests/zisk-reth/inputs/1-$BLOCK.bin ../../guests/zisk-reth/inputs/1-$BLOCK.hints $REMOTE:~/
 ```
@@ -54,7 +57,8 @@ scp -P $PORT ../../guests/zisk-reth/inputs/1-$BLOCK.bin ../../guests/zisk-reth/i
 ssh -p $PORT $REMOTE           # you're now on the box (a fresh shell)
 export BLOCK=24626900          # set once here too — Mac vars don't cross the ssh
 cd ~/zisk-infra/cluster
-./00-install-once.sh           # ziskup --provingkey (GPU) + memlock fix + patched multi-GPU worker
+./00-install-once.sh           # ziskup 1.1.0-alpha --provingkey (GPU) + memlock fix
+                               #   ZISK_VER=<x.y.z> installs another release
 ```
 
 ### 4 · Box — start the cluster, register the ELF, prove
@@ -104,7 +108,7 @@ Recursive **compressed** STARK (the analog of SP1/OpenVM `prove-compressed`); no
 (`--plonk`). Step count (ZisK's work-unit) comes from `./run execute`.
 
 ## Details → docs/
-- [docs/design.md](docs/design.md) — macOS build prereqs, ZisK CLI facts (v1.0.0-alpha), witness generation (sample vs RPC), tuning knobs, Mac-driven proving.
+- [docs/design.md](docs/design.md) — macOS build prereqs, ZisK CLI facts (v1.1.0-alpha), witness generation (sample vs RPC), tuning knobs, Mac-driven proving.
 - [docs/zisk-benchmark.md](docs/zisk-benchmark.md) — results · [docs/zisk-bringup-report.md](docs/zisk-bringup-report.md) — bring-up report.
 - [cluster/README.md](cluster/) — full MPI cluster bring-up + tuning.
 - [../../cli/report-schema.md](../../cli/report-schema.md) — the shared `report.json` contract every runner emits.

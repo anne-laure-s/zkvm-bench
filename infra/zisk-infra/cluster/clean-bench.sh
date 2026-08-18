@@ -3,7 +3,7 @@
 # For each (pass, block): high-precision wall-clock time + bounds (line offsets) in
 # worker.log → lets you then extract the exact EXECUTE→proof window without guessing the order.
 #
-# Prerequisites: cluster UP (coordinator + patched NO_MPI worker, registered) + inputs ~/1-*.{bin,hints}.
+# Prerequisites: cluster UP (coordinator + NO_MPI worker, registered) + inputs ~/1-*.{bin,hints}.
 #   Settings: PASSES=3 WARMUPS=2 bash clean-bench.sh
 set -u
 export PATH="$HOME/.zisk/bin:$PATH"

@@ -26,7 +26,7 @@
 #   remote (default)  `cargo-zisk remote prove …`  — talks to the box's coordinator/worker (multi-GPU)
 #   local             `cargo-zisk prove --asm --gpu …` — single-process (adds --gpu when supported)
 #
-# ⚠️ ZisK is v1.0.0-alpha and CLI flags/output formats shift between versions. Every
+# ⚠️ ZisK is v1.1.0-alpha and CLI flags/output formats shift between versions. Every
 # external invocation here is overridable via env (see CONFIG) and the output parsing
 # is best-effort. Confirm against your installed version with `cargo-zisk prove --help`
 # and `ziskemu --help`, then adjust the regexes / flags below or via the env knobs.
@@ -134,7 +134,7 @@ JSON
     ;;
 
   # ──────── PROVE ────────
-  # Verified against cargo-zisk v1.0.0-alpha source (cli/.../embedded/prove.rs):
+  # Verified against cargo-zisk v1.1.0-alpha source (cli/.../embedded/prove.rs):
   #   * `-o` is the PROOF FILE path (not a dir) → no glob/lift needed.
   #   * local `cargo-zisk prove --hints` REQUIRES `--asm`; `remote prove` does NOT take --asm.
   #   * default (no -c/--plonk) = the standard STARK proof (our "compressed" analog).

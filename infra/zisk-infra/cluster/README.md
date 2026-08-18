@@ -4,10 +4,11 @@ The box only **proves**. The Mac builds the ELF + generates the witness (input +
 them over (same discipline as the SP1 infra). ZisK installs cleanly via `ziskup` — no skopeo image
 extraction, no redis/postgres.
 
-**Multi-GPU here = single-process (`NO_MPI=1`), NOT MPI.** With the **patched** `zisk-worker`
-(`count_and_plan.cu` fix, installed by `00-install-once.sh`), one worker process drives **all** GPUs
-(proofman assigns every GPU to the single rank). This is the config the 16×5090 benchmark ran, and
-what `start.sh` does by default. Caveat: with the **stock** worker a single process uses ~1 GPU.
+**Multi-GPU here = single-process (`NO_MPI=1`), NOT MPI.** One worker process drives **all** GPUs
+(proofman assigns every GPU to the single rank) — what `start.sh` does by default. On the pinned
+1.1.0-alpha the **stock** worker does this: `count_and_plan` binds the owning GPU at every entry
+point. On a `ZISK_VER=1.0.0-alpha` box it takes the committed `zisk-worker.patched` instead (the
+config of the archived 16×5090 benchmark); the stock 1.0.0 worker crashes there on multi-GPU.
 
 ZisK's *official* multi-GPU path is MPI — `start.sh` still builds the exact `mpirun -np MPI_NP
 -map-by ppr:N:numa --bind-to numa … zisk-worker` that ZisK's deploy uses (`mpi_params.sh` auto-sizes
@@ -15,7 +16,7 @@ ZisK's *official* multi-GPU path is MPI — `start.sh` still builds the exact `m
 (NUMA membind fails on socket-1 ranks); if you must, drop NUMA: `MPI_MAPBY=slot MPI_BIND=none` with
 `-np = n_gpus` (1 rank/GPU). The `-g/--gpu` flag exists only on a **GPU build** (hidden on CPU builds).
 
-> ⚠️ **ZisK is v1.0.0-alpha & GPU flags are hidden on CPU builds.** On the box (GPU build) re-check
+> ⚠️ **ZisK is v1.1.0-alpha & GPU flags are hidden on CPU builds.** On the box (GPU build) re-check
 > `zisk-worker --help` / `cargo-zisk prove --help` for GPU options. The canonical bring-up is ZisK's
 > own installer (which `start.sh` mirrors):
 > ```sh
@@ -26,11 +27,11 @@ ZisK's *official* multi-GPU path is MPI — `start.sh` still builds the exact `m
 
 ## One-time, on the box (persists across stop/start)
 ```sh
-./00-install-once.sh                 # system deps + ziskup --provingkey (GPU) + provingKey
+./00-install-once.sh                 # system deps + ziskup 1.1.0-alpha --provingkey (GPU) + provingKey
 #   -> cargo-zisk --version MUST report [gpu]; check provingKey size it printed.
 ```
 
-## Proving — multi-GPU (verified against cargo-zisk v1.0.0-alpha)
+## Proving — multi-GPU (verified against cargo-zisk v1.1.0-alpha)
 
 **Distributed multi-GPU (coordinator + worker).** Setup is done on the coordinator
 (`remote setup`), NOT locally. The worker takes no `--gpu` (auto on GPU build) — it needs a
