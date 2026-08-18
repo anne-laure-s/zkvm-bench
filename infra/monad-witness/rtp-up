@@ -1247,7 +1247,21 @@ if [ "$PROVE_REAL" = 1 ]; then
 else
   PROVE_MODE_FLAGS="--mock --mock-secs $MOCK_SECS --mock-per-mstep $MOCK_PER_MSTEP --mock-speed $MOCK_SPEED --mock-jitter $MOCK_JITTER"
 fi
-onbox "tmux kill-session -t prove 2>/dev/null && echo '   · restarting prove (a live session would keep the old code and env)'; tmux new-session -d -s prove \"cd $BOX_REPO && REMOTE_WS=$PROVER_WS REMOTE_RUNNER=$RUNNER_DIR/zisk-runner ${PULL_VIA:+PULL_VIA=$PULL_VIA }WITNESS_PUMP=$RUNNER_DIR/witness-pump PUMP_SOCK=$PUMP_SOCK REMOTE_SUBMIT=$RUNNER_DIR/ethproofs-submit WITNESS_MANIFEST=\$HOME/witness-manifest.csv cli/prove-farm --guest monad-zisk $PROVE_MODE_FLAGS --remote $PROVER_TARGET --port $PROVER_PORT --interval 1 --watch --newest-first --no-prefetch --ethproofs-url $EP_URL${EP_TOKEN:+ --ethproofs-token $EP_TOKEN} --ethproofs-cluster $EP_CLUSTER 2>&1 | tee -a $PROVE_LOG\""
+# RECORDED, then launched FROM the recording — one string, so the file and what runs cannot drift. This is what
+# lets rtp-watchdog restart the prover on its own: it replays this file instead of rebuilding an invocation from
+# memory, which is exactly the mistake that produced 1789 proofs nobody submitted. Anything that reconstructs
+# this command by hand will eventually drop a flag, and the flags that go missing are the silent ones.
+prove_cmd="cd $BOX_REPO && REMOTE_WS=$PROVER_WS REMOTE_RUNNER=$RUNNER_DIR/zisk-runner \
+${PULL_VIA:+PULL_VIA=$PULL_VIA }WITNESS_PUMP=$RUNNER_DIR/witness-pump PUMP_SOCK=$PUMP_SOCK \
+REMOTE_SUBMIT=$RUNNER_DIR/ethproofs-submit WITNESS_MANIFEST=\$HOME/witness-manifest.csv \
+cli/prove-farm --guest monad-zisk $PROVE_MODE_FLAGS --remote $PROVER_TARGET --port $PROVER_PORT \
+--interval 1 --watch --newest-first --no-prefetch --ethproofs-url $EP_URL${EP_TOKEN:+ --ethproofs-token $EP_TOKEN} \
+--ethproofs-cluster $EP_CLUSTER 2>&1 | tee -a $PROVE_LOG"
+onbox "cat > \$HOME/.rtp-prove-cmd <<'RTPEOF'
+$prove_cmd
+RTPEOF
+chmod 600 \$HOME/.rtp-prove-cmd; echo '   · invocation recorded in ~/.rtp-prove-cmd (rtp-watchdog replays it)'"
+onbox "tmux kill-session -t prove 2>/dev/null && echo '   · restarting prove (a live session would keep the old code and env)'; tmux new-session -d -s prove \"\$(cat \$HOME/.rtp-prove-cmd)\""
 
 [ "$CRON" = 1 ] && { step "Installing the daily log archiver on the box"
   onbox "(crontab -l 2>/dev/null | grep -v archive-logs; echo '17 4 * * * \$HOME/zkvm-bench/infra/monad-witness/archive-logs >> \$HOME/archive-logs.log 2>&1') | crontab - && crontab -l | tail -1"; }

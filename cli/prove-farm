@@ -130,6 +130,7 @@ while [ $# -gt 0 ]; do
     --interval)          INTERVAL="${2:?}"; shift 2 ;;     # watch: idle re-scan (s); default 2
     --prefetch)          PREFETCH=1; shift ;;              # overlap the next transfer with this proof
     --no-prefetch)       PREFETCH=0; shift ;;
+    --no-submit)         NO_SUBMIT=1; shift ;;               # prove without delivering, deliberately
     --newest-first)      NEWEST_FIRST=1; shift ;;          # prove nearest the tip first (RTP policy)
     --mock)              MOCK=1; shift ;;                   # mock-cluster: fake the prover (no box) — plumbing test
     --mock-secs)         MOCK_SECS="${2:?}"; shift 2 ;;     # simulated proving time (0 = instant)
@@ -482,7 +483,18 @@ prove_one(){
 # timing.json, no REMOTE, or a failed remote invocation all fall back here rather than dropping a submission.
 submit_one(){  # $1=block  $2=run_dir
   local b="$1" rd="$2" slog rws rbase
-  [ -n "$ETHPROOFS_URL" ] || return 0
+  # NOT a silent success. An unconfigured submission used to `return 0` here, so a farm launched without
+  # --ethproofs-url proved block after block, marked each one `ok` in the ledger, and posted nothing — 1789
+  # proofs produced and none delivered, with every session up and every log healthy. `is_proven()` keys on the
+  # block number, so those blocks are never offered again: the output is not delayed, it is LOST.
+  # The startup guard below makes this unreachable in a watch loop; this line is what makes it visible anywhere
+  # else, once per run rather than per block so it cannot be scrolled away.
+  if [ -z "$ETHPROOFS_URL" ]; then
+    [ -n "${SUBMIT_WARNED:-}" ] || { log "!! NOT SUBMITTING: no --ethproofs-url. Proofs are being written to run \
+records and marked proven, but nothing is posted. Every block proved now is output that will not be delivered."; \
+      SUBMIT_WARNED=1; }
+    return 0
+  fi
   slog="$LOGDIR/submit-$GUEST-$b.log"
   [ -n "$rd" ] || { log "submit $b: no run record — skip"; return 1; }
   # Where the prover keeps its own copies — recorded by prove_remote, which owns the naming convention.
@@ -566,6 +578,17 @@ submit_one(){  # $1=block  $2=run_dir
     log "<< submit $b FAILED — see $slog"
   fi
 }
+
+# A WATCH LOOP THAT CANNOT SUBMIT IS PURE WASTE, and the failure is invisible: it proves forever, marks every
+# block proven, and delivers nothing. Refusing here is the difference between a typo and a lost night. Batch
+# runs (no --watch) are exempt: proving a fixed list to inspect the records is a legitimate use, and so is
+# --no-submit, which makes the intent explicit rather than inferred from an absent flag.
+if [ "$WATCH" = 1 ] && [ -z "$ETHPROOFS_URL" ] && [ "${NO_SUBMIT:-0}" != 1 ]; then
+  echo "prove-farm: --watch without --ethproofs-url would prove blocks forever and submit none of them, and \
+mark them proven so they are never retried. Pass --ethproofs-url <url>, or --no-submit if you really mean to \
+prove without delivering." >&2
+  exit 2
+fi
 
 log "prove-farm: guest=$GUEST ($REG_DESC) stack=$REG_INFRA remote=$([ "$MOCK" = 1 ] && { [ -n "$REMOTE" ] && echo "$REMOTE (mock prover)" || echo mock-cluster; } || echo "$REMOTE") mode=${MODE:-<default>}$([ "$WATCH" = 1 ] && echo ' [watch]')$([ "$NEWEST_FIRST" = 1 ] && echo ' [newest-first]')$([ "$MOCK" = 1 ] && { [ -n "$REMOTE" ] && echo ' [mock prover on a real remote — transfers are real]' || echo ' [mock-cluster, no box]'; })${ETHPROOFS_URL:+ [submit→$ETHPROOFS_URL cluster=$ETHPROOFS_CLUSTER]}  (out=$OUT)"
 

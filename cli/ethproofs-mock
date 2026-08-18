@@ -44,7 +44,7 @@ accepted unless --token is given. Verification is mock by default (a real, well-
 Store (default: run-data/ethproofs-mock-data/, git-ignored): submissions.jsonl (append log,
 replayed on restart) + proofs/<cluster>-<block>.bin (the decoded proofs).
 """
-import argparse, base64, json, os, subprocess, sys, threading
+import argparse, base64, json, os, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 
@@ -245,6 +245,44 @@ class Store:
             f.write(raw)
         return len(raw), raw[:len(MOCK_MAGIC)] == MOCK_MAGIC   # (size, is_mock — magic in the bytes)
 
+# ── real-time gate ──────────────────────────────────────────────────────────────────────────────────
+# A proof for a block the chain finished hours ago is not a late proof, it is a WRONG measurement. Accepting it
+# puts a submission timestamp with no relation to the block's own time into the same series every latency figure
+# is computed from, and nothing downstream can tell it apart. Observed: 40 records for blocks ~11 h old, in a
+# store whose whole purpose is to say how fast this pipeline proves.
+#
+# So the server refuses them, rather than accepting and leaving someone to find them in the numbers later. It
+# refuses on either of two signals, because a submitter may supply neither, one, or both:
+#
+#   t_block           the block's own timestamp, when the submitter joined the manifest. Direct and exact.
+#   chain_tip         from the producer's heartbeat. A block far below the tip is old by arithmetic alone
+#                     (~12 s per block on mainnet), which catches submitters that send no t_block at all.
+#
+# Neither available means no opinion: accept. A gate that guessed would reject a legitimate first submission
+# from a producer that has not sent a heartbeat yet.
+STALE_SECS   = float(os.environ.get("EP_MAX_AGE_SECS") or 900)      # 15 min: ~75 blocks of slack
+SLOT_SECS    = 12.0
+
+def staleness(cluster, block, body):
+    """(age_secs, how) if the age can be established, else (None, None)."""
+    t_block = body.get("t_block")
+    if t_block:
+        try:
+            return time.time() - float(t_block), "t_block"
+        except (TypeError, ValueError):
+            pass
+    hb = (STORE.pipelines or {}).get(cluster) if STORE else None
+    tip = (hb or {}).get("chain_tip")
+    if tip and block:
+        try:
+            behind = int(tip) - int(block)
+            if behind > 0:
+                return behind * SLOT_SECS, f"{behind} blocks behind the tip"
+        except (TypeError, ValueError):
+            pass
+    return None, None
+
+
 STORE = None
 TOKEN = None
 VERIFY_CMD = None   # external verifier: `<cmd> <proof_path> <block> <verifier_id> <vm> <guest>`, exit 0 = valid
@@ -338,6 +376,15 @@ class Handler(BaseHTTPRequestHandler):
             STORE.record("proving", body); print(f"{now_iso()}  ← /proofs/proving  {mk}cluster={cluster} {who}block={block}")
             return self._reply(200, {"proof_id": STORE.pid(cluster, block)})
         if self.path.rstrip("/") == "/proofs/proved":
+            age, how = staleness(cluster, block, body)
+            if age is not None and age > STALE_SECS:
+                print(f"{now_iso()}  ← /proofs/proved  REFUSED cluster={cluster} block={block} "
+                      f"— {age/60:.0f} min old ({how})")
+                return self._reply(409, {"error": "stale submission",
+                                         "detail": f"block is {age/60:.0f} min old ({how}); this store measures "
+                                                   f"real-time proving, and a missed proof is missed. Raise "
+                                                   f"EP_MAX_AGE_SECS only if you know why you are backfilling.",
+                                         "max_age_secs": STALE_SECS})
             pb = None; magic_mock = False
             if body.get("proof"):
                 pb, magic_mock = STORE.save_proof(cluster, block, body["proof"])

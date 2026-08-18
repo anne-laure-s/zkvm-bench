@@ -46,10 +46,13 @@ BLOCK_DB="${BLOCK_DB:-$HOME/block_db}"
 DB="${DB:-$HOME/triedb.db}"
 MPT="${MPT:-$MONAD_DIR/build/category/mpt/monad-mpt}"
 CLI="${CLI:-$MONAD_DIR/build/cmd/monad-cli}"
-FARM_CSV="${FARM_CSV:-$HOME/zkvm-bench/prove-farm.csv}"
-# Step 4 reports "nothing to invalidate" when this file is absent, so a WRONG path here reads as a clean pass.
-# That is the failure mode to watch: the guard cannot tell "no proofs to drop" from "looking in the wrong place",
-# and it stayed silent for exactly that reason until the path above was corrected.
+# DERIVED the way prove-farm derives it, never spelled out: it writes to $RUNDATA/prove-farm.csv with
+# RUNDATA defaulting to <repo>/run-data. A hand-written path here silently targets the wrong file — and step 4
+# reports "nothing to invalidate" when the file is absent, so a wrong path reads as a clean pass. Both spellings
+# of this ledger exist on the box, one of them stale by hours; guessing picked the stale one.
+REPO="${REPO:-$HOME/zkvm-bench}"
+RUNDATA="${RUNDATA:-$REPO/run-data}"
+FARM_CSV="${FARM_CSV:-$RUNDATA/prove-farm.csv}"
 MARGIN="${MARGIN:-64}"
 MAX_MARGIN="${MAX_MARGIN:-4096}"
 ALERT="$MONAD_DIR/logs/ALERT"

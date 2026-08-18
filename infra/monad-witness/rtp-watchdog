@@ -71,12 +71,72 @@ if [ -f "$MONAD_DIR/logs/STOP" ]; then
   say "logs/STOP present — a deliberate stop, not restarting"; exit 0
 fi
 
+# OUTPUT, not liveness. Every check in this file until now asks "is the process there" — and a prover that
+# proves without submitting passes all of them: session up, log moving, queue draining, ledger filling. The
+# pipeline's product is a DELIVERED proof, so the only check that means anything is whether proofs are landing.
+# 1789 of them were produced and none posted while every other signal read healthy.
+#
+# The signal: run records appearing with no submit log beside them. Both live on the box, so this needs nothing
+# from the Mac — a check that depended on the leaderboard being reachable would go blind exactly when the link
+# is the problem.
+# Derived like prove-farm's own paths ($RUNDATA/..., RUNDATA=<repo>/run-data), not written out. Pointing this
+# at the wrong directory makes the check fire on every single proof — a guard that cries wolf constantly is a
+# guard that gets ignored, which is worse than not having it.
+REPO="${REPO:-$HOME/zkvm-bench}"
+RUNDATA="${RUNDATA:-$REPO/run-data}"
+RESULTS="${RESULTS:-$REPO/infra/zisk-infra/results}"
+SUBMIT_LOGS="${SUBMIT_LOGS:-$RUNDATA/prove-farm-logs}"
+proved_recent=$(find "$RESULTS" -name report.json -newermt "-20 minutes" 2>/dev/null | wc -l | tr -d ' ')
+submit_recent=$(find "$SUBMIT_LOGS" -name 'submit-*.log' -newermt "-20 minutes" 2>/dev/null | wc -l | tr -d ' ')
+PROVE_CMD_FILE="${PROVE_CMD_FILE:-$HOME/.rtp-prove-cmd}"
+
+# Restart the prover from the invocation rtp-up RECORDED, never from one rebuilt here. A watchdog that
+# reassembled the command would drift from rtp-up the first time a flag is added, and the flags that go missing
+# silently are the ones that matter: --ethproofs-url absent means proving forever and delivering nothing.
+#
+# There is no catching up afterwards. A proof for a block the chain finished hours ago is not late, it is a
+# false measurement — ethproofs-mock now refuses it outright. So the only thing worth automating is SHRINKING
+# the window: 5 minutes of loss instead of the thirteen hours it took a human to notice.
+restart_prover() {
+  if [ ! -s "$PROVE_CMD_FILE" ]; then
+    say "cannot restart the prover: no $PROVE_CMD_FILE. It is written by rtp-up — run that once and this \
+becomes self-healing."
+    return 1
+  fi
+  if [ "$DRY" = 1 ]; then
+    say "  would run: tmux new-session -d -s prove \"\$(cat $PROVE_CMD_FILE)\""
+    return 0
+  fi
+  tmux kill-session -t prove 2>/dev/null
+  tmux new-session -d -s prove "$(cat "$PROVE_CMD_FILE")" && return 0
+  return 1
+}
+
+if [ "${proved_recent:-0}" -gt 3 ] && [ "${submit_recent:-0}" = 0 ]; then
+  say "PROVING BUT NOT DELIVERING: $proved_recent proof(s) in the last 20 min and NOT ONE submission. Those \
+blocks are marked proven and will never be retried, so they are output LOST — there is no backfill, a missed \
+proof is missed. Restarting the prover from the recorded invocation."
+  if restart_prover; then
+    [ "$DRY" = 1 ] || { echo "$(date +%s)" >> "$STATE"; say "prover restarted from $PROVE_CMD_FILE"; }
+  fi
+fi
+
 missing=""
 for s in $TIP_SESSIONS; do
   tmux has-session -t "$s" 2>/dev/null || missing="$missing $s"
 done
 prove_down=0
 tmux has-session -t prove 2>/dev/null || prove_down=1
+
+# `prove` absent on its own is a dead pipeline too: the producer keeps framing witnesses into a queue nobody
+# drains. It is not in TIP_SESSIONS because witness-follow does not own it — it is restarted from its own file.
+if [ -z "$missing" ] && [ "$prove_down" = 1 ]; then
+  say "tip sessions up but the prove session is gone — restarting it from the recorded invocation"
+  if restart_prover; then
+    [ "$DRY" = 1 ] || echo "$(date +%s)" >> "$STATE"
+  fi
+  exit 0
+fi
 
 if [ -z "$missing" ]; then
   # Everything up. Say nothing on the happy path: this runs 288 times a day and a quiet log is a readable one.
@@ -118,15 +178,23 @@ if [ "$DRY" = 1 ]; then
 fi
 # The env that rtp-up passes for the tip phase. Kept here rather than sourced, because a watchdog that depends
 # on the Mac being reachable is a watchdog that stops working exactly when the link is the problem.
+# ETHPROOFS_URL and CLUSTER matter as much as the polling knobs, and are the easiest to forget: without them
+# the tap starts fine, frames witnesses fine, and simply never sends its heartbeat — so the leaderboard freezes
+# while every session is up and every log looks healthy. That happened, and it read as "the pipeline stopped".
+# MOCK_PORT is what rtp-up forwards over the reverse tunnel; the tap posts to it on localhost.
 if (cd "$HERE" && HEAD_TAG="${HEAD_TAG:-latest}" CONFIRMATIONS="${CONFIRMATIONS:-0}" \
       FETCH_POLL="${FETCH_POLL:-1}" TAP_INTERVAL="${TAP_INTERVAL:-1}" REPLAY_POLL="${REPLAY_POLL:-0.3}" \
       SETTLE_SECS="${SETTLE_SECS:-0.5}" TIP_DIRECT="${TIP_DIRECT:-0}" \
       BLOCK_DB_TIMEOUT="${BLOCK_DB_TIMEOUT:-30}" PROVE_EVERY="${PROVE_EVERY:-2}" \
+      ETHPROOFS_URL="${ETHPROOFS_URL:-http://localhost:${MOCK_PORT:-8547}}" \
+      CLUSTER="${CLUSTER:-local-ZisK-monad}" \
       ./witness-follow start tip >>"$LOG" 2>&1); then
   echo "$now" >> "$STATE"
   say "restarted. $((recent + 1))/$MAX_RESTARTS in the last $((WINDOW_SECS / 60)) min."
-  [ "$prove_down" = 1 ] && say "NOTE: the prove session is also down. That one is rtp-up's — the prover needs \
-the Mac's tunnel and environment, so witnesses will queue until you re-run rtp-up."
+  if [ "$prove_down" = 1 ]; then
+    say "the prove session was down too — restarting it from the recorded invocation"
+    restart_prover || say "  prover NOT restarted; witnesses will queue until rtp-up runs"
+  fi
 else
   say "witness-follow start tip FAILED (see $LOG)"
   exit 1
