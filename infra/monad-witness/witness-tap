@@ -178,6 +178,36 @@ def seen_blocks():
                     pass
     return out
 
+def manifest_last():
+    """The highest block the manifest records, or None.
+
+    THE DIRECTORY CANNOT ANSWER THIS. `last_witness` used to be max(WITNESS_DIR), and that dir is emptied by
+    design — a raw witness is deleted the moment it is framed, precisely so the box does not hold 14 MB per
+    block twice. What stays behind is whatever `keep_reason` retains for profiling, so the maximum was pinned
+    to one old kept file: the heartbeat reported last_witness=25780229 for hours while the pipeline was at the
+    tip, and the leaderboard showed a 1889-block lag on a pipeline with nothing wrong with it.
+
+    The manifest is append-only and records every block processed, so its last line IS the last witness
+    produced. Read backwards from the end: this runs every cycle, and parsing 27k rows to learn one number is
+    work that grows with the run."""
+    if not os.path.exists(MANIFEST):
+        return None
+    try:
+        with open(MANIFEST, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            back = min(size, 65536)
+            f.seek(size - back)
+            tail = f.read().decode(errors="replace").splitlines()
+        for line in reversed(tail):
+            first = line.split(",", 1)[0].strip()
+            if first.isdigit():
+                return int(first)
+    except OSError:
+        pass
+    return None
+
+
 def append_manifest(row):
     """Append against the header the file ACTUALLY has, not the one this version of the script wants.
 
@@ -404,9 +434,14 @@ def cycle(seen, dry):
         log(f"ERROR: cannot read {WITNESS_DIR} ({e})")
         return
     blocks = sorted(int(m.group(1)) for m in (WITNESS_RE.match(n) for n in names) if m)
-    if not blocks:
-        return
-    last = blocks[-1]
+    # An EMPTY dir is the healthy steady state, not a reason to skip the cycle: returning here also skipped the
+    # heartbeat, so the leaderboard went silent exactly when the tap was keeping up perfectly with the tip.
+    # `last` comes from the manifest either way — see manifest_last() for why the directory cannot answer it.
+    last = manifest_last()
+    if last is None:
+        if not blocks:
+            return
+        last = blocks[-1]
     promoted = stale = 0
     sizes = {}
     # Retention needs to be decided BEFORE framing: on a cold start with a backlog (the replay catching up

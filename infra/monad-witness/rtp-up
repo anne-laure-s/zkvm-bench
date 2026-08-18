@@ -1135,7 +1135,20 @@ fi
 # how the long-lived-monad path stayed undeployed while the logs showed a perfectly healthy producer — twice in
 # one day, on two different components. Restarting costs one block; not restarting costs the whole change.
 onbox "tmux kill-session -t replay-tip 2>/dev/null; tmux kill-session -t tap 2>/dev/null; pkill -f '[r]un_replay.py' 2>/dev/null; pkill -f '[w]itness-tap' 2>/dev/null; sleep 2; echo '   · tip sessions cleared (they would keep the old code and env)'"
-onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL TAP_INTERVAL=$TAP_INTERVAL REPLAY_POLL=$REPLAY_POLL SETTLE_SECS=$SETTLE_SECS TIP_DIRECT=$TIP_DIRECT BLOCK_DB_TIMEOUT=$BLOCK_DB_TIMEOUT PROVE_EVERY=$PROVE_EVERY SKIP_AFTER=$SKIP_AFTER ETHPROOFS_URL=$EP_URL CLUSTER=$EP_CLUSTER ./witness-follow start tip"
+# RECORDED, then launched FROM the recording — same rule as the prover's invocation, and for the same reason:
+# anything that rebuilds this env by hand substitutes ITS defaults for the operator's configuration. Done once
+# already, twice over: a restart dropped ETHPROOFS_URL (so the heartbeat stopped and the leaderboard froze on a
+# healthy pipeline) and imposed PROVE_EVERY=2 on a run deliberately set to a slower cadence. Neither showed up
+# as an error. PROVE_EVERY especially is a POLICY, not a tuning knob — silently changing it changes what the
+# coverage figure means.
+tip_env="HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL TAP_INTERVAL=$TAP_INTERVAL \
+REPLAY_POLL=$REPLAY_POLL SETTLE_SECS=$SETTLE_SECS TIP_DIRECT=$TIP_DIRECT BLOCK_DB_TIMEOUT=$BLOCK_DB_TIMEOUT \
+PROVE_EVERY=$PROVE_EVERY SKIP_AFTER=$SKIP_AFTER ETHPROOFS_URL=$EP_URL CLUSTER=$EP_CLUSTER"
+onbox "cat > \$HOME/.rtp-tip-env <<'RTPEOF'
+$tip_env
+RTPEOF
+chmod 600 \$HOME/.rtp-tip-env; echo '   · tip env recorded in ~/.rtp-tip-env (rtp-watchdog replays it)'"
+onbox "cd $BOX_REPO/infra/monad-witness && env \$(cat \$HOME/.rtp-tip-env) ./witness-follow start tip"
 # The cadence is only meaningful in the tip phase: phase_sessions() starts the tap for `tip` and not for
 # `catchup`, so catch-up keeps advancing the replay at full speed and sampling never slows the backlog drain.
 

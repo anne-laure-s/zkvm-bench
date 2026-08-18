@@ -89,6 +89,7 @@ SUBMIT_LOGS="${SUBMIT_LOGS:-$RUNDATA/prove-farm-logs}"
 proved_recent=$(find "$RESULTS" -name report.json -newermt "-20 minutes" 2>/dev/null | wc -l | tr -d ' ')
 submit_recent=$(find "$SUBMIT_LOGS" -name 'submit-*.log' -newermt "-20 minutes" 2>/dev/null | wc -l | tr -d ' ')
 PROVE_CMD_FILE="${PROVE_CMD_FILE:-$HOME/.rtp-prove-cmd}"
+TIP_ENV_FILE="${TIP_ENV_FILE:-$HOME/.rtp-tip-env}"
 
 # Restart the prover from the invocation rtp-up RECORDED, never from one rebuilt here. A watchdog that
 # reassembled the command would drift from rtp-up the first time a flag is added, and the flags that go missing
@@ -182,13 +183,15 @@ fi
 # the tap starts fine, frames witnesses fine, and simply never sends its heartbeat — so the leaderboard freezes
 # while every session is up and every log looks healthy. That happened, and it read as "the pipeline stopped".
 # MOCK_PORT is what rtp-up forwards over the reverse tunnel; the tap posts to it on localhost.
-if (cd "$HERE" && HEAD_TAG="${HEAD_TAG:-latest}" CONFIRMATIONS="${CONFIRMATIONS:-0}" \
-      FETCH_POLL="${FETCH_POLL:-1}" TAP_INTERVAL="${TAP_INTERVAL:-1}" REPLAY_POLL="${REPLAY_POLL:-0.3}" \
-      SETTLE_SECS="${SETTLE_SECS:-0.5}" TIP_DIRECT="${TIP_DIRECT:-0}" \
-      BLOCK_DB_TIMEOUT="${BLOCK_DB_TIMEOUT:-30}" PROVE_EVERY="${PROVE_EVERY:-2}" \
-      ETHPROOFS_URL="${ETHPROOFS_URL:-http://localhost:${MOCK_PORT:-8547}}" \
-      CLUSTER="${CLUSTER:-local-ZisK-monad}" \
-      ./witness-follow start tip >>"$LOG" 2>&1); then
+# NO DEFAULTS INVENTED HERE. The env comes from the file rtp-up recorded; without it this restart would
+# substitute its own values, and PROVE_EVERY is a POLICY — it decides which blocks are offered at all, so
+# changing it silently changes what coverage means. That happened: a restart imposed 2 on a run set to 10.
+if [ ! -s "$TIP_ENV_FILE" ]; then
+  say "cannot restart the tip phase: no $TIP_ENV_FILE. It is written by rtp-up — run that once and this \
+becomes self-healing. Restarting with guessed settings would change the cadence and the heartbeat silently."
+  exit 1
+fi
+if (cd "$HERE" && env $(cat "$TIP_ENV_FILE") ./witness-follow start tip >>"$LOG" 2>&1); then
   echo "$now" >> "$STATE"
   say "restarted. $((recent + 1))/$MAX_RESTARTS in the last $((WINDOW_SECS / 60)) min."
   if [ "$prove_down" = 1 ]; then
