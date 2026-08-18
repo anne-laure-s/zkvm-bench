@@ -40,15 +40,123 @@ def pv_digest(run_dir):
     win, and `expected_pv.bin` — what a local emulation of the guest committed — is only a fallback, used
     when there is no prover output (a mock run). Sending the emulated digest while a real one exists would
     quietly attribute the guest's claim to the proof."""
-    for p in sorted(glob.glob(os.path.join(run_dir, "*.pv.bin"))) + [
-            os.path.join(run_dir, "expected_pv.bin")]:
-        if not os.path.isfile(p):
-            continue
+    p = pv_path(run_dir)
+    if p:
         try:
             return "sha256:" + hashlib.sha256(open(p, "rb").read()).hexdigest()[:16]
         except OSError:
             pass
     return None
+
+
+def pv_path(run_dir):
+    """WHICH file holds the public values. Split out of pv_digest so the digest that gets sent and the
+    values the gate below verifies are the same bytes — a gate that read a different file would bless a
+    digest it never inspected."""
+    for p in sorted(glob.glob(os.path.join(run_dir, "*.pv.bin"))) + [
+            os.path.join(run_dir, "expected_pv.bin")]:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+_CHECKPV = "unset"
+
+
+def load_checkpv():
+    """cli/check-pv as a module, or None. Cached, and never fatal.
+
+    An explicit SourceFileLoader, because scripts in cli/ carry no .py extension and
+    spec_from_file_location alone hands back a spec with loader=None for those.
+
+    Fail-open BUT LOUD: a box holding an older clone without check-pv must keep delivering proofs rather
+    than go silent — but every line that depends on it then says NOT VERIFIED."""
+    global _CHECKPV
+    if _CHECKPV != "unset":
+        return _CHECKPV
+    try:
+        import importlib.util as iu
+        from importlib.machinery import SourceFileLoader
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check-pv")
+        spec = iu.spec_from_file_location("_checkpv", path, loader=SourceFileLoader("_checkpv", path))
+        mod = iu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _CHECKPV = mod
+    except Exception as e:                                        # noqa: BLE001 — never fatal
+        print(f"ethproofs-submit: WARNING cannot load cli/check-pv ({e}) — public values will NOT be verified",
+              file=sys.stderr)
+        _CHECKPV = None
+    return _CHECKPV
+
+
+def pv_named(run_dir):
+    """The public values as {name: 0xhex}, or None.
+
+    Sent alongside the digest so the RECEIVER can verify them too. A 16-hex digest tells the server nothing
+    it can check: to re-derive it the server would have to guess the padding length, and a padding change
+    would then read as a wrong root and refuse every good proof. Named values are checkable directly, and a
+    refusal can say WHICH value was wrong."""
+    cp = load_checkpv()
+    p = pv_path(run_dir)
+    if cp is None or p is None:
+        return None
+    try:
+        with open(p, "rb") as f:
+            return {k: "0x" + v for k, v in cp.decode(f.read()).items()}
+    except (OSError, ValueError):
+        return None
+
+
+def verify_public_values(run_dir, block, manifest, rpc_url, dry):
+    """Refuse to submit a proof whose committed values are not the block's. -> (ok, note)
+
+    THIS IS THE GATE THAT WAS MISSING. A guest reading a witness format it was not built for, or an ELF built
+    against a different zkVM toolchain than the emulator running it, commits 256 bytes of zeros and exits 0.
+    Nothing else in the pipeline can tell that apart from a real proof: the step count is plausible, the proof
+    verifies, the digest is well-formed, and the leaderboard fills up with proofs about nothing.
+
+    Fail CLOSED on a mismatch and OPEN on missing ground truth. Those are different failures and the pipeline
+    must react differently: a wrong root means this proof must not be delivered, while an unreachable RPC
+    means only that we cannot tell — and blocking every submission on a reachable RPC would turn a link
+    problem into a total delivery outage, which is the failure this pipeline can least afford.
+
+    The layout and the comparison live in cli/check-pv, not here, so the receiving side re-derives the same
+    expectation from the same definition.
+    """
+    pv_file = pv_path(run_dir)
+    if pv_file is None:
+        return True, "no public values in the run record — nothing to verify"
+    cp = load_checkpv()
+    if cp is None:
+        return True, "NOT VERIFIED: cannot load cli/check-pv (see the warning above)"
+    try:
+        with open(pv_file, "rb") as f:
+            pv = f.read()
+    except OSError as e:
+        return True, f"NOT VERIFIED: cannot read {pv_file} ({e})"
+    if len(pv) < cp.WORDS[-1][1] + 32:
+        return False, f"{os.path.basename(pv_file)} is {len(pv)} B — too short to hold the guest's commitment"
+
+    truth, src = cp.ground_truth(block, manifest, rpc_url)
+    rows, verdict = cp.check(pv, truth)
+    if verdict == "empty":
+        return False, ("EMPTY COMMITMENT — every value byte is zero. The run exited cleanly and proved "
+                       "nothing; the guest almost certainly does not match the installed zkVM toolchain "
+                       "or the witness format. Rebuild it.")
+    if verdict == "mismatch":
+        bad = "; ".join(f"{n}=0x{g[:16]}… expected 0x{w[:16]}… ({src.get(n, '?')})"
+                        for n, g, w, ok in rows if ok is False)
+        return False, f"WRONG STATE — {bad}. The proof would verify, about the wrong block."
+    if verdict == "unverified":
+        return True, "NOT VERIFIED: no ground truth reachable (pass --manifest and/or --rpc)"
+    checked = [n for n, _g, _w, ok in rows if ok]
+    skipped = [n for n, _g, _w, ok in rows if ok is None]
+    note = "verified " + "+".join(checked) + f" ({','.join(sorted(set(src.values())))})"
+    # Name what was NOT checked. A partial pass is a pass — the two roots pin the state transition on their
+    # own — but "verified" must never read as "all three verified" when a source was missing.
+    if skipped:
+        note += "; NOT verified: " + "+".join(skipped)
+    return True, note
 
 
 def block_chain_time(manifest, block):
@@ -204,6 +312,13 @@ def main():
                                                         os.path.expanduser("~/witness-manifest.csv")),
                     help="producer manifest, for the block's chain timestamp -> end-to-end latency")
     ap.add_argument("--dry-run", action="store_true", help="print the requests, don't send")
+    ap.add_argument("--rpc", default=os.environ.get("RPC"),
+                    help="JSON-RPC URL used to complete the public-value check (block hash, and any "
+                         "root the manifest lacks). Env: RPC.")
+    ap.add_argument("--no-pv-check", action="store_true",
+                    help="submit even if the committed public values are wrong or empty. For "
+                         "deliberately-invalid test proofs ONLY — this is the check that separates a "
+                         "proof of the block from a proof of nothing.")
     args = ap.parse_args()
 
     url = args.ethproofs_url.rstrip("/")
@@ -294,11 +409,26 @@ def main():
             pass
     if pi is not None:
         proved["public_inputs"] = pi
+    # The values themselves, for the receiving side's own check. An extra field like vm/guest/t_block —
+    # dropped by --minimal, which is what real ethproofs gets.
+    if not args.minimal:
+        pvn = pv_named(args.run_dir)
+        if pvn:
+            proved["public_values"] = pvn
 
     lifecycle = {"block_number": block, "cluster_id": cluster, **ident}
     print(f"ethproofs-submit: {'[MOCK] ' if is_mock else ''}{'[minimal] ' if args.minimal else ''}vm={vm} guest={guest} block={block} cluster={cluster} -> {url}  "
           f"(proof={len(proof_bytes)}B from {kind}, time={ptime}ms, work={proved.get('proving_cycles')}, "
           f"vk={str(vid)[:14]}, pi={pi}{f', e2e={e2e}s' if e2e else ''})")
+
+    # BEFORE any POST. Refusing after /proofs/queued would leave a lifecycle open on a proof that never
+    # arrives, and the block would read as in-flight forever.
+    ok, note = (True, "skipped (--no-pv-check)") if args.no_pv_check else \
+        verify_public_values(args.run_dir, block, args.manifest, args.rpc, args.dry_run)
+    print(f"ethproofs-submit: public values: {note}")
+    if not ok:
+        print(f"ethproofs-submit: REFUSING to submit block {block} — {note}", file=sys.stderr)
+        return 4
 
     if not args.proved_only:
         post(url, args.token, "/proofs/queued", lifecycle, args.dry_run)
@@ -308,4 +438,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # sys.exit(main()), not main(): main() RETURNS its refusal code, and swallowing it would exit 0 on a
+    # refused submission — prove-farm would log a success for a proof that was never sent.
+    sys.exit(main())

@@ -56,6 +56,7 @@
 # the witness-less replay, polls the gap until it closes, then switches to the tip phase.
 #
 # Config (env): BOX=<box> (required)  MAC_USER=$USER  TUN_SSH_PORT=2222  MOCK_PORT=8547
+#               RPC=<url>  (the chain, for the public-value checks on both sides)
 #               MOCK_STORE=/tmp/ethproofs-rtp  MOCK_SECS=2.12  MOCK_PER_MSTEP=0.0364  MOCK_SPEED=2.5  MOCK_JITTER=0.5
 #               HEAD_TAG=latest  CONFIRMATIONS=0 (the head — real time)  RUNNER_DIR=$HOME/zisk-mock
 #               CATCHUP_TARGET=10 (blocks)  CATCHUP_POLL=30 (s)
@@ -97,6 +98,13 @@ BOX="${BOX:-}"
 MAC_USER="${MAC_USER:-$USER}"
 TUN_SSH_PORT="${TUN_SSH_PORT:-2222}"
 MOCK_PORT="${MOCK_PORT:-8547}"
+# The chain, for the PUBLIC-VALUE checks. The guest commits the pre-state root, the post-state root and
+# the block hash; the manifest carries the two roots, so this supplies the hash and covers a manifest
+# written before the block_hash column existed. It goes to two places on purpose: the submitter refuses
+# to send a proof whose committed values are not the block's, and the mock refuses to accept one — the
+# server keeps its own opinion rather than trusting the prover's. Headers only, so a non-archive node
+# serves it. Same default as witness-tap's.
+RPC="${RPC:-http://chi-001.devcore4.com:8545}"
 MOCK_STORE="${MOCK_STORE:-/tmp/ethproofs-rtp}"
 MOCK_SECS="${MOCK_SECS:-2.12}"        # least-squares fit on the 11 measured 16x5090 blocks:
 MOCK_PER_MSTEP="${MOCK_PER_MSTEP:-0.0364}"  #   secs = 2.12 + 0.0364 x Msteps  (+-0.2 s)
@@ -465,8 +473,23 @@ if [ -z "$PROVER" ]; then
   # sending a 508 KB base64 body back through the tunnel at 3.8 Mbit/s — ~1.10 s per block for bytes that never
   # left this machine. The box still decides: it invokes, reads the status, logs the verdict, writes the CSV.
   run "cp '$MAC_REPO/cli/ethproofs-submit' '$RUNNER_DIR/'"
-  run "chmod +x '$RUNNER_DIR/ethproofs-submit'"
+  # check-pv WITH it, and beside it: ethproofs-submit loads it from its OWN directory, so staging one without
+  # the other leaves the gate loaded-but-absent — it fails open with a NOT VERIFIED note and every proof goes
+  # out unchecked on the path that posts almost all of them. Verified below rather than assumed.
+  run "cp '$MAC_REPO/cli/check-pv' '$RUNNER_DIR/'"
+  run "chmod +x '$RUNNER_DIR/ethproofs-submit' '$RUNNER_DIR/check-pv'"
   run "chmod +x '$RUNNER_DIR/witness-pump'"
+  # The staged submitter must actually be able to load it. Same reasoning as the runner's mock-branch check
+  # a few steps down: a copy that did not land is indistinguishable from one that did, until a proof about
+  # nothing has already been delivered.
+  if [ "$DRY" != 1 ]; then
+    if "$RUNNER_DIR/ethproofs-submit" --help >/dev/null 2>&1 && [ -x "$RUNNER_DIR/check-pv" ] \
+       && "$RUNNER_DIR/check-pv" --help >/dev/null 2>&1; then
+      say "staged, and the public-value gate loads (check-pv beside ethproofs-submit)"
+    else
+      die "the public-value gate did not stage on the prover — without it every proof is submitted unchecked"
+    fi
+  fi
   # Restart it, never reuse: like the prover session, a live pump holds the code and env it started with.
   # PUMP_SOCK stays SHORT — a unix socket path is capped at ~104 bytes on macOS, the same limit that bit the
   # ssh ControlPath, and the pump refuses to start rather than emit a bare "AF_UNIX path too long".
@@ -617,7 +640,7 @@ if [ "$KEEP_MOCK" = 1 ]; then
 else
   run "pkill -f ethproofs-mock || true"
   run "sleep 1"
-  run "nohup '$MAC_REPO/cli/ethproofs-mock' --port $MOCK_PORT --store '$MOCK_STORE' --verify-cmd '$MAC_REPO/cli/verify-proof' >> ~/ethproofs-mock.log 2>&1 &"
+  run "nohup '$MAC_REPO/cli/ethproofs-mock' --port $MOCK_PORT --store '$MOCK_STORE' --rpc '$RPC' --verify-cmd '$MAC_REPO/cli/verify-proof' >> ~/ethproofs-mock.log 2>&1 &"
   run "sleep 2"
 fi
 if [ "$DRY" != 1 ]; then
@@ -1269,7 +1292,7 @@ ${PULL_VIA:+PULL_VIA=$PULL_VIA }WITNESS_PUMP=$RUNNER_DIR/witness-pump PUMP_SOCK=
 REMOTE_SUBMIT=$RUNNER_DIR/ethproofs-submit WITNESS_MANIFEST=\$HOME/witness-manifest.csv \
 cli/prove-farm --guest monad-zisk $PROVE_MODE_FLAGS --remote $PROVER_TARGET --port $PROVER_PORT \
 --interval 1 --watch --newest-first --no-prefetch --ethproofs-url $EP_URL${EP_TOKEN:+ --ethproofs-token $EP_TOKEN} \
---ethproofs-cluster $EP_CLUSTER 2>&1 | tee -a $PROVE_LOG"
+--ethproofs-cluster $EP_CLUSTER --rpc $RPC 2>&1 | tee -a $PROVE_LOG"
 onbox "cat > \$HOME/.rtp-prove-cmd <<'RTPEOF'
 $prove_cmd
 RTPEOF

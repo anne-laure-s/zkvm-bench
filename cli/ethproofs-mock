@@ -15,13 +15,14 @@ verifier with --verify-cmd `<cmd> <proof_path> <block> <verifier_id>` (exit 0 = 
 
 Endpoints (mirrors what the clients call). Proof identity is (cluster_id, block) — exactly as on
 ethproofs — so run each prover as its OWN cluster (cli/prove-farm defaults the cluster to the guest, so
-rsp vs zisk land on distinct clusters). Optional vm/guest/public_inputs (sent by cli/ethproofs-submit)
+rsp vs zisk land on distinct clusters). Optional vm/guest/public_inputs/public_values (sent by cli/ethproofs-submit)
 identify WHAT was proven and show on the leaderboard:
   POST /proofs/queued   {block_number, cluster_id, [vm, guest]}
   POST /proofs/proving  {block_number, cluster_id, [vm, guest]}
   POST /proofs/proved   {proof (base64), block_number, proving_cycles|proving_steps, proving_time (ms),
-                         verifier_id, cluster_id, [vm, guest, public_inputs, t_block, e2e_secs]}
+                         verifier_id, cluster_id, [vm, guest, public_inputs, public_values, t_block, e2e_secs]}
                          -> verified, returns {proof_id, verified}
+                         409 if the block is stale, or if public_values are not this block's (--rpc)
   GET  /                 leaderboard (HTML: pipeline banner + cluster·vm·guest·block·verified)
   GET  /proofs           JSON records   ·   GET /status   JSON pipeline state
 
@@ -108,6 +109,11 @@ class Store:
             "mock": body.get("mock"),                      # True = a FAKE proof (mock-cluster), not real
             "block_number": block,
             "public_inputs": body.get("public_inputs"),    # digest — identifies non-block proofs (e.g. fibonacci)
+            # What the guest committed, and this server's own verdict on it (see public_values_verdict).
+            # Recorded so "are the public values being checked?" is answerable from /proofs rather than
+            # from a log line that has scrolled away.
+            "public_values": body.get("public_values"),
+            "pv_verdict": body.get("pv_verdict"),
             # work-unit is cycles (SP1/OpenVM) or steps (ZisK) — record whichever is present
             "proving_cycles": body.get("proving_cycles", body.get("proving_steps")),
             "proving_time_ms": body.get("proving_time"),
@@ -283,6 +289,84 @@ def staleness(cluster, block, body):
     return None, None
 
 
+# ── public values ────────────────────────────────────────────────────────────────────────────────────
+# THE SERVER'S OWN CHECK on what the guest committed. The store is the trust anchor, so it must not take
+# the prover's word for which block a proof is about: a guest reading a witness format it was not built
+# for, or built against a different zkVM toolchain than the emulator running it, commits 256 bytes of zeros
+# and exits 0 — the proof verifies, about nothing at all.
+#
+# It checks the VALUES, not the `public_inputs` digest. Re-deriving that digest would mean guessing the
+# padding length the guest emits, so a padding change would read as a wrong root and refuse every good
+# proof. Named values are checkable directly and a refusal can say which one was wrong.
+#
+# The layout and the comparison come from cli/check-pv — the same definition the submitter gates on — so
+# the two sides cannot disagree about what a correct commitment looks like.
+#
+# FAIL OPEN when there is no independent source (no --rpc, chain unreachable, values not sent). Refusing
+# then would turn an RPC outage into a total delivery outage, and delivery is what this pipeline cannot
+# afford to lose. It refuses ONLY on a value it checked and found wrong.
+PV_RPC   = os.environ.get("EP_RPC")
+_PV_CACHE = {}
+_PV_CHECKPV = "unset"
+
+def load_checkpv():
+    """cli/check-pv as a module, or None. Cached; never fatal."""
+    global _PV_CHECKPV
+    if _PV_CHECKPV != "unset":
+        return _PV_CHECKPV
+    try:
+        import importlib.util as iu
+        from importlib.machinery import SourceFileLoader
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check-pv")
+        spec = iu.spec_from_file_location("_checkpv", path, loader=SourceFileLoader("_checkpv", path))
+        mod = iu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _PV_CHECKPV = mod
+    except Exception as e:                                        # noqa: BLE001
+        print(f"{now_iso()}  WARNING cannot load cli/check-pv ({e}) — public values will NOT be checked")
+        _PV_CHECKPV = None
+    return _PV_CHECKPV
+
+
+def public_values_verdict(block, body):
+    """(ok, detail): True = every value checked agrees · False = REFUSE · None = could not check."""
+    vals = body.get("public_values")
+    if not isinstance(vals, dict) or not vals:
+        return None, "not sent by the submitter"
+    cp = load_checkpv()
+    if cp is None:
+        return None, "cli/check-pv unavailable"
+    if not PV_RPC:
+        return None, "no --rpc: the server has no independent source"
+    if block is None:
+        return None, "no block number"
+    truth = _PV_CACHE.get(block)
+    if truth is None:
+        try:
+            truth = cp.truth_from_rpc(PV_RPC, int(block))
+        except Exception:                                         # noqa: BLE001
+            truth = {}
+        # Cache the answer, empty included, so an unreachable chain costs one call per block and not one per
+        # retry. Bounded crudely: this store is per-campaign and a block is never revisited.
+        if len(_PV_CACHE) > 4096:
+            _PV_CACHE.clear()
+        _PV_CACHE[block] = truth
+    if not truth:
+        return None, "chain unreachable"
+    bad, good = [], []
+    for name, want in truth.items():
+        got = cp.norm(vals.get(name))
+        if got is None:
+            continue
+        (good if got == want else bad).append(name)
+    if bad:
+        return False, "; ".join(
+            f"{n}: committed {str(vals.get(n))[:18]}… but the chain says 0x{truth[n][:16]}…" for n in bad)
+    if not good:
+        return None, "no value in common with the chain's answer"
+    return True, "+".join(good)
+
+
 STORE = None
 TOKEN = None
 VERIFY_CMD = None   # external verifier: `<cmd> <proof_path> <block> <verifier_id> <vm> <guest>`, exit 0 = valid
@@ -385,6 +469,19 @@ class Handler(BaseHTTPRequestHandler):
                                                    f"real-time proving, and a missed proof is missed. Raise "
                                                    f"EP_MAX_AGE_SECS only if you know why you are backfilling.",
                                          "max_age_secs": STALE_SECS})
+            # After staleness, before the proof is stored: a refused submission must leave nothing behind,
+            # exactly like a stale one.
+            pv_ok, pv_detail = public_values_verdict(block, body)
+            body["pv_verdict"] = ("ok:" if pv_ok else "REFUSED:" if pv_ok is False else "unchecked:") + pv_detail
+            if pv_ok is False:
+                print(f"{now_iso()}  ← /proofs/proved  REFUSED cluster={cluster} block={block} "
+                      f"— WRONG PUBLIC VALUES: {pv_detail}")
+                return self._reply(409, {"error": "wrong public values",
+                                         "detail": f"{pv_detail}. The proof may well be valid — about a "
+                                                   f"different block than {block}. Rebuild the guest against "
+                                                   f"the installed zkVM toolchain and check its witness format.",
+                                         "block_number": block})
+
             pb = None; magic_mock = False
             if body.get("proof"):
                 pb, magic_mock = STORE.save_proof(cluster, block, body["proof"])
@@ -555,13 +652,17 @@ class Handler(BaseHTTPRequestHandler):
         return self._reply(200, "\n".join(body).encode(), ctype="text/html; charset=utf-8")
 
 def main():
-    global STORE, TOKEN, VERIFY_CMD
+    global STORE, TOKEN, VERIFY_CMD, PV_RPC
     sys.stdout.reconfigure(line_buffering=True)  # live logs even when redirected (`ethproofs-mock &`)
     ap = argparse.ArgumentParser(description="home-made ethproofs.org stand-in")
     ap.add_argument("--port", type=int, default=int(os.environ.get("ETHPROOFS_MOCK_PORT", 8547)))
     ap.add_argument("--store", default=os.environ.get("ETHPROOFS_MOCK_STORE",
                                                       os.path.join(ROOT, "run-data", "ethproofs-mock-data")))
     ap.add_argument("--token", default=os.environ.get("ETHPROOFS_MOCK_TOKEN"))
+    ap.add_argument("--rpc", default=os.environ.get("EP_RPC"),
+                    help="JSON-RPC URL. Gives the server an INDEPENDENT source for the block's roots "
+                         "and hash, so it can refuse a proof whose committed values are not the "
+                         "block's. Without it the values are recorded but not checked. Env: EP_RPC.")
     ap.add_argument("--verify-cmd", default=os.environ.get("ETHPROOFS_MOCK_VERIFY_CMD"),
                     help="external verifier `<cmd> <proof_path> <block> <verifier_id>` (exit 0 = valid); "
                          "omit to use the built-in mock verification")
@@ -569,9 +670,15 @@ def main():
     STORE = Store(args.store)
     TOKEN = args.token
     VERIFY_CMD = args.verify_cmd
+    PV_RPC = args.rpc
     n = len(STORE.state)
     auth = f"Bearer {TOKEN}" if TOKEN else "open (any token accepted)"
     verify = f"external: {VERIFY_CMD}" if VERIFY_CMD else "built-in mock (well-formed check; real verifier via --verify-cmd)"
+    # Said out loud, because an unarmed gate reads exactly like an armed one in every other line
+    # of this banner — and this is the check that separates a proof of the block from a proof of nothing.
+    pvcheck = (f"checked against {PV_RPC} — a proof whose committed roots/hash are not the "
+               f"block's is REFUSED") if PV_RPC else \
+        "NOT CHECKED (no --rpc / EP_RPC): values are recorded, but nothing compares them with the chain"
     print(f"""ethproofs-mock — a local stand-in for the ethproofs.org API (the SERVER that receives + verifies proofs).
 It accepts what a prover submits (POST /proofs/queued · /proving · /proved), VERIFIES each proof, saves
 it, and shows a leaderboard — so the proving pipeline can submit here WITHOUT an ethproofs.org account.
@@ -585,6 +692,7 @@ server DOES do on /proved is VERIFY the submitted proof (mock by default — see
   store     : {args.store}   (submissions.jsonl + proofs/)
   auth      : {auth}     ·  {n} block(s) recorded so far
   verify    : {verify}
+  pub values: {pvcheck}
 
 To make a prover send its proofs HERE instead of ethproofs.org, set the prover's ethproofs URL to
 http://<host>:{args.port}  (<host> = 'localhost' if the prover runs on this machine, else this box's IP):

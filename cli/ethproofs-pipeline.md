@@ -53,7 +53,8 @@ cli/witness-farm            cli/prove-farm --watch             cli/ethproofs-sub
   + a proof file, so SP1 / ZisK / **OpenVM** all submit through the same tool, no per-stack Rust client.
   Field mapping (report.json → `/proofs/proved`): `proof.bin`→`proof`, `prove_secs×1000`→`proving_time`,
   `cycles`/`steps`→`proving_cycles`/`proving_steps`, `vkey_hash`→`verifier_id`, `zkvm`/`guest`→`vm`/`guest`,
-  `*.pv.bin` digest→`public_inputs`, and `mode=mock`→`mock` (CLI flags override). See `cli/ethproofs-submit --help`.
+  `*.pv.bin` digest→`public_inputs`, the values themselves→`public_values`, and `mode=mock`→`mock` (CLI flags
+  override). See `cli/ethproofs-submit --help`.
 - **no box? add `--mock`** — `cli/prove-farm --guest rsp --mock --watch --ethproofs-url http://localhost:8547`
   swaps the real cluster for a **mock-cluster** stand-in (fake proof, local, instant), so the whole
   decoupled pipeline runs on **real blocks with zero external dep** — the prover-seam sibling of
@@ -76,6 +77,22 @@ mock takes both).
 **What was proven** — every submission also carries `vm` (SP1/ZisK/OpenVM), `guest`
 (rsp/zisk-reth/monad-sp1/…) and, for non-block proofs, a `public_inputs` digest (from the run's
 `*.pv.bin`). These are metadata shown on the leaderboard; the identity stays `(cluster, block)`.
+
+**And it is checked, on both sides** — `cli/check-pv` holds the layout of what the guest commits (Monad:
+pre-state root, post-state root, block hash) and the comparison against ground truth. `ethproofs-submit`
+runs it before it posts and REFUSES (exit 4) a proof whose committed values are not the block's;
+`ethproofs-mock` re-derives the same expectation from its own `--rpc` and answers **409** rather than
+store one. That is why the submission also carries the values under `public_values`: a 16-hex digest is
+not checkable by a receiver, which would have to guess the guest's padding length to re-derive it.
+
+Both gates fail CLOSED on a value they checked and found wrong, and OPEN when no ground truth is
+reachable — an unreachable RPC must not become a delivery outage. Ground truth comes from the producer's
+manifest first (`post_state_root` for the block and for its parent, `block_hash`), so on the RTP path the
+check costs no network at all; the RPC only fills what the manifest lacks.
+
+This is what separates a proof of the block from a proof of nothing: a guest reading a witness format it
+was not built for, or built against a different zkVM toolchain than the emulator running it, exits 0 with
+a plausible step count and commits 256 zero bytes. Every liveness signal reads healthy through that.
 
 **Mock proofs are unmistakable** — a `prove-farm --mock` proof is fake and marked so it can never pass for
 real, four ways:
@@ -174,8 +191,8 @@ Each blocker resolves to a config change — no pipeline change. What to do when
 **Payload fidelity (verified against the vendored clients).** `cli/ethproofs-submit`'s CANONICAL payload
 — `{block_number, cluster_id, proof, proving_cycles, proving_time, verifier_id}` + `Content-Type` +
 `Authorization: Bearer` — matches EXACTLY what RSP `bin/eth-proofs` and ZisK `api.rs` POST (both put their
-work-unit in `proving_cycles`; there is no `proving_steps`). It adds `vm/guest/mock/public_inputs` for the
-mock leaderboard; **`--minimal` drops those** so a strict ethproofs.org sees only the canonical set.
+work-unit in `proving_cycles`; there is no `proving_steps`). It adds `vm/guest/mock/public_inputs/public_values`
+for the mock leaderboard; **`--minimal` drops those** so a strict ethproofs.org sees only the canonical set.
 
 ## Status
 

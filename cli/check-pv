@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""check-pv — verify EVERY public value the guest commits, against ground truth.
+
+A ZisK run that reads the wrong witness format, or an ELF built against a different zkVM toolchain than the
+emulator running it, does not panic and does not return non-zero. It executes, reports a plausible step
+count, and commits 256 bytes of zeros. The proof is then valid — about nothing. Every liveness signal in the
+pipeline reads healthy: session up, queue draining, ledger filling, proofs delivered, leaderboard moving.
+
+So the only check that separates "we proved a block" from "we proved nothing" is reading the values the
+guest committed and comparing all of them with what the chain says. That is this file, and it is the single
+place the layout and the comparison are defined — `cli/ethproofs-submit` gates submission on it and
+`cli/ethproofs-mock` re-derives the same expectation on the receiving side, so the two cannot disagree
+about what a correct commitment looks like.
+
+  ./cli/check-pv --pv <run>/pv.bin --block 25552112 [--manifest ...] [--rpc URL]
+  ./cli/check-pv --pv <file> --block N --post 0x.. --pre 0x.. --hash 0x..   # truth given explicitly
+
+EXIT CODES, and why they are distinguished. A caller in the submission path must react to these differently:
+  0  every value that could be checked AGREES
+  1  a value MISMATCHED, or the commitment is empty — a correctness failure; do not submit
+  2  usage error, or the public values could not be read
+  3  no ground truth could be established — nothing verified, nothing disproven
+Collapsing 3 into 1 would make an unreachable RPC stop every submission, trading a silent-wrong-proof
+failure for a silent-no-proof one. Collapsing 1 into 3 would defeat the whole file. Callers block on 1,
+warn on 3.
+
+GROUND TRUTH comes from, in order: explicit flags, the producer's manifest, the RPC. The manifest is
+preferred because it makes the check free in the submission path — no network on the hot path, and a
+verification that depends on a reachable RPC goes blind exactly when the link is the problem. Its
+post_state_root is the monad node's own execution of the block, an independent computation from the guest's,
+which is what makes it a cross-check rather than a tautology.
+"""
+import argparse, csv, json, os, sys, urllib.request
+
+# The layout the Monad ZisK guest commits: three 32-byte words, then zero padding to 256 B.
+# Re-derive it on any block whose parent is known: word 0 is `eth_getBlockByNumber(N).stateRoot`, word 1 is
+# the parent's `stateRoot`, word 2 is `eth_getBlockByNumber(N).hash`. Verified against the chain on
+# 25552112. A guest whose commitment order changes is a different generation: the words are named here, so
+# a change shows up as three named mismatches rather than as one opaque digest difference.
+WORDS = (("post_state_root", 0), ("pre_state_root", 32), ("block_hash", 64))
+PV_LEN = 256
+
+
+def norm(v):
+    """A bare lowercase 64-hex string, or None. Accepts 0x-prefixed, bare, or 32 raw bytes."""
+    if v is None:
+        return None
+    if isinstance(v, (bytes, bytearray)):
+        return v.hex() if len(v) == 32 else None
+    h = str(v).strip().lower()
+    h = h[2:] if h.startswith("0x") else h
+    return h if len(h) == 64 and all(c in "0123456789abcdef" for c in h) else None
+
+
+def norm_or_file(v):
+    """Like norm(), but a PATH is read: the corpus keeps ground truth in `<block>.post_state_root` files, so
+    `--post <file>` must not be silently ignored — it would report the value as unverified while looking
+    verified. Deliberately NOT used on wire or CSV data: only a value typed on the command line is allowed
+    to name a file."""
+    if v is None:
+        return None
+    if isinstance(v, str) and os.path.isfile(v):
+        try:
+            with open(v, "rb") as f:
+                raw = f.read()
+            return norm(raw) if len(raw) == 32 else norm(raw.decode("utf-8", "replace").strip())
+        except OSError:
+            return None
+    return norm(v)
+
+
+def decode(pv):
+    """pv bytes -> {name: hex}. Raises ValueError if the blob cannot hold the layout."""
+    if len(pv) < WORDS[-1][1] + 32:
+        raise ValueError(f"public values are {len(pv)} B — too short for the {len(WORDS)}-word layout")
+    return {name: pv[off:off + 32].hex() for name, off in WORDS}
+
+
+def is_empty(pv):
+    """The failure this file exists for: a guest that committed nothing at all."""
+    return not any(pv[:WORDS[-1][1] + 32])
+
+
+def rpc(url, method, params, timeout=15):
+    req = urllib.request.Request(url, json.dumps(
+        {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}).encode(),
+        {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r).get("result")
+
+
+def truth_from_manifest(manifest, block):
+    """Ground truth the producer already wrote down. Two of the three values need no network: the block's own
+    post-state root, and the PARENT's — which is this block's pre-state root, because the manifest records
+    every block the producer saw, not only the ones the cadence promoted."""
+    out = {}
+    if not manifest or not os.path.isfile(manifest):
+        return out
+    want = {str(block): "post_state_root", str(int(block) - 1): "pre_state_root"}
+    try:
+        with open(manifest, newline="") as f:
+            for row in csv.DictReader(f):
+                key = want.get((row.get("block") or "").strip())
+                if key and norm(row.get("post_state_root")):
+                    out[key] = norm(row.get("post_state_root"))
+                if (row.get("block") or "").strip() == str(block) and norm(row.get("block_hash")):
+                    out["block_hash"] = norm(row.get("block_hash"))
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def truth_from_rpc(url, block, need=None):
+    """The chain's own answer. Only headers are read, so a non-archive node serves this for any block.
+
+    The parent is fetched BY HASH, not by number: it follows the chain this block was actually built on, so a
+    reorg landing between the two calls cannot pair a block with a sibling's parent and report a spurious
+    pre-state mismatch."""
+    out = {}
+    if not url:
+        return out
+    try:
+        b = rpc(url, "eth_getBlockByNumber", [hex(int(block)), False])
+    except Exception:                                             # noqa: BLE001 — never fatal
+        return out
+    if not b:
+        return out
+    for key, field in (("post_state_root", "stateRoot"), ("block_hash", "hash")):
+        if norm(b.get(field)):
+            out[key] = norm(b.get(field))
+    if need is None or "pre_state_root" in need:
+        try:
+            p = rpc(url, "eth_getBlockByHash", [b["parentHash"], False]) if b.get("parentHash") else None
+            if not p:
+                p = rpc(url, "eth_getBlockByNumber", [hex(int(block) - 1), False])
+            if p and norm(p.get("stateRoot")):
+                out["pre_state_root"] = norm(p.get("stateRoot"))
+        except Exception:                                         # noqa: BLE001
+            pass
+    return out
+
+
+def ground_truth(block, manifest=None, rpc_url=None, explicit=None):
+    """Merge the sources by precedence, and remember WHICH one answered for each value."""
+    truth, src = {}, {}
+    for name, val in (explicit or {}).items():
+        if norm(val):
+            truth[name], src[name] = norm(val), "given"
+    for name, val in truth_from_manifest(manifest, block).items():
+        if name not in truth:
+            truth[name], src[name] = val, "manifest"
+    missing = [n for n, _ in WORDS if n not in truth]
+    if missing and rpc_url:
+        for name, val in truth_from_rpc(rpc_url, block, need=missing).items():
+            if name in missing:
+                truth[name], src[name] = val, "rpc"
+    return truth, src
+
+
+def check(pv, truth):
+    """-> (rows, verdict). rows is [(name, got, want|None, ok|None)]; verdict is one of
+    'empty' | 'mismatch' | 'ok' | 'unverified'."""
+    if is_empty(pv):
+        return [(n, pv[o:o + 32].hex(), truth.get(n), False) for n, o in WORDS], "empty"
+    got = decode(pv)
+    rows, checked, bad = [], 0, 0
+    for name, _ in WORDS:
+        want = truth.get(name)
+        ok = None if want is None else (got[name] == want)
+        if ok is not None:
+            checked += 1
+            bad += 0 if ok else 1
+        rows.append((name, got[name], want, ok))
+    if bad:
+        return rows, "mismatch"
+    return rows, ("ok" if checked else "unverified")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="verify all public values a guest committed")
+    ap.add_argument("--pv", required=True, help="the committed public values (pv.bin / expected_pv.bin)")
+    ap.add_argument("--block", required=True, type=int)
+    ap.add_argument("--manifest", help="producer manifest (post/pre roots, and block_hash if present)")
+    ap.add_argument("--rpc", default=os.environ.get("RPC"), help="JSON-RPC URL; fills what the manifest lacks")
+    ap.add_argument("--post", help="expected post-state root — hex, or a file holding it (overrides every source)")
+    ap.add_argument("--pre", help="expected pre-state root")
+    ap.add_argument("--hash", dest="bhash", help="expected block hash")
+    ap.add_argument("--strict", action="store_true",
+                    help="treat 'no ground truth' as a failure (exit 1) instead of exit 3")
+    ap.add_argument("--quiet", action="store_true", help="print one line unless something is wrong")
+    a = ap.parse_args()
+
+    try:
+        with open(a.pv, "rb") as f:
+            pv = f.read()
+    except OSError as e:
+        print(f"check-pv: cannot read public values: {e}", file=sys.stderr)
+        return 2
+    if len(pv) < WORDS[-1][1] + 32:
+        print(f"check-pv: {a.pv} is {len(pv)} B — too short for the {len(WORDS)}-word layout", file=sys.stderr)
+        return 2
+
+    truth, src = ground_truth(a.block, a.manifest, a.rpc,
+                              {"post_state_root": norm_or_file(a.post),
+                               "pre_state_root": norm_or_file(a.pre),
+                               "block_hash": norm_or_file(a.bhash)})
+    rows, verdict = check(pv, truth)
+
+    if verdict == "empty":
+        print(f"check-pv: block {a.block}: EMPTY COMMITMENT — all {WORDS[-1][1] + 32} value bytes are zero.\n"
+              f"  The run exited cleanly and proved nothing. This is what a witness-format mismatch, or an ELF\n"
+              f"  built against a different zkVM toolchain than the emulator, looks like: no panic, plausible\n"
+              f"  step count, zero output. Rebuild the guest against the installed toolchain and re-run.",
+              file=sys.stderr)
+        return 1
+    # ONE stream for the whole report, chosen by the verdict. Printing the failing lines to stderr and the
+    # passing ones to stdout interleaves them out of order in a farm log, so a mismatch reads as if it
+    # happened before the block it belongs to.
+    out = sys.stdout if verdict == "ok" else sys.stderr
+    if verdict != "ok" or not a.quiet:
+        say = [f"check-pv: block {a.block}  [{verdict}]"]
+        for name, got, want, ok in rows:
+            mark = "  ?" if ok is None else ("  OK" if ok else "FAIL")
+            line = f"  {mark}  {name:<16} 0x{got}"
+            if ok is False:
+                line += f"\n                        expected 0x{want}  ({src.get(name, '?')})"
+            elif ok is None:
+                line += "   (no ground truth for this value)"
+            else:
+                line += f"   [{src.get(name, '?')}]"
+            say.append(line)
+        if len(pv) >= PV_LEN and any(pv[WORDS[-1][1] + 32:]):
+            say.append(f"  note: bytes past the {len(WORDS)} named words are not zero — this guest may commit "
+                       f"more\n        values than this layout names (see WORDS in cli/check-pv).")
+        print("\n".join(say), file=out)
+
+    if verdict == "mismatch":
+        print("check-pv: the proof would be valid but about the WRONG state — refusing.", file=sys.stderr)
+        return 1
+    if verdict == "unverified":
+        print("check-pv: no ground truth available — NOTHING was verified "
+              "(pass --manifest/--rpc, or --post/--pre/--hash).", file=sys.stderr)
+        return 1 if a.strict else 3
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

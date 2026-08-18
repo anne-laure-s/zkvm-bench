@@ -115,6 +115,10 @@ MOCK_PER_MSTEP="${MOCK_PER_MSTEP:-0}"   # seconds per million steps — the actu
 MOCK_SPEED="${MOCK_SPEED:-1}"
 MOCK_EXEC_FALLBACK="${MOCK_EXEC_FALLBACK:-0}"   # no exec-report? emulate the block to get its step count
 ETHPROOFS_URL=""; ETHPROOFS_TOKEN="dev"; ETHPROOFS_CLUSTER=""    # cluster defaults to the guest (distinct per prover); --ethproofs-url to also submit
+# Passed to ethproofs-submit, which verifies EVERY public value the guest committed before it submits.
+# The manifest already carries the two state roots, so this only completes the block hash — and it must
+# be passed explicitly for the prover-side POST, where ssh does not carry the environment across.
+RPC="${RPC:-}"
 BLOCKS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -143,6 +147,7 @@ while [ $# -gt 0 ]; do
     --ethproofs-url)     ETHPROOFS_URL="${2:?}"; shift 2 ;;   # also submit each proof to this ethproofs API
     --ethproofs-token)   ETHPROOFS_TOKEN="${2:?}"; shift 2 ;;
     --ethproofs-cluster) ETHPROOFS_CLUSTER="${2:?}"; shift 2 ;;
+    --rpc)               RPC="${2:?}"; shift 2 ;;             # completes the public-value check (block hash)
     --list)         echo "guests (guests.registry):"; reg_list; exit 0 ;;
     -h|--help)      usage 0 ;;
     -*)             die "unknown argument '$1' (see --help)" ;;
@@ -483,6 +488,9 @@ prove_one(){
 # timing.json, no REMOTE, or a failed remote invocation all fall back here rather than dropping a submission.
 submit_one(){  # $1=block  $2=run_dir
   local b="$1" rd="$2" slog rws rbase
+  # The producer's manifest. Function-scope because BOTH submit paths need it: it carries the two state
+  # roots ethproofs-submit verifies the guest's commitment against, and the timings it reports.
+  local mf="${WITNESS_MANIFEST:-$HOME/witness-manifest.csv}"
   # NOT a silent success. An unconfigured submission used to `return 0` here, so a farm launched without
   # --ethproofs-url proved block after block, marked each one `ok` in the ledger, and posted nothing — 1789
   # proofs produced and none delivered, with every session up and every log healthy. `is_proven()` keys on the
@@ -510,13 +518,18 @@ records and marked proven, but nothing is posted. Every block proved now is outp
     # the submission: those fields are simply dropped, and the leaderboard shows a row with only transport and
     # prove filled. That is exactly how this broke, and it broke silently.
     #
-    # So both small inputs are shipped explicitly: timing.json (~250 B, measured on this side) and the ONE
-    # manifest row for this block plus its header (~300 B). base64 so no quoting or newline survives to bite —
-    # the alphabet is shell-safe, which a CSV row with a 0x-prefixed state root is not.
-    local mf="${WITNESS_MANIFEST:-$HOME/witness-manifest.csv}" p_tim p_man
+    # So both small inputs are shipped explicitly: timing.json (~250 B, measured on this side) and the
+    # manifest rows for this block AND ITS PARENT plus the header (~450 B). base64 so no quoting or newline
+    # survives to bite — the alphabet is shell-safe, which a CSV row with a 0x-prefixed state root is not.
+    #
+    # The parent's row is there for the public-value check: the pre-state root the guest commits IS the
+    # parent's post-state root, so one extra line makes two of the three values verifiable on the prover with
+    # no RPC call at all — and the check stays armed on a prover that cannot reach the chain.
+    local p_tim p_man
     p_tim="$(base64 < "$rd/timing.json" 2>/dev/null | tr -d '\n')"
     p_man=""
-    [ -r "$mf" ] && p_man="$({ head -1 "$mf"; grep -m1 "^$b," "$mf"; } 2>/dev/null | base64 | tr -d '\n')"
+    [ -r "$mf" ] && p_man="$({ head -1 "$mf"; grep -m1 "^$((b - 1))," "$mf"; grep -m1 "^$b," "$mf"; } \
+                               2>/dev/null | base64 | tr -d '\n')"
     # One exchange: build the shaped dir, drop the two inputs in, submit, clean up. `cp` not `ln`, because
     # the workspace really does prune under it — core.sh sweeps anything stale on every block, and `ln` would
     # hand ethproofs-submit a name that can vanish mid-submission.
@@ -534,7 +547,7 @@ records and marked proven, but nothing is posted. Every block proved now is outp
          && printf %s '$p_tim' | { base64 -d 2>/dev/null || base64 -D; } > \"\$d/timing.json\" \
          && { [ -n '$p_man' ] && printf %s '$p_man' | { base64 -d 2>/dev/null || base64 -D; } > \"\$d/manifest.csv\" || true; } \
          && '$REMOTE_SUBMIT' --run-dir \"\$d\" --block '$b' ${VM:+--vm '$VM'} --guest '$GUEST' \
-              --manifest \"\$d/manifest.csv\" \
+              --manifest \"\$d/manifest.csv\" ${RPC:+--rpc '$RPC'} \
               --ethproofs-url '$ETHPROOFS_URL' --token '$ETHPROOFS_TOKEN' --cluster '$ETHPROOFS_CLUSTER'; \
          rc=\$?; rm -rf \"\$d\" '$rws/proofs/$rbase.proof.bin' '$rws/proofs/$rbase.pv.bin' \
               '$rws/reports/$rbase.json' '$rws/reports/$rbase.log'; exit \$rc" > "$slog" 2>&1; then
@@ -572,6 +585,7 @@ records and marked proven, but nothing is posted. Every block proved now is outp
   log ">> submit $b → $ETHPROOFS_URL"
   if "$HERE/ethproofs-submit" --run-dir "$rd" --block "$b" ${VM:+--vm "$VM"} --guest "$GUEST" \
         --ethproofs-url "$ETHPROOFS_URL" --token "$ETHPROOFS_TOKEN" --cluster "$ETHPROOFS_CLUSTER" \
+        ${mf:+--manifest "$mf"} ${RPC:+--rpc "$RPC"} \
         >> "$slog" 2>&1; then
     log "<< submit $b ok  ($(tail -n1 "$slog"))"
   else

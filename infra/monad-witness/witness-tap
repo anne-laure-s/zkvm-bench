@@ -59,6 +59,9 @@ latency is measured on ONE clock and never mixes in the laptop's:
   bytes            witness size
   post_state_root  the expected root, the anchor for `run verify EXPECTED_ROOT=…`
   promoted         1 if it was framed into the queue, 0 if it was not (too far behind)
+  block_hash       the header hash, from the same RPC call as t_block (empty for non-promoted). With the
+                   two roots it completes the ground truth for cli/check-pv, which verifies every value the
+                   guest commits before a proof is submitted.
 
 Deliberately NOT here: proving and submission timings. Those come from prove-farm's report.json and the
 mock's submissions.jsonl; joining the three is the latency report, not this loop's job.
@@ -123,7 +126,7 @@ CHAIN_ID      = env("CHAIN_ID", "1")
 QUEUE     = os.path.join(REPO, "guests", GUEST, "fixtures")
 GEN_INPUT = os.path.join(REPO, "guests", GUEST, "gen-inputs")
 FIELDS    = ["block", "t_block", "t_avail", "t_witness", "t_queued", "bytes", "post_state_root", "promoted",
-             "warmup"]
+             "warmup", "block_hash"]
 _manifest_fields = None      # the header the FILE actually has; resolved once per process
 
 def log(msg):
@@ -144,12 +147,16 @@ def chain_tip():
         log(f"warn: chain tip unavailable ({e})")
         return None
 
-def block_time(n):
+def block_header(n):
+    """-> (timestamp, hash), both "" on failure. ONE RPC call for both: the response that carries the
+    header timestamp carries the hash too, so recording the hash costs nothing."""
     try:
         b = rpc("eth_getBlockByNumber", [hex(n), False])
-        return int(b["timestamp"], 16) if b else ""
+        if not b:
+            return "", ""
+        return int(b["timestamp"], 16), (b.get("hash") or "")
     except Exception:                                         # noqa: BLE001
-        return ""
+        return "", ""
 
 def block_db_mtime(n):
     for p in (os.path.join(BLOCK_DB, str(n)), os.path.join(BLOCK_DB, f"{n // 1_000_000}M", str(n))):
@@ -515,9 +522,10 @@ def cycle(seen, dry):
             if dry:
                 log(f"[dry-run] would record block {b} (promoted={1 if is_cadence else 0})")
             else:
+                t_blk, blk_hash = block_header(b) if is_cadence else ("", "")
                 append_manifest({
                     "block": b,
-                    "t_block": block_time(b) if is_cadence else "",  # 1 RPC call per queued block (~1/slot)
+                    "t_block": t_blk,                                # 1 RPC call per queued block (~1/slot)
                     "t_avail": block_db_mtime(b),
                     "t_witness": round(os.path.getmtime(wit), 3) if os.path.exists(wit) else "",
                     "t_queued": t_queued,
@@ -527,6 +535,11 @@ def cycle(seen, dry):
                     # Recorded so the coverage denominator stays honest AND a 0 here is explicable: a
                     # warm-up block was never a candidate, it is not a block the prover missed.
                     "warmup": 1 if warmup else 0,
+                    # The third public value the guest commits. post_state_root anchors the state and the
+                    # parent's row anchors the pre-state, so writing the hash here completes the ground truth
+                    # cli/check-pv needs — and completes it LOCALLY, so the submission path verifies every
+                    # value without a single RPC call on the hot path.
+                    "block_hash": blk_hash,
                 })
                 seen.add(b)
                 # The raw witness is now redundant, so it goes immediately — this is the whole point: the

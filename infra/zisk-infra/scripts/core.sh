@@ -588,6 +588,30 @@ verify_local() {
     fi
   fi
 
+  # 2b. EVERY public value, not only the post-state root. The guest commits three — pre-state root,
+  #     post-state root, block hash — and checking one of them leaves two unchecked: a run that commits
+  #     nothing at all (all-zero public values, which is what a guest built against a different zkVM
+  #     toolchain than the emulator produces) passes an EXPECTED_ROOT check only because EXPECTED_ROOT was
+  #     not set. cli/check-pv holds the layout and the comparison, and the submission path gates on the same
+  #     file, so this verb and the pipeline agree by construction.
+  #     Needs a block number: taken from the run record's report.json. RPC completes what the caller did not
+  #     supply; without one, the two roots still check against EXPECTED_ROOT/the manifest.
+  local checkpv; checkpv="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/cli/check-pv"
+  local vblock="${BLOCK:-}"
+  if [[ -z "$vblock" && -f "$pdir/report.json" ]]; then
+    vblock="$(sed -n 's/.*"block"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' "$pdir/report.json" | head -1)"
+  fi
+  if [[ -x "$checkpv" && -f "$pv" && -n "$vblock" ]]; then
+    echo "--- cross-checking ALL public values (block $vblock) ---"
+    "$checkpv" --pv "$pv" --block "$vblock" ${MANIFEST:+--manifest "$MANIFEST"} ${RPC:+--rpc "$RPC"} \
+               ${EXPECTED_ROOT:+--post "$EXPECTED_ROOT"}
+    case $? in
+      0) ;;
+      1) echo "ERROR: the committed public values are not this block's — see above" >&2; return 1 ;;
+      *) echo "WARN: could not establish ground truth for every public value (set RPC=<url> or MANIFEST=<csv>)" >&2 ;;
+    esac
+  fi
+
   # 3. Legacy full PV cross-check, only when the ELF and witness happen to be here.
   if [[ -n "${ELF:-}" && -n "${INPUT:-}" && -f "${ELF:-}" && -f "${INPUT:-}" ]]; then
     echo "--- recomputing expected public values (local emulation) ---"
