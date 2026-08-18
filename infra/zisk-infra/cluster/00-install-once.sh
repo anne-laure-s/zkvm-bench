@@ -135,8 +135,13 @@ echo "== patch memlock (unprivileged Docker / vast.ai: memlock hard-capped ~64 K
 # fix-memlock-patch.sh for the standalone version (+ cache purge when re-patching).
 GLB="$HOME/.zisk/zisk/emulator-asm/src/globals.c"
 if [ -f "$GLB" ] && grep -q '^int map_locked_flag = MAP_LOCKED;' "$GLB"; then
+  # Keep the pristine file, exactly as fix-memlock-patch.sh does. Without it, a box installed
+  # through THIS script alone has a patched globals.c and no backup — and tests/t4-memlock.sh
+  # reads a missing .orig as "never patched", so its `locked` arm would run unlocked under the
+  # wrong label and exonerate memlock on a measurement it never made.
+  [ -f "$GLB.orig" ] || cp "$GLB" "$GLB.orig"
   sed -i 's|^int map_locked_flag = MAP_LOCKED;|int map_locked_flag = 0; /* PATCH: unprivileged-Docker memlock cap, unlock by default */|' "$GLB"
-  echo "  patched map_locked_flag -> 0 in $GLB"
+  echo "  patched map_locked_flag -> 0 in $GLB (pristine copy kept at $GLB.orig)"
 elif [ -f "$GLB" ]; then
   echo "  (map_locked_flag already patched or default changed — ok)"
 else

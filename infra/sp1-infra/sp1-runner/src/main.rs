@@ -378,7 +378,7 @@ fn main() -> Result<()> {
             let pv_bytes = proof.public_values.as_slice().to_vec();
             println!("Public values : {} bytes", pv_bytes.len());
 
-            // Vérification (sauf si --skip-verify)
+            // Verification (unless --skip-verify)
             let verify_dt = if !args.skip_verify {
                 let t_verify = Instant::now();
                 prover

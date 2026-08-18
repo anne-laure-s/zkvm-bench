@@ -15,7 +15,10 @@ PASSES="${PASSES:-3}"; WARMUPS="${WARMUPS:-2}"
 
 mapfile -t BLOCKS < <(ls "$HOME"/1-*.bin 2>/dev/null | grep -v '\.pv\.bin$')
 [ "${#BLOCKS[@]}" -ge 1 ] || { echo "ERROR: no ~/1-*.bin inputs"; exit 1; }
-grep -qa "Registered worker" "$HOME/zisk-infra/cluster/logs/coordinator.log" 2>/dev/null \
+# `(^|[^a-z])registered`, case-insensitive: upstream has logged both "Registered worker …" and
+# "worker registered: …", and the guard excludes the UNregistered/DEregistered lines a previous
+# worker's teardown leaves behind. Matching one exact wording refuses to run on the other.
+grep -qaiE '(^|[^a-z])registered' "$HOME/zisk-infra/cluster/logs/coordinator.log" 2>/dev/null \
   || { echo "ERROR: worker not registered — run start.sh (NO_MPI) and wait for registration first."; exit 1; }
 
 echo "== remote setup (idempotent) =="
