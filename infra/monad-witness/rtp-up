@@ -373,6 +373,100 @@ onbox(){ if [ "$DRY" = 1 ]; then printf '   [%s] $ %s\n' "$BOX" "$*"; else ssh "
 # point of a dry run).
 onbox_q(){ ssh -o BatchMode=yes "$BOX" "$*" 2>/dev/null; }
 
+# sweep_leftovers <start|stop> — kill what a previous run left behind that no tmux session owns any more.
+#
+# `tmux kill-session` does NOT kill a process that has already been reparented. When a session dies while its
+# command runs, init (or launchd) adopts the child and it keeps going — invisible to every `tmux ls` and to every
+# check in this script. Restarting then does not replace it, it ADDS a second one.
+#
+# Two prove-farms on one prover workspace is the case that matters. Both pick the same head of the same queue,
+# both stage the input into the same $PROVER_WS/inputs/, and whichever finishes first deletes that input as part
+# of its retention. The other one's emulation then opens a file that is gone: no crash, just "Could not read
+# inputs file", a fall back to the fixed term of the cost model, and from then on every block carries a
+# fabricated duration and NO public values. One farm orphaned on 2026-08-17 ran 36 h beside the real one and
+# made 32 consecutive proofs measure nothing, while every session, log and heartbeat read healthy.
+#
+# THE BRACKET TRICK IS NOT COSMETIC. `ssh box "pkill -f cli/prove-farm"` puts that pattern on the box's own
+# command line, so pkill matches the shell running it and kills its own parent: the ssh returns 255 and the
+# sweep reads as a connection failure. `[c]li/prove-farm` matches the process but never the literal pattern.
+#
+# On the PROVER the patterns stay narrow on purpose. A bare `pkill -f ziskemu` would also kill unrelated
+# emulations — profiling/series runs six at a time on this Mac — so everything except the pump is matched only
+# inside the prover's own workspace, and skipped entirely when that path is not resolved yet.
+sweep_leftovers() {
+  local mode="$1" pat n killed=0
+  # start only: witness-follow restarts the fetcher a few steps later, so an orphan of it would become a second
+  # writer on one block_db. --stop leaves the fetcher alone by design (the block_db is cheap and reusable).
+  while IFS= read -r pat; do
+    [ -n "$pat" ] || continue
+    # </dev/null on every ssh in this loop: ssh reads stdin, and stdin here IS the pattern list. Without it
+    # the first iteration swallows the rest of the heredoc and the sweep silently checks one pattern out of five.
+    n="$(onbox_q "pgrep -cf \"$pat\"" </dev/null | tr -d ' \n')"
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    [ "$n" = 0 ] && continue
+    say "box: $n process(es) matching $pat — killing"
+    onbox "pkill -f \"$pat\" || true" </dev/null
+    killed=$((killed + n))
+  done <<BOXPATS
+[c]li/prove-farm
+[w]itness-tap
+[w]itness-follow supervise
+[r]un_replay.py
+build/cmd/[m]onad --chain
+$([ "$mode" = start ] && echo '[f]etch_blocks.py')
+BOXPATS
+
+  # The prover: the pump and its channels are ours by name, so they are safe to match anywhere.
+  while IFS= read -r pat; do
+    [ -n "$pat" ] || continue
+    run "pkill -f \"$pat\" 2>/dev/null || true" </dev/null
+  done <<PROVPATS
+[w]itness-pump serve
+exec .*[w]itness-pump send
+[w]itness-pump exec-host
+exec .*[w]itness-pump exec-agent
+PROVPATS
+  if [ -n "${RUNNER_DIR:-}" ] && [ -n "${PROVER_WS:-}" ]; then
+    run "pkill -f '$RUNNER_DIR/[z]isk-runner' 2>/dev/null || true"
+    run "pkill -f '[z]iskemu .*$PROVER_WS' 2>/dev/null || true"
+  else
+    say "prover: workspace not resolved here — leaving zisk-runner/ziskemu alone rather than matching them broadly"
+  fi
+  # NOT "orphans killed": this matches by pattern, so it also takes the session-owned processes — which is
+  # correct on both paths (start restarts them below, stop is stopping them anyway). Claiming orphanhood in the
+  # output would misreport the ordinary case as an incident every single run.
+  [ "$killed" = 0 ] && say "nothing left running on the box" || say "$killed process(es) killed on the box"
+  [ "$killed" = 0 ] && return 0
+
+  # AND CHECK THEY ACTUALLY DIED. `pkill` reports that it delivered a signal, not that anything exited, and this
+  # whole sweep exists because a process nobody could see kept running. A survivor is not cosmetic: a second
+  # prove-farm against one workspace is exactly the failure above, so on `start` it is fatal — continuing would
+  # rebuild the situation we just came to clear. On `stop` there is nothing left to protect, so it warns.
+  [ "$DRY" = 1 ] && return 0
+  sleep 1
+  local survivors=""
+  while IFS= read -r pat; do
+    [ -n "$pat" ] || continue
+    n="$(onbox_q "pgrep -cf \"$pat\"" </dev/null | tr -d ' \n')"
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    [ "$n" = 0 ] || survivors="$survivors $pat($n)"
+  done <<SURVIVORS
+[c]li/prove-farm
+[w]itness-tap
+[w]itness-follow supervise
+build/cmd/[m]onad --chain
+SURVIVORS
+  if [ -n "$survivors" ]; then
+    say "STILL RUNNING after the kill:$survivors"
+    onbox_q "pgrep -af '[c]li/prove-farm|[w]itness-tap' | head -5" </dev/null | sed 's/^/     /'
+    if [ "$mode" = start ]; then
+      die "the box still has processes this run would duplicate — kill them by hand (ssh $BOX 'pgrep -af \
+prove-farm; kill <pid>') and re-run. Starting now would put two farms on one prover workspace."
+    fi
+    say "left over after --stop; kill them by hand if they matter"
+  fi
+}
+
 # alert_error — the line that says WHY, pulled out of logs/ALERT.
 # The ALERT is a 3-line header plus `tail -40` of the run's log, so the failure is at its END, not its
 # start. Showing `head -3` gives "monad exited 1 / log: … / last lines:" and nothing else — which is how a
@@ -426,6 +520,8 @@ if [ "$STOP" = 1 ]; then
   run "pkill -f 'rtp-up-tunnel' || true"
   run "pkill -f 'R $TUN_SSH_PORT:127.0.0.1:22' || true"
   run "pkill -f ethproofs-mock || true"
+  step "Killing anything left running"
+  sweep_leftovers stop
   say "the fetcher on the box is left running (the block_db is cheap and reusable)"
   exit 0
 fi
@@ -436,6 +532,14 @@ fi
 # an uncommitted notes file was pure friction.
 # The one asymmetry worth naming: the box runs the PUSHED version, while the runner staged on this Mac at
 # step 1 is copied from the WORKING TREE. So uncommitted changes can make the two ends disagree.
+# BEFORE ANYTHING IS STARTED, and that is the whole point. Placed later — even one step later — it kills the
+# services this same run just launched: the data pump, the exec host and their channels all match its patterns,
+# and nothing restarts them. That is exactly what happened on 2026-08-19: every launch left a dead pump behind
+# a stale socket, the workspace probe failed on it, and 26 consecutive blocks died in one second each while the
+# transport that did work fell back to scp at a fifth of the link's speed.
+step "Leftovers from a previous run"
+sweep_leftovers start
+
 step "This repo's state"
 cd "$MAC_REPO" || die "cannot cd to $MAC_REPO"
 say "$(git log --oneline -1)"
