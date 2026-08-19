@@ -604,6 +604,44 @@ prove without delivering." >&2
   exit 2
 fi
 
+# ONE WATCHER, and the reason is not tidiness. Two --watch farms against the same prover workspace destroy
+# each other's work: both pick the same head of the same queue, both stage the input into the same
+# $REMOTE_WS/inputs/, and whichever finishes first DELETES that input as part of its retention — so the other
+# one's emulation opens a file that is no longer there. It does not crash: the runner reports "Could not read
+# inputs file", falls back to the fixed term of the cost model, and every block after that carries a fabricated
+# duration and NO public values. Nothing else in the pipeline notices.
+#
+# That is not hypothetical. A farm orphaned on 2026-08-17 (its tmux session died, init adopted the process)
+# was still running 36 h later beside the real one, and had turned every proof into a measurement of nothing.
+# It also predated the --ethproofs-url guard above, so it proved and submitted nothing for a day and a half.
+#
+# Killing the tmux session is NOT enough to prevent this — a reparented child survives it, which is exactly how
+# that one lasted. So the exclusion has to live here, held by the process itself for as long as it runs.
+# Keyed on $RUNDATA: both farms write the same ledger and both drive the same workspace, so one per run-data is
+# the right granularity. Batch runs are exempt, like the guard above — a one-shot re-prove of a fixed list is a
+# legitimate thing to do while a watcher runs.
+if [ "$WATCH" = 1 ]; then
+  LOCKF="${PROVE_FARM_LOCK:-$RUNDATA/prove-farm.watch.lock}"
+  mkdir -p "$(dirname "$LOCKF")"
+  if command -v flock >/dev/null 2>&1; then
+    exec 8>>"$LOCKF" || die "cannot open the watch lock $LOCKF"
+    if flock -n 8; then
+      # Truncate and stamp only AFTER the lock is ours, so a refused start never erases the holder's identity.
+      : > "$LOCKF"; printf 'pid %s started %s
+' "$$" "$(date +%FT%T)" >&8
+    else
+      echo "prove-farm: REFUSING to start — another prove-farm --watch already holds $LOCKF:" >&2
+      sed "s/^/  /" "$LOCKF" >&2 2>/dev/null
+      echo "  Two watchers on one prover workspace delete each other's staged inputs, and the loser's proofs silently become fabricated timings with no public values. Stop the other one first:" >&2
+      echo "    pgrep -af 'prove-farm .*--watch'   then   kill <pid>" >&2
+      echo "  (a farm whose tmux session died is reparented to init and keeps running — check for that too)" >&2
+      exit 2
+    fi
+  else
+    echo "prove-farm: WARNING no flock available — cannot guarantee a single watcher. Check by hand that no other 'prove-farm --watch' is running against $RUNDATA." >&2
+  fi
+fi
+
 log "prove-farm: guest=$GUEST ($REG_DESC) stack=$REG_INFRA remote=$([ "$MOCK" = 1 ] && { [ -n "$REMOTE" ] && echo "$REMOTE (mock prover)" || echo mock-cluster; } || echo "$REMOTE") mode=${MODE:-<default>}$([ "$WATCH" = 1 ] && echo ' [watch]')$([ "$NEWEST_FIRST" = 1 ] && echo ' [newest-first]')$([ "$MOCK" = 1 ] && { [ -n "$REMOTE" ] && echo ' [mock prover on a real remote — transfers are real]' || echo ' [mock-cluster, no box]'; })${ETHPROOFS_URL:+ [submit→$ETHPROOFS_URL cluster=$ETHPROOFS_CLUSTER]}  (out=$OUT)"
 
 if [ "$WATCH" = 1 ]; then
