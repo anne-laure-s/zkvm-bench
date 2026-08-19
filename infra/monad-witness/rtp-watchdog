@@ -30,9 +30,9 @@ MONAD_DIR="${MONAD_DIR:-$HOME/monad}"
 STATE="${WATCHDOG_STATE:-$HOME/.rtp-watchdog-state}"
 LOG="${WATCHDOG_LOG:-$HOME/rtp-watchdog.log}"
 LOCK="${WATCHDOG_LOCK:-$HOME/.rtp-watchdog.lock}"
-# Sessions the tip phase owns. `prove` is the farm and is started by rtp-up, not by witness-follow, so its
-# absence is reported but not repaired from here — restarting a prover needs the Mac's environment.
-TIP_SESSIONS="${TIP_SESSIONS:-fetch replay-tip tap}"
+# Sessions the tip phase owns: asked of ./witness-follow below, because that is what creates them. `prove` is
+# the farm and is started by rtp-up, not by witness-follow, so its absence is reported but not repaired from
+# here — restarting a prover needs the Mac's environment. TIP_SESSIONS= overrides the list.
 MAX_RESTARTS="${WATCHDOG_MAX_RESTARTS:-6}"      # inside the window below
 WINDOW_SECS="${WATCHDOG_WINDOW_SECS:-3600}"
 DRY=0
@@ -120,6 +120,18 @@ proof is missed. Restarting the prover from the recorded invocation."
   if restart_prover; then
     [ "$DRY" = 1 ] || { echo "$(date +%s)" >> "$STATE"; say "prover restarted from $PROVE_CMD_FILE"; }
   fi
+fi
+
+# The list, from the one thing that creates those sessions. A copy kept here would be a second place to
+# update, and the copy that falls behind is the invisible one: a session this does not name is a session
+# nothing restarts, on the box whose whole point is that nobody is watching it.
+[ -n "${TIP_SESSIONS:-}" ] || TIP_SESSIONS="$("$HERE/witness-follow" sessions tip 2>/dev/null)"
+# EMPTY is not "nothing to check", it is "no check at all": the loop below would find nothing missing, report
+# everything up and exit 0 — quietly, 288 times a day, with the pipeline down. So refuse to run instead.
+if [ -z "$(printf '%s' "$TIP_SESSIONS" | tr -d ' \t\n')" ]; then
+  say "cannot read the tip session list from $HERE/witness-follow ('sessions tip' printed nothing) — refusing \
+to run, because an empty list would report a dead pipeline as healthy. Fix that path, or set TIP_SESSIONS."
+  exit 1
 fi
 
 missing=""

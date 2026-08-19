@@ -27,6 +27,8 @@
 #   ./witness-follow start [catchup|tip]     start the tmux sessions for that phase
 #   ./witness-follow status                  where everything is (read-only)
 #   ./witness-follow stop                    SIGTERM the replay/tap (leaves the fetcher alone)
+#   ./witness-follow sessions [catchup|tip]  print the tmux sessions that phase owns (read-only). ./rtp-watchdog
+#                                            asks for them rather than keeping a second copy of the list.
 #
 # Config (env): MONAD_DIR REPO WITNESS_DIR BLOCK_DB DB RPC NTHREADS MAX_BATCH MIN_FOLLOW_BATCH
 #               PY ETHPROOFS_URL CLUSTER PROVE_EVERY KEEP_RECENT SKIP_AFTER
@@ -374,6 +376,9 @@ case "${1:-plan}" in
   supervise) cmd_supervise ;;
   stop)   cmd_stop ;;
   status) cmd_status ;;
-  -h|--help) sed -n '2,30p' "$0" ;;
-  *) die "unknown command '${1}' (plan | start | tip | status | stop)" ;;
+  sessions) shift || true
+            case "${1:-catchup}" in catchup|tip) ;; *) die "phase must be catchup or tip" ;; esac
+            phase_sessions "${1:-catchup}" ;;
+  -h|--help) sed -n '2,31p' "$0" ;;
+  *) die "unknown command '${1}' (plan | start | supervise | status | stop | sessions)" ;;
 esac
