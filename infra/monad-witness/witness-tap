@@ -124,6 +124,11 @@ SOURCE        = env("SOURCE", socket.gethostname().split(".")[0])
 CHAIN_ID      = env("CHAIN_ID", "1")
 
 QUEUE     = os.path.join(REPO, "guests", GUEST, "fixtures")
+# Where a witness kept for PROFILING goes once it is out of the proving window. A subdirectory of the queue,
+# because cli/prove-farm scans it with `find -maxdepth 1`: the files stay beside the queue they came from,
+# stay findable by hand and by the profiling tools, and are invisible to the prover. The queue then means one
+# thing only — blocks the prover should still attempt — which is what makes "consume the queue" a safe rule.
+KEPT      = env("KEPT_DIR", os.path.join(QUEUE, "kept"))
 GEN_INPUT = os.path.join(REPO, "guests", GUEST, "gen-inputs")
 FIELDS    = ["block", "t_block", "t_avail", "t_witness", "t_queued", "bytes", "post_state_root", "promoted",
              "warmup", "block_hash"]
@@ -353,14 +358,39 @@ def queued_blocks():
 
 def prune(blocks, last, sizes, status, dry):
     """Apply the retention policy to BOTH the raw dump dir and the framed queue. Returns
-    (dropped, abandoned, unqueued, kept_by_reason).
+    (dropped, abandoned, parked, kept_by_reason).
 
     The candidate set is the UNION of the two dirs, not just the dump dir: a framed input whose raw
     witness is already gone (the tap restarted, the dump dir was cleaned by hand) would otherwise never be
     re-examined, and cli/prove-farm would keep pulling ancient blocks out of the queue — the exact opposite
     of the RTP policy. Seen for real in a rehearsal: stale inputs 100 blocks behind the tip got proved."""
-    dropped = abandoned = 0
+    dropped = abandoned = parked = 0
     kept = {}
+
+    def park_queue_entry(b):
+        """Move a kept-for-profiling input OUT of the queue. Returns how many files moved.
+
+        Keeping a witness and offering it to the prover are two different decisions, and conflating them
+        costs real proof slots: `in_window` already stops the tap from FRAMING an old block, but a block
+        framed while it was recent and then kept as `big` stayed in the queue for ever, so --newest-first
+        came back to it every time the queue drained. Seen twice — 25641069/25641121 proved at tip 25641348,
+        and again on 2026-08-19 with blocks 355-375 behind the tip. Moving the file is what makes the two
+        decisions physically separate instead of merely documented."""
+        n = 0
+        for suffix in (".bin", ".post_state_root"):
+            src = os.path.join(QUEUE, f"{CHAIN_ID}-{b}{suffix}")
+            if not os.path.exists(src):
+                continue
+            if dry:
+                n += 1
+                continue
+            try:
+                os.makedirs(KEPT, exist_ok=True)
+                os.replace(src, os.path.join(KEPT, f"{CHAIN_ID}-{b}{suffix}"))
+                n += 1
+            except OSError as e:                              # noqa: BLE001 — never fatal
+                log(f"warn: cannot park {os.path.basename(src)} ({e})")
+        return n
 
     def drop_queue_entry(b):
         """Remove the framed input (never the .exec-report.json: it outlives the witness)."""
@@ -398,6 +428,9 @@ def prune(blocks, last, sizes, status, dry):
         reason = keep_reason(b, last, bytes_of(b), status)
         if reason:
             kept[reason] = kept.get(reason, 0) + 1
+            # Worth its bytes, but no longer worth a proof slot: out of the queue it goes.
+            if not in_window(b, last):
+                parked += park_queue_entry(b)
             continue
         if status.get(b, (None, None))[0] != "ok":
             abandoned += 1
@@ -406,7 +439,7 @@ def prune(blocks, last, sizes, status, dry):
         safe_unlink(os.path.join(WITNESS_DIR, f"{b}.post_state_root"), dry)
         drop_queue_entry(b)
         dropped += 1
-    return dropped, abandoned, kept
+    return dropped, abandoned, parked, kept
 
 def queue_files():
     """How many framed inputs sit in the queue.
@@ -551,7 +584,7 @@ def cycle(seen, dry):
 
 
     # Retention runs over everything present, driven by what the prover has actually done.
-    dropped, abandoned, kept = prune(blocks, last, sizes, status, dry)
+    dropped, abandoned, parked, kept = prune(blocks, last, sizes, status, dry)
     raw_left = len([n for n in os.listdir(WITNESS_DIR) if WITNESS_RE.match(n)]) if os.path.isdir(WITNESS_DIR) else 0
 
     tip = chain_tip()
@@ -561,7 +594,8 @@ def cycle(seen, dry):
     # framing is failing or the replay is outrunning the tap.
     log(f"{'[dry-run] ' if dry else ''}last_witness={last} tip={tip} lag={lag} queued={promoted}"
         f"{f' stale={stale}' if stale else ''} dropped={dropped}"
-        f"{f' (abandoned {abandoned})' if abandoned else ''} kept[{kept_str}] "
+        f"{f' (abandoned {abandoned})' if abandoned else ''}"
+        f"{f' parked={parked}' if parked else ''} kept[{kept_str}] "
         f"queue={queue_files()} raw={raw_left}")
     # No heartbeat on a dry run: "dry" has to mean no side effects anywhere, including the dashboard.
     if not dry:
