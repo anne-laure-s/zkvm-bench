@@ -455,19 +455,33 @@ PROVPATS
   # kill used is re-checked, so on `start` any of them is fatal — continuing would rebuild the situation we just
   # came to clear. On `stop` there is nothing left to protect, so it warns.
   [ "$DRY" = 1 ] && return 0
-  sleep 1
-  local survivors=""
-  while IFS= read -r pat; do
-    [ -n "$pat" ] || continue
-    n="$(onbox_q "pgrep -cf \"$pat\"" </dev/null | tr -d ' \n')"
-    case "$n" in ''|*[!0-9]*) n=0 ;; esac
-    [ "$n" = 0 ] || survivors="$survivors $pat($n)"
-  done <<<"$boxpats"
+  # pkill is ASYNCHRONOUS: it delivers a signal and returns. A `witness-pump send` with an open ssh channel and
+  # a 7 MB transfer in flight, or a python process unwinding one, routinely needs more than a second. Every
+  # pattern is now fatal on `start`, so a single check would turn a slow exit into a refused run — which is a
+  # new way to not start, not a guard. So POLL, and re-check only what is still there: a pattern that clears on
+  # try 3 was never a survivor. Nothing here waits on the ordinary case, which clears on the first try.
+  local pending="$boxpats" still="" survivors="" try
+  for try in 1 2 3 4 5; do
+    sleep 1
+    still=""; survivors=""
+    while IFS= read -r pat; do
+      [ -n "$pat" ] || continue
+      n="$(onbox_q "pgrep -cf \"$pat\"" </dev/null | tr -d ' \n')"
+      case "$n" in ''|*[!0-9]*) n=0 ;; esac
+      [ "$n" = 0 ] && continue
+      still="$still$pat
+"
+      survivors="$survivors $pat($n)"
+    done <<<"$pending"
+    [ -z "$still" ] && break
+    [ "$try" = 5 ] || say "still exiting after ${try}s:$survivors — waiting"
+    pending="$still"
+  done
   if [ -n "$survivors" ]; then
-    say "STILL RUNNING after the kill:$survivors"
-    # The same list again, as one ERE, so the line that says WHAT survived can name any of them. A fixed
+    say "STILL RUNNING ${try}s after the kill:$survivors"
+    # What SURVIVED, as one ERE, so the line that says which processes they are can name any of them. A fixed
     # two-pattern probe printed nothing for the other five, which reads as "reported, but not there".
-    onbox_q "pgrep -af '$(printf '%s' "$boxpats" | tr '\n' '|' | sed 's/|$//')' | head -5" </dev/null \
+    onbox_q "pgrep -af '$(printf '%s' "$pending" | tr '\n' '|' | sed 's/|$//')' | head -5" </dev/null \
       | sed 's/^/     /'
     if [ "$mode" = start ]; then
       die "the box still has processes this run would duplicate — kill them by hand (ssh $BOX 'pgrep -af \
