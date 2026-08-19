@@ -117,6 +117,31 @@ def mode_send():
                         if not chunk:
                             break                       # file shrank: the reader times out on a short body
                         out.write(chunk); left -= len(chunk)
+            elif req.startswith("SHARE\t"):
+                # ONE CHANNEL'S SHARE, SPLIT BY THE BOX. The caller used to ask SIZE first and then N
+                # ranges: two round trips before the first byte, 170 ms of the 538 ms fixed cost on an
+                # 85 ms link. Here the box owns the arithmetic and states it in the reply — total size,
+                # this share's offset, this share's length — so N requests can go out at once with
+                # nothing known in advance, and the two sides cannot disagree about the split.
+                # An older box has no such verb: `getsize` on the whole request line raises, the handler
+                # answers LE64(-1) and the channel survives, which is what the caller falls back on.
+                _, path, i, n = req.split("\t", 3)
+                i, n = int(i), int(n)
+                size = os.path.getsize(path)
+                step = size // n
+                off = i * step
+                ln = (size - off) if i == n - 1 else step
+                with open(path, "rb") as f:
+                    f.seek(off)
+                    out.write(HDR.pack(size))
+                    out.write(HDR.pack(off))
+                    out.write(HDR.pack(ln))
+                    left = ln
+                    while left:
+                        chunk = f.read(min(1 << 20, left))
+                        if not chunk:
+                            break               # file shrank: the reader times out on a short body
+                        out.write(chunk); left -= len(chunk)
             elif req.startswith("SIZE\t"):
                 out.write(HDR.pack(os.path.getsize(req.split("\t", 1)[1])))
             else:
@@ -253,6 +278,36 @@ class Channel:
                 b = self._readn(min(1 << 20, left), deadline)
                 f.write(b); left -= len(b)
 
+    def share_into(self, src, i, n, part, on_size):
+        """This channel's share of `src`, split N ways by the box. Returns the share's length, or None if
+        the box does not know the verb — the caller then uses the SIZE + GET path.
+
+        No size is needed to send this: that is the whole point. The reply opens with the total size, so
+        the first worker to read a header preallocates the file and releases the others."""
+        deadline = time.time() + TIMEOUT
+        if not self.connect():
+            raise ConnectionError(f"channel {self.idx}: no connection")
+        self.p.stdin.write(f"SHARE\t{src}\t{i}\t{n}\n".encode()); self.p.stdin.flush()
+        (size,) = HDR.unpack(self._readn(HDR.size, deadline))
+        if size < 0:
+            # Unreadable file, or a box that predates SHARE. Tell the others so none of them waits for a
+            # preallocation that will never come.
+            on_size(None)
+            return None
+        (off,) = HDR.unpack(self._readn(HDR.size, deadline))
+        (ln,) = HDR.unpack(self._readn(HDR.size, deadline))
+        # on_size both preallocates (once) and holds every worker until that is done, so no one truncates a
+        # file another is already writing into. False means the transfer is dead.
+        if not on_size(size):
+            return None
+        with open(part, "r+b") as f:
+            f.seek(off)
+            left = ln
+            while left:
+                b = self._readn(min(1 << 20, left), deadline)
+                f.write(b); left -= len(b)
+        return ln
+
     def fetch(self, src, dst):
         """Whole file over this one channel — the single-channel path, unchanged."""
         if not self.connect():
@@ -303,9 +358,84 @@ class Pool:
         for c in self.chs:
             c.close()
 
+    def _fetch_shared(self, src, dst):
+        """N shares in flight with NOTHING known in advance — no SIZE round trip. Returns the byte count,
+        or None if the box has no SHARE verb (nothing is written in that case).
+
+        This is the 85 ms the old path spent asking for a size before it could divide it: the box divides,
+        and says so in each reply. The arithmetic exists in one place now, which also means the two sides
+        cannot drift into splitting the same file differently."""
+        n = len(self.chs)
+        part = dst + ".part"
+        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+        with open(part, "wb"):
+            pass
+        ready = threading.Event()
+        lock = threading.Lock()
+        state = {"size": 0, "dead": False}
+
+        def on_size(size):
+            with lock:
+                if size is None:
+                    state["dead"] = True
+                    ready.set()
+                    return False
+                if not ready.is_set():
+                    with open(part, "r+b") as f:
+                        f.truncate(size)                      # sized once, so every worker can seek freely
+                    state["size"] = size
+                    ready.set()
+            if not ready.wait(TIMEOUT):                       # outside the lock: waiting under it deadlocks
+                return False
+            return not state["dead"]
+
+        errs, done, unknown = [], [0] * n, []
+
+        def work(i, ch):
+            try:
+                with ch.lock:
+                    r = ch.share_into(src, i, n, part, on_size)
+                if r is None:
+                    unknown.append(ch.idx)
+                else:
+                    done[i] = r
+            except Exception as e:                            # noqa: BLE001 — every failure is a fallback
+                errs.append(f"ch{ch.idx}: {e}")
+                ch.close()                                    # a torn stream would mis-frame later requests
+                on_size(None)                                 # never leave a sibling waiting on this one
+
+        ts = [threading.Thread(target=work, args=(i, self.chs[i]), daemon=True) for i in range(n)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(TIMEOUT + 10)
+        if unknown and not errs:
+            try:
+                os.unlink(part)
+            except OSError:
+                pass
+            return None
+        if errs or not state["size"] or sum(done) != state["size"]:
+            try:
+                os.unlink(part)
+            except OSError:
+                pass
+            raise ConnectionError(
+                "share fetch failed: " + ("; ".join(errs) if errs
+                                          else f"short body ({sum(done)} of {state['size']} B)"))
+        os.replace(part, dst)
+        return state["size"]
+
     def fetch(self, src, dst):
         if len(self.chs) == 1:
             return self.chs[0].fetch(src, dst)
+        if not getattr(self, "no_share", False):
+            got = self._fetch_shared(src, dst)
+            if got is not None:
+                return got
+            # Only an old box answers that way, and it will answer that way every time: ask once, then stop.
+            self.no_share = True
+            log("the box has no SHARE verb — falling back to SIZE+GET, one extra round trip per witness")
         size = self.chs[0].size_of(src)
         if size <= 0:
             raise FileNotFoundError(src)
