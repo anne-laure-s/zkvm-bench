@@ -12,12 +12,18 @@
 # That second case shares its witness set rather than copying gigabytes: point the generation's `witnesses` at
 # the one it reads, and the format checks below still see the real bytes through the link.
 #
-#   ./use-gen                 list generations, mark the current one
-#   ./use-gen <generation>    point `current` at it and install its ELFs
+#   ./use-gen                 list generations, mark the current one, and show what is installed
+#   ./use-gen <generation>    point `current` at it and install whichever ELFs it ships
 #
-# `current` and `fixtures` are symlinks (gitignored, local state). The two top-level ELFs are the
-# paths guests/monad-{zisk,sp1}/*.elf link to and ARE tracked, so switching shows up as a modification
-# to commit — that is deliberate: the ELF is what produced the numbers.
+# A generation may ship ONE backend. The ZisK and SP1 halves come from the same source but different
+# toolchains and land at different times, and refusing to select the built half only invites copying another
+# generation's binary in — which credits it to a source that never produced it. Selecting a one-backend
+# generation therefore leaves the other top-level ELF alone, and `current-<backend>` records where each
+# installed ELF came from so that mixed state is visible instead of implied.
+#
+# `current`, `current-zisk`, `current-sp1` and `fixtures` are symlinks (gitignored, local state). The
+# top-level ELFs are the paths guests/monad-{zisk,sp1}/*.elf link to and ARE tracked, so switching shows up
+# as a modification to commit — that is deliberate: the ELF is what produced the numbers.
 set -eu
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
@@ -26,6 +32,35 @@ cd "$HERE"
 # right. It reads the framed shape too — the same witness reaches the prover behind an LE64 length prefix — so
 # both ends of the pipeline are checked by the same detector.
 fmt() { ./witness-fmt "$1" | awk '{print $1, $2}'; }
+
+# report_installed [<generation just selected>] — what is installed per backend, and where it came from.
+# One definition, called by the listing and by the switch: a mixed pair reported in one place and not the
+# other is how it gets missed.
+report_installed() {
+  local sel="${1:-}" b e from zg="" sg=""
+  for b in zisk sp1; do
+    e="monad-zkvm-guest-$b.elf"
+    from="$(readlink "current-$b" 2>/dev/null || true)"; from="${from#gen/}"
+    [ "$b" = zisk ] && zg="$from" || sg="$from"
+    if [ -f "$e" ]; then
+      printf "  %-26s %s…  from %s\n" "$e" "$(shasum -a 256 "$e" | cut -c1-16)" "${from:-<unrecorded>}"
+    else
+      printf "  %-26s (not installed)\n" "$e"
+    fi
+  done
+  # A MIXED PAIR IS THE FAILURE THIS RECORD EXISTS FOR. Two ELFs from different generations compare two
+  # different guests, and every number taken from them compares the wrong thing. Selecting a one-backend
+  # generation is exactly how the state arises, so it is stated loudly instead of left to be noticed.
+  if [ -f monad-zkvm-guest-zisk.elf ] && [ -f monad-zkvm-guest-sp1.elf ] && [ "$zg" != "$sg" ]; then
+    echo
+    echo "!! MIXED PAIR — the two backends come from DIFFERENT generations:"
+    echo "     zisk <- ${zg:-<unrecorded>}"
+    echo "     sp1  <- ${sg:-<unrecorded>}"
+    echo "   Anything that reads both is comparing two guests."
+    [ -n "$sel" ] && echo "   Build the missing half from $sel's source and re-select, or select one that ships both." \
+                  || echo "   Build the missing half and re-select, or select a generation that ships both."
+  fi
+}
 
 if [ $# -eq 0 ]; then
   cur="$(readlink current 2>/dev/null || echo '(none)')"
@@ -38,6 +73,9 @@ if [ $# -eq 0 ]; then
     printf "  %s %-26s %4s witnesses  %s elf  %s\n" \
            "$([ "gen/$g" = "$cur" ] && echo '*' || echo ' ')" "$g" "$n" "$e" "$f"
   done
+  echo
+  echo "installed:"
+  report_installed
   exit 0
 fi
 
@@ -45,9 +83,16 @@ G="$1"; D="gen/$G"
 [ -d "$D" ] || { echo "no such generation: $D"; exit 1; }
 n=$(ls "$D/witnesses"/*.witness 2>/dev/null | wc -l | tr -d ' ')
 [ "$n" -gt 0 ] || { echo "$D/witnesses is empty — nothing to select"; exit 1; }
-for e in monad-zkvm-guest-zisk.elf monad-zkvm-guest-sp1.elf; do
-  [ -f "$D/elf/$e" ] || { echo "missing $D/elf/$e — build it before selecting this generation"; exit 1; }
+# WHICH BACKENDS this generation ships. One is allowed. The two sides are built from the same source but by
+# different toolchains and they land at different times, so demanding both to select either one has a
+# predictable outcome: someone copies another generation's binary in to satisfy the check, and that binary is
+# then attributed to a source which never produced it. A half-built generation is an honest state; a forged
+# pair is not.
+have=""
+for b in zisk sp1; do
+  [ -f "$D/elf/monad-zkvm-guest-$b.elf" ] && have="$have $b"
 done
+[ -n "$have" ] || { echo "no ELF in $D/elf — expected monad-zkvm-guest-zisk.elf and/or -sp1.elf"; exit 1; }
 
 # Refuse a set that is not one format throughout: that is the failure this layout exists to prevent,
 # and it is invisible in a directory listing.
@@ -64,13 +109,17 @@ fi
 
 ln -sfn "$D" current
 [ -L fixtures ] || ln -s current/witnesses fixtures
-cp "$D/elf/monad-zkvm-guest-zisk.elf" "$D/elf/monad-zkvm-guest-sp1.elf" .
+# current-<backend> records WHICH GENERATION each installed ELF came from. Without it, selecting a one-backend
+# generation leaves the other top-level ELF in place with nothing saying where it is from — and the two then
+# read as a matched pair to every tool that loads them. Local state, like `current` and `fixtures`.
+for b in $have; do
+  cp "$D/elf/monad-zkvm-guest-$b.elf" .
+  ln -sfn "$D" "current-$b"
+done
 
 echo "now using $G"
 echo "  witnesses  $n · format $f1"
 echo "  fixtures   -> $(readlink fixtures) -> $D/witnesses"
-for e in monad-zkvm-guest-zisk.elf monad-zkvm-guest-sp1.elf; do
-  echo "  $e  $(shasum -a 256 "$e" | cut -c1-16)…"
-done
+report_installed "$G"
 echo
-echo "the two ELFs are tracked — 'git status' will show them modified; that is the record of the switch"
+echo "the installed ELFs are tracked — 'git status' will show them modified; that is the record of the switch"

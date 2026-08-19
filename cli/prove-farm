@@ -290,7 +290,9 @@ mock_plan(){  # $3 = dir to write derived artefacts into (the run record)
   # keep the report so nothing pays for it twice. This is the one place emulation belongs in a live run: it
   # stands in for proving, and its cost is deducted by the caller so the mock's occupancy equals the model.
   if [ -z "$nsteps" ] && [ "$MOCK_EXEC_FALLBACK" = 1 ] && awk "BEGIN{exit !($MOCK_PER_MSTEP > 0)}"; then
-    elf="$ROOT/guests/$REG_RUNG/$REG_RUNG.elf"
+    # The SAME override the prove path honours ($ELF, read by infra/zisk-infra/run). If these two diverged,
+    # the emulation would report steps and public values for one guest while the proof came from another.
+    elf="${ELF:-$ROOT/guests/$REG_RUNG/$REG_RUNG.elf}"
     if [ -f "$elf" ]; then
       local t_emul=$SECONDS
       # REPORT/PV override execute_local's "next to the input" default, so the queue stays pure.

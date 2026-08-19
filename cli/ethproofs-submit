@@ -36,10 +36,10 @@ def pv_digest(run_dir):
     """A short, stable digest of the committed public values (the proof's public inputs/outputs).
     Identifies non-block proofs (e.g. fibonacci) and pins what was proven.
 
-    Order matters and is explicit rather than glob-alphabetical: the PROVER's own public values (*.pv.bin)
-    win, and `expected_pv.bin` — what a local emulation of the guest committed — is only a fallback, used
-    when there is no prover output (a mock run). Sending the emulated digest while a real one exists would
-    quietly attribute the guest's claim to the proof."""
+    Order matters and is explicit rather than glob-alphabetical: the PROVER's own public values win —
+    `<base>.pv.bin` beside the proof, or `pv.bin` once a run record holds it — and `expected_pv.bin`, what a
+    LOCAL EMULATION of the guest committed, is only a fallback. Sending the emulated digest while a real one
+    exists would quietly attribute the guest's claim to the proof."""
     p = pv_path(run_dir)
     if p:
         try:
@@ -52,8 +52,19 @@ def pv_digest(run_dir):
 def pv_path(run_dir):
     """WHICH file holds the public values. Split out of pv_digest so the digest that gets sent and the
     values the gate below verifies are the same bytes — a gate that read a different file would bless a
-    digest it never inspected."""
+    digest it never inspected.
+
+    THREE NAMES, because the same bytes are called different things depending on where the submission runs:
+      <base>.pv.bin   what the prover writes beside the proof — the prover-side temp dir has this one
+      pv.bin          the same file after core.sh moves it into the box's run record (`prove_remote`)
+      expected_pv.bin a LOCAL EMULATION's values, a weaker claim, so it comes last
+
+    `pv.bin` does NOT match the `*.pv.bin` glob — that pattern needs something before the dot — so leaving it
+    out silently disabled the gate on every submission posted FROM THE BOX: no public values found, nothing to
+    verify, proof delivered. The prover-side path was checked and the fallback path was not, which is the worst
+    of the two arrangements because the fallback is where a refused proof lands."""
     for p in sorted(glob.glob(os.path.join(run_dir, "*.pv.bin"))) + [
+            os.path.join(run_dir, "pv.bin"),
             os.path.join(run_dir, "expected_pv.bin")]:
         if os.path.isfile(p):
             return p

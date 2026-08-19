@@ -135,7 +135,11 @@ case "$cmd" in
     # backend is already the coordinator (cluster), not a single local prover.
     : "${GUEST:?set GUEST=<name>}" "${BLOCK:?set BLOCK=<n>}"
     tag="${CHAIN_ID:-1}-$BLOCK"
-    ELF="$GUESTS_DIR/$GUEST/$GUEST.elf"
+    # ELF is overridable like INPUT is by WITNESS: proving a guest that is not the one installed at the
+    # registry path is a normal thing to want (a candidate build, a generation that ships only one backend),
+    # and hardcoding it forced a commit of the tracked ELF just to try one. The run record keeps the honest
+    # answer either way — report.json carries elf_sha256.
+    ELF="${ELF:-$GUESTS_DIR/$GUEST/$GUEST.elf}"
     INPUT="${WITNESS:-$GUESTS_DIR/$GUEST/fixtures/$tag.bin}"
     [[ -f "$INPUT" ]] || INPUT="$GUESTS_DIR/$GUEST/inputs/$tag.bin"
     ELF="$(abspath "$ELF")"; INPUT="$(abspath "$INPUT")"

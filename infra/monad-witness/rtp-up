@@ -105,6 +105,12 @@ MOCK_PORT="${MOCK_PORT:-8547}"
 # server keeps its own opinion rather than trusting the prover's. Headers only, so a non-archive node
 # serves it. Same default as witness-tap's.
 RPC="${RPC:-http://chi-001.devcore4.com:8545}"
+# GUEST_ELF — prove with THIS ELF instead of the one committed at the box's registry path.
+# A path ON THIS MAC: generations live here, and their elf/ directories are gitignored, so the binary a
+# candidate generation ships cannot reach the box through git at all. Unset = the committed ELF, unchanged
+# behaviour. Set = it is copied to the box under its own sha and passed as ELF= in the prove invocation, so
+# nothing is committed to try a guest and the two cannot be confused: the filename IS the checksum.
+GUEST_ELF="${GUEST_ELF:-}"
 MOCK_STORE="${MOCK_STORE:-/tmp/ethproofs-rtp}"
 MOCK_SECS="${MOCK_SECS:-2.12}"        # least-squares fit on the 11 measured 16x5090 blocks:
 MOCK_PER_MSTEP="${MOCK_PER_MSTEP:-0.0364}"  #   secs = 2.12 + 0.0364 x Msteps  (+-0.2 s)
@@ -850,6 +856,38 @@ the branch where the ethereum runloop WAITS for a block instead of asserting. Sw
     ssh $BOX 'cd monad && git checkout $MONAD_BRANCH && cmake --build build --target monad -j\$(nproc)'
   (MONAD_BRANCH= skips this check.)"
   say "branch $mb"
+
+  # AND IS THAT CHECKOUT WHAT THE BRANCH SAYS? Everything below verifies that the
+  # binary matches the box's checkout — one link short of what the pipeline needs,
+  # which is that the producer is built from what $MONAD_BRANCH actually holds. A
+  # commit pushed upstream was invisible here: the checkout stayed put, the binary
+  # matched it, the check said "matches the checkout", and the run proceeded on a
+  # producer from days earlier. That is exactly the silent staleness the rest of
+  # this script exists to prevent, so it is checked before the binary is.
+  onbox_q "cd $MONAD_DIR_BOX && git fetch -q origin '+refs/heads/$MONAD_BRANCH:refs/remotes/origin/$MONAD_BRANCH'" >/dev/null 2>&1
+  behind="$(onbox_q "cd $MONAD_DIR_BOX && git rev-list --count HEAD..origin/$MONAD_BRANCH 2>/dev/null" | tr -d ' \n')"
+  ahead="$(onbox_q "cd $MONAD_DIR_BOX && git rev-list --count origin/$MONAD_BRANCH..HEAD 2>/dev/null" | tr -d ' \n')"
+  case "$behind" in ''|*[!0-9]*) behind=0 ;; esac
+  case "$ahead"  in ''|*[!0-9]*) ahead=0 ;; esac
+  if [ "$behind" != 0 ] && [ "$ahead" != 0 ]; then
+    die "$BOX's monad checkout has diverged from origin/$MONAD_BRANCH ($ahead local, $behind upstream).
+   rtp-up will not resolve that: reconcile it by hand and re-run."
+  elif [ "$behind" != 0 ]; then
+    say "checkout is $behind commit(s) behind origin/$MONAD_BRANCH"
+    if [ "$BUILD_MONAD" != 1 ]; then
+      die "$BOX's monad is behind origin/$MONAD_BRANCH, so the producer would run old code. Update it:
+    ssh $BOX 'cd monad && git pull --ff-only && cmake --build build --target monad -j\$(nproc)'
+  (BUILD_MONAD=1 — the default — fast-forwards and rebuilds here instead.)"
+    fi
+    onbox "cd $MONAD_DIR_BOX && git merge --ff-only origin/$MONAD_BRANCH 2>&1 | tail -2" \
+      || die "could not fast-forward $BOX's monad to origin/$MONAD_BRANCH — reconcile it by hand."
+    say "fast-forwarded; the binary check below will rebuild it"
+  elif [ "$ahead" != 0 ]; then
+    say "checkout is $ahead commit(s) AHEAD of origin/$MONAD_BRANCH (unpushed work — left alone)"
+  fi
+
+  # AFTER the fast-forward, so the binary is compared against the commit the box
+  # now holds and not the one it held a moment ago.
   mhead="$(onbox_q "cd $MONAD_DIR_BOX && git rev-parse HEAD")"
   # The build commit is compiled in — monad prints it as "running with commit '<sha>'" — so it can be read out
   # of the binary without starting it. If no 40-hex string is found at all, fall back to mtime: a binary older
@@ -883,18 +921,38 @@ the branch where the ethereum runloop WAITS for a block instead of asserting. Sw
     #   * `tail -25` kept the ninja progress lines and cut the diagnostic above them — the opposite of useful.
     # This is the one long step in the script and the place a human has to read the output, so it all comes.
     if ! onbox "set -o pipefail; cd $MONAD_DIR_BOX && cmake --build build --target monad -j\$(nproc) 2>&1"; then
-      die "the rebuild failed on $BOX — the compiler output is above. Nothing else was started.
-   If it is a missing override on a boost::fibers base class, the submodules are out of step with the
-   branch: \`ssh $BOX 'cd monad && git submodule status'\` against \`git ls-tree HEAD third_party/fiber\`."
+      die "the rebuild failed on $BOX — THE COMPILER OUTPUT IS ABOVE, and it names the cause. Nothing
+   else was started, so the producer is still on the binary it had.
+   The submodules are NOT the suspect: they were synced a moment ago, in this same step. The one case
+   where they still are is a missing override on a boost::fibers base class, which means the sync did
+   not take: \`ssh $BOX 'cd monad && git submodule status'\` against \`git ls-tree HEAD third_party/fiber\`.
+   Anything else — and an unused function or a narrowing conversion counts, this build is -Werror — is
+   the code that was just pulled, not the environment."
     fi
     # Re-verify rather than trust the exit code: a build can succeed and still not produce a binary carrying
     # this commit (wrong build dir, a target that was already up to date against different sources).
+    # TWO SIGNALS, because the sha alone cannot answer this after an incremental
+    # build. GIT_COMMIT_HASH is captured by `git rev-parse HEAD` at CMake CONFIGURE
+    # time (CMakeLists.txt) and reaches the binary as a compile definition on
+    # cmd/monad — so a build that only recompiles the files that changed leaves the
+    # embedded sha at whatever the last configure saw. Demanding it made this step
+    # kill a perfectly good rebuild: two objects recompiled, the executable
+    # relinked, and the check declared failure.
+    #
+    # So: the sha when it is there (exact, and what the producer's own log line
+    # will say), else the binary being NEWER than the commit — which is what an
+    # incremental build actually proves.
     if onbox_q "strings -a $MONAD_DIR_BOX/build/cmd/monad 2>/dev/null | grep -qF '$mhead' && echo yes" | grep -q yes; then
       say "rebuilt, and the binary now carries ${mhead:0:12}"
+    elif onbox_q "test \$(stat -c %Y $MONAD_DIR_BOX/build/cmd/monad) -gt \$(cd $MONAD_DIR_BOX && git log -1 --format=%ct) && echo newer" | grep -q newer; then
+      say "rebuilt: the binary is newer than ${mhead:0:12}, so it carries it"
+      say "  (its embedded GIT_COMMIT_HASH still shows the last CMake configure — cosmetic,"
+      say "   but it is what 'running with commit' logs, so re-configure to refresh it:"
+      say "   ssh $BOX 'cd monad && GIT_COMMIT_HASH=\$(git rev-parse HEAD) cmake -B build && cmake --build build --target monad')"
     else
-      die "the rebuild reported success but $BOX's binary still does not carry ${mhead:0:12}.
-   Check that $MONAD_DIR_BOX/build is the build directory this checkout uses:
-     ssh $BOX 'cd monad && cmake --build build --target monad -j\$(nproc) && strings -a build/cmd/monad | grep -c $mhead'"
+      die "the rebuild reported success but $BOX's binary is neither carrying ${mhead:0:12} nor newer
+   than it. Check that $MONAD_DIR_BOX/build is the build directory this checkout uses:
+     ssh $BOX 'cd monad && cmake --build build --target monad -j\$(nproc) && ls -l build/cmd/monad'"
     fi
   fi
 
@@ -969,6 +1027,72 @@ if [ "$DRY" != 1 ]; then
   fi
 fi
 
+# ── the guest ELF, when it is not the committed one ────────────────────────────────────────────────
+BOX_ELF=""
+if [ -n "$GUEST_ELF" ]; then
+  step "Guest ELF override"
+  # THREE SPELLINGS, because requiring an absolute path is a trap: the natural
+  # thing to type is a repo-relative path, and prefixing it with $PWD silently
+  # doubles a segment when the shell is not sitting at the repo root
+  # (guests/monad/guests/monad/gen/...). Accept, in order: the path as given, the
+  # same path under this repo, and a bare generation name.
+  case "$GUEST_ELF" in
+    /*) ;;
+    *)  if [ -f "$MAC_REPO/$GUEST_ELF" ]; then
+          say "resolved against $MAC_REPO"
+          GUEST_ELF="$MAC_REPO/$GUEST_ELF"
+        fi ;;
+  esac
+  if [ ! -f "$GUEST_ELF" ]; then
+    gen_elf="$MAC_REPO/guests/monad/gen/$(basename "$GUEST_ELF")/elf/monad-zkvm-guest-zisk.elf"
+    if [ -f "$gen_elf" ]; then
+      say "read as a generation name"
+      GUEST_ELF="$gen_elf"
+    fi
+  fi
+  if [ ! -f "$GUEST_ELF" ]; then
+    die "GUEST_ELF=$GUEST_ELF is not a file on this Mac. Give an absolute path, a path
+   relative to $MAC_REPO, or just a generation name — these all work:
+     GUEST_ELF=zkvm-r8-2026-08-0df7094a1
+     GUEST_ELF=guests/monad/gen/zkvm-r8-2026-08-0df7094a1/elf/monad-zkvm-guest-zisk.elf
+     GUEST_ELF=$MAC_REPO/guests/monad/gen/zkvm-r8-2026-08-0df7094a1/elf/monad-zkvm-guest-zisk.elf
+   Available: $(ls "$MAC_REPO/guests/monad/gen" 2>/dev/null | tr '\n' ' ')"
+  fi
+  elf_sha="$(shasum -a 256 "$GUEST_ELF" | cut -d' ' -f1)"
+  BOX_ELF="\$HOME/rtp-guest-$(printf '%s' "$elf_sha" | cut -c1-16).elf"
+  say "$GUEST_ELF"
+  say "sha256 $elf_sha"
+  # Named by its own checksum, so a second override lands beside the first instead of overwriting it, and so
+  # the path in ~/.rtp-prove-cmd says WHICH binary that run used without needing to hash anything.
+  # A RELATIVE remote path, and no local resolution of the box's $HOME. scp and
+  # ssh both resolve a relative path against the remote home, and the prove
+  # command carries $HOME unexpanded for the box's own shell to handle — so
+  # nothing here has to ask the box where its home is.
+  #
+  # Asking cost an outage. onbox_q hides its stderr, so the one ssh that failed
+  # returned an empty string; that empty string became the scp destination, which
+  # silently means "the remote home under the same basename"; and the verification
+  # then ran `sha256sum` with no argument, which reads stdin and waits for ever.
+  # Three silent degradations in a row, from one unchecked value.
+  box_elf_rel="rtp-guest-$(printf '%s' "$elf_sha" | cut -c1-16).elf"
+  if [ "$DRY" = 1 ]; then
+    printf '   $ scp %s %s:%s\n' "$GUEST_ELF" "$BOX" "$box_elf_rel"
+  else
+    scp -q -o BatchMode=yes "$GUEST_ELF" "$BOX:$box_elf_rel" \
+      || die "could not copy the ELF to $BOX"
+    remote_sha="$(onbox_q "sha256sum '$box_elf_rel' | cut -c1-16" | tr -d ' \n')"
+    [ -n "$remote_sha" ] \
+      || die "could not read back the ELF's checksum on $BOX (ssh returned nothing).
+   The file may be there, but nothing has verified it — refusing to prove with it."
+    [ "$remote_sha" = "$(printf '%s' "$elf_sha" | cut -c1-16)" ] \
+      || die "the ELF on $BOX hashes to $remote_sha, not $(printf '%s' "$elf_sha" | cut -c1-16)"
+    say "landed on $BOX as $BOX_ELF (sha verified after the copy)"
+  fi
+  # Both halves of the mock path read $ELF: infra/zisk-infra/run for the prove, cli/prove-farm for the
+  # emulation that measures the work. Passing it once covers both.
+  say "the committed ELF at $BOX_REPO/guests/monad-zisk/monad-zisk.elf is NOT what will be proved"
+fi
+
 # ── 6c. a remote prover's runner, pushed from the box's freshly-pulled clone ────────────────────────
 if [ -n "$PROVER" ]; then
   # Resolve the PROVER's own $HOME before anything is written there. Asked FROM THE BOX, over the same
@@ -1026,7 +1150,13 @@ unrelated to the block. Install ZisK there, or keep the prover on the Mac."
     # uses. It then finds the checksum matching and skips the upload — and, more to the point, the setup below
     # has something to act on. `scp` follows the symlink, so what lands is the real ELF.
     onbox "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET 'mkdir -p $PROVER_WS/elfs'"
-    onbox "scp -q -o BatchMode=yes -P $PROVER_PORT $BOX_REPO/guests/monad-zisk/monad-zisk.elf $PROVER_TARGET:$PROVER_WS/elfs/"
+    # The override too, under the name prove_remote will look for — otherwise `remote setup` would key the
+    # committed ELF while every block proves another one, and the coordinator would miss on all of them.
+    if [ -n "${BOX_ELF:-}" ]; then
+      onbox "scp -q -o BatchMode=yes -P $PROVER_PORT $BOX_ELF $PROVER_TARGET:$PROVER_WS/elfs/monad-zisk.elf"
+    else
+      onbox "scp -q -o BatchMode=yes -P $PROVER_PORT $BOX_REPO/guests/monad-zisk/monad-zisk.elf $PROVER_TARGET:$PROVER_WS/elfs/"
+    fi
     # NO --hints. The Monad guest has no reth-style hints-gen, and `remote setup -e <elf>` without the flag is
     # the documented form for a hint-less guest (infra/zisk-infra/cluster/README.md). Passing --hints here is
     # what every other setup call in the repo does, and it is wrong for this guest.
@@ -1391,7 +1521,7 @@ fi
 # lets rtp-watchdog restart the prover on its own: it replays this file instead of rebuilding an invocation from
 # memory, which is exactly the mistake that produced 1789 proofs nobody submitted. Anything that reconstructs
 # this command by hand will eventually drop a flag, and the flags that go missing are the silent ones.
-prove_cmd="cd $BOX_REPO && REMOTE_WS=$PROVER_WS REMOTE_RUNNER=$RUNNER_DIR/zisk-runner \
+prove_cmd="cd $BOX_REPO && ${BOX_ELF:+ELF=$BOX_ELF }REMOTE_WS=$PROVER_WS REMOTE_RUNNER=$RUNNER_DIR/zisk-runner \
 ${PULL_VIA:+PULL_VIA=$PULL_VIA }WITNESS_PUMP=$RUNNER_DIR/witness-pump PUMP_SOCK=$PUMP_SOCK \
 REMOTE_SUBMIT=$RUNNER_DIR/ethproofs-submit WITNESS_MANIFEST=\$HOME/witness-manifest.csv \
 cli/prove-farm --guest monad-zisk $PROVE_MODE_FLAGS --remote $PROVER_TARGET --port $PROVER_PORT \
