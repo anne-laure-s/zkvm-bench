@@ -37,13 +37,14 @@
 #                                          deliberate `stop` writes logs/STOP and is never fought.
 #               FETCH_POLL TAP_INTERVAL REPLAY_POLL   (polling latency: 6 s, 6 s and 12 s by default,
 #                                          waiting in the end-to-end budget for no benefit)
-#               TIP_DIRECT=0 BLOCK_DB_TIMEOUT=30    at the tip, TIP_DIRECT=1 runs ONE long-lived monad that
+#               TIP_DIRECT=1 BLOCK_DB_TIMEOUT=30    at the tip, TIP_DIRECT=1 runs ONE long-lived monad that
 #                                          waits for blocks instead of run_replay.py starting a fresh one per
-#                                          batch, removing a process start per block from chain->witness. Off
-#                                          by default here AND in rtp-up: measured 0.19 s median on that leg
-#                                          over 300 tip blocks, so the gain is unproven. BLOCK_DB_TIMEOUT is
-#                                          SECONDS AS A BARE INTEGER — the parser rejects "30s" with "Could
-#                                          not convert", although --help prints its own default as "0s".
+#                                          batch, removing a process start per block from chain->witness. On
+#                                          by default here AND in rtp-up, which is where the measurements
+#                                          that settle it are recorded. TIP_DIRECT=0 restores the
+#                                          run_replay.py path. BLOCK_DB_TIMEOUT is SECONDS AS A BARE INTEGER
+#                                          — the parser rejects "30s" with "Could not convert", although
+#                                          --help prints its own default as "0s".
 set -uo pipefail
 
 MONAD_DIR="${MONAD_DIR:-$HOME/monad}"
@@ -55,6 +56,9 @@ RPC="${RPC:-http://chi-001.devcore4.com:8545}"
 NTHREADS="${NTHREADS:-8}"
 MAX_BATCH="${MAX_BATCH:-2000}"
 MIN_FOLLOW_BATCH="${MIN_FOLLOW_BATCH:-1}"
+# ONE definition, read by run_tip_once and by the `replay-tip` env line below. Two spellings of the same
+# default drift, and the drift is invisible: both paths run, one of them just is not the one rtp-up runs.
+TIP_DIRECT="${TIP_DIRECT:-1}"
 PY="${PY:-$HOME/.pyenv/versions/3.12.13/bin/python3}"   # a fresh tmux has no pyenv in PATH
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -132,13 +136,17 @@ phase_sessions() { [ "$1" = tip ] && echo "fetch replay-tip tap" || echo "fetch 
 # writes, and by nothing else.
 # run_tip_once — one run of the tip producer, on whichever path TIP_DIRECT selects.
 #
-# TIP_DIRECT=1: monad directly, long-lived. TIP_DIRECT=0 (the default): the old run_replay.py path, kept so the
+# TIP_DIRECT=1 (the default): monad directly, long-lived. TIP_DIRECT=0: the run_replay.py path, kept so the
 # two can be MEASURED against each other rather than one replacing the other on an argument.
 #
-# The default is 0 here to match rtp-up's. rtp-up passes the value explicitly on every call, so this default
-# only governs a direct invocation of this script — the path with no operator watching it, and the one where a
-# default disagreeing with rtp-up's would silently select the long-lived monad instead of run_replay.py. Both
-# spellings below (`run_tip_once` and the `replay-tip` env line) have to carry the same one.
+# The default matches rtp-up's, and is defined once at the top. rtp-up passes the value explicitly on every
+# call, so that default only governs a direct invocation of this script — the path with no operator watching
+# it, and the one where a default disagreeing with rtp-up's would silently run the other path.
+#
+# What this path does NOT have is rtp-up's step 5b, which proves the binary was built from al/rtp — the branch
+# whose ethereum runloop waits for a block instead of asserting. On any other binary `--block-db-timeout` exits
+# 107 and writes an ALERT that ./reorg-recover refuses, because it is not a reorg. So it says which binary it
+# needs before starting, and TIP_DIRECT=0 is the path that needs no particular one.
 #
 # The direct path has to write logs/ALERT itself, because that marker is run_replay.py's job and ./reorg-recover
 # parses it for the failing block number. Same shape, same first lines, so nothing downstream changes.
@@ -199,7 +207,7 @@ wait_for_start_block() {
 }
 
 run_tip_once() {
-  if [ "${TIP_DIRECT:-0}" = 0 ]; then
+  if [ "$TIP_DIRECT" = 0 ]; then
     echo "supervise: tip replay via run_replay.py (TIP_DIRECT=0 — one monad process per batch)"
     eval "$(replay_cmd tip)"; return $?
   fi
@@ -207,6 +215,8 @@ run_tip_once() {
   mkdir -p "$MONAD_DIR/logs" "$WITNESS_DIR"
   wait_for_start_block || return 1
   echo "supervise: tip producer direct, one long-lived process -> $log"
+  echo "supervise:   needs a monad built from al/rtp; nothing here verifies that (rtp-up step 5b does). On any"
+  echo "supervise:   other binary --block-db-timeout exits 107 — use TIP_DIRECT=0, which needs no particular one."
   echo "supervise:   $(tip_direct_cmd)"
   eval "$(tip_direct_cmd)" > "$log" 2>&1; rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -304,7 +314,7 @@ fix the cause, then rm it. Never clear it blindly."
       # be spelled out here or it would quietly run on defaults.
       replay-tip)   tmux new-session -d -s "$s" "cd $HERE && MONAD_DIR=$MONAD_DIR REPO=$REPO \
 WITNESS_DIR=$WITNESS_DIR BLOCK_DB=$BLOCK_DB DB=$DB RPC=$RPC NTHREADS=$NTHREADS PY=$PY \
-MAX_BATCH=$MAX_BATCH MIN_FOLLOW_BATCH=$MIN_FOLLOW_BATCH TIP_DIRECT=${TIP_DIRECT:-0} \
+MAX_BATCH=$MAX_BATCH MIN_FOLLOW_BATCH=$MIN_FOLLOW_BATCH TIP_DIRECT=$TIP_DIRECT \
 BLOCK_DB_TIMEOUT=${BLOCK_DB_TIMEOUT:-30} ${REPLAY_POLL:+REPLAY_POLL=$REPLAY_POLL }\
 ${HEAD_TAG:+HEAD_TAG=$HEAD_TAG }${CONFIRMATIONS:+CONFIRMATIONS=$CONFIRMATIONS }\
 ${FETCH_POLL:+FETCH_POLL=$FETCH_POLL }./witness-follow supervise >> ~/replay-supervise.log 2>&1" ;;

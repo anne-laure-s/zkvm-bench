@@ -400,28 +400,26 @@ onbox_q(){ ssh -o BatchMode=yes "$BOX" "$*" 2>/dev/null; }
 # emulations — profiling/series runs six at a time on this Mac — so everything except the pump is matched only
 # inside the prover's own workspace, and skipped entirely when that path is not resolved yet.
 sweep_leftovers() {
-  local mode="$1" pat n killed=0
-  # start only: witness-follow restarts the fetcher a few steps later, so an orphan of it would become a second
-  # writer on one block_db. --stop leaves the fetcher alone by design (the block_db is cheap and reusable).
+  local mode="$1" pat n killed=0 boxpats
+  # ONE list, for the kill AND for the survivor check below. Two hand-maintained copies drift, and the copy
+  # that loses an entry is the CHECK: a pattern it does not name reads as dead whether it is or not.
+  boxpats="$(printf '%s\n' '[c]li/prove-farm' '[w]itness-tap' '[w]itness-follow supervise' \
+                           '[r]un_replay.py' 'build/cmd/[m]onad --chain' '[w]itness-pump')"
+  # The fetcher, on start only: witness-follow restarts it a few steps later, so an orphan of it would become a
+  # second writer on one block_db. --stop leaves the fetcher alone by design (the block_db is cheap and reusable).
+  [ "$mode" = start ] && boxpats="$boxpats
+[f]etch_blocks.py"
   while IFS= read -r pat; do
     [ -n "$pat" ] || continue
     # </dev/null on every ssh in this loop: ssh reads stdin, and stdin here IS the pattern list. Without it
-    # the first iteration swallows the rest of the heredoc and the sweep silently checks one pattern out of five.
+    # the first iteration swallows the rest of the list and the sweep silently checks one pattern out of seven.
     n="$(onbox_q "pgrep -cf \"$pat\"" </dev/null | tr -d ' \n')"
     case "$n" in ''|*[!0-9]*) n=0 ;; esac
     [ "$n" = 0 ] && continue
     say "box: $n process(es) matching $pat — killing"
     onbox "pkill -f \"$pat\" || true" </dev/null
     killed=$((killed + n))
-  done <<BOXPATS
-[c]li/prove-farm
-[w]itness-tap
-[w]itness-follow supervise
-[r]un_replay.py
-build/cmd/[m]onad --chain
-[w]itness-pump
-$([ "$mode" = start ] && echo '[f]etch_blocks.py')
-BOXPATS
+  done <<<"$boxpats"
 
   # The prover: the pump and its channels are ours by name, so they are safe to match anywhere.
   # NO `exec ` PREFIX. The channels are `ssh -C -o BatchMode=yes <box> $HOME/.../witness-pump exec-agent`
@@ -451,9 +449,11 @@ PROVPATS
   [ "$killed" = 0 ] && return 0
 
   # AND CHECK THEY ACTUALLY DIED. `pkill` reports that it delivered a signal, not that anything exited, and this
-  # whole sweep exists because a process nobody could see kept running. A survivor is not cosmetic: a second
-  # prove-farm against one workspace is exactly the failure above, so on `start` it is fatal — continuing would
-  # rebuild the situation we just came to clear. On `stop` there is nothing left to protect, so it warns.
+  # whole sweep exists because a process nobody could see kept running. A survivor is not cosmetic, and not only
+  # for prove-farm: a second run_replay.py is a second writer on one triedb, a second fetcher a second writer on
+  # one block_db, and a surviving witness-pump keeps the socket the new host cannot then serve. Every pattern the
+  # kill used is re-checked, so on `start` any of them is fatal — continuing would rebuild the situation we just
+  # came to clear. On `stop` there is nothing left to protect, so it warns.
   [ "$DRY" = 1 ] && return 0
   sleep 1
   local survivors=""
@@ -462,18 +462,17 @@ PROVPATS
     n="$(onbox_q "pgrep -cf \"$pat\"" </dev/null | tr -d ' \n')"
     case "$n" in ''|*[!0-9]*) n=0 ;; esac
     [ "$n" = 0 ] || survivors="$survivors $pat($n)"
-  done <<SURVIVORS
-[c]li/prove-farm
-[w]itness-tap
-[w]itness-follow supervise
-build/cmd/[m]onad --chain
-SURVIVORS
+  done <<<"$boxpats"
   if [ -n "$survivors" ]; then
     say "STILL RUNNING after the kill:$survivors"
-    onbox_q "pgrep -af '[c]li/prove-farm|[w]itness-tap' | head -5" </dev/null | sed 's/^/     /'
+    # The same list again, as one ERE, so the line that says WHAT survived can name any of them. A fixed
+    # two-pattern probe printed nothing for the other five, which reads as "reported, but not there".
+    onbox_q "pgrep -af '$(printf '%s' "$boxpats" | tr '\n' '|' | sed 's/|$//')' | head -5" </dev/null \
+      | sed 's/^/     /'
     if [ "$mode" = start ]; then
       die "the box still has processes this run would duplicate — kill them by hand (ssh $BOX 'pgrep -af \
-prove-farm; kill <pid>') and re-run. Starting now would put two farms on one prover workspace."
+\"prove-farm|witness-tap|run_replay|witness-pump|fetch_blocks\"; kill <pid>') and re-run. Starting now would
+   put two of them on one workspace, one triedb or one block_db."
     fi
     say "left over after --stop; kill them by hand if they matter"
   fi
