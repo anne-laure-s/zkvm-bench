@@ -419,18 +419,24 @@ sweep_leftovers() {
 [w]itness-follow supervise
 [r]un_replay.py
 build/cmd/[m]onad --chain
+[w]itness-pump
 $([ "$mode" = start ] && echo '[f]etch_blocks.py')
 BOXPATS
 
   # The prover: the pump and its channels are ours by name, so they are safe to match anywhere.
+  # NO `exec ` PREFIX. The channels are `ssh -C -o BatchMode=yes <box> $HOME/.../witness-pump exec-agent`
+  # with no literal `exec ` in them, so the prefixed patterns matched nothing and every run added four more:
+  # 11 on this Mac and 19 on the box, and a stale pair kept the box-side socket while the new host could not
+  # serve it. `witness-pump run` then answered success with no output, the workspace probe came back empty,
+  # and every single block failed with "cannot prepare remote workspace".
   while IFS= read -r pat; do
     [ -n "$pat" ] || continue
     run "pkill -f \"$pat\" 2>/dev/null || true" </dev/null
   done <<PROVPATS
 [w]itness-pump serve
-exec .*[w]itness-pump send
+[w]itness-pump send
 [w]itness-pump exec-host
-exec .*[w]itness-pump exec-agent
+[w]itness-pump exec-agent
 PROVPATS
   if [ -n "${RUNNER_DIR:-}" ] && [ -n "${PROVER_WS:-}" ]; then
     run "pkill -f '$RUNNER_DIR/[z]isk-runner' 2>/dev/null || true"
@@ -645,7 +651,7 @@ rm -f '$PUMP_SOCK'; true"
     fi
   fi
   PUMP_CHANNELS="${PUMP_CHANNELS:-1}"
-  run "PUMP_SOCK='$PUMP_SOCK' PUMP_BOX='$BOX' PUMP_CHANNELS='$PUMP_CHANNELS' nohup '$RUNNER_DIR/witness-pump' serve >> ~/witness-pump.log 2>&1 &"
+  run "( trap '' INT; PUMP_SOCK='$PUMP_SOCK' PUMP_BOX='$BOX' PUMP_CHANNELS='$PUMP_CHANNELS' nohup '$RUNNER_DIR/witness-pump' serve >> ~/witness-pump.log 2>&1 & )"
   if [ "$DRY" != 1 ]; then
     # Give it a moment to bind and open the channel, then check BOTH: a socket with no channel behind it
     # would fail every block silently into the scp fallback, which is exactly the "deployed but not working"
@@ -667,8 +673,26 @@ rm -f '$PUMP_SOCK'; true"
   # box then has nothing left to take away. Without it, proving keeps going on the multiplexed master already
   # authenticated and stops for good when that expires — measured at six hours of silence with the producer
   # perfectly healthy and every session still up.
-  run "PUMP_BOX='$BOX' PUMP_REMOTE_CMD='$BOX_REPO/infra/zisk-infra/witness-pump' \
-nohup '$RUNNER_DIR/witness-pump' exec-host >> ~/witness-exec.log 2>&1 &"
+  run "( trap '' INT; PUMP_BOX='$BOX' PUMP_REMOTE_CMD='$BOX_REPO/infra/zisk-infra/witness-pump' \
+nohup '$RUNNER_DIR/witness-pump' exec-host >> ~/witness-exec.log 2>&1 & )"
+  # STARTED IS NOT SERVING. The box picks the exec channel on a `-S` test, which a socket file left by a dead
+  # agent passes — so an unverified channel does not degrade, it fails every block. Prove it answers here.
+  if [ "$DRY" != 1 ]; then
+    exec_ok=0
+    for _try in 1 2 3 4 5 6; do
+      if onbox_q "cd $BOX_REPO && PUMP_EXEC_SOCK=\$HOME/.zisk-exec.sock infra/zisk-infra/witness-pump run 'echo up'" | grep -q up; then
+        exec_ok=1; break
+      fi
+      sleep 2
+    done
+    [ "$exec_ok" = 1 ] \
+      && say "exec channel answers from $BOX" \
+      || die "the exec channel does not answer from $BOX after 12 s. Nothing else was started.
+   The key installed a few steps above still works right now, so box->Mac ssh is not the problem — the
+   channel itself is. It matters LATER: the box's hourly cron deletes that key, and from then on the channel
+   is the only way the prover stays reachable, which is exactly why it is established while the key is there.
+   Look at ~/witness-exec.log on this Mac and \`ssh $BOX 'ls -la ~/.zisk-exec.sock'\`."
+  fi
   if [ "$DRY" != 1 ]; then
     sleep 4
     if onbox_q "test -S ~/.zisk-exec.sock && echo yes" | grep -q yes; then
@@ -750,7 +774,7 @@ if [ "$KEEP_MOCK" = 1 ]; then
 else
   run "pkill -f ethproofs-mock || true"
   run "sleep 1"
-  run "nohup '$MAC_REPO/cli/ethproofs-mock' --port $MOCK_PORT --store '$MOCK_STORE' --rpc '$RPC' --verify-cmd '$MAC_REPO/cli/verify-proof' >> ~/ethproofs-mock.log 2>&1 &"
+  run "( trap '' INT; nohup '$MAC_REPO/cli/ethproofs-mock' --port $MOCK_PORT --store '$MOCK_STORE' --rpc '$RPC' --verify-cmd '$MAC_REPO/cli/verify-proof' >> ~/ethproofs-mock.log 2>&1 & )"
   run "sleep 2"
 fi
 if [ "$DRY" != 1 ]; then
@@ -781,7 +805,7 @@ run "pkill -f 'rtp-up-tunnel' 2>/dev/null; pkill -f 'R $TUN_SSH_PORT:127.0.0.1:2
 # The box side can also be holding the port from a dropped session; a bound port there fails the forward.
 onbox_q "pkill -f 'sshd.*$TUN_SSH_PORT' 2>/dev/null; true" >/dev/null 2>&1 || true
 run "sleep 1"
-run "nohup bash -c 'while true; do ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o BatchMode=yes -R $TUN_SSH_PORT:127.0.0.1:22 -R $MOCK_PORT:127.0.0.1:$MOCK_PORT $BOX; echo \"rtp-up-tunnel: link down, retrying in 5s\"; sleep 5; done' >> ~/tunnel.log 2>&1 &"
+run "( trap '' INT; nohup bash -c 'while true; do ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o BatchMode=yes -R $TUN_SSH_PORT:127.0.0.1:22 -R $MOCK_PORT:127.0.0.1:$MOCK_PORT $BOX; echo \"rtp-up-tunnel: link down, retrying in 5s\"; sleep 5; done' >> ~/tunnel.log 2>&1 & )"
 run "sleep 3"
 if [ "$DRY" != 1 ] && ! tun_alive; then
   say "WARNING: nothing is listening on $BOX:$TUN_SSH_PORT after the restart — see ~/tunnel.log."

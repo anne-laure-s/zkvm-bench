@@ -143,9 +143,20 @@ prove_remote() {
   # socket is not an error here — it is the pre-channel behaviour, which works whenever the key does.
   local exec_sock="${PUMP_EXEC_SOCK:-$HOME/.zisk-exec.sock}"
   local pump_local="${WITNESS_PUMP_LOCAL:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/witness-pump}"
+  # A SOCKET FILE IS NOT A CHANNEL. `-S` only says "this path is a socket", and an agent whose peer died
+  # leaves the file behind: connecting then gets ECONNREFUSED, every block dies on the workspace probe, and
+  # the plain-ssh fallback that exists for exactly this case never runs. Seen 2026-08-19: 26 consecutive
+  # blocks failed in 1 s each with "cannot prepare remote workspace" while ssh itself was perfectly fine.
+  # So prove the channel answers before choosing it — one trivial round trip against a 12 s slot — and
+  # degrade to ssh instead of failing the block.
   if [[ -S "$exec_sock" && -x "$pump_local" ]]; then
-    ssh=(env "PUMP_EXEC_SOCK=$exec_sock" "$pump_local" run)
-    echo "Control over the persistent exec channel (no box-side key needed)."
+    if PUMP_EXEC_SOCK="$exec_sock" "$pump_local" run "true" >/dev/null 2>&1; then
+      ssh=(env "PUMP_EXEC_SOCK=$exec_sock" "$pump_local" run)
+      echo "Control over the persistent exec channel (no box-side key needed)."
+    else
+      echo "WARNING: $exec_sock exists but the exec channel does not answer — falling back to ssh," >&2
+      echo "         which needs a key on this box. Restart the channel with rtp-up." >&2
+    fi
   fi
   # scp takes the same options but spells the port -P.
   local scpo=("${mux[@]}" -P "$port")
