@@ -102,6 +102,9 @@ PROVE_EVERY = int(env("PROVE_EVERY", 1))     # 1 = every block (RTP). 100 = ethp
 INTERVAL      = float(env("INTERVAL", 6))        # half a slot: never more than one block behind
 # Retention policy (see the header): what makes a witness still worth its 7 MB.
 KEEP_RECENT   = int(env("KEEP_RECENT", 10))      # newest N always kept — nothing in flight is removed
+# 100 is the standalone default and deliberately loose; rtp-up DERIVES it from the cadence
+# (SKIP_AFTER_WINDOWS x PROVE_EVERY, floor 12) and forwards it, because what makes a block worthless is not a
+# fixed number of blocks but how many of its OWN windows have gone by.
 SKIP_AFTER    = int(env("SKIP_AFTER", 100))      # un-proved and this far behind -> abandoned, dropped
 # WARM-UP: the first block a fresh producer emits is slower than the rest — it pays the one-time per-process
 # costs (the KZG trusted setup on first use, a cold page cache, the db's first reads). With TIP_DIRECT=1 that

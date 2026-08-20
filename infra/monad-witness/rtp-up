@@ -88,7 +88,8 @@
 #               KZG_STRICT=0    make step 5b's lazy-trusted-setup check fatal instead of a warning. Off by
 #                   default: an unpatched binary still produces correct witnesses, just ~2 s/block slower.
 #               SKIP_AFTER      how far behind the tip an un-proved block is abandoned, in BLOCKS.
-#                   Derived as max(10 x PROVE_EVERY, 100) so the window always holds ~10 SAMPLED blocks.
+#                   Derived as SKIP_AFTER_WINDOWS x PROVE_EVERY (floor 12): a block gets that many of its own
+#                   windows and no more. SKIP_AFTER_WINDOWS=3 by default; set either one to override.
 #               PROVE_EVERY=1   prove every Nth BLOCK (not seconds — N counts blocks). 1 = every block.
 #                   NEVER derived. With --real the projected service times and a suggested N are printed;
 #                   the value stays yours. A cadence faster than the prover's throughput gives a queue that
@@ -239,7 +240,21 @@ PROVE_EVERY="${PROVE_EVERY:-1}"
 # 100 with N=30 it is 3.3 — a prover three sampled blocks behind starts losing work it will never get back.
 # Derived to keep ~10 sampled blocks in the window, floored at witness-tap's own default so a small N never
 # makes the window tighter than it is today.
-SKIP_AFTER="${SKIP_AFTER:-$(( PROVE_EVERY * 10 > 100 ? PROVE_EVERY * 10 : 100 ))}"
+# HOW LONG A BLOCK IS STILL WORTH PROVING, counted in its OWN windows. A sampled block owns PROVE_EVERY × 12 s;
+# if it has not been proved after SKIP_AFTER_WINDOWS of those, nothing it produces can land inside any window
+# it could have claimed, and the slot it would take belongs to a fresher block. Three is the default: enough
+# that a normal service (~30 s) plus a queue wait never trips it, short enough that a straggler does not sit in
+# the queue for twenty minutes.
+#
+# The old default was max(10 × PROVE_EVERY, 100) — 100 blocks at any cadence below 10, i.e. 20 MINUTES of lag
+# tolerated for a block whose window is one minute. It never bound, which is why stragglers accumulated and
+# came back out of order long after they were worthless.
+#
+# FLOORED BY THE NEVER-TOUCHED WINDOW. witness-tap keeps the newest KEEP_RECENT (10) blocks whatever else it
+# thinks, because one of them may be in flight — `recent` is tested before `unproved` in keep_reason. A
+# SKIP_AFTER below that is inert, so the floor is stated here rather than discovered as a knob that did nothing.
+SKIP_AFTER_WINDOWS="${SKIP_AFTER_WINDOWS:-3}"
+SKIP_AFTER="${SKIP_AFTER:-$(( SKIP_AFTER_WINDOWS * PROVE_EVERY > 12 ? SKIP_AFTER_WINDOWS * PROVE_EVERY : 12 ))}"
 # Validated here because there is no `set -e`: a non-numeric value would make `[ -gt ]` complain and carry on,
 # and 0 would reach witness-tap as `b % 0` — a ZeroDivisionError that kills the tap one block into the run.
 # `die` is defined further down, so this reports the failure itself. The numeric test is second on purpose:
