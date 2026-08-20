@@ -58,8 +58,10 @@
 # the witness-less replay, polls the gap until it closes, then switches to the tip phase.
 #
 # Config (env): BOX=<box> (required)  MAC_USER=$USER  TUN_SSH_PORT=2222  MOCK_PORT=8547
-#               BOX_FROM_PROVER=<user@host the PROVER can reach the box by>
-#                   Derived from the box itself when BOX is a bare alias. Everything the prover dials uses it.
+#               BOX_FROM_PROVER=<user@host the PROVER can reach the box by>  BOX_PORT_FROM_PROVER=22
+#                   Both derived from `ssh -G $BOX` — this Mac's own resolution of the alias, which is the only
+#                   place the user, the real hostname AND the sshd port all exist. Everything the prover dials
+#                   uses them; everything the Mac dials keeps using $BOX.
 #               RPC=<url>  (the chain, for the public-value checks on both sides)
 #               MOCK_STORE=/tmp/ethproofs-rtp  MOCK_SECS=2.12  MOCK_PER_MSTEP=0.0364  MOCK_SPEED=2.5  MOCK_JITTER=0.5
 #               HEAD_TAG=latest  CONFIRMATIONS=0 (the head — real time)  RUNNER_DIR=$HOME/zisk-mock
@@ -912,6 +914,36 @@ key printed above? ~ not group-writable? See ~/tunnel.log"
   # The prover hop, whichever it is. For a remote prover this is the check that matters most: the box must
   # reach it with a key, unattended, or every block fails at upload and the queue silently drains to nothing.
   if [ -n "$PROVER" ]; then
+    # ESTABLISH IT, do not just check it. The box's hourly `find ~/.ssh -type f -name 'id_*' -delete` takes
+    # BOTH halves of its keypair, so a pubkey deposited on the prover by hand is worthless within the hour and
+    # every later run dies here. That is not an operator mistake to be documented, it is a standing condition
+    # to be handled at startup — which is exactly what "the key is only needed at startup" means.
+    #
+    # This Mac is the only party that can do it: it reaches the box (its own key) and the prover (its own key),
+    # while the box↔prover pair is what we are trying to create. So: make sure the box HAS a keypair, then put
+    # its public half on the prover from here.
+    #
+    # It appends to an access file, so it takes the two precautions that file demands: a no-clobber .bak of
+    # the original, and a newline guard — a file with no trailing newline glues the new key onto the last
+    # existing one and invalidates BOTH, which locks you out of the machine you are provisioning.
+    if [ "$DRY" != 1 ]; then
+      box_pub="$(onbox_q "ls ~/.ssh/id_*.pub >/dev/null 2>&1 || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519 </dev/null >/dev/null 2>&1; cat ~/.ssh/id_*.pub 2>/dev/null | head -1")"
+      case "$box_pub" in
+        ssh-*|ecdsa-*)
+          if printf '%s\n' "$box_pub" | ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+               -p "$PROVER_PORT" "$PROVER_TARGET" \
+               "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys \
+&& { cp -n ~/.ssh/authorized_keys ~/.ssh/authorized_keys.rtp-bak 2>/dev/null || true; } \
+&& { [ -n \"\$(tail -c1 ~/.ssh/authorized_keys)\" ] && echo >> ~/.ssh/authorized_keys || true; } \
+&& while read -r l; do grep -qxF \"\$l\" ~/.ssh/authorized_keys || echo \"\$l\" >> ~/.ssh/authorized_keys; done \
+&& chmod 600 ~/.ssh/authorized_keys && echo ok" 2>/dev/null | grep -q ok; then
+            say "$BOX's key is authorised on $PROVER_TARGET (re-done every run: the box's cron deletes it hourly)"
+          else
+            say "WARNING: could not put $BOX's key on $PROVER_TARGET from this Mac — the check below will say so."
+          fi ;;
+        *) say "WARNING: $BOX has no usable public key to authorise (got '${box_pub:0:20}')." ;;
+      esac
+    fi
     onbox_q "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p $PROVER_PORT $PROVER_TARGET true" \
       && say "$BOX can ssh into the prover $PROVER_TARGET without a password" \
       || die "$BOX cannot ssh into $PROVER_TARGET (port $PROVER_PORT). Add $BOX's ~/.ssh/id_ed25519.pub to \
@@ -1230,6 +1262,25 @@ if [ -n "$PROVER" ]; then
   # so the channels never started and nothing in the output said the run was degraded.
   onprover(){ onbox "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET '$*'"; }
   onprover_q(){ onbox_q "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET '$*'"; }
+  # THE PROVER'S HOST KEY, ON THE BOX — and this one comes FIRST, because the very next thing that happens is
+  # the box dialling the prover with BatchMode=yes. A fresh prover is unknown to the box, ssh will not prompt,
+  # and the dial dies on `Host key verification failed` before any later check can say why.
+  # Mirror image of the box's key going the other way: taken from THIS MAC's known_hosts, which has it because
+  # you connected to the prover from here; never scanned, so nothing is trusted on first contact.
+  if [ "$DRY" != 1 ]; then
+    ph="${PROVER_TARGET#*@}"
+    pk="$(ssh-keygen -F "[$ph]:$PROVER_PORT" 2>/dev/null | grep -v '^#')"
+    [ -n "$pk" ] || pk="$(ssh-keygen -F "$ph" 2>/dev/null | grep -v '^#')"
+    if [ -n "$pk" ]; then
+      printf '%s\n' "$pk" | onbox_q "mkdir -p ~/.ssh && chmod 700 ~/.ssh \
+&& touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts \
+&& while read -r l; do grep -qxF \"\$l\" ~/.ssh/known_hosts || echo \"\$l\" >> ~/.ssh/known_hosts; done" \
+        && say "the prover's host key is known on $BOX (from this Mac's known_hosts)"
+    else
+      say "WARNING: this Mac has no known_hosts entry for [$ph]:$PROVER_PORT, so $BOX has no verified host key"
+      say "  for the prover and its first ssh will fail. Connect to the prover from here once, then re-run."
+    fi
+  fi
   # Resolve the PROVER's own $HOME before anything is written there. Asked FROM THE BOX, over the same
   # box->prover hop the staging uses, so a failure here is the same failure the staging would hit — and it
   # surfaces now, with a message, instead of as a scp into a surprising path.
@@ -1238,9 +1289,12 @@ if [ -n "$PROVER" ]; then
     if [ -z "$PROVER_HOME" ]; then
       # Dry runs have no round trip to make; a real run that cannot ask has a broken box->prover hop.
       if [ "$DRY" = 1 ]; then PROVER_HOME='$HOME'
-      else die "cannot read \$HOME on $PROVER_TARGET from $BOX. The box must be able to
-   ssh -p $PROVER_PORT $PROVER_TARGET  without a password — that hop is a precondition, not
-   something this script sets up. Test it from the box, then re-run."
+      else die "cannot read \$HOME on $PROVER_TARGET from $BOX. This must work, from the box:
+       ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET true
+   Run it there and read what it says:
+     'Host key verification failed' -> the step above could not give $BOX the prover's host key.
+     'Permission denied'            -> $BOX has no key on the prover. That hop is a precondition this script
+        does not set up: put $BOX:~/.ssh/id_*.pub into $PROVER_TARGET:~/.ssh/authorized_keys."
       fi
     fi
     # Per MODE, not one name for both: a mock and a real deployment on the same prover must not share a runner
@@ -1316,25 +1370,34 @@ unrelated to the block. Install ZisK there, or keep the prover on the Mac."
   # this box's cron never touches. prove_cmd already passes WITNESS_PUMP, PUMP_SOCK and REMOTE_SUBMIT for
   # every mode; only the starting was missing.
   step "Persistent channels on $PROVER_TARGET (so the key is needed only now)"
-  # DERIVE the box's name as the prover sees it, when $BOX cannot possibly be one. No dot and no user means
-  # an ~/.ssh/config alias, which resolves here and nowhere else — and the box knows both halves of the answer
-  # itself. Deriving beats defaulting to the alias: the alias is *known* wrong on a rented box, and the
-  # failure it produces (`Could not resolve hostname nyc-003`) arrives after the channels have started.
-  if [ -z "${BOX_FROM_PROVER_SET:-}" ] && [ "$BOX_FROM_PROVER" = "$BOX" ] && [ "$DRY" != 1 ]; then
-    case "$BOX" in
-      *.*|*@*) ;;                                           # already a real address
-      *) derived="$(onbox_q 'echo "$(whoami)@$(hostname -f)"' | tr -d ' \r\n')"
-         case "$derived" in
-           *@*.*) BOX_FROM_PROVER="$derived"
-                  say "the prover will dial the box as '$BOX_FROM_PROVER' ('$BOX' is an alias of this Mac only)" ;;
-           *)     say "WARNING: '$BOX' looks like a local alias and the box could not name itself \
-(got '${derived:-nothing}'). The prover will try '$BOX' and probably fail to resolve it — \
-set BOX_FROM_PROVER=user@host." ;;
-         esac ;;
-    esac
+  # HOW THE PROVER REACHES THE BOX — user, host AND PORT, taken from `ssh -G`, which is what this Mac's own
+  # ~/.ssh/config resolves $BOX to. That is the authoritative source and the box cannot supply it: asking the
+  # box its `hostname -f` gets the name right and silently misses the port, which is how a correct-looking
+  # address produced `Connection refused` on 22 while the real sshd was on 9022.
+  #
+  # Three separate things fail here, one at a time: a name that resolves nowhere else, a port that is not 22,
+  # and a key the box has not been told about. Deriving the first two leaves only the one that is genuinely a
+  # decision.
+  if [ -z "${BOX_FROM_PROVER_SET:-}" ]; then
+    eval "$(ssh -G "$BOX" 2>/dev/null | awk '
+      /^hostname /{h=$2} /^port /{p=$2} /^user /{u=$2}
+      /^proxyjump /{j=$2} /^proxycommand /{sub(/^proxycommand /,""); c=$0}
+      END{printf "g_host=%s; g_port=%s; g_user=%s; g_jump=%s; g_cmd=%s\n", h, p, u,
+                 (j=="none"?"":j), (c==""||c=="none"?"":"set")}')"
+    if [ -n "${g_host:-}" ]; then
+      BOX_FROM_PROVER="${g_user:+$g_user@}$g_host"
+      BOX_PORT_FROM_PROVER="${g_port:-22}"
+      [ "$BOX_FROM_PROVER:$BOX_PORT_FROM_PROVER" = "$BOX:22" ] \
+        || say "the prover will dial the box as $BOX_FROM_PROVER port $BOX_PORT_FROM_PROVER (from ssh -G $BOX)"
+    fi
+    # A jump host is this Mac's route, not a property of the box. The prover has no way to replicate it, so
+    # every channel would fail — and it would fail as a refused connection, which reads like a firewall.
+    if [ -n "${g_jump:-}" ] || [ -n "${g_cmd:-}" ]; then
+      say "WARNING: this Mac reaches $BOX through a jump host / ProxyCommand. The prover cannot use it —"
+      say "  give it a route it can dial itself: BOX_FROM_PROVER=user@host BOX_PORT_FROM_PROVER=<port>."
+    fi
   fi
-  [ "$BOX_FROM_PROVER" = "$BOX" ] \
-    || say "the prover will dial the box as '$BOX_FROM_PROVER' (this Mac uses '$BOX')"
+  BOX_PORT_FROM_PROVER="${BOX_PORT_FROM_PROVER:-22}"
   for f in infra/zisk-infra/witness-pump cli/ethproofs-submit cli/check-pv; do
     onbox "scp -q -o BatchMode=yes -P $PROVER_PORT $BOX_REPO/$f $PROVER_TARGET:$RUNNER_DIR/"
   done
@@ -1347,20 +1410,50 @@ set BOX_FROM_PROVER=user@host." ;;
       && say "submitter and the public-value gate staged" \
       || die "the submitter or check-pv did not stage on $PROVER_TARGET — proofs would ship unverified"
   fi
+  # THE BOX'S HOST KEY, ON THE PROVER. The fourth thing that fails in this exact spot, after the name, the
+  # port and the key: with BatchMode=yes ssh will not prompt to accept an unknown host, so the prover's very
+  # first dial dies on `Host key verification failed` — and every channel is a dial.
+  #
+  # Taken from THIS MAC's known_hosts, not from ssh-keyscan on the prover. Same result on a good day, but
+  # keyscan trusts whatever the rented box's network hands back, while these are the keys this Mac has been
+  # connecting with all along. A host key is public; copying one is not handling a credential. If the Mac has
+  # no entry, say so rather than fall back to trust-on-first-use — that choice is not this script's to make.
+  if [ "$DRY" != 1 ]; then
+    box_host="${BOX_FROM_PROVER#*@}"
+    hk="$(ssh-keygen -F "[$box_host]:$BOX_PORT_FROM_PROVER" 2>/dev/null | grep -v '^#')"
+    [ -n "$hk" ] || hk="$(ssh-keygen -F "$box_host" 2>/dev/null | grep -v '^#')"
+    if [ -n "$hk" ]; then
+      if printf '%s\n' "$hk" | onprover_q "mkdir -p ~/.ssh && chmod 700 ~/.ssh \
+&& touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts \
+&& while read -r l; do grep -qxF \"\$l\" ~/.ssh/known_hosts || echo \"\$l\" >> ~/.ssh/known_hosts; done \
+&& echo installed" | grep -q installed; then
+        say "the box's host key is known on $PROVER_TARGET ($(printf '%s\n' "$hk" | grep -c .) entries, from this Mac's known_hosts)"
+      else
+        say "WARNING: could not install the box's host key on $PROVER_TARGET — the next check will say so."
+      fi
+    else
+      say "WARNING: this Mac has no known_hosts entry for [$box_host]:$BOX_PORT_FROM_PROVER, so there is no"
+      say "  verified host key to give the prover. Connect to the box from here once, then re-run."
+    fi
+  fi
+
   # THE DIRECTION THAT CARRIES EVERYTHING, checked first. Both channels are dialled BY THE PROVER, so what has
   # to work is prover->box: the prover needs its own key to $BOX, and $BOX has to be a name the PROVER resolves
   # (an alias in this Mac's ~/.ssh/config means nothing there). If it does not, both channels still "start" —
   # the pump binds its socket, the exec-host retries in a loop — and every block quietly falls back to
   # per-block ssh from the box, which is precisely what the hourly key-deleting cron then breaks.
   if [ "$DRY" != 1 ]; then
-    onprover_q "ssh -o BatchMode=yes -o ConnectTimeout=8 $BOX_FROM_PROVER true && echo up" | grep -q up \
+    onprover_q "ssh -o BatchMode=yes -o ConnectTimeout=8 -p $BOX_PORT_FROM_PROVER $BOX_FROM_PROVER true \
+&& echo up" | grep -q up \
       || die "$PROVER_TARGET cannot reach '$BOX_FROM_PROVER' over ssh, and that is the direction all the
    channels dial. On the prover this must work with no password and no agent forwarding:
-       ssh $BOX_FROM_PROVER true
+       ssh -p $BOX_PORT_FROM_PROVER $BOX_FROM_PROVER true
    Two separate causes, and the message ssh gives you says which:
      'Could not resolve hostname'  -> that name means nothing on the prover. An alias from this Mac's
         ~/.ssh/config is not a name; pass the real one with BOX_FROM_PROVER=user@fqdn (this box calls
         itself $(onbox_q hostname -f 2>/dev/null || echo '<hostname -f on the box>')).
+     'Host key verification failed' -> the prover does not know the box's host key. The step above installs it
+        from this Mac's known_hosts; that warned if it could not.
      'Permission denied'           -> the prover's key is not in $BOX:~/.ssh/authorized_keys yet. From the
         Mac, and only you can decide to do it:
           ssh -p $PROVER_PORT $PROVER_TARGET 'ls ~/.ssh/id_*.pub 2>/dev/null || ssh-keygen -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'
@@ -1383,6 +1476,7 @@ set BOX_FROM_PROVER=user@host." ;;
   # command travels inside onprover's single quotes.
   onprover "pkill -f \"witness-pump serve\" 2>/dev/null; pkill -f \"witness-pump exec-host\" 2>/dev/null; true"
   onprover "( trap \"\" INT; PUMP_SOCK=$PUMP_SOCK PUMP_BOX=$BOX_FROM_PROVER PUMP_CHANNELS=$PUMP_CHANNELS \
+PUMP_SSH_OPTS=\"-C -o BatchMode=yes -p $BOX_PORT_FROM_PROVER\" \
 nohup $RUNNER_DIR/witness-pump serve >> \$HOME/witness-pump.log 2>&1 & )"
   # ABSOLUTE, resolved on the box. BOX_REPO is the literal string "$HOME/zkvm-bench" so that it resolves on
   # the box — but this value travels THROUGH the prover's shell, which would expand $HOME to the PROVER's home
@@ -1394,6 +1488,7 @@ nohup $RUNNER_DIR/witness-pump serve >> \$HOME/witness-pump.log 2>&1 & )"
     [ -n "$BOX_REPO_ABS" ] || die "cannot resolve $BOX_REPO on $BOX — the box's clone is what both channels run"
   fi
   onprover "( trap \"\" INT; PUMP_BOX=$BOX_FROM_PROVER PUMP_REMOTE_CMD=$BOX_REPO_ABS/infra/zisk-infra/witness-pump \
+PUMP_SSH_OPTS=\"-C -o BatchMode=yes -p $BOX_PORT_FROM_PROVER\" \
 nohup $RUNNER_DIR/witness-pump exec-host >> \$HOME/witness-exec.log 2>&1 & )"
   if [ "$DRY" != 1 ]; then
     # STARTED IS NOT SERVING, on either side. The data channel is checked from the prover (its socket lives
@@ -1439,7 +1534,7 @@ infra/zisk-infra/witness-pump run 'echo up'" | grep -q up && ok_exec=1
       onprover "pkill -f \"L $ep_port:127.0.0.1:$ep_port\" 2>/dev/null; true"
       onprover "( trap \"\" INT; nohup bash -c \"while true; do \
 ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o BatchMode=yes \
--L $ep_port:127.0.0.1:$ep_port $BOX_FROM_PROVER; sleep 5; done\" >> \$HOME/ep-forward.log 2>&1 & )"
+-p $BOX_PORT_FROM_PROVER -L $ep_port:127.0.0.1:$ep_port $BOX_FROM_PROVER; sleep 5; done\" >> \$HOME/ep-forward.log 2>&1 & )"
       if [ "$DRY" != 1 ]; then
         ep_ok=0
         for _try in 1 2 3 4 5 6; do
