@@ -88,6 +88,24 @@ parse_steps() {
   printf '%s' "$n"
 }
 
+# vkey — the verification key of the ZisK installed HERE, as hex, or empty.
+#
+# ethproofs' `verifier_id` answers "which verifier can check this proof", and for ZisK that is not a
+# per-program key: the setup is per-ELF but the final verification key is part of the install, one file of
+# exactly 32 bytes. So the key itself IS the identifier — no hashing, no derivation.
+#
+# It is read on the PROVER, the machine whose verifier the proof belongs to. That matters: this Mac and the
+# devcore box hold different keys because they run different ZisK builds, and a proof made under one cannot be
+# checked by the other. Publishing the key is what makes such a mismatch legible on the leaderboard instead of
+# surfacing as a mysterious REJECTED.
+vkey() {
+  local f="${ZISK_VERKEY:-$HOME/.zisk/provingKey/zisk/vadcop_final/vadcop_final.verkey.bin}"
+  [[ -r "$f" ]] || return 0
+  local hex
+  hex="$(xxd -p "$f" 2>/dev/null | tr -d '\n')"
+  [[ -n "$hex" ]] && printf '0x%s' "$hex"
+}
+
 write_report() { # $1 = json body
   [[ -z "$REPORT" ]] && return 0
   ensure_parent "$REPORT"
@@ -334,6 +352,7 @@ JSON
   "total_secs": $(jnum "$total_dt"),
   "proof_bytes": $(jnum "$proof_bytes"),
   "verified": $(jbool $([[ -n "$verify_dt" ]] && echo 1 || echo 0)),
+  "vkey_hash": $(v="$(vkey)"; [[ -n "$v" ]] && printf '"%s"' "$v" || printf null),
   "backend": "$ZISK_PROVE_BACKEND"
 }
 JSON
