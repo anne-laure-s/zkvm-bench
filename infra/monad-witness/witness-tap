@@ -246,6 +246,14 @@ def append_manifest(row):
             _manifest_fields = hdr if hdr else list(FIELDS)
         except OSError:
             _manifest_fields = list(FIELDS)
+        # And SAY when the file is missing a column, because the drop is otherwise invisible: downstream reads
+        # an absent column as data the producer never had, not as a manifest that predates it. Once per process,
+        # since the header is resolved once.
+        missing = [c for c in FIELDS if c not in _manifest_fields]
+        if missing:
+            log(f"NOTE {MANIFEST} predates these columns and is NOT receiving them: {', '.join(missing)}. "
+                f"Every column its header has is written normally. Move the file aside to start one that "
+                f"carries them.")
     with open(MANIFEST, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=_manifest_fields, extrasaction="ignore", restval="")
         if new:

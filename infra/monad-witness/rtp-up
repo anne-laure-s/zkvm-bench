@@ -901,11 +901,34 @@ the branch where the ethereum runloop WAITS for a block instead of asserting. Sw
   # matched it, the check said "matches the checkout", and the run proceeded on a
   # producer from days earlier. That is exactly the silent staleness the rest of
   # this script exists to prevent, so it is checked before the binary is.
-  onbox_q "cd $MONAD_DIR_BOX && git fetch -q origin '+refs/heads/$MONAD_BRANCH:refs/remotes/origin/$MONAD_BRANCH'" >/dev/null 2>&1
+  # The fetch's OUTCOME is kept. A fetch that fails leaves the PREVIOUS origin/$MONAD_BRANCH in place — days
+  # old, and still perfectly countable — so the counts below would read "up to date" against a ref that is
+  # itself stale. Same silent staleness, one level up, and the counts cannot reveal it.
+  fetched=1
+  onbox_q "cd $MONAD_DIR_BOX && git fetch -q origin '+refs/heads/$MONAD_BRANCH:refs/remotes/origin/$MONAD_BRANCH'" \
+    >/dev/null 2>&1 || fetched=0
   behind="$(onbox_q "cd $MONAD_DIR_BOX && git rev-list --count HEAD..origin/$MONAD_BRANCH 2>/dev/null" | tr -d ' \n')"
   ahead="$(onbox_q "cd $MONAD_DIR_BOX && git rev-list --count origin/$MONAD_BRANCH..HEAD 2>/dev/null" | tr -d ' \n')"
-  case "$behind" in ''|*[!0-9]*) behind=0 ;; esac
-  case "$ahead"  in ''|*[!0-9]*) ahead=0 ;; esac
+  # EMPTY IS NOT ZERO. `git rev-list --count HEAD..origin/<branch>` exits 128 with NO OUTPUT when that ref does
+  # not exist, and folding that into 0 makes all three branches below silent — this check then announces nothing
+  # for a comparison it never performed, which is precisely the staleness the paragraph above says it exists to
+  # prevent. So the two cases are told apart, and "could not tell" is said out loud instead of read as agreement.
+  # A warning, not fatal, and deliberately: 5b-bis below still proves the binary matches the CHECKOUT, so what
+  # is unknown here is only the checkout's relation to upstream — and blocking a bring-up on a network blip
+  # would cost more than it saves. Silence is the failure mode; stopping is not the fix.
+  unreadable=0
+  case "$behind" in ''|*[!0-9]*) unreadable=1; behind=0 ;; esac
+  case "$ahead"  in ''|*[!0-9]*) unreadable=1; ahead=0 ;; esac
+  if [ "$unreadable" = 1 ]; then
+    say "⚠️  cannot compare $BOX's checkout with origin/$MONAD_BRANCH — THE BRANCH-FRESHNESS CHECK DID NOT RUN."
+    say "    git rev-list returned no count, so origin/$MONAD_BRANCH most likely does not exist on the box."
+    say "    The producer may be running old code and nothing here can tell. Check by hand:"
+    say "      ssh $BOX 'cd monad && git fetch origin $MONAD_BRANCH && git status -sb'"
+  elif [ "$fetched" != 1 ]; then
+    say "⚠️  git fetch FAILED on $BOX, so what follows is measured against a possibly stale"
+    say "    origin/$MONAD_BRANCH — a network or auth failure reads as 'up to date' here. Verify:"
+    say "      ssh $BOX 'cd monad && git fetch origin $MONAD_BRANCH'"
+  fi
   if [ "$behind" != 0 ] && [ "$ahead" != 0 ]; then
     die "$BOX's monad checkout has diverged from origin/$MONAD_BRANCH ($ahead local, $behind upstream).
    rtp-up will not resolve that: reconcile it by hand and re-run."

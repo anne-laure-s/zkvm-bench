@@ -364,7 +364,13 @@ cmd_status() {
   echo "  queue: $(ls "$REPO/guests/monad-zisk/fixtures" 2>/dev/null | grep -cE '^[0-9]+-[0-9]+\.bin$') input(s)"
   # Guard the file test: a redirection from a missing file prints its own error before any 2>/dev/null
   # inside the substitution can catch it — noisy on every status call before the tap has ever run.
-  local M="${MANIFEST:-$HOME/witness-manifest.csv}"
+  # Derived from WITNESS_DIR, which is the rule ./witness-tap applies (it writes the manifest as the dump's
+  # SIBLING, deliberately outside the directory it purges). A literal $HOME/witness-manifest.csv here agrees
+  # with the tap only while WITNESS_DIR is the default: move the dump, and this reports on a manifest nothing
+  # is writing. Both ends now derive from the same input, so they move together.
+  # `${WITNESS_DIR%/*}` and not `dirname`: they part company on a trailing slash — dirname /a/b/ is /a, while
+  # the tap's os.path.dirname("/a/b/") is /a/b. Reproducing the AUTHORITY's rule is the whole point of deriving.
+  local M="${MANIFEST:-${WITNESS_DIR%/*}/witness-manifest.csv}"
   if [ -f "$M" ]; then echo "  manif: $(( $(wc -l < "$M") - 1 )) row(s)"
   else echo "  manif: 0 row(s)  (no $M yet)"; fi
   echo "== disk =="; df -h / | tail -1 | sed 's/^/  /'; echo "  triedb: $(du -sh "$DB" 2>/dev/null | cut -f1)"

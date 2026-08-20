@@ -189,16 +189,20 @@ trap 'echo >&2; log "interrupted — stopping…"; exit 130' INT TERM
 is_proven(){ awk -F, -v b="$1" -v g="$GUEST" '$2==b && $3==g && $5=="ok"{f=1} END{exit !f}' "$OUT" 2>/dev/null; }
 
 # report.json (shared prove contract) -> "prove_secs<TAB>total_secs<TAB>proof_bytes" (jq if present, else grep).
+# The report's own `mode` travels with the numbers, because the ledger must record what the RUNNER did and
+# not what this script was asked to do. The column used to carry `--mode`, which rtp-up never passes: all 5904
+# rows came out empty, and nothing in the ledger told a mock row from a real one. The runner always writes it.
 parse_report(){
   local f="$1"
   if command -v jq >/dev/null 2>&1; then
-    jq -r '[.prove_secs, .total_secs, .proof_bytes] | map(. // "") | @tsv' "$f" 2>/dev/null
+    jq -r '[.prove_secs, .total_secs, .proof_bytes, .mode] | map(. // "") | @tsv' "$f" 2>/dev/null
   else
-    local ps ts pb
+    local ps ts pb md
     ps=$(grep -oE '"prove_secs"[[:space:]]*:[[:space:]]*[0-9.]+' "$f" 2>/dev/null | grep -oE '[0-9.]+$')
     ts=$(grep -oE '"total_secs"[[:space:]]*:[[:space:]]*[0-9.]+' "$f" 2>/dev/null | grep -oE '[0-9.]+$')
     pb=$(grep -oE '"proof_bytes"[[:space:]]*:[[:space:]]*[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+$')
-    printf '%s\t%s\t%s\n' "$ps" "$ts" "$pb"
+    md=$(grep -oE '"mode"[[:space:]]*:[[:space:]]*"[^"]*"' "$f" 2>/dev/null | head -1 | sed -E 's/.*"([^"]*)"$/\1/')
+    printf '%s\t%s\t%s\t%s\n' "$ps" "$ts" "$pb" "$md"
   fi
 }
 
@@ -457,8 +461,9 @@ prove_one(){
   rm -f "$ref"; run_dir="${rep%/report.json}"
   proof=""; [ -n "$run_dir" ] && for p in "$run_dir/proof.bin" "$run_dir"/segments; do [ -e "$p" ] && { proof="$p"; break; }; done
   if [ "$rc" = 0 ] && [ -n "$rep" ] && [ -n "$proof" ]; then
-    IFS=$'\t' read -r ps ts pb < <(parse_report "$rep")
-    echo "$(date +%FT%T),$b,$GUEST,${MODE:-},ok,${ps:-},${ts:-},${pb:-},$run_dir" >> "$OUT"
+    IFS=$'\t' read -r ps ts pb md < <(parse_report "$rep")
+    # `md` is what the runner recorded; ${MODE:-} only says what was ASKED for, and rtp-up asks for nothing.
+    echo "$(date +%FT%T),$b,$GUEST,${md:-${MODE:-}},ok,${ps:-},${ts:-},${pb:-},$run_dir" >> "$OUT"
     log "<< $b ok — prove=${ps:-?}s total=${ts:-?}s proof=${pb:-?}B  record=$run_dir  (wall $((SECONDS-t0))s)"
     LAST_OK=1; LAST_RUN_DIR="$run_dir"
   else
