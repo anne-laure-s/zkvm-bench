@@ -45,7 +45,7 @@ accepted unless --token is given. Verification is mock by default (a real, well-
 Store (default: run-data/ethproofs-mock-data/, git-ignored): submissions.jsonl (append log,
 replayed on restart) + proofs/<cluster>-<block>.bin (the decoded proofs).
 """
-import argparse, base64, json, os, subprocess, sys, threading, time
+import argparse, base64, json, os, subprocess, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 
@@ -328,14 +328,72 @@ def load_checkpv():
     return _PV_CHECKPV
 
 
+# The extractor: infra/zisk-infra/zisk-publics, a ~20-line binary over `zisk-sdk`. `cargo-zisk verify` takes
+# only --proof and prints nothing, so the CLI cannot answer "which block is this proof about?" — the SDK can:
+# Proof::verify() validates the proof against its embedded public values, and Proof::publics() reads them.
+# Build it once: cd infra/zisk-infra/zisk-publics && cargo build --release
+PUBLICS_CMD = os.environ.get("ZISK_PUBLICS") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "infra", "zisk-infra", "zisk-publics", "target", "release", "zisk-publics")
+
+
+def publics_from_proof(proof_b64):
+    """The values THE PROOF commits to, or None. Read with ZisK's own deserializer, after its own verify.
+
+    THIS IS THE HALF THAT MAKES THE CHECK MEAN ANYTHING. The reference client
+    (0xPolygonHermez/zisk-ethproofs) posts block_number, cluster_id, proving_time, proving_cycles, proof and
+    verifier_id — no public values, no roots — because establishing what a proof is about is the VERIFIER's
+    job, not the submitter's. A server that waits for the client to declare its own roots is trusting the one
+    party the check exists to doubt, and on a real ZisK cluster it waits for ever: `cargo-zisk remote prove`
+    emits no public-values file at all.
+
+    So the server reads them off the proof it was handed. `verify()` inside the extractor is what binds the
+    two: values read without it would describe a file, not a proof.
+    """
+    if not proof_b64 or not os.path.exists(PUBLICS_CMD):
+        return None
+    # A TEMP FILE, not the store. This runs BEFORE the submission is accepted, and a refused submission must
+    # leave nothing behind — same invariant the staleness check upholds one line above. So the bytes get their
+    # own file for the length of one exec and it goes away whatever happens.
+    tmp = None
+    try:
+        raw = base64.b64decode(proof_b64)
+        fd, tmp = tempfile.mkstemp(prefix="ep-pv-", suffix=".proof.bin")
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        r = subprocess.run([PUBLICS_CMD, tmp], capture_output=True, timeout=120)
+        return r.stdout if r.returncode == 0 and r.stdout else None
+    except (ValueError, TypeError, OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 def public_values_verdict(block, body):
     """(ok, detail): True = every value checked agrees · False = REFUSE · None = could not check."""
-    vals = body.get("public_values")
-    if not isinstance(vals, dict) or not vals:
-        return None, "not sent by the submitter"
     cp = load_checkpv()
     if cp is None:
         return None, "cli/check-pv unavailable"
+    # THE PROOF FIRST, the submitter's word second. Same reason the reference client sends nothing: what the
+    # client says it committed is a claim, what the proof commits is a fact.
+    pv = publics_from_proof(body.get("proof"))
+    vals = None
+    if pv is not None:
+        try:
+            vals = cp.decode(pv)
+            source = "read from the proof"
+        except ValueError:
+            pv, vals = None, None
+    if vals is None:
+        vals = body.get("public_values")
+        source = "as sent by the submitter"
+    if not isinstance(vals, dict) or not vals:
+        return None, ("not sent by the submitter, and not readable from the proof "
+                      f"(no {os.path.basename(PUBLICS_CMD)} — build it to arm this check)")
     if not PV_RPC:
         return None, "no --rpc: the server has no independent source"
     if block is None:

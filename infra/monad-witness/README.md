@@ -371,11 +371,314 @@ clone carries everything the queue and the prover driver need — no build on th
 cd ~/zkvm-bench && git pull && cd infra/monad-witness && ./witness-follow status
 ```
 
-## Real proving on a cluster
+## Real proving on a cluster, end to end
 
-`./rtp-up --real` swaps the model prover for a ZisK cluster on a GPU box. One entry point, from the Mac.
+Three machines, one entry point. `./rtp-up --real` from the Mac wires all of it; what it deliberately does
+not do — enable Remote Login, commit your code, install a toolchain, switch your monad branch — is listed at
+the top of the script.
 
-### The ssh key is needed only at startup
+| machine | role | what it needs |
+|---|---|---|
+| this Mac | driver · ethproofs mock · **verifier** | Remote Login on, `cargo-zisk` (verify only, ~30 ms/proof) |
+| the box | producer: fetch → replay → witness → queue → `prove-farm` | monad on `al/rtp`, a clone of this repo, the triedb snapshot (see *Box prerequisites* above) |
+| the prover | ZisK coordinator + workers on the GPUs | ZisK installed, cluster up, ≥64 GB disk for the proving key |
+
+### 0. The three names everything else uses
+
+`rtp-up` reads `REMOTE` and `PORT` — the same names `core.sh` and `prove-farm` use — so one export covers the
+whole runbook, and every command below is copy-pasteable as written.
+
+```sh
+export BOX=nyc-003
+export REMOTE=root@1.2.3.4 PORT=41022
+```
+
+(`PROVER`/`PROVER_PORT` still work and win when both are set.)
+
+### 1. A fresh prover, from nothing
+
+Everything here is one-time and survives a stop/start (except a RAM-hosted proving key). `rtp-up` stages the
+four files it needs onto the prover from the box's clone on every run, so **the prover's clone is only for
+this bring-up** — it never has to be updated afterwards.
+
+**First, what the install cannot give you.** Check these before spending an hour:
+
+```sh
+ssh -p "$PORT" "$REMOTE" 'nvidia-smi -L; df -h --output=avail $HOME | tail -1; ulimit -l'
+```
+
+- **The NVIDIA driver must already be there.** `ziskup` decides at install time whether it builds `[gpu]` or
+  `[cpu]`, and a `[cpu]` `cargo-zisk` cannot prove on the GPUs. No driver, no proving — change box.
+- **≥64 GB free**, or the install refuses. On a high-RAM small-disk box put the key in RAM instead:
+  `ZISK_KEY_DIR=/dev/shm/zisk`, and re-run after every instance stop (RAM is not persistent). It fails fast if
+  that path is `noexec` — the key contains `dlopen`'d `.so` files.
+- `ulimit -l` — remember the number, it decides the memlock step below.
+- Count the GPUs while you are there; that is your `PROVE_GPUS`.
+
+**Then, in order.** `00-install-once.sh` runs `apt-get` unprefixed, so this wants **root** (`REMOTE=root@…`):
+
+```sh
+ssh -p "$PORT" "$REMOTE" 'apt-get update -qq && apt-get install -y -qq git curl'
+```
+
+That first line is not redundant: the install script installs `git` itself, but you need `git` before it to
+get the script at all.
+
+```sh
+ssh -p "$PORT" "$REMOTE" "git clone $(git remote get-url origin) ~/zkvm-bench"
+ssh -p "$PORT" "$REMOTE" 'cd ~/zkvm-bench/infra/zisk-infra/cluster && ./00-install-once.sh'
+```
+
+System deps → rustup → `ziskup 1.1.0-alpha` (pinned; `ZISK_VER=` to change it) → the STARK proving key: a
+~3.5 GB download that extracts to 30-70 GB, plus const-tree generation. Long. It hard-fails if `cargo-zisk`
+is not `[gpu]` or the key is missing, so a success here means those two things are true.
+
+**The memlock shim.** ZisK's asm backend `mmap`s its ROM with `MAP_LOCKED`; an unprivileged container
+(vast.ai) caps memlock at 64 KB and cannot raise it, so those mmaps fail with `errno=11` at
+`STARTING_ASM_MICROSERVICES`. Build the shim unconditionally — `start.sh` auto-loads it when present and it is
+harmless where memlock is fine:
+
+```sh
+ssh -p "$PORT" "$REMOTE" 'cd ~/zkvm-bench/infra/zisk-infra/cluster && gcc -shared -fPIC -O2 -o ~/nolock.so nolock.c -ldl && ls -l ~/nolock.so'
+```
+
+If `00-install-once.sh` printed `WARN: could not raise memlock`, or `ulimit -l` showed a small cap, the
+microservices need the source patch as well:
+
+```sh
+ssh -p "$PORT" "$REMOTE" 'cd ~/zkvm-bench/infra/zisk-infra/cluster && bash fix-memlock-patch.sh'
+```
+
+It sets `map_locked_flag = 0` in `~/.zisk/zisk/emulator-asm/src/globals.c` (keeping a `.orig`) and purges the
+cached ROM binaries so the next setup recompiles from the patched source. With plenty of RAM, unlocking costs
+nothing — the pages are never swapped anyway.
+
+**Bring the cluster up:**
+
+```sh
+ssh -p "$PORT" "$REMOTE" 'cd ~/zkvm-bench/infra/zisk-infra/cluster && ./start.sh'
+```
+
+Coordinator on api `7000` / cluster `50051` / metrics `9090`, one worker across all GPUs, asm backend,
+`nolock.so` auto-loaded. `infra/zisk-infra/docs/runbook-vastai.md` has the box requirements and the first
+failures to expect; `cluster/README.md` has the canonical upstream commands if this misbehaves.
+
+**Confirm before going further:**
+
+```sh
+ssh -p "$PORT" "$REMOTE" 'PATH=$HOME/.zisk/bin:$PATH cargo-zisk --version; ls -d ~/.zisk/provingKey >/dev/null && echo "provingKey ok"; curl -sf -o /dev/null -w "coordinator %{http_code}\n" http://127.0.0.1:9090/health; command -v ziskemu >/dev/null && echo "ziskemu ok"'
+```
+
+Wanted: `[gpu]`, `provingKey ok`, `coordinator 200`. `ziskemu` comes with `ziskup` and is not needed to
+prove — it is what a *mock* rehearsal on this same box would measure step counts with.
+
+**Same ZisK version on the prover and the Mac.** The Mac verifies every proof the mock accepts, with its own
+`cargo-zisk`. A prover on `1.0.0-alpha` against a Mac on `1.1.0-alpha` produces valid proofs that fail
+verification here, which reads as a broken prover.
+
+```sh
+cargo-zisk --version        # on this Mac, for comparison
+```
+
+The per-ELF `cargo-zisk remote setup` is **not** a manual step: `rtp-up --real` runs it, without `--hints`
+(the Monad guest has none), and it is idempotent.
+
+### 2. The two ssh directions
+
+Four different things fail in this one spot, one at a time, and ssh's message tells you which:
+
+| message | cause | who fixes it |
+|---|---|---|
+| `Could not resolve hostname nyc-003` | an alias that resolves only on this Mac | `rtp-up`, from `ssh -G` |
+| `Connection refused … port 22` | the sshd is not on 22 | `rtp-up`, from `ssh -G` |
+| `Host key verification failed` | one side has never seen the other's host key, and `BatchMode` will not prompt | `rtp-up`, from this Mac's `known_hosts` |
+| `Permission denied` | no key in the other side's `authorized_keys` | **you** — below |
+
+So the route and the host keys are handled. What is left is the two `authorized_keys`, and they are needed in
+both directions for different reasons:
+
+- **box → prover**, to stage the runner and the channel binaries. Needed **at startup only**.
+- **prover → box**, which every channel dials. Needed **for the whole run**.
+
+First let this Mac learn the prover, interactively, once — this is the one fingerprint prompt in the whole
+runbook, and `rtp-up` copies what you accept here to the box:
+
+```sh
+ssh -p "$PORT" "$REMOTE" true
+```
+
+Resolve the box's route into two variables, so every command below is exact:
+
+```sh
+eval "$(ssh -G "$BOX" | awk '/^hostname /{h=$2} /^port /{p=$2} /^user /{u=$2} END{print "BH="u"@"h"; BP="p}')"
+echo "the prover must dial: $BH port $BP"
+```
+
+Both commands below carry two guards, and both were learned the hard way on a fresh box:
+
+- `tail -c1` — an `authorized_keys` file routinely has no trailing newline, and a plain `cat >>` then glues
+  the appended key onto the last existing one, invalidating **both**. That is a lockout, not a warning.
+- `cp -n … .bak` — a no-clobber copy, so the *original* survives however many times this is re-run. Recovery
+  is then `cp ~/.ssh/authorized_keys.bak ~/.ssh/authorized_keys` from any shell that still works.
+
+`rtp-up` takes the same two precautions everywhere it writes to a `.ssh` file (`known_hosts.rtp-bak`).
+
+**The box's key onto the prover — `rtp-up` does this itself, every run.** It has to: the box's hourly
+`find ~/.ssh -type f -name 'id_*' -delete` takes both halves of its keypair, so a pubkey placed here by hand
+stops working within the hour and the next run dies at *End-to-end reachability*. This Mac is the only party
+that can fix it — it holds a key to both machines, which is precisely what the box and the prover do not yet
+have between them. So `rtp-up` makes sure the box has a keypair and authorises it on the prover from here,
+with the `.bak` and the newline guard, skipping the line if it is already present.
+
+The manual equivalent, for a first look or when `rtp-up` says it could not:
+
+```sh
+ssh "$BOX" 'ls ~/.ssh/id_*.pub 2>/dev/null || ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 < /dev/null'
+ssh "$BOX" 'cat ~/.ssh/id_*.pub' | ssh -o StrictHostKeyChecking=accept-new -p "$PORT" "$REMOTE" 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && cp -n ~/.ssh/authorized_keys ~/.ssh/authorized_keys.bak 2>/dev/null; { [ -n "$(tail -c1 ~/.ssh/authorized_keys)" ] && echo >> ~/.ssh/authorized_keys || true; } && while read -r l; do grep -qxF "$l" ~/.ssh/authorized_keys || echo "$l" >> ~/.ssh/authorized_keys; done && chmod 600 ~/.ssh/authorized_keys && echo added'
+```
+
+`< /dev/null` on the keygen: with a private key present but its `.pub` missing, `ssh-keygen` asks
+`Overwrite (y/n)?` and would hang on a non-interactive ssh. If you see that question, the private key is
+there — rebuild the public half from it instead: `ssh-keygen -y -f ~/.ssh/id_ed25519 > ~/.ssh/id_ed25519.pub`.
+
+**The prover's key onto the box.** `authorized_keys` is not what the cron deletes, so this one lasts:
+
+```sh
+ssh -p "$PORT" "$REMOTE" 'ls ~/.ssh/id_*.pub 2>/dev/null || ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 < /dev/null'
+ssh -p "$PORT" "$REMOTE" 'cat ~/.ssh/id_*.pub' | ssh "$BOX" 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && cp -n ~/.ssh/authorized_keys ~/.ssh/authorized_keys.bak 2>/dev/null; { [ -n "$(tail -c1 ~/.ssh/authorized_keys)" ] && echo >> ~/.ssh/authorized_keys || true; } && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo added'
+```
+
+**Both directions, verified.** These still fail on the host keys until `rtp-up` has run once — add
+`-o StrictHostKeyChecking=accept-new` to check the keys alone, or just let `rtp-up --real` tell you:
+
+```sh
+ssh "$BOX" "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p $PORT $REMOTE true && echo 'box -> prover ok'"
+ssh -p "$PORT" "$REMOTE" "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p $BP $BH true && echo 'prover -> box ok'"
+```
+
+The Mac also has to be reachable **from the box** — `rtp-up` installs the reverse tunnel and verifies it, but
+it cannot turn on Remote Login for you (System Settings → General → Sharing).
+
+### 3. Pick the guest
+
+```sh
+./guests/monad/use-gen
+```
+
+The installed ELF is committed, so the box gets it by `git pull`. To prove a candidate that is not committed,
+add `GUEST_ELF=<generation-name|path>` to the launch below: it is copied to the box under its own sha — the
+filename **is** the checksum, so two candidates can never be confused. Step *Witness format vs guest
+generation* then checks the guest against what the box's monad branch actually emits; that mismatch is not a
+graceful failure, and witness filenames are identical across formats.
+
+### 4. Launch
+
+Read it first, run nothing:
+
+```sh
+PROVE_GPUS=16 PROVE_EVERY=2 ./infra/monad-witness/rtp-up --real --dry-run
+```
+
+Then for real:
+
+```sh
+PROVE_GPUS=16 PROVE_EVERY=2 ./infra/monad-witness/rtp-up --real
+```
+
+| variable | why you would set it |
+|---|---|
+| `PROVE_GPUS` | how many GPUs the cluster has — the cadence projection and the leaderboard label |
+| `PROVE_EVERY` | the cadence, in **blocks**. Never derived — see below |
+| `GUEST_ELF` | prove an uncommitted candidate |
+| `EP_URL` / `EP_TOKEN` / `EP_CLUSTER` | somewhere other than the local mock |
+| `MOCK_STORE` | the mock's records. Default `/tmp/ethproofs-rtp`, which a reboot clears — give it a real path for a campaign you want to keep |
+| `PROVER_LOG_FILES` | prover-side logs whose tails ride back with the artifacts |
+| `PUMP_CHANNELS` | pin the stream count (the box→prover link is not profiled from the Mac) |
+| `KEPT_MAX_GB` | the cap on the box's parked collection |
+
+**The cadence is yours.** `--real` prints a projected worst case and the `PROVE_EVERY` that would cover it,
+then uses the value you gave. At `PROVE_EVERY=1` with a service time above 12 s the queue cannot drain: the
+tap's `unproved` counter climbs without bound and blocks start being abandoned at the `SKIP_AFTER` window.
+Selection is `block % N == 0`, so the same blocks are picked across runs and across zkVMs, and coverage then
+reports `1/N` as its **ceiling**, not a shortfall.
+
+### 5. What a healthy start looks like
+
+19 steps. The ones that decide whether the run is real:
+
+```
+== Persistent channels on root@1.2.3.4 (so the key is needed only now)
+   submitter and the public-value gate staged
+   data channel serving on root@1.2.3.4:/tmp/zisk-pump-real.sock
+   exec channel answers from nyc-003 with no box-side key
+== Forwarding the submission endpoint onto root@1.2.3.4:8547
+   the prover reaches http://localhost:8547 — it will post its own proofs
+== Witness format vs guest generation
+== Starting the prover (REAL ZisK cluster on root@1.2.3.4, 16 GPU)
+```
+
+A `WARNING` in place of any of those means the run continues **degraded**: witnesses or proofs cross on
+per-block ssh, which also stops working when the box's hourly key-deleting cron fires. `rtp-up` dies rather
+than continue on: no `cargo-zisk` on the prover, a coordinator that does not answer, a prover that cannot
+reach the box, a channel that does not answer, a missing `check-pv` beside the submitter, or a `logs/ALERT`
+on the box (a reorg — it prints the rewind commands and refuses to start on top of it).
+
+### 6. Watching it
+
+```sh
+ssh "$BOX" 'tail -2 ~/witness-tap.log; tail -6 ~/prove-real.log'
+```
+
+- `witness-tap.log` — `lag` 2-3 blocks · `raw` 0-1 · `unproved` must not climb.
+- `prove-real.log` — `prove=X wall=Z`; **`Z-X` is the transport**.
+
+```sh
+open "http://localhost:8547"
+```
+
+The leaderboard. A real proof reads **✓**; `⊘` means a mock proof slipped in.
+
+```sh
+ssh -p "$PORT" "$REMOTE" 'nvidia-smi'
+ssh -p "$PORT" "$REMOTE" 'tail -20 ~/zkvm-bench/infra/zisk-infra/cluster/logs/worker.log'
+```
+
+The GPUs must actually be busy during a proof. Worker phases: `EXECUTE` ·
+`CALCULATING_CONTRIBUTIONS` · `GENERATING_INNER_PROOFS`.
+
+```sh
+ssh "$BOX" 'cd ~/zkvm-bench && profiling/rtp-latency.py --manifest ~/witness-manifest.csv --results infra/zisk-infra/results --guest monad-zisk | tail -15'
+```
+
+The first thing worth doing once blocks land is replacing the projection with the measurement:
+
+```sh
+ssh "$BOX" "grep -o 'prove=[0-9.]*' ~/prove-real.log | tail -20"
+```
+
+If it differs from the projection, the cadence derived at startup is wrong — re-derive `PROVE_EVERY`.
+
+### 7. Is a proof real?
+
+Three independent gates, and they do not trust each other:
+
+1. **The submitter refuses to send** a proof whose committed public values are not this block's — post-state
+   root, pre-state root and block hash, all three. Every submission line ends
+   `ok:post_state_root+block_hash+pre_state_root`; anything else is a proof that did not commit to this block.
+2. **The mock refuses to accept** one, from its own `--rpc`: `409` on public values that are not the block's.
+   The server keeps its own opinion rather than trusting the prover.
+3. **The mock verifies it cryptographically**, on this Mac, via `cli/verify-proof` → `cargo-zisk verify -p`.
+   A mock proof is rejected outright — a fake proof must never come back "verified".
+
+```sh
+ssh "$BOX" "grep -c 'ok:post_state_root+block_hash+pre_state_root' ~/prove-real.log"
+curl -s http://localhost:8547/status | python3 -m json.tool
+```
+
+`vkey_hash` in each `report.json` is the prover's verification key. It is **per-install, not per-ELF**: it
+differs between machines, and a change on one machine means its proving key was reinstalled.
+
+### 8. The ssh key is needed only at startup
 
 Every link to the prover is a **persistent channel, dialled by the prover**:
 
@@ -385,92 +688,52 @@ Every link to the prover is a **persistent channel, dialled by the prover**:
 | `witness-pump exec-host` | every control call the box makes on the prover | `~/.zisk-exec.sock` on the box |
 | `ssh -L` onto the box | the submission endpoint, when it is the local mock | `$MOCK_PORT` on the prover |
 
-The third one exists because the prover POSTs its own proofs, so `EP_URL` is resolved **on the prover**: a mock
-at `localhost:8547` is the prover's own localhost with nothing behind it, and every block would fall back to
-posting from the box with the proof crossing back over the slow hop. `rtp-up --real` forwards the port when
-`EP_URL` is local, checks `GET /status` through it, and says so when it cannot.
+The third exists because the prover POSTs its own proofs, so `EP_URL` is resolved **on the prover**: a mock at
+`localhost:8547` is the prover's own localhost with nothing behind it, and every block would fall back to
+posting from the box with the proof crossing back over the slow hop.
 
 `rtp-up --real` stages `witness-pump`, `ethproofs-submit` and `check-pv` on the prover from the box's clone,
-starts both channels, and verifies both **answer** — a bound socket with no channel behind it is the failure
-mode, not the success case, so the data channel is only accepted once its log says `channels open` and the
-exec channel only once it returns from the box.
+starts all three channels, and verifies each one **answers** — a bound socket with no channel behind it is the
+failure mode, not the success case, so the data channel is only accepted once its log says `channels open`
+and the exec channel only once it returns from the box.
 
 What this buys: after startup nothing needs a box→prover key. The box's hourly
-`find ~/.ssh -type f -name 'id_*' -delete` can take it, and proving continues. The direction that must keep
-working is the other one — **the prover's own key to the box** — and `rtp-up` checks it before starting
-anything, because without it both channels come up and every block silently falls back to per-block ssh.
+`find ~/.ssh -type f -name 'id_*' -delete` can take it and proving continues. The direction that must keep
+working is the prover's own key to the box.
 
-### Once per prover
-
-```sh
-ssh <prover> 'git clone <this repo> ~/zkvm-bench; cd ~/zkvm-bench \
-  && infra/zisk-infra/cluster/00-install-once.sh && infra/zisk-infra/cluster/start.sh'
-```
-
-The proving key extracts to ~70 GB, so the prover needs the disk for it — `infra/zisk-infra/docs/runbook-vastai.md`
-has the box requirements.
-
-Then give the prover a key to the box, and confirm the direction that matters:
+Check them by hand at any time:
 
 ```sh
-ssh <prover> 'ssh -o BatchMode=yes <box> true && echo reachable'
+ssh -p "$PORT" "$REMOTE" 'ls -l /tmp/zisk-pump-real.sock; grep -c "channels open" ~/witness-pump.log'
+ssh "$BOX" 'cd ~/zkvm-bench && PUMP_EXEC_SOCK=$HOME/.zisk-exec.sock infra/zisk-infra/witness-pump run "hostname"'
 ```
 
-### Every run
+The second prints the **prover's** hostname if the exec channel is alive — it ran there.
+
+### Rehearsing without the GPUs
+
+`REMOTE=<box>` **without** `--real` puts the *model* prover on a remote box: every transfer, all three
+channels, the queue policy, the submission and all three public-value gates are the real thing, and only the
+prover's sleep is fiction. It gets its own runner dir (`zisk-mock` against `zisk-prover`), workspace, pump
+socket, log and ethproofs cluster id (`mock-<host>-ZisK-monad`), so a rehearsal cannot collide with — or be
+mistaken for — a real deployment on the leaderboard.
+
+It needs `ziskemu` on that box. Without it the model loses its only per-block input and every simulated
+duration is the same fixed term: a constant pretending to be a measurement. `rtp-up` says so loudly rather
+than failing.
+
+### 9. Down
 
 ```sh
-BOX=<box> PROVER=<ssh target the box can reach> PROVE_GPUS=16 PROVE_EVERY=1 \
-  ./infra/monad-witness/rtp-up --real
+./infra/monad-witness/rtp-up --stop
 ```
 
-- `GUEST_ELF=<generation|path>` proves with an uncommitted guest; the file is copied under its own sha, so the
-  filename is the checksum.
-- `EP_URL` / `EP_TOKEN` / `EP_CLUSTER` send elsewhere than the local mock. A non-local `EP_URL` is checked from
-  the prover directly — no forward.
-- `PROVER_LOG_FILES="~/prove.log /tmp/zisk-coordinator.log"` brings those logs' tails back inside the artifact
-  tarball, for when there is proving margin to spare.
-- `PUMP_CHANNELS=N` pins the stream count: `netprofile` measures the link from the prover, and on a real prover
-  this Mac is not on that link, so the default is 1 rather than a guess dressed as a measurement.
-- `--dry-run` prints every command and runs none.
-
-`rtp-up --real` refuses to start on: no `cargo-zisk` on the prover, a coordinator that does not answer, a
-prover that cannot reach the box, a channel that does not answer, a missing `check-pv` beside the submitter
-(the public-value gate would load-but-absent and every proof would ship unchecked).
-
-### Rehearsing on a cheap box first
-
-`PROVER=<box>` **without** `--real` puts the *model* prover on a remote box: every transfer, both channels,
-the queue policy, the submission and the public-value gate are the real thing, and only the prover's sleep is
-fiction. Same command, minus the flag:
+Stops the box's sessions, the tunnel and the mock on the Mac, and all three of the prover's channels. The
+fetcher is left running: the `block_db` is cheap and reusable. The cluster on the prover keeps running:
 
 ```sh
-BOX=<box> PROVER=<cheap box> ./infra/monad-witness/rtp-up
+ssh -p "$PORT" "$REMOTE" 'cd ~/zkvm-bench/infra/zisk-infra/cluster && ./stop.sh'
 ```
 
-It gets its own runner dir (`zisk-mock` against `zisk-prover`), workspace, pump socket, log and ethproofs
-cluster id, so a rehearsal and a real deployment cannot collide on one host. Two things to know:
-
-- **`ziskemu` on that box or the measurement is a constant.** The model's only per-block input is the step
-  count it emulates; without `ziskemu` every simulated duration is the same fixed term — a constant
-  pretending to be a measurement. `rtp-up` says so loudly rather than failing.
-- The ELF is uploaded by `prove_remote` itself, on checksum mismatch. Nothing to stage by hand.
-
-### While it runs
-
-```sh
-ssh <box> 'tail -2 ~/witness-tap.log; tail -6 ~/prove-real.log'
-```
-
-`prove=X wall=Z` — `Z-X` is the transport. `vkey_hash` in each `report.json` is the prover's verification key,
-which is per-install and not per-ELF: it differs between machines, and a change on one machine means its
-proving key was reinstalled. Every submission line ends in `ok:post_state_root+block_hash+pre_state_root`;
-anything else is a proof that did not commit to this block.
-
-### Down
-
-```sh
-BOX=<box> PROVER=<prover> ./infra/monad-witness/rtp-up --stop
-```
-
-Stops the box's sessions, the tunnel and the mock on the Mac, and all three of the prover's channels. The fetcher is
-left running: the `block_db` is cheap and reusable.
+A missed proof is missed: there is no catch-up. Restarting mid-campaign resumes at the tip, and the blocks
+that went by while it was down are gone from the coverage.

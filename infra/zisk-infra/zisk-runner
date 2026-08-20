@@ -122,7 +122,11 @@ case "$MODE" in
     [[ -n "$ELF" && -n "$INPUT" ]] || { echo "ERROR: execute needs --elf and --input" >&2; exit 2; }
     echo "ELF      : $ELF"
     echo "Input    : $INPUT"
-    emu_log="$(mktemp -t zisk-emu)"
+    # XXXXXX IS REQUIRED. `mktemp -t zisk-emu` works on macOS (it appends its own suffix) and fails on GNU
+    # coreutils with "too few X's in template" — so on the box the emulation ran, printed its metrics, and
+    # captured them into '' : steps came back null in every exec-report while the run looked successful. The
+    # public values were fine, which is what made it invisible: the artefact that matters was there.
+    emu_log="$(mktemp -t zisk-emu.XXXXXX)"
     t0="$(now)"
     # -m logs metrics (steps/duration). -o writes the program output (public values)
     # if a path is given; harmless if the version ignores it.
@@ -225,7 +229,7 @@ JSON
       if _nz "${ZISK_MOCK_PER_MSTEP:-}"; then
         if command -v "$ZISK_EMU_BIN" >/dev/null 2>&1; then
           echo "Cmd      : [MOCK PROVER] emulating to measure the work ($ZISK_EMU_BIN)"
-          emu_log="$(mktemp -t zisk-mock-emu)"
+          emu_log="$(mktemp -t zisk-mock-emu.XXXXXX)"
           te0="$(now)"
           # Same invocation as --mode execute: -m for the metrics, -o for the real public values.
           if [[ -n "$PV" ]]; then ensure_parent "$PV"; fi

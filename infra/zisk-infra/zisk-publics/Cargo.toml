@@ -1,0 +1,16 @@
+[package]
+name = "zisk-publics"
+version = "0.1.0"
+edition = "2021"
+
+# The ONE thing cargo-zisk's CLI does not expose. `cargo-zisk verify` takes only --proof and prints no
+# values, so nothing in this repo could answer "which block is this proof about?" from the proof itself.
+# The SDK can: Proof::verify() validates the proof against its embedded public values, and Proof::publics()
+# reads them back. Same version as the prover's toolchain — a proof is only readable by the release that
+# wrote it.
+[dependencies]
+zisk-sdk = "1.1.0-alpha"
+
+[[bin]]
+name = "zisk-publics"
+path = "src/main.rs"

@@ -864,6 +864,14 @@ if [ "$DRY" != 1 ]; then
 fi
 
 # ── 3. ethproofs-mock ──────────────────────────────────────────────────────────────────────────────
+# The extractor the mock needs to read a proof's public values. Absent, the mock's gate falls OPEN — it says
+# so on startup, but a warning in a scrollback is not a check. Named here because this is the step that owns
+# the mock, and because "the gate is armed" must be visible at launch, not discovered from a 409 that never came.
+if [ ! -x "$MAC_REPO/infra/zisk-infra/zisk-publics/target/release/zisk-publics" ]; then
+  say "⚠️  zisk-publics is not built — the mock cannot read a proof's committed values, so it will accept any"
+  say "    proof that verifies, for any block. Build it once (~90 s):"
+  say "      (cd infra/zisk-infra/zisk-publics && cargo build --release)"
+fi
 step "ethproofs-mock on :$MOCK_PORT (store $MOCK_STORE)"
 if [ "$KEEP_MOCK" = 1 ]; then
   say "--keep-mock: leaving whatever is running alone"
@@ -1879,7 +1887,7 @@ else
     say "  the producer may still be starting; re-run this script once it is emitting, or check by hand:"
     say "    ssh $BOX 'ls -t ~/witnesses/*.witness | head -1'"
   else
-    tmp_wit="$(mktemp -t rtpfmt)"
+    tmp_wit="$(mktemp -t rtpfmt.XXXXXX)"   # XXXXXX: GNU mktemp rejects a template without them
     if scp -q "$BOX:$wit" "$tmp_wit" 2>/dev/null; then
       prod_fmt="$("$MAC_REPO"/guests/monad/witness-fmt --quiet "$tmp_wit" 2>/dev/null || echo unreadable)"
     else
