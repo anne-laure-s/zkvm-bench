@@ -58,6 +58,8 @@
 # the witness-less replay, polls the gap until it closes, then switches to the tip phase.
 #
 # Config (env): BOX=<box> (required)  MAC_USER=$USER  TUN_SSH_PORT=2222  MOCK_PORT=8547
+#               BOX_FROM_PROVER=<user@host the PROVER can reach the box by>
+#                   Derived from the box itself when BOX is a bare alias. Everything the prover dials uses it.
 #               RPC=<url>  (the chain, for the public-value checks on both sides)
 #               MOCK_STORE=/tmp/ethproofs-rtp  MOCK_SECS=2.12  MOCK_PER_MSTEP=0.0364  MOCK_SPEED=2.5  MOCK_JITTER=0.5
 #               HEAD_TAG=latest  CONFIRMATIONS=0 (the head — real time)  RUNNER_DIR=$HOME/zisk-mock
@@ -93,6 +95,7 @@
 #                   100 = ethproofs sampling. Selection is `block % N == 0`, so the same blocks are picked
 #                   across runs and across zkVMs. Coverage then reports 1/N as its CEILING, not a shortfall.
 #               PROVER=<ssh target the BOX can reach>  PROVER_PORT=22
+#                   REMOTE / PORT are accepted as aliases — the names core.sh and prove-farm already use.
 #                   unset = the mock prover runs on this Mac through the tunnel: 20-34 s per block of pure
 #                   transport, the largest term left in the end-to-end. Set it to a datacenter host and the
 #                   witness never touches the home link. See the block above PROVER= for the details.
@@ -102,7 +105,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAC_REPO="$(cd "$HERE/../.." && pwd)"
 
 # No default: the box is infrastructure, not part of this repo. Checked below, after --help.
+#
+# BOX_FROM_PROVER — the same box, under the name the PROVER can reach it by. Two different machines resolve
+# names differently and there is no reason they should agree: `BOX=nyc-003` is an alias in THIS Mac's
+# ~/.ssh/config (it carries the user, the key, maybe a ProxyJump), and on a rented GPU box it is nothing at
+# all — `ssh: Could not resolve hostname nyc-003`. The prover needs a real address AND the right user, e.g.
+# aschmitt@nyc-003.devcore4.com. Defaults to $BOX, which is correct whenever the box has a globally
+# resolvable name; set it when the Mac uses an alias. Everything the PROVER dials uses this; everything the
+# MAC dials keeps using $BOX.
 BOX="${BOX:-}"
+BOX_FROM_PROVER_SET="${BOX_FROM_PROVER:-}"                 # was it given? the derivation must not override it
+BOX_FROM_PROVER="${BOX_FROM_PROVER:-$BOX}"
 MAC_USER="${MAC_USER:-$USER}"
 TUN_SSH_PORT="${TUN_SSH_PORT:-2222}"
 MOCK_PORT="${MOCK_PORT:-8547}"
@@ -263,6 +276,16 @@ fi
 # and today's mock path papers over it by using the Mac's absolute path on the remote host: it "works" because
 # mkdir creates it, but the runner then lives at /Users/<you>/zisk-mock on a Linux box, and every `~/...`
 # instruction printed about that host is wrong. Real mode resolves the prover's own $HOME instead (6d).
+# RESOLVED BEFORE THE MODE BLOCK, because the mode block reads it: RUNNER_DIR must not default to this Mac's
+# $HOME when the prover is elsewhere, and EP_CLUSTER must name that prover. Resolved after them, the alias
+# worked for the ssh calls and silently did nothing for either — a remote prover staging into /Users/<me>.
+# SAY when the alias is what supplied it. A REMOTE left exported from an unrelated zisk-infra session would
+# otherwise move the prover off this Mac without the operator having asked for it in this command. Decided
+# BEFORE the assignment, which is the only moment the two are still distinguishable.
+PROVER_FROM_ALIAS=0
+[ -z "${PROVER:-}" ] && [ -n "${REMOTE:-}" ] && PROVER_FROM_ALIAS=1
+PROVER="${PROVER:-${REMOTE:-}}"
+
 # The mock path is deliberately LEFT AS IS: it is a working deployment, and changing where it stages files is
 # not part of making real proving work. The same fix applies there whenever someone wants it.
 if [ "$PROVE_REAL" = 1 ]; then
@@ -292,7 +315,13 @@ else
   # `local-ZisK-monad`, so a rehearsal on a remote box and one on this Mac become one indistinguishable row —
   # and the whole point of rehearsing elsewhere is that the transport is different.
   if [ -n "${PROVER:-}" ]; then
-    ep_who="${PROVER##*@}"; ep_who="${ep_who%%.*}"          # user@host.domain -> host
+    ep_who="${PROVER##*@}"                                  # user@host -> host
+    # An IP keeps all four octets — `${host%%.*}` would label a box at 10.0.0.7 as `mock-10`, which is not a
+    # name, it is a collision waiting for the next box on the same /8.
+    case "$ep_who" in
+      *[!0-9.]*) ep_who="${ep_who%%.*}" ;;                  # a hostname: the first label is enough
+      *)         ep_who="${ep_who//./-}" ;;                 # an IPv4: keep it whole
+    esac
     EP_CLUSTER="${EP_CLUSTER:-mock-$ep_who-ZisK-monad}"
   else
     EP_CLUSTER="${EP_CLUSTER:-local-ZisK-monad}"
@@ -325,9 +354,12 @@ COORDINATOR_HEALTH="${COORDINATOR_HEALTH:-http://127.0.0.1:9090/health}"
 # The runner is staged there FROM THE BOX, not from here: the box is what has to reach it, so staging over
 # the same path proves the path. ziskemu must exist on it, or the mock loses the step measurement and falls
 # back to its fixed term — which would quietly turn every simulated duration into the same number.
-PROVER="${PROVER:-}"
+# REMOTE/PORT are accepted as the same thing, because that is what the rest of the repo calls them:
+# core.sh's prove_remote requires `REMOTE=user@host` and reads `PORT`, prove-farm takes --remote/--port. A
+# session that already has them exported should not have to restate them under a second pair of names.
+# PROVER/PROVER_PORT still win when both are set.
 if [ -n "$PROVER" ]; then
-  PROVER_TARGET="$PROVER";               PROVER_PORT="${PROVER_PORT:-22}";      PROVER_WHERE="$PROVER"
+  PROVER_TARGET="$PROVER";               PROVER_PORT="${PROVER_PORT:-${PORT:-22}}"; PROVER_WHERE="$PROVER"
 else
   PROVER_TARGET="$MAC_USER@localhost";   PROVER_PORT="$TUN_SSH_PORT";           PROVER_WHERE="this Mac"
 fi
@@ -757,6 +789,7 @@ nohup '$RUNNER_DIR/witness-pump' exec-host >> ~/witness-exec.log 2>&1 & )"
     || say "WARNING: no ziskemu on this Mac — the model will fall back to its fixed term only"
 else
   step "$([ "$PROVE_REAL" = 1 ] && echo "Real prover" || echo "Mock prover") on $PROVER (not this Mac) — staging deferred to after the box's clone is updated"
+  [ "$PROVER_FROM_ALIAS" = 1 ] && say "from REMOTE in the environment (PROVER= overrides it; unset REMOTE for a prover on this Mac)"
 fi
 
 # ── 2. the box must be able to ssh back here, without a password ────────────────────────────────────
@@ -1283,6 +1316,25 @@ unrelated to the block. Install ZisK there, or keep the prover on the Mac."
   # this box's cron never touches. prove_cmd already passes WITNESS_PUMP, PUMP_SOCK and REMOTE_SUBMIT for
   # every mode; only the starting was missing.
   step "Persistent channels on $PROVER_TARGET (so the key is needed only now)"
+  # DERIVE the box's name as the prover sees it, when $BOX cannot possibly be one. No dot and no user means
+  # an ~/.ssh/config alias, which resolves here and nowhere else — and the box knows both halves of the answer
+  # itself. Deriving beats defaulting to the alias: the alias is *known* wrong on a rented box, and the
+  # failure it produces (`Could not resolve hostname nyc-003`) arrives after the channels have started.
+  if [ -z "${BOX_FROM_PROVER_SET:-}" ] && [ "$BOX_FROM_PROVER" = "$BOX" ] && [ "$DRY" != 1 ]; then
+    case "$BOX" in
+      *.*|*@*) ;;                                           # already a real address
+      *) derived="$(onbox_q 'echo "$(whoami)@$(hostname -f)"' | tr -d ' \r\n')"
+         case "$derived" in
+           *@*.*) BOX_FROM_PROVER="$derived"
+                  say "the prover will dial the box as '$BOX_FROM_PROVER' ('$BOX' is an alias of this Mac only)" ;;
+           *)     say "WARNING: '$BOX' looks like a local alias and the box could not name itself \
+(got '${derived:-nothing}'). The prover will try '$BOX' and probably fail to resolve it — \
+set BOX_FROM_PROVER=user@host." ;;
+         esac ;;
+    esac
+  fi
+  [ "$BOX_FROM_PROVER" = "$BOX" ] \
+    || say "the prover will dial the box as '$BOX_FROM_PROVER' (this Mac uses '$BOX')"
   for f in infra/zisk-infra/witness-pump cli/ethproofs-submit cli/check-pv; do
     onbox "scp -q -o BatchMode=yes -P $PROVER_PORT $BOX_REPO/$f $PROVER_TARGET:$RUNNER_DIR/"
   done
@@ -1301,11 +1353,19 @@ unrelated to the block. Install ZisK there, or keep the prover on the Mac."
   # the pump binds its socket, the exec-host retries in a loop — and every block quietly falls back to
   # per-block ssh from the box, which is precisely what the hourly key-deleting cron then breaks.
   if [ "$DRY" != 1 ]; then
-    onprover_q "ssh -o BatchMode=yes -o ConnectTimeout=8 $BOX true && echo up" | grep -q up \
-      || die "$PROVER_TARGET cannot reach $BOX over ssh, and that is the direction both channels dial.
-   On the prover: ssh $BOX true — it must work with no password and no agent forwarding.
-   Fix whichever it is: the prover's key is not in $BOX:~/.ssh/authorized_keys, or '$BOX' is not a name the
-   prover resolves (BOX=<host the prover can reach> to use a different one)."
+    onprover_q "ssh -o BatchMode=yes -o ConnectTimeout=8 $BOX_FROM_PROVER true && echo up" | grep -q up \
+      || die "$PROVER_TARGET cannot reach '$BOX_FROM_PROVER' over ssh, and that is the direction all the
+   channels dial. On the prover this must work with no password and no agent forwarding:
+       ssh $BOX_FROM_PROVER true
+   Two separate causes, and the message ssh gives you says which:
+     'Could not resolve hostname'  -> that name means nothing on the prover. An alias from this Mac's
+        ~/.ssh/config is not a name; pass the real one with BOX_FROM_PROVER=user@fqdn (this box calls
+        itself $(onbox_q hostname -f 2>/dev/null || echo '<hostname -f on the box>')).
+     'Permission denied'           -> the prover's key is not in $BOX:~/.ssh/authorized_keys yet. From the
+        Mac, and only you can decide to do it:
+          ssh -p $PROVER_PORT $PROVER_TARGET 'ls ~/.ssh/id_*.pub 2>/dev/null || ssh-keygen -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'
+          ssh -p $PROVER_PORT $PROVER_TARGET 'cat ~/.ssh/id_*.pub' | ssh $BOX 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo added'
+        The box's hourly cron deletes ~/.ssh/id_* there — it does not touch authorized_keys, so this lasts."
   fi
 
   # How many parallel streams. On the local prover netprofile MEASURES this, because it runs on the prover and
@@ -1322,7 +1382,7 @@ unrelated to the block. Install ZisK there, or keep the prover on the Mac."
   # Restart, never reuse: a live channel holds the code and env it started with. Double quotes only — the
   # command travels inside onprover's single quotes.
   onprover "pkill -f \"witness-pump serve\" 2>/dev/null; pkill -f \"witness-pump exec-host\" 2>/dev/null; true"
-  onprover "( trap \"\" INT; PUMP_SOCK=$PUMP_SOCK PUMP_BOX=$BOX PUMP_CHANNELS=$PUMP_CHANNELS \
+  onprover "( trap \"\" INT; PUMP_SOCK=$PUMP_SOCK PUMP_BOX=$BOX_FROM_PROVER PUMP_CHANNELS=$PUMP_CHANNELS \
 nohup $RUNNER_DIR/witness-pump serve >> \$HOME/witness-pump.log 2>&1 & )"
   # ABSOLUTE, resolved on the box. BOX_REPO is the literal string "$HOME/zkvm-bench" so that it resolves on
   # the box — but this value travels THROUGH the prover's shell, which would expand $HOME to the PROVER's home
@@ -1333,7 +1393,7 @@ nohup $RUNNER_DIR/witness-pump serve >> \$HOME/witness-pump.log 2>&1 & )"
     BOX_REPO_ABS="$(onbox_q "cd $BOX_REPO && pwd")"
     [ -n "$BOX_REPO_ABS" ] || die "cannot resolve $BOX_REPO on $BOX — the box's clone is what both channels run"
   fi
-  onprover "( trap \"\" INT; PUMP_BOX=$BOX PUMP_REMOTE_CMD=$BOX_REPO_ABS/infra/zisk-infra/witness-pump \
+  onprover "( trap \"\" INT; PUMP_BOX=$BOX_FROM_PROVER PUMP_REMOTE_CMD=$BOX_REPO_ABS/infra/zisk-infra/witness-pump \
 nohup $RUNNER_DIR/witness-pump exec-host >> \$HOME/witness-exec.log 2>&1 & )"
   if [ "$DRY" != 1 ]; then
     # STARTED IS NOT SERVING, on either side. The data channel is checked from the prover (its socket lives
@@ -1349,7 +1409,7 @@ infra/zisk-infra/witness-pump run 'echo up'" | grep -q up && ok_exec=1
     done
     [ "$ok_data" = 1 ] \
       && say "data channel serving on $PROVER_TARGET:$PUMP_SOCK" \
-      || die "the pump on $PROVER_TARGET has no channel open to $BOX — a bound socket alone is the failure
+      || die "the pump on $PROVER_TARGET has no channel open to $BOX_FROM_PROVER — a bound socket alone is the failure
    mode, not the success case: witnesses would cross on per-block ssh, which stops for good when this box's
    cron deletes the key. See $PROVER_TARGET:~/witness-pump.log."
     [ "$ok_exec" = 1 ] \
@@ -1379,7 +1439,7 @@ infra/zisk-infra/witness-pump run 'echo up'" | grep -q up && ok_exec=1
       onprover "pkill -f \"L $ep_port:127.0.0.1:$ep_port\" 2>/dev/null; true"
       onprover "( trap \"\" INT; nohup bash -c \"while true; do \
 ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o BatchMode=yes \
--L $ep_port:127.0.0.1:$ep_port $BOX; sleep 5; done\" >> \$HOME/ep-forward.log 2>&1 & )"
+-L $ep_port:127.0.0.1:$ep_port $BOX_FROM_PROVER; sleep 5; done\" >> \$HOME/ep-forward.log 2>&1 & )"
       if [ "$DRY" != 1 ]; then
         ep_ok=0
         for _try in 1 2 3 4 5 6; do
