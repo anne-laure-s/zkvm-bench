@@ -1514,8 +1514,9 @@ $RUNNER_DIR/netprofile"
     say "channels: [dry-run] would probe the link from $PROVER_TARGET"
   else
     step "Link profile, measured from $PROVER_TARGET"
-    onprover "cd $RUNNER_DIR && NETPROFILE_DB=\$HOME/.zisk-networks.json ./netprofile probe \
-$BOX_FROM_PROVER 2>&1 | tail -6" || true
+    onprover "cd $RUNNER_DIR && NETPROFILE_DB=\$HOME/.zisk-networks.json \
+NETPROFILE_SSH_OPTS=\"-o BatchMode=yes -p $BOX_PORT_FROM_PROVER\" ./netprofile probe \
+$BOX_FROM_PROVER 2>&1 | tail -8" || true
     # `params` prints shell assignments; read the one we apply and nothing else.
     PUMP_CHANNELS="$(onprover_q "cd $RUNNER_DIR && NETPROFILE_DB=\$HOME/.zisk-networks.json ./netprofile \
 params $BOX_FROM_PROVER 2>/dev/null" | sed -n 's/.*NETPROFILE_CHANNELS=\([0-9]*\).*/\1/p' | head -1)"
