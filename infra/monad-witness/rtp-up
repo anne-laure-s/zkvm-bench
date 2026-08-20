@@ -288,7 +288,15 @@ else
   # hard cap for a unix socket path on macOS, and $HOME can already be half of it.
   PUMP_SOCK="${PUMP_SOCK:-/tmp/zisk-pump.sock}"
   PROVE_LOG="${PROVE_LOG:-~/prove-mock.log}"
-  EP_CLUSTER="${EP_CLUSTER:-local-ZisK-monad}"
+  # NAME THE PROVER, when it is not this Mac. Every mock run would otherwise land on the leaderboard under
+  # `local-ZisK-monad`, so a rehearsal on a remote box and one on this Mac become one indistinguishable row —
+  # and the whole point of rehearsing elsewhere is that the transport is different.
+  if [ -n "${PROVER:-}" ]; then
+    ep_who="${PROVER##*@}"; ep_who="${ep_who%%.*}"          # user@host.domain -> host
+    EP_CLUSTER="${EP_CLUSTER:-mock-$ep_who-ZisK-monad}"
+  else
+    EP_CLUSTER="${EP_CLUSTER:-local-ZisK-monad}"
+  fi
 fi
 # Where the proofs get submitted. Defaults to the local ethproofs-mock through the tunnel, which is what every
 # run so far has used; point it at ethproofs.org (with a real token and the cluster id they assign) when the
@@ -1783,7 +1791,7 @@ if [ "$PROVE_REAL" = 1 ]; then
   # nothing in this repo has ever had: a measured proving time for this guest.
   cat <<EOF
    on $PROVER_TARGET (the prover):
-     tail -f ~/zisk-infra/cluster/logs/worker.log
+     tail -f <where start.sh ran>/logs/worker.log
                                           phases: EXECUTE · CALCULATING_CONTRIBUTIONS · GENERATING_INNER_PROOFS
      cat $PROVER_WS/reports/\$(ls -t $PROVER_WS/reports 2>/dev/null | grep '\.log\$' | head -1)
                                           the per-block prove log
