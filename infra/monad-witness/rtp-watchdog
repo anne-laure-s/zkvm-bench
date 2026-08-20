@@ -86,9 +86,66 @@ REPO="${REPO:-$HOME/zkvm-bench}"
 RUNDATA="${RUNDATA:-$REPO/run-data}"
 RESULTS="${RESULTS:-$REPO/infra/zisk-infra/results}"
 SUBMIT_LOGS="${SUBMIT_LOGS:-$RUNDATA/prove-farm-logs}"
+# FIRST, because a dead pump explains most of what the checks below would otherwise misread: proofs that stop
+# arriving, a prover that looks broken, "proving but not delivering". Fixing the transport before judging the
+# prover keeps this script from restarting something that was never at fault.
+check_pump
+
 proved_recent=$(find "$RESULTS" -name report.json -newermt "-20 minutes" 2>/dev/null | wc -l | tr -d ' ')
 submit_recent=$(find "$SUBMIT_LOGS" -name 'submit-*.log' -newermt "-20 minutes" 2>/dev/null | wc -l | tr -d ' ')
 PROVE_CMD_FILE="${PROVE_CMD_FILE:-$HOME/.rtp-prove-cmd}"
+PUMP_CMD_FILE="${PUMP_CMD_FILE:-$HOME/.rtp-pump-cmd}"
+PUMP_EXEC_SOCK="${PUMP_EXEC_SOCK:-$HOME/.zisk-exec.sock}"
+
+# check_pump — the data channel, on a REMOTE prover, and why it is worth a watchdog at all.
+#
+# THE FALLBACK IS ONLY A FALLBACK FOR ONE HOUR. When the pump dies, core.sh reverts to `scp` for the witness —
+# which needs THIS BOX's key to the prover, and the hourly `find ~/.ssh -type f -name 'id_*' -delete` takes it.
+# So after the first top of the hour a dead pump is not a slower pipeline, it is a stopped one: every block
+# comes back rc=255. Observed 2026-08-20, and it is the reason this check exists rather than being left to the
+# operator noticing.
+#
+# EVERYTHING HERE GOES THROUGH THE EXEC CHANNEL, for the same reason: it is dialled by the prover, so it works
+# with no key on this box. If that channel is gone too, there is nothing this script can do from here — it says
+# so and stops, because a restart it cannot reach is not a repair.
+pump_run(){ PUMP_EXEC_SOCK="$PUMP_EXEC_SOCK" "$REPO/infra/zisk-infra/witness-pump" run "$*" 2>/dev/null; }
+
+check_pump() {
+  [ -s "$PUMP_CMD_FILE" ] || return 0            # no remote pump in this deployment (a prover on the Mac)
+  if ! pump_run "true" >/dev/null 2>&1; then
+    say "the exec channel does not answer, so the pump cannot be checked or restarted from here. Nothing on \
+this box can reach the prover without a key. Re-run rtp-up when you can."
+    return 1
+  fi
+  # `[w]itness-pump serve` and NOT the plain string: this command line names the process it looks for, so an
+  # unbracketed pattern would match the shell running it. The same rule the restart below depends on.
+  n="$(pump_run 'pgrep -c -f "[w]itness-pump serve" || true' | tr -cd '0-9')"
+  [ -n "$n" ] || n=0
+  if [ "$n" -gt 0 ]; then
+    return 0
+  fi
+  say "the pump is NOT serving on the prover — every witness would fall back to scp, which needs this box's \
+key, which the hourly cron deletes. Restarting it from $PUMP_CMD_FILE."
+  if [ "$DRY" = 1 ]; then
+    say "  [dry-run] would replay $PUMP_CMD_FILE over the exec channel"
+    return 0
+  fi
+  # Restart and CHECK, in two separate calls. One call cannot both kill and start: the start line names
+  # `witness-pump serve`, so a pkill in the same command line matches its own shell and nothing after it runs.
+  # The stale socket first, or the new server may find the path taken. Its value comes from the RECORDED
+  # command — the only place that knows it — and not from a remote shell, where PUMP_SOCK is unset.
+  sock="$(sed -n 's/.*PUMP_SOCK=\([^ ]*\).*/\1/p' "$PUMP_CMD_FILE" | head -1)"
+  [ -n "$sock" ] && pump_run "rm -f $sock" >/dev/null 2>&1 || true
+  pump_run "$(cat "$PUMP_CMD_FILE")" >/dev/null 2>&1 || true
+  sleep 5
+  n="$(pump_run 'pgrep -c -f "[w]itness-pump serve" || true' | tr -cd '0-9')"
+  if [ "${n:-0}" -gt 0 ]; then
+    say "  pump back up ($(pump_run 'grep -o "channels open: [0-9/]*" $HOME/witness-pump.log | tail -1'))"
+    echo "$(date +%s)" >> "$STATE"
+  else
+    say "  the replay did not bring it back — see the prover's ~/witness-pump.log"
+  fi
+}
 TIP_ENV_FILE="${TIP_ENV_FILE:-$HOME/.rtp-tip-env}"
 
 # Restart the prover from the invocation rtp-up RECORDED, never from one rebuilt here. A watchdog that

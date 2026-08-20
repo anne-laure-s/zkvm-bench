@@ -1431,10 +1431,11 @@ unrelated to the block. Install ZisK there, or keep the prover on the Mac."
     fi
   fi
   BOX_PORT_FROM_PROVER="${BOX_PORT_FROM_PROVER:-22}"
-  for f in infra/zisk-infra/witness-pump cli/ethproofs-submit cli/check-pv; do
+  for f in infra/zisk-infra/witness-pump cli/ethproofs-submit cli/check-pv infra/monad-witness/netprofile; do
     onbox "scp -q -o BatchMode=yes -P $PROVER_PORT $BOX_REPO/$f $PROVER_TARGET:$RUNNER_DIR/"
   done
-  onprover "chmod +x $RUNNER_DIR/witness-pump $RUNNER_DIR/ethproofs-submit $RUNNER_DIR/check-pv"
+  onprover "chmod +x $RUNNER_DIR/witness-pump $RUNNER_DIR/ethproofs-submit $RUNNER_DIR/check-pv \
+$RUNNER_DIR/netprofile"
   # check-pv beside ethproofs-submit, or the public-value gate loads-but-absent and every proof ships
   # unchecked — the same pairing the local prover needs.
   if [ "$DRY" != 1 ]; then
@@ -1498,15 +1499,31 @@ unrelated to the block. Install ZisK there, or keep the prover on the Mac."
         The box's hourly cron deletes ~/.ssh/id_* there — it does not touch authorized_keys, so this lasts."
   fi
 
-  # How many parallel streams. On the local prover netprofile MEASURES this, because it runs on the prover and
-  # can probe the link itself; from here it cannot — the link that matters is box->prover, and nothing on this
-  # Mac sits on it. So: an explicit PUMP_CHANNELS wins, otherwise one channel, and say which it is rather than
-  # let a default read as a measurement.
+  # How many parallel streams — MEASURED, on the link that carries the witnesses. netprofile runs where the
+  # pump serves, and that is the prover; it was already staged above. Defaulting to 1 "because the Mac cannot
+  # see this link" was a figure dressed as a decision, and on a 194 ms trans-Pacific path it was the worst
+  # available: a single stream spends most of an 8 MB transfer in slow start. Measured on exactly that link,
+  # 1 -> 4 channels took the witness from ~23 to ~33 Mbit/s.
+  #
+  # The probe costs ~40 s of link once per run and writes a per-link record on the PROVER, so a second run on
+  # the same box reuses it and says so. An explicit PUMP_CHANNELS still wins, for pinning a measurement.
   if [ -n "${PUMP_CHANNELS:-}" ]; then
-    say "channels: $PUMP_CHANNELS (pinned)"
-  else
+    say "channels: $PUMP_CHANNELS (pinned, no probe)"
+  elif [ "$DRY" = 1 ]; then
     PUMP_CHANNELS=1
-    say "channels: 1 (the $BOX->$PROVER_TARGET link is not profiled from here — PUMP_CHANNELS=N to pin it)"
+    say "channels: [dry-run] would probe the link from $PROVER_TARGET"
+  else
+    step "Link profile, measured from $PROVER_TARGET"
+    onprover "cd $RUNNER_DIR && NETPROFILE_DB=\$HOME/.zisk-networks.json ./netprofile probe \
+$BOX_FROM_PROVER 2>&1 | tail -6" || true
+    # `params` prints shell assignments; read the one we apply and nothing else.
+    PUMP_CHANNELS="$(onprover_q "cd $RUNNER_DIR && NETPROFILE_DB=\$HOME/.zisk-networks.json ./netprofile \
+params $BOX_FROM_PROVER 2>/dev/null" | sed -n 's/.*NETPROFILE_CHANNELS=\([0-9]*\).*/\1/p' | head -1)"
+    case "$PUMP_CHANNELS" in
+      ''|*[!0-9]*|0) PUMP_CHANNELS=1
+                     say "channels: 1 — the probe returned nothing usable (PUMP_CHANNELS=N to pin it)" ;;
+      *)             say "channels: $PUMP_CHANNELS (measured on this link)" ;;
+    esac
   fi
 
   # Restart, never reuse: a live channel holds the code and env it started with. Double quotes only — the
@@ -1517,9 +1534,21 @@ unrelated to the block. Install ZisK there, or keep the prover on the Mac."
   # this line exists to prevent. `[w]` makes the regex not match its own text. Demonstrated on Linux: the
   # whole remote shell dies, a trailing `echo` included, so the caller sees no output at all.
   onprover "pkill -f \"[w]itness-pump serve\" 2>/dev/null; pkill -f \"[w]itness-pump exec-host\" 2>/dev/null; true"
-  onprover "( trap \"\" INT; PUMP_SOCK=$PUMP_SOCK PUMP_BOX=$BOX_FROM_PROVER PUMP_CHANNELS=$PUMP_CHANNELS \
+  # RECORDED, then started FROM the recording — the same rule the prover's invocation follows, and for the
+  # same reason: rtp-watchdog has to be able to bring this back at 3 a.m. without rebuilding a command from
+  # memory, and a command rebuilt from memory eventually drops the flag nobody notices. The file lives on the
+  # BOX because that is where the watchdog runs; the command inside it is executed ON THE PROVER.
+  # DOUBLE QUOTES INSIDE, always: this string is passed to onprover, which wraps it in '...' for the box's
+  # ssh. One apostrophe here ends that argument and the prover receives a truncated command — the same trap
+  # that turned a forward loop into `bash -c exec` earlier today.
+  pump_cmd="( trap \"\" INT; PUMP_SOCK=$PUMP_SOCK PUMP_BOX=$BOX_FROM_PROVER PUMP_CHANNELS=$PUMP_CHANNELS \
 PUMP_SSH_OPTS=\"-C -o BatchMode=yes -p $BOX_PORT_FROM_PROVER\" \
 nohup $RUNNER_DIR/witness-pump serve >> \$HOME/witness-pump.log 2>&1 & )"
+  onbox "cat > \$HOME/.rtp-pump-cmd <<'RTPEOF'
+$pump_cmd
+RTPEOF
+chmod 600 \$HOME/.rtp-pump-cmd; echo '   · pump invocation recorded in ~/.rtp-pump-cmd (rtp-watchdog replays it)'"
+  onprover "$pump_cmd"
   # ABSOLUTE, resolved on the box. BOX_REPO is the literal string "$HOME/zkvm-bench" so that it resolves on
   # the box — but this value travels THROUGH the prover's shell, which would expand $HOME to the PROVER's home
   # and point exec-host at a path that does not exist there or, worse, at a different clone. So ask the box

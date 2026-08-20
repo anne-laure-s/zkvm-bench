@@ -82,7 +82,30 @@ def fingerprint():
             phy = line.split(":", 1)[1].strip()
             break
     if not mac and not chan:
-        return "unknown", "unidentified link (no gateway MAC, no Wi-Fi)"
+        # LINUX, where none of the above exists: `route -n get default` is macOS syntax and there is no
+        # SPAirPortDataType. A datacenter prover has one wired link, so what matters is not naming the radio
+        # but having an id that is STABLE and changes when the machine does — otherwise every rented box
+        # inherits the previous one's figures, which is the exact confusion this file was written to end.
+        gw4 = ""
+        for line in sh("ip", "route", "show", "default").split():
+            if line.count(".") == 3 and line[0].isdigit():
+                gw4 = line
+                break
+        if gw4:
+            for tok in sh("ip", "neigh", "show", gw4).split():
+                if tok.count(":") == 5:
+                    mac = tok.lower()
+                    break
+        # THE HOSTNAME WINS over the gateway MAC here, which is the opposite of the macOS rule and deliberate.
+        # A container's default route points at a Docker bridge (172.17.0.1), whose MAC belongs to the PHYSICAL
+        # host — so two different rented instances on the same machine would share it and each would inherit
+        # the other's figures. The container id changes with the instance, which is the boundary that matters.
+        host = sh("hostname") or ""
+        if host:
+            return f"host:{host}", f"container {host}" + (f" via {gw4}" if gw4 else "")
+        if mac:
+            return f"{mac}|wired", f"wired via {gw4}"
+        return "unknown", "unidentified link (no hostname, no gateway MAC)"
     ident = f"{mac or 'nogw'}|{chan or 'wired'}"
     label = f"{phy or '?'} {chan or 'wired'}".strip()
     return ident, label
