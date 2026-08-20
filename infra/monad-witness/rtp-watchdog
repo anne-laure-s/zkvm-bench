@@ -98,7 +98,31 @@ TIP_ENV_FILE="${TIP_ENV_FILE:-$HOME/.rtp-tip-env}"
 # There is no catching up afterwards. A proof for a block the chain finished hours ago is not late, it is a
 # false measurement — ethproofs-mock now refuses it outright. So the only thing worth automating is SHRINKING
 # the window: 5 minutes of loss instead of the thirteen hours it took a human to notice.
+# prove_in_flight — is prove_remote mid-exchange right now? A run dir exists from the moment the prove starts
+# and gets its report.json only when the artifacts come back, so "young dir, no report yet" is exactly the
+# in-flight window. Bounded by INFLIGHT_SECS so an ABANDONED dir (killed attempt, dead prover) ages out and
+# stops blocking restarts for ever.
+INFLIGHT_SECS="${INFLIGHT_SECS:-180}"
+prove_in_flight() {
+  [ -d "$RESULTS" ] || return 1
+  local d
+  d="$(find "$RESULTS" -mindepth 3 -maxdepth 3 -type d -newermt "-$INFLIGHT_SECS seconds" 2>/dev/null \
+       | while IFS= read -r c; do [ -s "$c/report.json" ] || { printf '%s' "$c"; break; }; done)"
+  [ -n "$d" ]
+}
+
 restart_prover() {
+  # NEVER ON TOP OF A LIVE PROVE. `tmux kill-session -t prove` takes the prove with it, and a real prove is
+  # ~20 s of GPU work whose artifacts are only fetched at the very end — so killing it mid-flight destroys
+  # the proof AND guarantees no submission, which is the exact condition that triggered this restart. It
+  # closes a loop: restart -> prove killed -> still not delivering -> restart, every 5 minutes, for ever.
+  # Observed on 2026-08-20: 12 restarts, not one proof delivered, and each one threw away a finished proof
+  # that was sitting on the prover waiting to be collected.
+  if prove_in_flight; then
+    say "NOT restarting: a prove is in flight (run dir younger than ${INFLIGHT_SECS}s with no report yet). \
+Killing it is what would make 'not delivering' true. Waiting for the next tick."
+    return 1
+  fi
   if [ ! -s "$PROVE_CMD_FILE" ]; then
     say "cannot restart the prover: no $PROVE_CMD_FILE. It is written by rtp-up — run that once and this \
 becomes self-healing."

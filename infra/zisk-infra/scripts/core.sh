@@ -395,6 +395,20 @@ ${ZISK_MOCK_PROOF_BYTES:+ZISK_MOCK_PROOF_BYTES=$ZISK_MOCK_PROOF_BYTES }"
   echo "Retrieving artifacts into $run_dir ..."
   local getdir; getdir="$(mktemp -d)"
   local members="proofs/$base.proof.bin reports/$base.json reports/$base.log proofs/$base.pv.bin"
+  # PROVER-SIDE LOGS THE RUNNER DOES NOT SEE. reports/$base.log is the runner's own output; when the proof comes
+  # from a cluster, the diagnosis lives in the coordinator's and workers' logs instead, and those stay on the
+  # prover — so a failure inside the cluster leaves the box with the runner's view and nothing underneath it.
+  # PROVER_LOG_FILES bundles their tails into the tarball the artifacts already ride: no extra round trip, and
+  # they land in the run record beside the proof they belong to.
+  #
+  # Off by default, and TAILED rather than copied whole: these files grow without bound, and a prove is the worst
+  # moment to move megabytes over the link the witness is already using. Turn it on when the proof takes long
+  # enough that a few hundred lines are free — which is exactly the real-prover case.
+  local plog_files="${PROVER_LOG_FILES:-}" plog_tail="${PROVER_LOG_TAIL:-200}" plog_cmd=""
+  if [[ -n "$plog_files" ]]; then
+    plog_cmd="{ for f in $plog_files; do [ -r \"\$f\" ] || continue; echo \"-- \$f (last $plog_tail lines) --\"; tail -n $plog_tail \"\$f\"; echo; done; } > $ws/reports/$base.prover.log 2>&1 || true;"
+    members="$members reports/$base.prover.log"
+  fi
   # AND THE ARTIFACTS COME BACK OFF THE TUNNEL. Everything on the box->prover ssh, in BOTH directions, is
   # TCP-in-TCP through the reverse forward: 3.8 Mbit/s against 25 direct. Sending the tar on that connection's
   # stdout was free while a mock proof was 480 bytes; at a realistic 381 KB it is ~0.82 s. The pump already
@@ -437,7 +451,7 @@ ${ZISK_MOCK_PROOF_BYTES:+ZISK_MOCK_PROOF_BYTES=$ZISK_MOCK_PROOF_BYTES }"
     --output $ws/proofs/$base.proof.bin \
     --public-values $ws/proofs/$base.pv.bin \
     --report $ws/reports/$base.json 2>&1 | tee $ws/reports/$base.log; } >&2
-cd $ws && tar cf - $members 2>/dev/null > $ws/art.tar; $push_cmd; rm -rf $ws/art.tar $ws_clean" \
+$plog_cmd cd $ws && tar cf - $members 2>/dev/null > $ws/art.tar; $push_cmd; rm -rf $ws/art.tar $ws_clean" \
     > "$getdir/stream.tar"
   # stderr is deliberately NOT redirected: it now carries the prover's own log, streamed live. Silencing it here
   # would have thrown away every line the prover prints — the whole reason the log moved to stderr was to keep
@@ -453,6 +467,8 @@ cd $ws && tar cf - $members 2>/dev/null > $ws/art.tar; $push_cmd; rm -rf $ws/art
   mv "$getdir/proofs/$base.proof.bin" "$run_dir/proof.bin"   2>/dev/null
   mv "$getdir/reports/$base.json"     "$run_dir/report.json" 2>/dev/null
   mv "$getdir/reports/$base.log"      "$run_dir/prove.log"   2>/dev/null
+  # Only there when PROVER_LOG_FILES asked for it; absent is the normal case, so neither path complains.
+  mv "$getdir/reports/$base.prover.log" "$run_dir/prover.log"  2>/dev/null
   mv "$getdir/proofs/$base.pv.bin"    "$run_dir/pv.bin"      2>/dev/null
   rm -rf "$getdir"
   # The proof is the one artifact whose absence must fail loudly: with four separate scp calls a missing proof

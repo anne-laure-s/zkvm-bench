@@ -463,7 +463,16 @@ sweep_leftovers() {
   # ONE list, for the kill AND for the survivor check below. Two hand-maintained copies drift, and the copy
   # that loses an entry is the CHECK: a pattern it does not name reads as dead whether it is or not.
   boxpats="$(printf '%s\n' '[c]li/prove-farm' '[w]itness-tap' '[w]itness-follow supervise' \
-                           '[r]un_replay.py' 'build/cmd/[m]onad --chain' '[w]itness-pump')"
+                           '[r]un_replay.py' 'build/cmd/[m]onad --chain')"
+  # KILLED, BUT NEVER BLOCKING. The box-side pump processes are `exec-agent` and `send`, and neither is ours to
+  # own: both are spawned BY THE PROVER's persistent channels, and exec-host redials every 5 s. So killing the
+  # agent here and then demanding it stay dead is a race this sweep cannot win — measured: it reported
+  # `STILL RUNNING 5s after the kill: [w]itness-pump(1)` on a box where the kill worked every time and the
+  # prover simply reconnected. They also cannot cause the harm this check exists to prevent: a relay is not a
+  # second writer on a triedb, a block_db or a workspace. Clearing a stale one still matters (it holds the
+  # socket the new agent needs), so they are killed — and the channel step later restarts BOTH ends properly,
+  # which is the only thing that actually settles them.
+  local boxsoft="[w]itness-pump"
   # The fetcher, on start only: witness-follow restarts it a few steps later, so an orphan of it would become a
   # second writer on one block_db. --stop leaves the fetcher alone by design (the block_db is cheap and reusable).
   [ "$mode" = start ] && boxpats="$boxpats
@@ -478,7 +487,8 @@ sweep_leftovers() {
     say "box: $n process(es) matching $pat — killing"
     onbox "pkill -f \"$pat\" || true" </dev/null
     killed=$((killed + n))
-  done <<<"$boxpats"
+  done <<<"$boxpats
+$boxsoft"
 
   # The prover: the pump and its channels are ours by name, so they are safe to match anywhere.
   # NO `exec ` PREFIX. The channels are `ssh -C -o BatchMode=yes <box> $HOME/.../witness-pump exec-agent`
@@ -544,8 +554,10 @@ PROVPATS
       | sed 's/^/     /'
     if [ "$mode" = start ]; then
       die "the box still has processes this run would duplicate — kill them by hand (ssh $BOX 'pgrep -af \
-\"prove-farm|witness-tap|run_replay|witness-pump|fetch_blocks\"; kill <pid>') and re-run. Starting now would
-   put two of them on one workspace, one triedb or one block_db."
+\"prove-farm|witness-tap|run_replay|fetch_blocks|cmd/monad\"; kill <pid>') and re-run. Starting now would
+   put two of them on one workspace, one triedb or one block_db.
+   The pump's box-side relays are NOT in this list: the prover redials them, so they are killed and not
+   waited for — the channel step restarts both ends."
     fi
     say "left over after --stop; kill them by hand if they matter"
   fi
@@ -605,8 +617,8 @@ if [ "$STOP" = 1 ]; then
     # in that case the next start's pkill clears them anyway.
     step "Stopping the channels on $PROVER_TARGET"
     onbox "ssh -o BatchMode=yes -o ConnectTimeout=8 -p $PROVER_PORT $PROVER_TARGET \
-'pkill -f \"witness-pump serve\" 2>/dev/null; pkill -f \"witness-pump exec-host\" 2>/dev/null; \
-pkill -f \"L [0-9]*:127.0.0.1:[0-9]*\" 2>/dev/null; true' \
+'pkill -f \"[w]itness-pump serve\" 2>/dev/null; pkill -f \"[w]itness-pump exec-host\" 2>/dev/null; \
+pkill -f \"ssh -N .*[-]L [0-9]*:127.0.0.1:\" 2>/dev/null; true' \
 2>/dev/null || echo '   · could not reach the prover (its channels will be cleared at the next start)'"
   fi
   step "Stopping the tunnel and the mock on this Mac"
@@ -1274,6 +1286,8 @@ if [ -n "$PROVER" ]; then
     if [ -n "$pk" ]; then
       printf '%s\n' "$pk" | onbox_q "mkdir -p ~/.ssh && chmod 700 ~/.ssh \
 && touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts \
+&& { cp -n ~/.ssh/known_hosts ~/.ssh/known_hosts.rtp-bak 2>/dev/null || true; } \
+&& { [ -n \"\$(tail -c1 ~/.ssh/known_hosts)\" ] && echo >> ~/.ssh/known_hosts || true; } \
 && while read -r l; do grep -qxF \"\$l\" ~/.ssh/known_hosts || echo \"\$l\" >> ~/.ssh/known_hosts; done" \
         && say "the prover's host key is known on $BOX (from this Mac's known_hosts)"
     else
@@ -1425,6 +1439,8 @@ unrelated to the block. Install ZisK there, or keep the prover on the Mac."
     if [ -n "$hk" ]; then
       if printf '%s\n' "$hk" | onprover_q "mkdir -p ~/.ssh && chmod 700 ~/.ssh \
 && touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts \
+&& { cp -n ~/.ssh/known_hosts ~/.ssh/known_hosts.rtp-bak 2>/dev/null || true; } \
+&& { [ -n \"\$(tail -c1 ~/.ssh/known_hosts)\" ] && echo >> ~/.ssh/known_hosts || true; } \
 && while read -r l; do grep -qxF \"\$l\" ~/.ssh/known_hosts || echo \"\$l\" >> ~/.ssh/known_hosts; done \
 && echo installed" | grep -q installed; then
         say "the box's host key is known on $PROVER_TARGET ($(printf '%s\n' "$hk" | grep -c .) entries, from this Mac's known_hosts)"
@@ -1456,8 +1472,10 @@ unrelated to the block. Install ZisK there, or keep the prover on the Mac."
         from this Mac's known_hosts; that warned if it could not.
      'Permission denied'           -> the prover's key is not in $BOX:~/.ssh/authorized_keys yet. From the
         Mac, and only you can decide to do it:
-          ssh -p $PROVER_PORT $PROVER_TARGET 'ls ~/.ssh/id_*.pub 2>/dev/null || ssh-keygen -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'
-          ssh -p $PROVER_PORT $PROVER_TARGET 'cat ~/.ssh/id_*.pub' | ssh $BOX 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo added'
+          ssh -p $PROVER_PORT $PROVER_TARGET 'ls ~/.ssh/id_*.pub 2>/dev/null || ssh-keygen -t ed25519 -N \"\" -f ~/.ssh/id_ed25519 < /dev/null'
+          ssh -p $PROVER_PORT $PROVER_TARGET 'cat ~/.ssh/id_*.pub' | ssh $BOX 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && { [ -n \"\$(tail -c1 ~/.ssh/authorized_keys)\" ] && echo >> ~/.ssh/authorized_keys || true; } && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo added'
+        The `tail -c1` guard is not decoration: a file with no trailing newline glues the appended key onto
+        the last existing one and invalidates BOTH, locking you out of the machine you just wrote to.
         The box's hourly cron deletes ~/.ssh/id_* there — it does not touch authorized_keys, so this lasts."
   fi
 
@@ -1474,7 +1492,12 @@ unrelated to the block. Install ZisK there, or keep the prover on the Mac."
 
   # Restart, never reuse: a live channel holds the code and env it started with. Double quotes only — the
   # command travels inside onprover's single quotes.
-  onprover "pkill -f \"witness-pump serve\" 2>/dev/null; pkill -f \"witness-pump exec-host\" 2>/dev/null; true"
+  # BRACKETED, or the pattern kills the shell running it: this command line IS the remote shell's own cmdline,
+  # so `pkill -f "witness-pump serve"` matches itself. It dies on the first pattern and never reaches the
+  # second, leaving the OLD exec-host alive beside the new one — precisely the "restart, never reuse" failure
+  # this line exists to prevent. `[w]` makes the regex not match its own text. Demonstrated on Linux: the
+  # whole remote shell dies, a trailing `echo` included, so the caller sees no output at all.
+  onprover "pkill -f \"[w]itness-pump serve\" 2>/dev/null; pkill -f \"[w]itness-pump exec-host\" 2>/dev/null; true"
   onprover "( trap \"\" INT; PUMP_SOCK=$PUMP_SOCK PUMP_BOX=$BOX_FROM_PROVER PUMP_CHANNELS=$PUMP_CHANNELS \
 PUMP_SSH_OPTS=\"-C -o BatchMode=yes -p $BOX_PORT_FROM_PROVER\" \
 nohup $RUNNER_DIR/witness-pump serve >> \$HOME/witness-pump.log 2>&1 & )"
@@ -1497,8 +1520,13 @@ nohup $RUNNER_DIR/witness-pump exec-host >> \$HOME/witness-exec.log 2>&1 & )"
     for _try in 1 2 3 4 5 6; do
       [ "$ok_data" = 1 ] || onprover_q "test -S $PUMP_SOCK && grep -q \"channels open\" \
 \$HOME/witness-pump.log && echo up" | grep -q up && ok_data=1
+      # `set -o pipefail` ON PURPOSE, not `echo up`. Everything that crosses this channel is a bash script —
+      # core.sh's prove opens with exactly this line so a prover failure propagates through its `tee`. A
+      # channel that relays to /bin/sh answers `up` perfectly and then fails EVERY prove in two seconds with
+      # `no-report no-proof`. Measured, on a prover whose /bin/sh is dash 0.5.11: the check passed, the run
+      # was dead. So the check runs the feature, not a command any shell can do.
       [ "$ok_exec" = 1 ] || onbox_q "cd $BOX_REPO && PUMP_EXEC_SOCK=\$HOME/.zisk-exec.sock \
-infra/zisk-infra/witness-pump run 'echo up'" | grep -q up && ok_exec=1
+infra/zisk-infra/witness-pump run 'set -o pipefail; echo up'" | grep -q up && ok_exec=1
       [ "$ok_data" = 1 ] && [ "$ok_exec" = 1 ] && break
       sleep 3
     done
@@ -1509,8 +1537,16 @@ infra/zisk-infra/witness-pump run 'echo up'" | grep -q up && ok_exec=1
    cron deletes the key. See $PROVER_TARGET:~/witness-pump.log."
     [ "$ok_exec" = 1 ] \
       && say "exec channel answers from $BOX with no box-side key" \
-      || die "the exec channel does not answer from $BOX. Every control call would need the box's key, which
-   the hourly cron deletes. See ~/witness-exec.log on $PROVER_TARGET, and check the PROVER can ssh to $BOX."
+      || die "the exec channel does not answer a bash command from $BOX. Every control call would need the
+   box's key, which the hourly cron deletes. Two causes:
+     * the channel is not up at all — see ~/witness-exec.log on $PROVER_TARGET, and check the PROVER can
+       ssh to $BOX;
+     * it is up but relaying to a shell without \`pipefail\` (a /bin/sh that is old dash). Everything that
+       crosses this channel is a bash script, so the pump runs payloads under bash — a copy that predates
+       that does not, and no environment variable can retrofit it. The staged binary comes from the BOX's
+       clone, so the fix is to get it there:
+         git push  &&  ssh $BOX 'cd $BOX_REPO && git pull --ff-only'   then re-run this script.
+       (PUMP_SHELL=<path> is for a box whose bash is somewhere unusual, not for an old copy.)"
   fi
 
   # ── the submission endpoint, AS THE PROVER SEES IT ───────────────────────────────────────────────
@@ -1531,7 +1567,7 @@ infra/zisk-infra/witness-pump run 'echo up'" | grep -q up && ok_exec=1
       # onprover's '...' at the box, so one apostrophe here ends the ssh argument and the loop silently
       # becomes `bash -c exec`. The forward's own pattern is distinctive enough to kill by, so the loop needs
       # no name of its own.
-      onprover "pkill -f \"L $ep_port:127.0.0.1:$ep_port\" 2>/dev/null; true"
+      onprover "pkill -f \"[-]L $ep_port:127.0.0.1:$ep_port\" 2>/dev/null; true"
       onprover "( trap \"\" INT; nohup bash -c \"while true; do \
 ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o BatchMode=yes \
 -p $BOX_PORT_FROM_PROVER -L $ep_port:127.0.0.1:$ep_port $BOX_FROM_PROVER; sleep 5; done\" >> \$HOME/ep-forward.log 2>&1 & )"

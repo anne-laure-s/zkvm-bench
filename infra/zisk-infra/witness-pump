@@ -51,6 +51,10 @@ import os, socket, struct, subprocess, sys, threading, time
 SOCK    = os.path.expanduser(os.environ.get("PUMP_SOCK") or "~/.zisk-witness-pump.sock")
 BOX     = os.environ.get("PUMP_BOX") or ""
 SSHOPTS = (os.environ.get("PUMP_SSH_OPTS") or "-C -o BatchMode=yes").split()
+# The shell exec-host runs a relayed command with. bash when it exists, because that is what the commands are
+# written for; PUMP_SHELL overrides for a box that keeps bash somewhere else.
+EXEC_SHELL = os.environ.get("PUMP_SHELL") or next(
+    (sh for sh in ("/bin/bash", "/usr/bin/bash") if os.path.exists(sh)), None)
 TIMEOUT = float(os.environ.get("PUMP_TIMEOUT") or 120)
 # Parallel channels for ONE witness. 1 = the single-channel path. netprofile measures the right value per
 # network and records it; rtp-up passes it. See Pool for why this exists again after being removed once.
@@ -633,7 +637,13 @@ def mode_exec_host():
                     continue
                 # Streamed, not collected: the runner's log has to appear on the box WHILE the proof runs,
                 # which is how a hung prover stays visible. Collecting it would give that up.
-                r = subprocess.Popen(payload.decode(), shell=True,
+                # BASH, EXPLICITLY. shell=True means /bin/sh, which is dash on Debian/Ubuntu — and every
+                # payload that crosses this channel is a bash script written for `ssh host "cmd"`, where the
+                # login shell runs it. The difference is not academic: core.sh opens with `set -o pipefail`,
+                # dash rejects it as an illegal option, and the prove dies in 2 s with `no-report no-proof`
+                # on every block — a channel that "works" and fails everything, which is the one failure mode
+                # this pump is supposed to make impossible.
+                r = subprocess.Popen(payload.decode(), shell=True, executable=EXEC_SHELL,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
                 def pump_stream(src, tag_):
                     while True:
@@ -680,18 +690,41 @@ def mode_exec_agent():
         conn, _ = srv.accept()
         with conn:
             f = conn.makefile("rwb")
+            # ONE upstream stream, shared by every caller in turn — so a command's frames MUST all be read
+            # before the next caller is served. They are not correlated by any id: the answer is simply
+            # whatever comes back next. That makes an abandoned reply poison, not litter.
+            #
+            # What used to happen: writing to a caller that had already gone (core.sh's $(...) closing early,
+            # prove-farm retrying a second later) raised, the handler jumped to `except`, and the rest of that
+            # command's frames stayed in the stream. The next caller read THEM. Measured on a live run: a
+            # request for `set -o pipefail; echo up` came back with the output of an nvidia-smi, and core.sh's
+            # workspace probe got someone else's stdout and reported `did not resolve` — every block, in one
+            # second, for as long as the channel stayed up. Every reply after the first abandonment is wrong.
+            #
+            # So: once the command is upstream, drain to its X no matter what the caller does. A send failure
+            # is ignored on purpose — the caller is gone, and the stream still has to be left clean.
+            sent = False
             try:
                 tag, cmd = _read_frame(f)
                 if tag != b"C":
                     continue
                 _send_frame(up, b"C", cmd)                      # up to the prover
+                sent = True
                 while True:
                     t2, body = _read_frame(down)                # back from the prover
                     if t2 is None:
-                        _send_frame(f, b"X", b"255")
+                        sent = False                            # upstream is gone; nothing left to drain
+                        try:
+                            _send_frame(f, b"X", b"255")
+                        except OSError:
+                            pass
                         break
-                    _send_frame(f, t2, body)
+                    try:
+                        _send_frame(f, t2, body)
+                    except OSError:
+                        pass                                    # caller gone: keep reading, do not abandon
                     if t2 == b"X":
+                        sent = False
                         break
             except Exception:                                   # noqa: BLE001 — one caller must not stop the agent
                 try:
@@ -699,6 +732,12 @@ def mode_exec_agent():
                 except OSError:
                     pass
             finally:
+                # THE RESYNC, before anything else. Reached when the read loop itself raised after the command
+                # went up: the rest of that command's frames are still in the stream and belong to nobody.
+                while sent:
+                    t2, _body = _read_frame(down)
+                    if t2 is None or t2 == b"X":
+                        break
                 try:
                     f.flush()
                 except OSError:
