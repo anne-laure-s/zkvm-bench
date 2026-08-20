@@ -167,9 +167,12 @@ class Store:
             "source": body.get("source"),               # free-form: who is reporting (e.g. the witness box)
             "chain_tip": body.get("chain_tip"),         # the head the producer is following
             "last_witness": body.get("last_witness"),   # newest block a witness exists for
-            # framed inputs sitting in the queue — NOT an un-proven backlog (prove-farm leaves proven
-            # inputs in place); the backlog signal is the lag below. Legacy name accepted too.
+            # PICKABLE framed inputs: what the prover can still take. witness-tap used to send every framed
+            # input here, proved ones included, so this number could read as a backlog when there was none —
+            # it now sends the two separately. Legacy name accepted too, and a tap that predates the split
+            # simply reports no retained files rather than a wrong zero.
             "queue_files": body.get("queue_files", body.get("queue_depth")),
+            "queue_retained": body.get("queue_retained"),
         }
         with self.lock:
             self.pipelines[key] = hb
@@ -216,6 +219,7 @@ class Store:
                 "source": hb.get("source"), "heartbeat_ts": hb.get("ts"),
                 "chain_tip": tip, "last_witness": hb.get("last_witness"),
                 "queue_files": hb.get("queue_files"),
+                "queue_retained": hb.get("queue_retained"),
                 **d,
                 "lag_blocks": {"witness": lag(hb.get("last_witness")), "proving": lag(d["proving"]),
                                "proved": lag(d["proved"]), "verified": lag(d["verified"])},
@@ -507,9 +511,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.rstrip("/") == "/status":
             # Producer heartbeat — the only source for the CHAIN tip (no proof record carries it).
             hb = STORE.set_status(body)
+            # Precomputed, not inlined: a nested f-string reusing the same quote character is a 3.12+ feature
+            # and this server runs on the operator's Mac (3.9).
+            ret_note = f" (+{hb['queue_retained']} retained)" if hb.get("queue_retained") else ""
             print(f"{now_iso()}  ← /status          {('[' + str(hb['source']) + '] ') if hb.get('source') else ''}"
                   f"cluster={hb.get('cluster_id')} tip={hb.get('chain_tip')} "
-                  f"witness={hb.get('last_witness')} queue={hb.get('queue_files')}")
+                  f"witness={hb.get('last_witness')} queue={hb.get('queue_files')}{ret_note}")
             return self._reply(200, {"ok": True})
         if self.path.rstrip("/") == "/proofs/queued":
             STORE.record("queued", body); print(f"{now_iso()}  ← /proofs/queued   {mk}cluster={cluster} {who}block={block}")

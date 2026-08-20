@@ -545,11 +545,35 @@ def queue_files():
     meaningful backlog signal is the LAG between last_witness and the last proved block."""
     return len(queued_blocks()) if os.path.isdir(QUEUE) else 0
 
-def heartbeat(tip, last_witness):
-    """Feed cli/ethproofs-mock's POST /status — the producer is the only party that knows the tip."""
+
+def queue_split(status):
+    """(pickable, retained) — the queue separated by whether the prover can still take the block.
+
+    ONE NUMBER COULD NOT MEAN BOTH. `queue=` counted every framed input, and cli/prove-farm skips the proved
+    ones (its own is_proven), so `queue=4` could equally be four blocks of pending work or none at all. Read as
+    a backlog it alarmed for nothing; read as a disk count it hid a real backlog. Two numbers, one meaning each.
+    A block is retained rather than pickable when it is proved and keep_reason still wants its bytes — `big`,
+    `slow`, `sample`, or simply `recent` — which is also why the pair is not derivable from the kept[] tally.
+    """
+    pickable = retained = 0
+    for b in queued_blocks():
+        st, _ = status.get(b, (None, None))
+        if st == "ok":
+            retained += 1
+        else:
+            pickable += 1
+    return pickable, retained
+
+def heartbeat(tip, last_witness, pickable=None, retained=0):
+    """Feed cli/ethproofs-mock's POST /status — the producer is the only party that knows the tip.
+
+    `queue_files` now carries the PICKABLE count, which is what a dashboard reader means by "queue"; the
+    proved-but-retained files travel beside it as `queue_retained` instead of being summed into it."""
     if not ETHPROOFS_URL:
         return
-    body = {"chain_tip": tip, "last_witness": last_witness, "queue_files": queue_files(),
+    body = {"chain_tip": tip, "last_witness": last_witness,
+            "queue_files": queue_files() if pickable is None else pickable,
+            "queue_retained": retained,
             "vm": VM, "guest": GUEST, "source": SOURCE}
     if CLUSTER:
         body["cluster_id"] = CLUSTER
@@ -690,6 +714,7 @@ def cycle(seen, dry):
 
     tip = chain_tip()
     lag = (tip - last) if isinstance(tip, int) else "?"
+    q_pick, q_ret = queue_split(status)
     kept_str = " ".join(f"{k}={v}" for k, v in sorted(kept.items())) or "-"
     # raw= should hover at 0-1: the dump dir is drained every cycle, so anything piling up there means
     # framing is failing or the replay is outrunning the tap.
@@ -699,10 +724,10 @@ def cycle(seen, dry):
         f"{f' parked={parked}' if parked else ''}"
         f"{f' kept_dir={kept_size}' if kept_size else ''}"
         f"{f' evicted={evicted}' if evicted else ''} kept[{kept_str}] "
-        f"queue={queue_files()} raw={raw_left}")
+        f"queue={q_pick}{f' retained={q_ret}' if q_ret else ''} raw={raw_left}")
     # No heartbeat on a dry run: "dry" has to mean no side effects anywhere, including the dashboard.
     if not dry:
-        heartbeat(tip, last)
+        heartbeat(tip, last, q_pick, q_ret)
 
 def main():
     dry = "--dry-run" in sys.argv
