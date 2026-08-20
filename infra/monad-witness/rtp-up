@@ -297,6 +297,14 @@ if [ "$PROVE_REAL" = 1 ]; then
   PUMP_SOCK="${PUMP_SOCK:-/tmp/zisk-pump-real.sock}"
   PROVE_LOG="${PROVE_LOG:-~/prove-real.log}"
   EP_CLUSTER="${EP_CLUSTER:-${PROVE_GPUS}gpu-ZisK-monad}"
+  # THE PHASE SPLIT, which exists only on the prover. The coordinator logs, per job:
+  #   Finished JobId(…) ✔ Duration: 23.062s (5.475s+17.537s+0.050s) Steps: 113.914.853 Instances: 78
+  # — the three phase durations the runbook names (EXECUTE · CALCULATING_CONTRIBUTIONS ·
+  # GENERATING_INNER_PROOFS), plus the coordinator's own step count. Nothing in the run record has it: the
+  # runner sees only its own wall clock, and `cargo-zisk remote prove` reports no phases. So its tail rides
+  # back inside the artifact tarball that already crosses, as prover.log — no extra round trip, a few KB.
+  # Wrong path (a cluster started elsewhere) is not an error: core.sh skips a file it cannot read.
+  PROVER_LOG_FILES="${PROVER_LOG_FILES-\$HOME/zkvm-bench/infra/zisk-infra/cluster/logs/coordinator.log}"
 else
   # THE MOCK PROVER CAN ALSO BE REMOTE — a cheap box, precisely so the paying one is not the thing being
   # rehearsed on. Then these must NOT default to this Mac's $HOME: `mkdir -p /Users/<me>/zisk-mock` on a Linux

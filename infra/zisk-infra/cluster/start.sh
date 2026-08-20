@@ -58,7 +58,13 @@ if [[ "${WORKERS_ONLY:-}" != 1 ]]; then
 fi
 
 # ── worker args (shared by MPI and single-process paths) ──────────────────────
-wargs=(--coordinator-url "http://localhost:$CLUSTER_PORT" --proving-key "$PROVING_KEY" --gpu)
+# 127.0.0.1 rather than localhost, to take name resolution out of the path: the coordinator binds 0.0.0.0
+# (IPv4 only) while this container's /etc/hosts maps localhost to ::1 alone. It is NOT what broke a worker
+# replacement on 2026-08-20 — `localhost` was in use by the worker that registered fine before it and by the
+# one that registered fine after, against the same coordinator. That was a hand-started worker grafted onto a
+# 2-hour-old coordinator holding the previous worker's setup; `stop.sh` + `start.sh` as a pair, then the
+# per-ELF `remote setup`, is what fixed it. COORDINATOR_HOST overrides for a split deployment.
+wargs=(--coordinator-url "http://${COORDINATOR_HOST:-127.0.0.1}:$CLUSTER_PORT" --proving-key "$PROVING_KEY" --gpu)
 if [[ "$WORKER_BACKEND" == asm ]]; then
   # asm is the DEFAULT backend (selected simply by NOT passing --emulator; see
   # worker cli/main.rs). `--asm <path>` is OPTIONAL and is NOT used to locate the ROM

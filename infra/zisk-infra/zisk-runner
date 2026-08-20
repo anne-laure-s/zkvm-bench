@@ -101,8 +101,12 @@ parse_steps() {
 vkey() {
   local f="${ZISK_VERKEY:-$HOME/.zisk/provingKey/zisk/vadcop_final/vadcop_final.verkey.bin}"
   [[ -r "$f" ]] || return 0
+  # xxd OR od. `xxd` ships with vim-common and a prover image need not have it — this one does not, so the
+  # helper returned empty, `vkey_hash` was null in every report, the submission carried no verifier_id and the
+  # leaderboard's column stayed blank. `od` is coreutils and is always there.
   local hex
   hex="$(xxd -p "$f" 2>/dev/null | tr -d '\n')"
+  [[ -n "$hex" ]] || hex="$(od -An -tx1 -v "$f" 2>/dev/null | tr -d ' \n')"
   [[ -n "$hex" ]] && printf '0x%s' "$hex"
 }
 
@@ -319,12 +323,21 @@ JSON
 
     echo "Cmd      : $*"
     t0="$(now)"
-    "$@"
-    rc=$?
+    # TEE'd, not swallowed. The output must keep STREAMING — core.sh relays it live, and a hung prover is only
+    # visible that way — and it must be readable afterwards, because on the cluster path the step count is
+    # printed there and NOWHERE else: `cargo-zisk remote prove` writes no report and the coordinator's own log
+    # stays on the prover. Without this the run record carried no work unit at all, so every submission went
+    # out with `work=None` and rtp-latency's work column stayed empty.
+    # PIPESTATUS[0], because the status that decides the run is the prover's, not tee's.
+    prove_out="$(mktemp -t zisk-prove.XXXXXX)"
+    "$@" 2>&1 | tee "$prove_out"
+    rc=${PIPESTATUS[0]}
     t1="$(now)"
+    steps="$(parse_steps "$prove_out")"
+    rm -f "$prove_out"
     [[ "$rc" == 0 ]] || { echo "ERROR: prove exited $rc" >&2; exit "$rc"; }
     prove_dt="$(elapsed "$t0" "$t1")"
-    echo "Prove         : ${prove_dt}s"
+    echo "Prove         : ${prove_dt}s${steps:+  ($steps steps)}"
 
     # `-o` wrote the proof directly to $OUTPUT.
     if [[ -f "$OUTPUT" ]]; then
@@ -351,6 +364,7 @@ JSON
     write_report "$(cat <<JSON
 {
   "mode": "$MODE",
+  "steps": $(jnum "${steps:-}"),
   "prove_secs": $(jnum "$prove_dt"),
   "verify_secs": $(jnum "$verify_dt"),
   "total_secs": $(jnum "$total_dt"),

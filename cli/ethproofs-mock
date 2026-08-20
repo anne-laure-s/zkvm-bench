@@ -606,9 +606,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.rstrip("/") == "/status":
             return self._reply(200, {"ts": now_iso(), "pipelines": STORE.status()})
         # leaderboard
+        # NEWEST FIRST, and the cluster is only a tie-break. Sorting on cluster_id first buried a live
+        # campaign under every row of any other cluster whose name happened to sort higher: `1gpu-ZisK-monad`
+        # against a store still holding an earlier `local-ZisK-monad` run put the real proofs at row 3459 of
+        # 3481 — present, verified, and invisible. A leaderboard is read for what just happened, so `ts`
+        # leads; the rest keeps the order stable for rows submitted in the same second.
         rows = sorted(STORE.state.values(),
-                      key=lambda r: (r.get("cluster_id") or 0, str(r.get("vm") or ""),
-                                     str(r.get("guest") or ""), r.get("block_number") or 0), reverse=True)
+                      key=lambda r: (str(r.get("ts") or ""), r.get("cluster_id") or 0,
+                                     str(r.get("vm") or ""), str(r.get("guest") or ""),
+                                     r.get("block_number") or 0), reverse=True)
         def td(v): return "" if v is None else v
         def secs(ms): return "" if ms is None else f"{ms / 1000:.1f}"
 
