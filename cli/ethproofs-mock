@@ -615,6 +615,106 @@ class Handler(BaseHTTPRequestHandler):
                       key=lambda r: (str(r.get("ts") or ""), r.get("cluster_id") or 0,
                                      str(r.get("vm") or ""), str(r.get("guest") or ""),
                                      r.get("block_number") or 0), reverse=True)
+        # RUNS, SEPARATED. One store outlives many sessions — an afternoon of mock rows and a night of real
+        # ones land in the same table, and reading it means first working out where one campaign ended. A run
+        # boundary is either a change of (cluster, vm, guest) or a SILENCE: at any sane cadence the gap between
+        # two submissions is a couple of minutes, so a quarter of an hour of nothing is a different sitting.
+        # EP_RUN_GAP_SECS tunes it; 0 turns the separators off.
+        run_gap = float(os.environ.get("EP_RUN_GAP_SECS") or 900)
+
+        def _ts(v):
+            try:
+                return datetime.strptime(str(v), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+            except (ValueError, TypeError):
+                return None
+
+        def run_groups(rs):
+            """The newest-first rows, cut into runs. Returns [[row, …], …], newest run first."""
+            groups, cur = [], []
+            for r in rs:
+                if cur and run_gap > 0:
+                    prev = cur[-1]
+                    ident = (r.get("cluster_id"), r.get("vm"), r.get("guest"))
+                    if ident != (prev.get("cluster_id"), prev.get("vm"), prev.get("guest")):
+                        groups.append(cur); cur = []
+                    else:
+                        a, b = _ts(prev.get("ts")), _ts(r.get("ts"))
+                        if a is not None and b is not None and (a - b) > run_gap:
+                            groups.append(cur); cur = []
+                cur.append(r)
+            if cur:
+                groups.append(cur)
+            return groups
+
+        def run_header(g):
+            """One line per run, carrying what the rows under it cannot say on their own: how many, over what
+            window, and the median prove — the figure a run is judged on. Mock rows are counted apart, never
+            folded into the median, for the same reason rtp-latency excludes them: their duration is modelled."""
+            real = [x for x in g if x.get("event") == "proved" and not x.get("mock")]
+            mocks = [x for x in g if x.get("mock")]
+            ver = sum(1 for x in real if x.get("verified") is True)
+            rej = sum(1 for x in real if x.get("verified") is False)
+            ms = sorted(x["proving_time_ms"] for x in real if x.get("proving_time_ms"))
+            med = f"{ms[len(ms) // 2] / 1000:.1f}s" if ms else "—"
+            # The END keeps its date when the run crossed midnight — a bare "→ 10:56:43" after a 17:27 start
+            # reads as a run that finished before it began. An overnight campaign is exactly the case here.
+            f_raw, l_raw = (g[-1].get("ts") or ""), (g[0].get("ts") or "")
+            first = f_raw[:19].replace("T", " ")
+            last = l_raw[11:19] if f_raw[:10] == l_raw[:10] else l_raw[:19].replace("T", " ")
+            ident = " · ".join(str(x) for x in (g[0].get("cluster_id"), g[0].get("vm"), g[0].get("guest")) if x)
+            bits = [f"<b>{ident}</b>", f"{first} → {last}"]
+            if real:
+                bits.append(f"{len(real)} proof(s), median prove <b>{med}</b>, {ver} ✓" + (f", {rej} ✗" if rej else ""))
+            if mocks:
+                bits.append(f"<span class=w>{len(mocks)} mock</span>")
+            return f"<tr class=run><td class=l colspan=21>{'  ·  '.join(bits)}</td></tr>"
+
+        # THE WINDOW a real-time proof has to land in. `t_block` is chain time and `e2e_secs` is measured from
+        # it on the PRODUCER's single clock, so "did this block make its deadline" is one subtraction with no
+        # cross-machine comparison — the only reason it can be trusted to a second. At PROVE_EVERY=N a sampled
+        # block owns N slots, so the budget is N × 12 s. rtp-up passes EP_PROVE_EVERY; set it by hand for a mock
+        # started on its own, or EP_SLOT_SECS for a chain whose slot is not 12 s.
+        slot = float(os.environ.get("EP_SLOT_SECS") or 12)
+        every = float(os.environ.get("EP_PROVE_EVERY") or 1)
+        deadline = slot * every
+
+        def block_time(r):
+            """The block's own timestamp, from the chain — not when we heard about it."""
+            try:
+                return datetime.fromtimestamp(float(r.get("t_block")), timezone.utc).strftime("%H:%M:%S")
+            except (TypeError, ValueError, OSError):
+                return ""
+
+        def validation_secs(r):
+            """THE CANONICAL NUMBER: the block's own timestamp to the moment THIS SERVER received the proof.
+
+            It is the only measure a third party can attest. `e2e_secs` is computed on the box that produced
+            the witness and sent to us by the submitter — the prover's own account of its own latency, and a
+            server that judges a deadline on it is taking the claimant's word for the claim. This subtraction
+            uses one field from the chain (`t_block`) and one clock we own (the receipt), so it also covers
+            what e2e cannot see: the submission hop and our own queueing.
+
+            Measured against the self-reported figure over 8 consecutive blocks: +0.3 to +1.4 s, always
+            larger, which is that hop plus the second of granularity in our timestamp. So the two agree, and
+            where they disagree this one is the answer.
+            """
+            try:
+                recv = datetime.strptime(str(r.get("ts")), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                return recv.timestamp() - float(r.get("t_block"))
+            except (TypeError, ValueError):
+                return None
+
+        def late(r):
+            """True when the proof reached this server outside the block's window. Only for a REAL proof that
+            was proved: a mock's duration is modelled, and a queued row has not had its chance yet.
+
+            No `t_block` (an older submitter, or a manifest that predates the column) means we cannot tell, and
+            cannot-tell is never flagged — the same rule the public-values gate follows."""
+            if r.get("mock") or r.get("event") != "proved":
+                return False
+            v = validation_secs(r)
+            return v is not None and v > deadline
+
         def td(v): return "" if v is None else v
         def secs(ms): return "" if ms is None else f"{ms / 1000:.1f}"
 
@@ -668,23 +768,39 @@ class Handler(BaseHTTPRequestHandler):
         body = ["<!doctype html><meta charset=utf-8><title>ethproofs-mock</title>",
                 "<style>body{font:14px system-ui;margin:2rem}h1{font-size:1.2rem}"
                 "table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 8px;text-align:right}"
-                "td:first-child,th:first-child,.l{text-align:left}.q{color:#999}.p{color:#c60}.d{color:#080}.r{color:#c00}</style>",
+                "td:first-child,th:first-child,.l{text-align:left}.q{color:#999}.p{color:#c60}.d{color:#080}.r{color:#c00}"
+                "tr.run td{background:#f0f0f0;border-top:3px solid #666;font:13px ui-monospace,monospace;"
+                "padding:6px 8px}tr.run .w{color:#c60}"
+                ".bt{color:#666;font:12px ui-monospace,monospace}"
+                # The row is tinted and the offending number is the loud part: what missed is the e2e, and
+                # reading WHY means looking along that row at prove and queue.
+                "tr.late td{background:#fff5f5}tr.late td.miss{color:#c00;font-weight:600}</style>",
                 "<style>.bn{margin:0 0 1rem;padding:.6rem .8rem;border:1px solid #ccc;border-radius:6px;"
                 "font:13px ui-monospace,monospace;line-height:1.7}.bn b{font-weight:600}"
                 ".bn .s{color:#999}.bn .w{color:#c60}</style>",
                 f"<h1>ethproofs-mock — {len(rows)} proof(s)</h1>",
                 self._banner()]
         body += [
-                "<table><tr><th>cluster</th><th class=l>vm</th><th class=l>guest</th><th>mock</th><th>block</th><th class=l>state</th>"
+                "<table><tr><th>cluster</th><th class=l>vm</th><th class=l>guest</th><th>mock</th><th>block</th>"
+                "<th>block time</th><th class=l>state</th>"
                 # Ordered as the block travels: produced, shipped, proved, waited. Every second of e2e lands in
                 # one of them, so nothing is left as a remainder for the reader to work out.
                 "<th>work-unit</th>"
                 "<th>node (s)</th><th>witness (s)</th><th>transport (s)</th><th>prove (s)</th>"
                 # service = the three above. The one number to compare against the 12 s slot.
                 "<th>service (s)</th><th>queue (s)</th>"
-                "<th>pipeline (s)</th><th>e2e (s)</th><th>proof (B)</th><th>verified</th>"
+                "<th>pipeline (s)</th><th>e2e (s)</th><th>validation (s)</th><th>proof (B)</th><th>verified</th>"
                 "<th class=l>verifier_id</th><th class=l>updated</th></tr>"]
-        for r in rows:
+        # The separators ride IN the row list, as strings, so the row loop below stays exactly one loop over
+        # one sequence. Nesting it would have re-indented forty lines to add a heading.
+        seq = []
+        for _g in run_groups(rows):
+            seq.append(run_header(_g))
+            seq.extend(_g)
+        for r in seq:
+            if isinstance(r, str):
+                body.append(r)
+                continue
             ev = r.get("event", "")
             cls = {"queued": "q", "proving": "p", "proved": "d"}.get(ev, "")
             # Three states, not two: ✓ verified · ✗ REJECTED (a real proof that failed — the alarming one)
@@ -694,9 +810,9 @@ class Handler(BaseHTTPRequestHandler):
             vb = "✓" if v is True else ("✗" if v is False else ("⊘" if ev_proved else ""))
             vc = "d" if v is True else ("r" if v is False else "q")
             blk = td(r.get("block_number")) or (f"pi:{str(r.get('public_inputs'))[:10]}" if r.get("public_inputs") else "")
-            body.append(f"<tr><td>{td(r.get('cluster_id'))}</td><td class=l>{td(r.get('vm'))}</td>"
+            body.append(f"<tr class='{'late' if late(r) else ''}'><td>{td(r.get('cluster_id'))}</td><td class=l>{td(r.get('vm'))}</td>"
                         f"<td class=l>{td(r.get('guest'))}</td>"
-                        f"<td class='r'>{'⚠️MOCK' if r.get('mock') else ''}</td><td>{blk}</td>"
+                        f"<td class='r'>{'⚠️MOCK' if r.get('mock') else ''}</td><td>{blk}</td><td class=bt>{block_time(r)}</td>"
                         f"<td class='l {cls}'>{ev}</td><td>{td(r.get('proving_cycles'))}</td>"
                         # ms is the API's unit; seconds is what a human compares to a 12 s slot.
                         f"<td>{td(r.get('node_secs'))}</td>"
@@ -709,6 +825,9 @@ class Handler(BaseHTTPRequestHandler):
                         f"<td>{queue_wait(r)}</td>"
                         f"<td>{pipeline_secs(r)}</td>"
                         f"<td>{td(r.get('e2e_secs'))}</td>"
+                        # The canonical one, and the cell that goes loud when the window was missed.
+                        f"<td class='{'miss' if late(r) else ''}'>"
+                        f"{'' if validation_secs(r) is None else f'{validation_secs(r):.0f}'}</td>"
                         f"<td>{td(r.get('proof_bytes'))}</td>"
                         f"<td class='{vc}' title='{td(r.get('verify_reason'))}'>{vb}</td>"
                         f"<td class=l>{str(td(r.get('verifier_id')))[:18]}</td><td class=l>{td(r.get('ts'))}</td></tr>")

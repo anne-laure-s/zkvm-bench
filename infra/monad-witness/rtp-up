@@ -886,7 +886,10 @@ if [ "$KEEP_MOCK" = 1 ]; then
 else
   run "pkill -f ethproofs-mock || true"
   run "sleep 1"
-  run "( trap '' INT; nohup '$MAC_REPO/cli/ethproofs-mock' --port $MOCK_PORT --store '$MOCK_STORE' --rpc '$RPC' --verify-cmd '$MAC_REPO/cli/verify-proof' >> ~/ethproofs-mock.log 2>&1 & )"
+  # EP_PROVE_EVERY so the leaderboard knows this run's deadline. A sampled block owns PROVE_EVERY slots, so
+  # the window it had to land in is PROVE_EVERY × 12 s — and a mock told nothing assumes 1, which would flag
+  # every block on a sampled campaign as late.
+  run "( trap '' INT; EP_PROVE_EVERY=$PROVE_EVERY nohup '$MAC_REPO/cli/ethproofs-mock' --port $MOCK_PORT --store '$MOCK_STORE' --rpc '$RPC' --verify-cmd '$MAC_REPO/cli/verify-proof' >> ~/ethproofs-mock.log 2>&1 & )"
   run "sleep 2"
 fi
 if [ "$DRY" != 1 ]; then
