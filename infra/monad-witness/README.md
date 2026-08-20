@@ -257,6 +257,25 @@ and would be dropped the moment it was proved.
 Each cycle logs the breakdown, e.g. `dropped=18 kept[big=1 proof-failed=1 recent=5 sample=1 slow=1
 unproved=3] queue=12 raw=0` — so what the box is keeping, and why, is never a mystery.
 
+### The parked collection is capped
+
+A kept block leaves the queue for `fixtures/kept/` — kept for a profile, invisible to the prover. Nothing
+used to remove one, so it grew for as long as the pipeline ran: **3.7 GB across 768 files** by 2026-08-20, on
+a box whose disk is 91% triedb. `KEPT_MAX_GB` (default 20, `0` = unbounded) bounds it: over the cap the
+oldest outliers go first, and **every eviction is logged** — it is measurement data being deleted.
+
+The sampled corpus (`block % KEEP_SAMPLE == 0`) is never a candidate. It is what makes a number from August
+comparable to one from November, so a cap the corpus alone exceeds is *reported*, not enforced:
+
+```
+kept: 21.40 GB still over KEPT_MAX_GB=20 — 21.40 GB of it is the sampled corpus, which is never
+      evicted. Raise KEPT_MAX_GB, or archive the corpus off this box.
+```
+
+The sweep runs only when a block was parked — the one thing that makes the directory grow — so the 1 s tap
+cycle does not stat the whole collection every second. `kept_dir=` in the cycle line carries the size
+whenever it changed, which is what made the growth invisible before.
+
 The tap is the **only** piece of the whole pipeline that removes files, so: it refuses to touch anything
 outside `WITNESS_DIR` or not named `<digits>.{witness,post_state_root}`, and `--dry-run` previews without
 deleting *or recording* (a recorded block is never reprocessed, so a dry run that wrote the manifest would
@@ -351,3 +370,107 @@ clone carries everything the queue and the prover driver need — no build on th
 ```sh
 cd ~/zkvm-bench && git pull && cd infra/monad-witness && ./witness-follow status
 ```
+
+## Real proving on a cluster
+
+`./rtp-up --real` swaps the model prover for a ZisK cluster on a GPU box. One entry point, from the Mac.
+
+### The ssh key is needed only at startup
+
+Every link to the prover is a **persistent channel, dialled by the prover**:
+
+| channel | carries | socket |
+|---|---|---|
+| `witness-pump serve` | the witness (N streams, range-split) | `$PUMP_SOCK` on the prover |
+| `witness-pump exec-host` | every control call the box makes on the prover | `~/.zisk-exec.sock` on the box |
+| `ssh -L` onto the box | the submission endpoint, when it is the local mock | `$MOCK_PORT` on the prover |
+
+The third one exists because the prover POSTs its own proofs, so `EP_URL` is resolved **on the prover**: a mock
+at `localhost:8547` is the prover's own localhost with nothing behind it, and every block would fall back to
+posting from the box with the proof crossing back over the slow hop. `rtp-up --real` forwards the port when
+`EP_URL` is local, checks `GET /status` through it, and says so when it cannot.
+
+`rtp-up --real` stages `witness-pump`, `ethproofs-submit` and `check-pv` on the prover from the box's clone,
+starts both channels, and verifies both **answer** — a bound socket with no channel behind it is the failure
+mode, not the success case, so the data channel is only accepted once its log says `channels open` and the
+exec channel only once it returns from the box.
+
+What this buys: after startup nothing needs a box→prover key. The box's hourly
+`find ~/.ssh -type f -name 'id_*' -delete` can take it, and proving continues. The direction that must keep
+working is the other one — **the prover's own key to the box** — and `rtp-up` checks it before starting
+anything, because without it both channels come up and every block silently falls back to per-block ssh.
+
+### Once per prover
+
+```sh
+ssh <prover> 'git clone <this repo> ~/zkvm-bench; cd ~/zkvm-bench \
+  && infra/zisk-infra/cluster/00-install-once.sh && infra/zisk-infra/cluster/start.sh'
+```
+
+The proving key extracts to ~70 GB, so the prover needs the disk for it — `infra/zisk-infra/docs/runbook-vastai.md`
+has the box requirements.
+
+Then give the prover a key to the box, and confirm the direction that matters:
+
+```sh
+ssh <prover> 'ssh -o BatchMode=yes <box> true && echo reachable'
+```
+
+### Every run
+
+```sh
+BOX=<box> PROVER=<ssh target the box can reach> PROVE_GPUS=16 PROVE_EVERY=1 \
+  ./infra/monad-witness/rtp-up --real
+```
+
+- `GUEST_ELF=<generation|path>` proves with an uncommitted guest; the file is copied under its own sha, so the
+  filename is the checksum.
+- `EP_URL` / `EP_TOKEN` / `EP_CLUSTER` send elsewhere than the local mock. A non-local `EP_URL` is checked from
+  the prover directly — no forward.
+- `PROVER_LOG_FILES="~/prove.log /tmp/zisk-coordinator.log"` brings those logs' tails back inside the artifact
+  tarball, for when there is proving margin to spare.
+- `PUMP_CHANNELS=N` pins the stream count: `netprofile` measures the link from the prover, and on a real prover
+  this Mac is not on that link, so the default is 1 rather than a guess dressed as a measurement.
+- `--dry-run` prints every command and runs none.
+
+`rtp-up --real` refuses to start on: no `cargo-zisk` on the prover, a coordinator that does not answer, a
+prover that cannot reach the box, a channel that does not answer, a missing `check-pv` beside the submitter
+(the public-value gate would load-but-absent and every proof would ship unchecked).
+
+### Rehearsing on a cheap box first
+
+`PROVER=<box>` **without** `--real` puts the *model* prover on a remote box: every transfer, both channels,
+the queue policy, the submission and the public-value gate are the real thing, and only the prover's sleep is
+fiction. Same command, minus the flag:
+
+```sh
+BOX=<box> PROVER=<cheap box> ./infra/monad-witness/rtp-up
+```
+
+It gets its own runner dir (`zisk-mock` against `zisk-prover`), workspace, pump socket, log and ethproofs
+cluster id, so a rehearsal and a real deployment cannot collide on one host. Two things to know:
+
+- **`ziskemu` on that box or the measurement is a constant.** The model's only per-block input is the step
+  count it emulates; without `ziskemu` every simulated duration is the same fixed term — a constant
+  pretending to be a measurement. `rtp-up` says so loudly rather than failing.
+- The ELF is uploaded by `prove_remote` itself, on checksum mismatch. Nothing to stage by hand.
+
+### While it runs
+
+```sh
+ssh <box> 'tail -2 ~/witness-tap.log; tail -6 ~/prove-real.log'
+```
+
+`prove=X wall=Z` — `Z-X` is the transport. `vkey_hash` in each `report.json` is the prover's verification key,
+which is per-install and not per-ELF: it differs between machines, and a change on one machine means its
+proving key was reinstalled. Every submission line ends in `ok:post_state_root+block_hash+pre_state_root`;
+anything else is a proof that did not commit to this block.
+
+### Down
+
+```sh
+BOX=<box> PROVER=<prover> ./infra/monad-witness/rtp-up --stop
+```
+
+Stops the box's sessions, the tunnel and the mock on the Mac, and all three of the prover's channels. The fetcher is
+left running: the `block_db` is cheap and reusable.

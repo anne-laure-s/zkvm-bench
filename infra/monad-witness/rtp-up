@@ -39,13 +39,15 @@
 #                  has none), checks the coordinator is answering before starting, prints the projected
 #                  service times and the cadence they suggest (PROVE_EVERY stays yours), and gives the
 #                  deployment its own runner dir, workspace, socket, log and ethproofs cluster id so it
-#                  cannot collide with a mock one on the same host.
+#                  cannot collide with a mock one on the same host. And it establishes the two persistent
+#                  channels ON THE PROVER (data + exec, both dialled by the prover), so the box->prover key
+#                  is needed at startup and never again — see "Real proving on a cluster" in the README.
 #     --dry-run    print every command, run none of them
 #     --purge      empty the prover queue and the witness dump first, for a clean coverage measurement
 #     --keep-mock  do not restart ethproofs-mock (default: restart it, so it can never run stale code —
 #                  its store persists, nothing is lost)
 #     --cron       also install the daily archive-logs cron on the box
-#     --stop       tear the whole thing down instead (box sessions, tunnel, mock)
+#     --stop       tear the whole thing down instead (box sessions, tunnel, mock, prover channels)
 #
 # It also patches the fetcher for `newHeads` notifications (and installs websocket-client on the box for
 # them), so a block is picked up on arrival rather than on the next poll.
@@ -73,6 +75,12 @@
 #                   liveness check only; cluster/start.sh on that box is what configures it.
 #               RUNNER_DIR / PROVER_WS           paths ON THE PROVER. With --real they default under the
 #                   prover's own $HOME (resolved from the box); unset them unless you mean something else.
+#               PROVER_LOG_FILES  logs ON THE PROVER whose tails ride back with the artifacts, space-separated
+#                   (e.g. "~/prove.log /tmp/zisk-coordinator.log"). PROVER_LOG_TAIL=200 lines each. They land
+#                   in the result tarball as prover.log. Empty = nothing extra crosses.
+#               KEPT_MAX_GB     cap on the box's parked-witness collection, in GB (witness-tap's default is
+#                   20; 0 = unbounded). The sampled corpus is never evicted, so a cap below its size is
+#                   reported rather than enforced.
 #               KZG_STRICT=0    make step 5b's lazy-trusted-setup check fatal instead of a warning. Off by
 #                   default: an unpatched binary still produces correct witnesses, just ~2 s/block slower.
 #               SKIP_AFTER      how far behind the tip an un-proved block is abandoned, in BLOCKS.
@@ -265,8 +273,17 @@ if [ "$PROVE_REAL" = 1 ]; then
   PROVE_LOG="${PROVE_LOG:-~/prove-real.log}"
   EP_CLUSTER="${EP_CLUSTER:-${PROVE_GPUS}gpu-ZisK-monad}"
 else
-  RUNNER_DIR="${RUNNER_DIR:-$HOME/zisk-mock}"
-  PROVER_WS="${PROVER_WS:-$HOME/zisk-mock-ws}"
+  # THE MOCK PROVER CAN ALSO BE REMOTE — a cheap box, precisely so the paying one is not the thing being
+  # rehearsed on. Then these must NOT default to this Mac's $HOME: `mkdir -p /Users/<me>/zisk-mock` on a Linux
+  # prover fails outright, and 6c only resolves the prover's own $HOME when they are empty. So: empty when the
+  # prover is elsewhere, this Mac's paths when the prover IS this Mac.
+  if [ -n "${PROVER:-}" ]; then
+    RUNNER_DIR="${RUNNER_DIR:-}"
+    PROVER_WS="${PROVER_WS:-}"
+  else
+    RUNNER_DIR="${RUNNER_DIR:-$HOME/zisk-mock}"
+    PROVER_WS="${PROVER_WS:-$HOME/zisk-mock-ws}"
+  fi
   # witness-pump's unix socket, on the PROVER. Deliberately in /tmp and deliberately short: ~104 bytes is the
   # hard cap for a unix socket path on macOS, and $HOME can already be half of it.
   PUMP_SOCK="${PUMP_SOCK:-/tmp/zisk-pump.sock}"
@@ -539,6 +556,17 @@ fi
 if [ "$STOP" = 1 ]; then
   step "Stopping the box's sessions"
   onbox "cd $BOX_REPO/infra/monad-witness && ./witness-follow stop; tmux kill-session -t prove 2>/dev/null; tmux ls 2>&1 | sed 's/^/   /'"
+  if [ -n "$PROVER" ]; then
+    # The prover's own channels. Left up, they hold ssh connections to the box AND the code they started with,
+    # so the next run's exec check would answer from the OLD witness-pump and look perfectly healthy.
+    # Best-effort on purpose: this hop needs the box's key, which the hourly cron may already have deleted —
+    # in that case the next start's pkill clears them anyway.
+    step "Stopping the channels on $PROVER_TARGET"
+    onbox "ssh -o BatchMode=yes -o ConnectTimeout=8 -p $PROVER_PORT $PROVER_TARGET \
+'pkill -f \"witness-pump serve\" 2>/dev/null; pkill -f \"witness-pump exec-host\" 2>/dev/null; \
+pkill -f \"L [0-9]*:127.0.0.1:[0-9]*\" 2>/dev/null; true' \
+2>/dev/null || echo '   · could not reach the prover (its channels will be cleared at the next start)'"
+  fi
   step "Stopping the tunnel and the mock on this Mac"
   # The supervisor FIRST, or it would immediately redial the ssh we are about to kill. And match the actual
   # command line: the forward spec, not "ssh -N -R" — the -o options sit between those tokens.
@@ -1155,6 +1183,12 @@ fi
 
 # ── 6c. a remote prover's runner, pushed from the box's freshly-pulled clone ────────────────────────
 if [ -n "$PROVER" ]; then
+  # DEFINED HERE, not inside the --real branch: everything below this point that talks to the prover — the
+  # channels above all — applies to a MOCK prover on a remote box just as much. Left in the real branch, a
+  # remote mock run printed `onprover: command not found` six times and carried on (there is no `set -e`),
+  # so the channels never started and nothing in the output said the run was degraded.
+  onprover(){ onbox "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET '$*'"; }
+  onprover_q(){ onbox_q "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET '$*'"; }
   # Resolve the PROVER's own $HOME before anything is written there. Asked FROM THE BOX, over the same
   # box->prover hop the staging uses, so a failure here is the same failure the staging would hit — and it
   # surfaces now, with a message, instead of as a scp into a surprising path.
@@ -1168,8 +1202,11 @@ if [ -n "$PROVER" ]; then
    something this script sets up. Test it from the box, then re-run."
       fi
     fi
-    RUNNER_DIR="${RUNNER_DIR:-$PROVER_HOME/zisk-prover}"
-    PROVER_WS="${PROVER_WS:-$PROVER_HOME/zisk-prover-ws}"
+    # Per MODE, not one name for both: a mock and a real deployment on the same prover must not share a runner
+    # dir or a workspace — that is the same separation PUMP_SOCK, PROVE_LOG and EP_CLUSTER already make.
+    if [ "$PROVE_REAL" = 1 ]; then pdir=zisk-prover; else pdir=zisk-mock; fi
+    RUNNER_DIR="${RUNNER_DIR:-$PROVER_HOME/$pdir}"
+    PROVER_WS="${PROVER_WS:-$PROVER_HOME/$pdir-ws}"
     say "prover \$HOME is $PROVER_HOME → runner $RUNNER_DIR, workspace $PROVER_WS"
   fi
   step "Staging the runner on $PROVER_TARGET:$RUNNER_DIR (from the box)"
@@ -1193,8 +1230,6 @@ unrelated to the block. Install ZisK there, or keep the prover on the Mac."
   # per-ELF setup"), so a real run against a fresh ELF would fail block after block with nothing saying why.
   if [ "$PROVE_REAL" = 1 ]; then
     step "Real prover on $PROVER_TARGET: cluster liveness + per-ELF setup"
-    onprover(){ onbox "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET '$*'"; }
-    onprover_q(){ onbox_q "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET '$*'"; }
     if [ "$DRY" != 1 ]; then
       onprover_q "PATH=\$HOME/.zisk/bin:\$PATH command -v cargo-zisk >/dev/null 2>&1" \
         || die "no cargo-zisk on $PROVER_TARGET — run infra/zisk-infra/cluster/00-install-once.sh there first."
@@ -1225,6 +1260,139 @@ unrelated to the block. Install ZisK there, or keep the prover on the Mac."
     onprover "PATH=\$HOME/.zisk/bin:\$PATH cargo-zisk remote setup -e $PROVER_WS/elfs/monad-zisk.elf \
 --coordinator $COORDINATOR_URL 2>&1 | tail -5"
   fi
+
+  # ── the persistent channels, on a REAL prover ────────────────────────────────────────────────────
+  # THE KEY IS ONLY NEEDED AT STARTUP, and that is the whole design. Without this, a real run leans on
+  # box->prover ssh for every single block: one connection per witness, per artifact fetch, per submission —
+  # and the box's hourly cron (`find ~/.ssh -type f -name id_* -delete`) takes that key away, so the campaign
+  # dies at the top of the hour with everything else looking healthy. Renaming the key to dodge the cron is
+  # not the answer: it trades the architecture for a workaround, and the next machine gets it wrong again.
+  #
+  # So the same two channels the local prover has, established here while the key still exists:
+  #   * witness-pump serve    — the prover PULLS witnesses over N persistent streams
+  #   * witness-pump exec-host — the box RUNS commands on the prover with no box-side key at all
+  # Both are dialled BY THE PROVER, so the connection that matters afterwards uses the PROVER's key, which
+  # this box's cron never touches. prove_cmd already passes WITNESS_PUMP, PUMP_SOCK and REMOTE_SUBMIT for
+  # every mode; only the starting was missing.
+  step "Persistent channels on $PROVER_TARGET (so the key is needed only now)"
+  for f in infra/zisk-infra/witness-pump cli/ethproofs-submit cli/check-pv; do
+    onbox "scp -q -o BatchMode=yes -P $PROVER_PORT $BOX_REPO/$f $PROVER_TARGET:$RUNNER_DIR/"
+  done
+  onprover "chmod +x $RUNNER_DIR/witness-pump $RUNNER_DIR/ethproofs-submit $RUNNER_DIR/check-pv"
+  # check-pv beside ethproofs-submit, or the public-value gate loads-but-absent and every proof ships
+  # unchecked — the same pairing the local prover needs.
+  if [ "$DRY" != 1 ]; then
+    onprover_q "test -x $RUNNER_DIR/check-pv && $RUNNER_DIR/ethproofs-submit --help >/dev/null 2>&1 && echo ok" \
+      | grep -q ok \
+      && say "submitter and the public-value gate staged" \
+      || die "the submitter or check-pv did not stage on $PROVER_TARGET — proofs would ship unverified"
+  fi
+  # THE DIRECTION THAT CARRIES EVERYTHING, checked first. Both channels are dialled BY THE PROVER, so what has
+  # to work is prover->box: the prover needs its own key to $BOX, and $BOX has to be a name the PROVER resolves
+  # (an alias in this Mac's ~/.ssh/config means nothing there). If it does not, both channels still "start" —
+  # the pump binds its socket, the exec-host retries in a loop — and every block quietly falls back to
+  # per-block ssh from the box, which is precisely what the hourly key-deleting cron then breaks.
+  if [ "$DRY" != 1 ]; then
+    onprover_q "ssh -o BatchMode=yes -o ConnectTimeout=8 $BOX true && echo up" | grep -q up \
+      || die "$PROVER_TARGET cannot reach $BOX over ssh, and that is the direction both channels dial.
+   On the prover: ssh $BOX true — it must work with no password and no agent forwarding.
+   Fix whichever it is: the prover's key is not in $BOX:~/.ssh/authorized_keys, or '$BOX' is not a name the
+   prover resolves (BOX=<host the prover can reach> to use a different one)."
+  fi
+
+  # How many parallel streams. On the local prover netprofile MEASURES this, because it runs on the prover and
+  # can probe the link itself; from here it cannot — the link that matters is box->prover, and nothing on this
+  # Mac sits on it. So: an explicit PUMP_CHANNELS wins, otherwise one channel, and say which it is rather than
+  # let a default read as a measurement.
+  if [ -n "${PUMP_CHANNELS:-}" ]; then
+    say "channels: $PUMP_CHANNELS (pinned)"
+  else
+    PUMP_CHANNELS=1
+    say "channels: 1 (the $BOX->$PROVER_TARGET link is not profiled from here — PUMP_CHANNELS=N to pin it)"
+  fi
+
+  # Restart, never reuse: a live channel holds the code and env it started with. Double quotes only — the
+  # command travels inside onprover's single quotes.
+  onprover "pkill -f \"witness-pump serve\" 2>/dev/null; pkill -f \"witness-pump exec-host\" 2>/dev/null; true"
+  onprover "( trap \"\" INT; PUMP_SOCK=$PUMP_SOCK PUMP_BOX=$BOX PUMP_CHANNELS=$PUMP_CHANNELS \
+nohup $RUNNER_DIR/witness-pump serve >> \$HOME/witness-pump.log 2>&1 & )"
+  # ABSOLUTE, resolved on the box. BOX_REPO is the literal string "$HOME/zkvm-bench" so that it resolves on
+  # the box — but this value travels THROUGH the prover's shell, which would expand $HOME to the PROVER's home
+  # and point exec-host at a path that does not exist there or, worse, at a different clone. So ask the box
+  # what the path is, once, and pass the answer.
+  BOX_REPO_ABS="$BOX_REPO"
+  if [ "$DRY" != 1 ]; then
+    BOX_REPO_ABS="$(onbox_q "cd $BOX_REPO && pwd")"
+    [ -n "$BOX_REPO_ABS" ] || die "cannot resolve $BOX_REPO on $BOX — the box's clone is what both channels run"
+  fi
+  onprover "( trap \"\" INT; PUMP_BOX=$BOX PUMP_REMOTE_CMD=$BOX_REPO_ABS/infra/zisk-infra/witness-pump \
+nohup $RUNNER_DIR/witness-pump exec-host >> \$HOME/witness-exec.log 2>&1 & )"
+  if [ "$DRY" != 1 ]; then
+    # STARTED IS NOT SERVING, on either side. The data channel is checked from the prover (its socket lives
+    # there); the exec channel from the BOX, which is the side that will use it.
+    ok_data=0 ok_exec=0
+    for _try in 1 2 3 4 5 6; do
+      [ "$ok_data" = 1 ] || onprover_q "test -S $PUMP_SOCK && grep -q \"channels open\" \
+\$HOME/witness-pump.log && echo up" | grep -q up && ok_data=1
+      [ "$ok_exec" = 1 ] || onbox_q "cd $BOX_REPO && PUMP_EXEC_SOCK=\$HOME/.zisk-exec.sock \
+infra/zisk-infra/witness-pump run 'echo up'" | grep -q up && ok_exec=1
+      [ "$ok_data" = 1 ] && [ "$ok_exec" = 1 ] && break
+      sleep 3
+    done
+    [ "$ok_data" = 1 ] \
+      && say "data channel serving on $PROVER_TARGET:$PUMP_SOCK" \
+      || die "the pump on $PROVER_TARGET has no channel open to $BOX — a bound socket alone is the failure
+   mode, not the success case: witnesses would cross on per-block ssh, which stops for good when this box's
+   cron deletes the key. See $PROVER_TARGET:~/witness-pump.log."
+    [ "$ok_exec" = 1 ] \
+      && say "exec channel answers from $BOX with no box-side key" \
+      || die "the exec channel does not answer from $BOX. Every control call would need the box's key, which
+   the hourly cron deletes. See ~/witness-exec.log on $PROVER_TARGET, and check the PROVER can ssh to $BOX."
+  fi
+
+  # ── the submission endpoint, AS THE PROVER SEES IT ───────────────────────────────────────────────
+  # The prover POSTs the proof itself ("posted BY the prover — the proof never crosses the tunnel"), so
+  # ETHPROOFS_URL is resolved on the PROVER. With a mock on this Mac that URL is localhost:$MOCK_PORT, which on
+  # a real prover is the PROVER's own localhost with nothing behind it: every block's prover-side submit fails
+  # and falls back to posting from the box, dragging the 508 KB proof back over the slow hop — the exact cost
+  # that path exists to avoid, and prove-farm only escalates the wording after it has happened many times.
+  #
+  # The box already publishes the mock on its own 127.0.0.1:$MOCK_PORT (this Mac's reverse tunnel). So give the
+  # prover a forward onto it — dialled BY THE PROVER, like everything else here, so it needs no box-side key.
+  ep_hostport="$(printf '%s' "$EP_URL" | sed -E 's#^[a-z]+://##; s#/.*$##')"
+  case "$ep_hostport" in
+    localhost:*|127.0.0.1:*)
+      ep_port="${ep_hostport##*:}"
+      step "Forwarding the submission endpoint onto $PROVER_TARGET:$ep_port"
+      # DOUBLE QUOTES ONLY, and no single quote anywhere in the payload: this string is nested inside
+      # onprover's '...' at the box, so one apostrophe here ends the ssh argument and the loop silently
+      # becomes `bash -c exec`. The forward's own pattern is distinctive enough to kill by, so the loop needs
+      # no name of its own.
+      onprover "pkill -f \"L $ep_port:127.0.0.1:$ep_port\" 2>/dev/null; true"
+      onprover "( trap \"\" INT; nohup bash -c \"while true; do \
+ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o BatchMode=yes \
+-L $ep_port:127.0.0.1:$ep_port $BOX; sleep 5; done\" >> \$HOME/ep-forward.log 2>&1 & )"
+      if [ "$DRY" != 1 ]; then
+        ep_ok=0
+        for _try in 1 2 3 4 5 6; do
+          onprover_q "curl -sf -m 5 -o /dev/null $EP_URL/status && echo up" | grep -q up && { ep_ok=1; break; }
+          sleep 3
+        done
+        [ "$ep_ok" = 1 ] \
+          && say "the prover reaches $EP_URL — it will post its own proofs" \
+          || say "WARNING: the prover cannot reach $EP_URL. Every proof would be posted from $BOX instead, so
+   the proof crosses the prover->box hop on every block. See $PROVER_TARGET:~/ep-forward.log, or set EP_URL to
+   an endpoint the prover reaches directly."
+      fi
+      ;;
+    *)
+      if [ "$DRY" != 1 ]; then
+        onprover_q "curl -sf -m 8 -o /dev/null $EP_URL/status && echo up" | grep -q up \
+          && say "the prover reaches $EP_URL directly" \
+          || say "WARNING: the prover cannot reach $EP_URL — proofs would be posted from $BOX, one slow hop each."
+      fi
+      ;;
+  esac
 fi
 
 # ── 6b. the fetcher: newHeads subscription instead of polling ──────────────────────────────────────
@@ -1460,7 +1628,8 @@ onbox "tmux kill-session -t replay-tip 2>/dev/null; tmux kill-session -t tap 2>/
 # coverage figure means.
 tip_env="HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL TAP_INTERVAL=$TAP_INTERVAL \
 REPLAY_POLL=$REPLAY_POLL SETTLE_SECS=$SETTLE_SECS TIP_DIRECT=$TIP_DIRECT BLOCK_DB_TIMEOUT=$BLOCK_DB_TIMEOUT \
-PROVE_EVERY=$PROVE_EVERY SKIP_AFTER=$SKIP_AFTER ETHPROOFS_URL=$EP_URL CLUSTER=$EP_CLUSTER"
+PROVE_EVERY=$PROVE_EVERY SKIP_AFTER=$SKIP_AFTER ETHPROOFS_URL=$EP_URL CLUSTER=$EP_CLUSTER\
+${KEPT_MAX_GB:+ KEPT_MAX_GB=$KEPT_MAX_GB}"
 onbox "cat > \$HOME/.rtp-tip-env <<'RTPEOF'
 $tip_env
 RTPEOF
@@ -1581,7 +1750,11 @@ fi
 # lets rtp-watchdog restart the prover on its own: it replays this file instead of rebuilding an invocation from
 # memory, which is exactly the mistake that produced 1789 proofs nobody submitted. Anything that reconstructs
 # this command by hand will eventually drop a flag, and the flags that go missing are the silent ones.
+# PROVER_LOG_FILES is a pass-through, and it has to be one: it is set on the BOX, read by core.sh on the box,
+# and its effect happens on the PROVER — so an operator setting it here would otherwise see it vanish. Empty by
+# default; when set, each named log's tail rides back inside the artifact tarball that already crosses.
 prove_cmd="cd $BOX_REPO && ${BOX_ELF:+ELF=$BOX_ELF }REMOTE_WS=$PROVER_WS REMOTE_RUNNER=$RUNNER_DIR/zisk-runner \
+${PROVER_LOG_FILES:+PROVER_LOG_FILES='$PROVER_LOG_FILES' }${PROVER_LOG_TAIL:+PROVER_LOG_TAIL=$PROVER_LOG_TAIL }\
 ${PULL_VIA:+PULL_VIA=$PULL_VIA }WITNESS_PUMP=$RUNNER_DIR/witness-pump PUMP_SOCK=$PUMP_SOCK \
 REMOTE_SUBMIT=$RUNNER_DIR/ethproofs-submit WITNESS_MANIFEST=\$HOME/witness-manifest.csv \
 cli/prove-farm --guest monad-zisk $PROVE_MODE_FLAGS --remote $PROVER_TARGET --port $PROVER_PORT \

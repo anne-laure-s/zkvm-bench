@@ -41,6 +41,10 @@ firehose into the three things the RTP pipeline actually needs, and nothing else
 
                `*.exec-report.json` files are NEVER deleted: a few hundred bytes each, and they carry the
                deterministic work-unit (ZisK steps) for a block whose 7 MB witness is long gone.
+
+               The parked collection is CAPPED, at KEPT_MAX_GB (0 = unbounded). Over the cap, the oldest
+               outliers go first and each eviction is logged; the sampled corpus is never a candidate, so a
+               cap the corpus alone exceeds is reported instead of enforced.
   3. RECORD  — one manifest row per block with the timestamps the latency report joins on, plus a
                heartbeat to the ethproofs mock (POST /status) so the dashboard knows the chain tip.
 
@@ -115,6 +119,7 @@ KEEP_SAMPLE   = int(env("KEEP_SAMPLE", 1000))    # block % this == 0 -> kept for
 # A "keep forever" rule must stay near the p99 — at 12 MB it caught 7% of blocks, i.e. ~150 MB/h piling up.
 KEEP_BIG_MB   = float(env("KEEP_BIG_MB", 14))    # witness this large -> kept (outlier worth profiling)
 KEEP_SLOW_SECS = float(env("KEEP_SLOW_SECS", 45))  # proof took this long -> kept (outlier)
+KEPT_MAX_GB   = float(env("KEPT_MAX_GB", 20))    # cap on the parked collection, GB; 0 = unbounded
 SETTLE_SECS   = float(env("SETTLE_SECS", 2))     # ignore a witness younger than this (still being written)
 ETHPROOFS_URL = env("ETHPROOFS_URL")
 CLUSTER       = env("CLUSTER")
@@ -449,6 +454,83 @@ def prune(blocks, last, sizes, status, dry):
         dropped += 1
     return dropped, abandoned, parked, kept
 
+def human(n):
+    """Bytes as MB below a gigabyte, GB above. A cap expressed in GB still has to report a 5 MB overflow as
+    5 MB: "0.0 GB still over the cap" tells the operator nothing about what to change."""
+    return f"{n / 1024 ** 2:.0f} MB" if n < 1024 ** 3 else f"{n / 1024 ** 3:.2f} GB"
+
+def kept_entries():
+    """Every parked block under KEPT: {block: (bytes, [paths])}. Only files matching the tag form are
+    considered, so nothing an operator left in there by hand is ever a candidate for deletion."""
+    out = {}
+    if not os.path.isdir(KEPT):
+        return out
+    for n in os.listdir(KEPT):
+        m = re.match(rf"^{re.escape(CHAIN_ID)}-(\d+)\.(bin|post_state_root)$", n)
+        if not m:
+            continue
+        b = int(m.group(1))
+        path = os.path.join(KEPT, n)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        prev_size, paths = out.get(b, (0, []))
+        out[b] = (prev_size + size, paths + [path])
+    return out
+
+def sweep_kept(dry):
+    """Bound the profiling collection. Returns (evicted_blocks, freed_bytes, total_bytes).
+
+    KEPT is the one directory in this pipeline with no upper bound: `big`, `slow` and `proof-failed` blocks
+    accumulate for as long as the pipeline runs, ~5 MB each, on a box whose disk is mostly triedb already.
+    Measured 2026-08-20: 3.7 GB across 768 files, and nothing had ever removed one.
+
+    THE SAMPLED CORPUS IS NEVER EVICTED. `block % KEEP_SAMPLE == 0` is the reproducible benchmark set — the
+    one thing here that other measurements are compared against, and it is what makes a number from August
+    comparable to a number from November. Everything else in KEPT is an outlier kept for a profile that may
+    or may not happen, so that is what the cap acts on, oldest block first.
+
+    A cap the corpus alone exceeds is reported, not enforced: deleting the corpus to satisfy a disk budget
+    would trade the thing being measured for the room to measure it."""
+    if KEPT_MAX_GB <= 0:
+        return 0, 0, sum(sz for sz, _ in kept_entries().values())
+    cap = int(KEPT_MAX_GB * 1024 ** 3)
+    entries = kept_entries()
+    total = sum(sz for sz, _ in entries.values())
+    if total <= cap:
+        return 0, 0, total
+    # Oldest first, and the corpus is not a candidate at all.
+    candidates = [b for b in sorted(entries) if not (KEEP_SAMPLE and b % KEEP_SAMPLE == 0)]
+    evicted = freed = 0
+    for b in candidates:
+        if total - freed <= cap:
+            break
+        size, paths = entries[b]
+        # Every eviction gets a line: this is a deletion of measurement data, so it is never silent.
+        log(f"{'[dry-run] ' if dry else ''}kept: evicting {b} ({human(size)}) — "
+            f"{human(total - freed)} parked, over KEPT_MAX_GB={KEPT_MAX_GB:g}")
+        gone = 0
+        for path in paths:
+            if dry:
+                gone += 1
+                continue
+            try:
+                os.unlink(path)
+                gone += 1
+            except OSError as e:                              # noqa: BLE001 — never fatal
+                log(f"warn: cannot evict {os.path.basename(path)} ({e})")
+        if gone:
+            evicted += 1
+            freed += size
+    if total - freed > cap:
+        # Say WHICH constraint held, or the operator reads "still over the cap" as a broken sweep.
+        corpus = sum(sz for b, (sz, _) in entries.items() if KEEP_SAMPLE and b % KEEP_SAMPLE == 0)
+        log(f"kept: {human(total - freed)} still over KEPT_MAX_GB={KEPT_MAX_GB:g} — "
+            f"{human(corpus)} of it is the sampled corpus, which is never evicted. "
+            f"Raise KEPT_MAX_GB, or archive the corpus off this box.")
+    return evicted, freed, total - freed
+
 def queue_files():
     """How many framed inputs sit in the queue.
 
@@ -593,6 +675,14 @@ def cycle(seen, dry):
 
     # Retention runs over everything present, driven by what the prover has actually done.
     dropped, abandoned, parked, kept = prune(blocks, last, sizes, status, dry)
+    # ONLY WHEN IT GREW. park_queue_entry is the only thing that adds to KEPT, so `parked` is exactly the
+    # growth condition — and TAP_INTERVAL is 1 s, so an unconditional stat of every parked file would be
+    # hundreds of syscalls a second for a directory that changes a few times an hour.
+    evicted = 0
+    kept_size = ""
+    if parked:
+        evicted, _freed, kept_total = sweep_kept(dry)
+        kept_size = human(kept_total).replace(" ", "")     # one token, like every other field on this line
     raw_left = len([n for n in os.listdir(WITNESS_DIR) if WITNESS_RE.match(n)]) if os.path.isdir(WITNESS_DIR) else 0
 
     tip = chain_tip()
@@ -603,7 +693,9 @@ def cycle(seen, dry):
     log(f"{'[dry-run] ' if dry else ''}last_witness={last} tip={tip} lag={lag} queued={promoted}"
         f"{f' stale={stale}' if stale else ''} dropped={dropped}"
         f"{f' (abandoned {abandoned})' if abandoned else ''}"
-        f"{f' parked={parked}' if parked else ''} kept[{kept_str}] "
+        f"{f' parked={parked}' if parked else ''}"
+        f"{f' kept_dir={kept_size}' if kept_size else ''}"
+        f"{f' evicted={evicted}' if evicted else ''} kept[{kept_str}] "
         f"queue={queue_files()} raw={raw_left}")
     # No heartbeat on a dry run: "dry" has to mean no side effects anywhere, including the dashboard.
     if not dry:
@@ -624,6 +716,7 @@ def main():
         sys.exit(f"witness-tap: {GEN_INPUT} not found/executable (is REPO={REPO} the zkvm-bench clone?)")
     log(f"dir={WITNESS_DIR} repo={REPO} prove_every={PROVE_EVERY} keep_recent={KEEP_RECENT} "
         f"warmup={WARMUP_BLOCKS} "
+        f"kept_max={f'{KEPT_MAX_GB:g}GB' if KEPT_MAX_GB > 0 else 'unbounded'} "
         f"manifest={MANIFEST}{' [DRY-RUN]' if dry else ''}{' [once]' if once else ''}"
         f"{f' heartbeat={ETHPROOFS_URL}' if ETHPROOFS_URL else ''}")
     seen = seen_blocks()

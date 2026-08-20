@@ -273,10 +273,11 @@ def main(argv):
         known["params"] = params
     save(db)
     print(f"  params  {params}   (stored in {DB})")
-    # channels is recorded, not applied — see derive(). Say so rather than implying rtp-up will use it.
+    # channels is both recorded AND applied: rtp-up reads it back with `netprofile params` and starts
+    # witness-pump with that many channels, which split one witness by byte range (the SHARE verb).
     if params.get("channels", 1) > 1:
-        print(f"  note: N={params['channels']} would help, but parallel range fetching is not implemented"
-              f" — the figure is recorded for when it is.")
+        print(f"  note: rtp-up will start witness-pump with N={params['channels']} channels on this link"
+              f" — PUMP_CHANNELS=N to pin a different number.")
     return 2 if changed else 0
 
 
