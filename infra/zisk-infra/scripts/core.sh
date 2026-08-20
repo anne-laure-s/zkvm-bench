@@ -464,12 +464,22 @@ $plog_cmd cd $ws && tar cf - $members 2>/dev/null > $ws/art.tar; $push_cmd; rm -
   fi
   rm -f "$getdir/stream.tar"
 
-  mv "$getdir/proofs/$base.proof.bin" "$run_dir/proof.bin"   2>/dev/null
-  mv "$getdir/reports/$base.json"     "$run_dir/report.json" 2>/dev/null
-  mv "$getdir/reports/$base.log"      "$run_dir/prove.log"   2>/dev/null
-  # Only there when PROVER_LOG_FILES asked for it; absent is the normal case, so neither path complains.
-  mv "$getdir/reports/$base.prover.log" "$run_dir/prover.log"  2>/dev/null
-  mv "$getdir/proofs/$base.pv.bin"    "$run_dir/pv.bin"      2>/dev/null
+  # `|| true` ON EVERY ONE, and it is not defensive noise. This runs under `set -euo pipefail` (from
+  # infra/zisk-infra/run), so a `mv` of a file that is not there is a failing simple command that ENDS THE
+  # SCRIPT — and with `2>/dev/null` on it, silently. Two of these are legitimately absent:
+  #   * prover.log — only produced when PROVER_LOG_FILES asked for it;
+  #   * pv.bin     — `cargo-zisk remote prove` (the cluster path) does not emit public values at all.
+  # So on a REAL prover the function died right here, every block: proof.bin, report.json and prove.log were
+  # already in the run record, timing.json was never written, nothing was printed, and prove_remote returned
+  # 1. cli/prove-farm read that as FAIL, re-queued the block and retried for ever — while a valid, verified
+  # 414 KB proof sat in the run dir it had just fetched. Measured 2026-08-20: every real block, all afternoon.
+  # The one artifact whose absence must be fatal is proof.bin, and that has its own check below, with a
+  # message. Silence is the failure mode this line has to stop producing.
+  mv "$getdir/proofs/$base.proof.bin" "$run_dir/proof.bin"   2>/dev/null || true
+  mv "$getdir/reports/$base.json"     "$run_dir/report.json" 2>/dev/null || true
+  mv "$getdir/reports/$base.log"      "$run_dir/prove.log"   2>/dev/null || true
+  mv "$getdir/reports/$base.prover.log" "$run_dir/prover.log"  2>/dev/null || true
+  mv "$getdir/proofs/$base.pv.bin"    "$run_dir/pv.bin"      2>/dev/null || true
   rm -rf "$getdir"
   # The proof is the one artifact whose absence must fail loudly: with four separate scp calls a missing proof
   # failed on its own line, and a single stream must not turn that into a silent empty run record.
