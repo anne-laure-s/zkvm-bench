@@ -337,10 +337,17 @@ cmd_stop() {
   mkdir -p "$MONAD_DIR/logs" && : > "$MONAD_DIR/logs/STOP"
   for s in replay-catchup replay-tip tap profile; do
     tmux has-session -t "$s" 2>/dev/null || continue
-    # SIGTERM run_replay.py: it forwards to monad and exits WITHOUT writing an ALERT (a clean stop).
-    pkill -TERM -f "[r]un_replay.py" 2>/dev/null
-    pkill -TERM -f "[w]itness-tap" 2>/dev/null
-    pkill -TERM -f "[w]itness-profile" 2>/dev/null
+    # SIGTERM the PANE's process group, not a cmdline pattern. `pkill -TERM -f "[w]itness-tap"` and friends
+    # look targeted and are not: tmux 3.6 leaves the creating session's command in the SERVER's argv, so
+    # whichever session started the server makes that server match one of these patterns — and killing it
+    # takes down every session, prove-farm included, which this function promises two lines below to leave
+    # alone. reorg-recover's step 1 did exactly that on 2026-08-20 and ended a ten-hour run.
+    #
+    # The negative pid reaches the pane's shell AND its child, so run_replay.py still gets its SIGTERM and
+    # still forwards to monad and exits without writing an ALERT — a clean stop stays a clean stop.
+    for pid in $(tmux list-panes -t "$s" -F '#{pane_pid}' 2>/dev/null); do
+      kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    done
     sleep 3; tmux kill-session -t "$s" 2>/dev/null
     echo "· stopped $s"
   done

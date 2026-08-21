@@ -32,7 +32,7 @@
 #  It DOES rebuild monad's binary when it does not match the checkout: BUILD_MONAD=1 is the default, and
 #  that repair is one deterministic command. BUILD_MONAD=0 turns it back into an error with instructions.
 #
-#   ./rtp-up [--real] [--dry-run] [--purge] [--keep-mock] [--cron] [--stop]
+#   ./rtp-up [--real] [--dry-run] [--purge] [--keep-mock] [--cron] [--recover] [--stop]
 #
 #     --real       prove on a REAL ZisK cluster instead of the model. REQUIRES PROVER=<gpu box>.
 #                  Also: runs the per-ELF `cargo-zisk remote setup` (without --hints — the Monad guest
@@ -47,6 +47,8 @@
 #     --keep-mock  do not restart ethproofs-mock (default: restart it, so it can never run stale code —
 #                  its store persists, nothing is lost)
 #     --cron       also install the daily archive-logs cron on the box
+#     --recover    if logs/ALERT is present, run reorg-recover first instead of refusing to start. Same code
+#                  path the supervisor takes on its own; MARGIN=<n> is forwarded to it.
 #     --stop       tear the whole thing down instead (box sessions, tunnel, mock, prover channels)
 #
 # It also patches the fetcher for `newHeads` notifications (and installs websocket-client on the box for
@@ -437,7 +439,7 @@ TIP_DIRECT="${TIP_DIRECT:-1}"
 BLOCK_DB_TIMEOUT="${BLOCK_DB_TIMEOUT:-30}"
 BOX_REPO="${BOX_REPO:-\$HOME/zkvm-bench}"
 
-DRY=0 PURGE=0 KEEP_MOCK=0 CRON=0 STOP=0
+DRY=0 PURGE=0 KEEP_MOCK=0 CRON=0 STOP=0 RECOVER=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)   DRY=1; shift ;;
@@ -445,6 +447,7 @@ while [ $# -gt 0 ]; do
     --keep-mock) KEEP_MOCK=1; shift ;;
     --real)      PROVE_REAL=1; shift ;;
     --cron)      CRON=1; shift ;;
+    --recover)   RECOVER=1; shift ;;
     --stop)      STOP=1; shift ;;
     -h|--help)   sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
     *)           echo "rtp-up: unknown argument '$1' (see --help)" >&2; exit 2 ;;
@@ -920,7 +923,19 @@ fi
 step "Reverse tunnel ($TUN_SSH_PORT -> this Mac's sshd, $MOCK_PORT -> the mock)"
 tun_alive(){ [ -n "$(onbox_q "ss -ltn 2>/dev/null | grep -c ':$TUN_SSH_PORT '")" ] \
              && [ "$(onbox_q "ss -ltn 2>/dev/null | grep -c ':$TUN_SSH_PORT '")" != "0" ]; }
-# ALWAYS RESTARTED, never reused — the same rule as the prove session, and for a sharper reason here.
+# tun_usable — not "is the port bound" but "can the box actually get in through it with its own key".
+# That is the only question worth asking, and asking it FIRST is what stops this step from destroying a
+# working tunnel. On 2026-08-21 a live forward was holding the port, this step killed its Mac side, the new
+# ssh could not rebind (the box-side listener outlives a connection that died without a FIN — a sleeping Mac),
+# and step 5 then reported "cannot ssh in using its own key" about a key that was correct all along.
+tun_usable(){
+  [ "$DRY" = 1 ] && return 1
+  onbox_q "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o IdentityAgent=none \
+-o IdentitiesOnly=yes -o ConnectTimeout=8 -i ~/.ssh/id_ed25519 -p $TUN_SSH_PORT $MAC_USER@localhost true" \
+    >/dev/null 2>&1
+}
+
+# RESTARTED unless it already works — the prove session's rule, with the exception this one earned.
 # `tun_alive` only asks whether SOMETHING listens on the port. Two failure modes hide behind a yes:
 #   * a stale ssh from a previous run holds $TUN_SSH_PORT while its Mac side is gone, so the port is bound
 #     and the tunnel is useless — and this step then says "already listening" and changes nothing;
@@ -931,9 +946,28 @@ tun_alive(){ [ -n "$(onbox_q "ss -ltn 2>/dev/null | grep -c ':$TUN_SSH_PORT '")"
 #     repeated until nothing was up at all, which is how every box->Mac submission came to fail.
 # So: kill the supervisor AND its ssh (the loop's own pkill pattern misses the child, exactly like the pump's
 # did), then start one. Step 5 below verifies the result end to end and dies if it is not usable.
+if tun_usable; then
+  say "the tunnel on $TUN_SSH_PORT already carries the box's own key — kept, not restarted"
+  TUN_KEPT=1
+else
 run "pkill -f 'rtp-up-tunnel' 2>/dev/null; pkill -f 'R $TUN_SSH_PORT:127.0.0.1:22' 2>/dev/null; true"
-# The box side can also be holding the port from a dropped session; a bound port there fails the forward.
-onbox_q "pkill -f 'sshd.*$TUN_SSH_PORT' 2>/dev/null; true" >/dev/null 2>&1 || true
+# The box side can also hold the port after a dropped session. NOT `pkill -f "sshd.*$TUN_SSH_PORT"`: an sshd
+# session's command line is `sshd-session: <user> [priv]` and never contains the port, so that pattern matched
+# nothing and the stale listener survived every run. Nothing on this side can kill root's sshd child, so the
+# honest move is to WAIT for it — sshd reclaims it once its keepalive fires — and to say what to do if it does
+# not go, rather than start a tunnel that cannot bind and let step 5 blame the key for it.
+if [ "$DRY" != 1 ]; then
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    tun_alive || break
+    [ "$_i" = 1 ] && say "  $TUN_SSH_PORT is still held on the box; waiting for sshd to release it"
+    sleep 2
+  done
+  if tun_alive; then
+    die "$TUN_SSH_PORT is held on $BOX by a forward this Mac can neither use nor kill (it belongs to root's \
+sshd, left by a session that died without closing — a sleeping Mac does exactly this). Either wait for sshd's \
+keepalive to reap it, or take another port: TUN_SSH_PORT=$((TUN_SSH_PORT + 1)) $0 --real"
+  fi
+fi
 run "sleep 1"
 run "( trap '' INT; nohup bash -c 'while true; do ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o BatchMode=yes -R $TUN_SSH_PORT:127.0.0.1:22 -R $MOCK_PORT:127.0.0.1:$MOCK_PORT $BOX; echo \"rtp-up-tunnel: link down, retrying in 5s\"; sleep 5; done' >> ~/tunnel.log 2>&1 & )"
 run "sleep 3"
@@ -941,6 +975,7 @@ if [ "$DRY" != 1 ] && ! tun_alive; then
   say "WARNING: nothing is listening on $BOX:$TUN_SSH_PORT after the restart — see ~/tunnel.log."
   say "  'remote port forwarding failed' there means the port is still held on the box; step 5 will die on it."
 fi
+fi   # end of the "tunnel not already usable" branch
 
 # ── 5. both directions must actually work, before anything is started ──────────────────────────────
 step "End-to-end reachability"
@@ -951,9 +986,30 @@ if [ "$DRY" != 1 ]; then
   # will actually have — their own key, nothing else.
   onbox_q "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o IdentityAgent=none -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 -p $TUN_SSH_PORT $MAC_USER@localhost true" \
     && say "$BOX can ssh into this Mac with its OWN key (no agent involved)" \
-    || die "$BOX cannot ssh in using its own key. An agent may still make it look fine interactively, but the \
-tmux sessions have no agent. Check: Remote Login enabled on this Mac? ~/.ssh/authorized_keys contains the \
-key printed above? ~ not group-writable? See ~/tunnel.log"
+    || {
+         # TRANSPORT FIRST, then the key. This message used to name only the key, and on 2026-08-21 it sent the
+         # operator into ~/.ssh/authorized_keys — where a template line ended up pasted verbatim — for a key
+         # that was already correct: the real fault was a stale forward holding the port. Two different
+         # failures wear the same symptom here, and only one of them is about a key.
+         if ! onbox_q "exec 3<>/dev/tcp/127.0.0.1/$TUN_SSH_PORT" >/dev/null 2>&1; then
+           die "nothing answers on $BOX:$TUN_SSH_PORT — this is the TUNNEL, not the key. ~/tunnel.log will say \
+'remote port forwarding failed', which means the port is still held on the box: wait for sshd to release it, \
+or take another with TUN_SSH_PORT=$((TUN_SSH_PORT + 1))."
+         fi
+         # Something answers, so a forward exists; where it lands is the next question. Its banner settles it —
+         # this Mac's own sshd version, or somebody else's tunnel on a shared box.
+         _b="$(onbox_q "exec 3<>/dev/tcp/127.0.0.1/$TUN_SSH_PORT && head -c 40 <&3" 2>/dev/null | tr -d '\r')"
+         _m="$( { exec 3<>/dev/tcp/127.0.0.1/22 && head -c 40 <&3; } 2>/dev/null | tr -d '\r')"
+         if [ -n "$_b" ] && [ -n "$_m" ] && [ "$_b" != "$_m" ]; then
+           die "$BOX:$TUN_SSH_PORT answers '$_b' but this Mac's sshd says '$_m' — that forward lands somewhere \
+else (another user's tunnel, on a box with a dozen accounts). Take another port: \
+TUN_SSH_PORT=$((TUN_SSH_PORT + 1))."
+         fi
+         die "the tunnel is up and does land on this Mac, so this IS the key: $BOX's own key is refused. An \
+agent may still make it look fine interactively; the tmux sessions have no agent. Check, in this order: \
+~/.ssh/authorized_keys contains the key printed above · Remote Login enabled on this Mac · ~ not \
+group-writable. See ~/tunnel.log"
+       }
   onbox_q "curl -sf http://localhost:$MOCK_PORT/status >/dev/null" \
     && say "$BOX can reach the mock through the tunnel" \
     || die "$BOX cannot reach the mock on :$MOCK_PORT — the tunnel's forward is not up (see ~/tunnel.log)"
@@ -1788,7 +1844,8 @@ else
 while the chain is $gap blocks ahead. There is a HOLE in block_db — almost certainly a purge done with the \
 fetcher still running. Fix it by removing everything above the triedb head so the fetch resumes contiguously:
 
-  pkill -f fetch_blocks.py; tmux kill-session -t fetch
+  tmux kill-session -t fetch    # NOT pkill -f fetch_blocks.py: that pattern can match the tmux
+                                # server's own argv and take every session down with it
   ls ~/block_db | awk '\$1+0 > $last' > /tmp/drop.txt; wc -l < /tmp/drop.txt
   (cd ~/block_db && xargs -a /tmp/drop.txt rm -f)
 
@@ -1872,17 +1929,37 @@ if [ "$DRY" != 1 ] && [ -n "$(onbox_q "ls ~/monad/logs/ALERT 2>/dev/null")" ]; t
   # At CONFIRMATIONS=0 this is what a reorg looks like: the replay could not apply the next block on top of
   # one that left the canonical chain. Recovery is a rewind + re-fetch, and it must be deliberate.
   say "⚠️  logs/ALERT is present — the replay stopped on a failed batch (a reorg, at CONFIRMATIONS=0)."
-  say "    Recover with, on $BOX:"
-  say "      L=\$(grep -o '"last_executed": [0-9]*' ~/monad/status.json | grep -o '[0-9]*')"
-  say "      ~/monad/build/category/mpt/monad-mpt --storage ~/triedb.db --rewind-to \$((L - 3)) --yes"
-  say "      rm -f ~/block_db/\$((L - 2)) ~/block_db/\$((L - 1)) ~/block_db/\$L ~/monad/logs/ALERT"
-  die "not starting the producer on top of an ALERT — rewind first, then re-run."
+  # ONE recovery procedure, and it is the one cmd_supervise already runs unattended. The hand recipe printed
+  # here until 2026-08-21 diverged from it in four ways, the last of them fatal: a fixed L-3 rewind with no
+  # escalation on a repeat, no check that the failure was reorg-shaped, the orphaned blocks' rows left in
+  # prove-farm.csv still describing proofs of blocks that had left the chain — and no --allow-dirty, which
+  # monad-mpt needs exactly here because the dirty flag is set when the replay dies mid-batch. The recipe
+  # would have refused on the only occasion it was ever shown.
+  if [ "$RECOVER" = 1 ]; then
+    step "Recovering from the ALERT before starting (--recover)"
+    onbox "cd $BOX_REPO/infra/monad-witness && ${MARGIN:+MARGIN=$MARGIN }./reorg-recover" \
+      || die "reorg-recover refused or failed (its reason is above). Nothing has been started."
+    say "recovered — carrying on with the start"
+  else
+    say "    Recover with the tool the supervisor itself uses, on $BOX:"
+    say "      cd ~/zkvm-bench/infra/monad-witness && ./reorg-recover --dry-run   # what it would discard"
+    say "      cd ~/zkvm-bench/infra/monad-witness && ./reorg-recover"
+    say "    MARGIN=4 discards fewer already-proved blocks; it doubles on its own if that is too shallow."
+    die "not starting the producer on top of an ALERT — recover first, or re-run with --recover."
+  fi
 fi
 # Kill the tip sessions first, for the same reason the prover is always restarted: a live tmux session carries
 # the code and environment it was created with, and witness-follow skips sessions that already exist. That is
 # how the long-lived-monad path stayed undeployed while the logs showed a perfectly healthy producer — twice in
 # one day, on two different components. Restarting costs one block; not restarting costs the whole change.
-onbox "tmux kill-session -t replay-tip 2>/dev/null; tmux kill-session -t tap 2>/dev/null; pkill -f '[r]un_replay.py' 2>/dev/null; pkill -f '[w]itness-tap' 2>/dev/null; sleep 2; echo '   · tip sessions cleared (they would keep the old code and env)'"
+# Kill the PANES, not a cmdline pattern: tmux leaves the creating session's command in the SERVER's argv, so
+# `pkill -f '[w]itness-tap'` can match the server and take down every session — including a prove-farm from
+# the previous run that this script has not replaced yet. Same defect that ended the 2026-08-20 run from
+# reorg-recover's step 1; see witness-follow's cmd_stop for the full account.
+onbox "for s in replay-tip tap; do for pid in \$(tmux list-panes -t \$s -F '#{pane_pid}' 2>/dev/null); do \
+kill -TERM -\"\$pid\" 2>/dev/null || kill -TERM \"\$pid\" 2>/dev/null; done; \
+tmux kill-session -t \$s 2>/dev/null; done; sleep 2; \
+echo '   · tip sessions cleared (they would keep the old code and env)'"
 # RECORDED, then launched FROM the recording — same rule as the prover's invocation, and for the same reason:
 # anything that rebuilds this env by hand substitutes ITS defaults for the operator's configuration. Done once
 # already, twice over: a restart dropped ETHPROOFS_URL (so the heartbeat stopped and the leaderboard froze on a
@@ -2033,6 +2110,22 @@ onbox "tmux kill-session -t prove 2>/dev/null && echo '   · restarting prove (a
   onbox "(crontab -l 2>/dev/null | grep -v archive-logs; echo '17 4 * * * \$HOME/zkvm-bench/infra/monad-witness/archive-logs >> \$HOME/archive-logs.log 2>&1') | crontab - && crontab -l | tail -1"; }
 
 # ── 7. where to look ───────────────────────────────────────────────────────────────────────────────
+# ── 6c. the safety net ─────────────────────────────────────────
+# LAST, and unconditional on the real path. Every recording above announces itself as something
+# "rtp-watchdog replays it" — and nothing here ever hired the watchdog that would. That gap has a measured
+# cost: on 2026-08-20 the pipeline stopped at 19:57 (reorg-recover's step 1 killed the tmux server) and
+# nobody noticed for ten hours. All three recordings were in place; the rescuer was not on the payroll.
+#
+# Installed at the END because a watchdog armed before the pipeline exists would spend its first ticks
+# reviving pieces this script is still deploying. `--install` greps the crontab and exits if the entry is
+# already there, so re-running rtp-up is free.
+#
+# Real path only: a mock run is a short experiment on this Mac, and a cron entry that outlives it is litter.
+if [ "$PROVE_REAL" = 1 ]; then
+  step "Arming the watchdog on the box (every 5 minutes)"
+  onbox "cd $BOX_REPO/infra/monad-witness && ./rtp-watchdog --install"
+fi
+
 step "Up. What to watch"
 cat <<EOF
    on $BOX:

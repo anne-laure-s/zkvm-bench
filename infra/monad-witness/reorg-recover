@@ -131,9 +131,32 @@ fi
 # having rewound anything, so the next attempt discards hundreds of extra good blocks and re-fetches the whole
 # backlog to undo a divergence that is usually one block deep.
 
-log "1/5 stopping the fetcher (it must not write while block_db is trimmed)"
-run "pkill -f '[f]etch_blocks.py' 2>/dev/null; tmux kill-session -t fetch 2>/dev/null; true"
+srv_before=0; tmux ls >/dev/null 2>&1 && srv_before=1
+log "1/5 stopping the fetcher (it must not write while block_db is trimmed)$([ "$srv_before" = 0 ] \
+&& echo ' — no tmux server running, so there is nothing to stop')"
+# NOT `pkill -f fetch_blocks.py`, and this is the whole reason the 2026-08-20 overnight run ended here.
+# tmux 3.6 leaves the CREATING session's command in the SERVER process's argv, so a server born running the
+# fetcher carries `fetch_blocks.py` in its own cmdline — and that pattern then kills the server, taking every
+# session with it: the tap, prove-farm, and the supervisor running THIS script, mid-recovery. The log showed
+# this step announcing itself and nothing after it ever running. Reproduced on the box: three sessions, one
+# pkill, `no server running`. The bracket trick does not help — it only hides the pattern's own occurrence,
+# never another process that happens to mention the same text.
+#
+# tmux knows the pane's pid, so ask it instead of matching a command line. The negative pid signals the
+# pane's process GROUP, which is the shell and the python child together — the same reach the pkill had,
+# without the collateral. run_replay.py/fetch_blocks.py still receive SIGTERM, so a clean stop stays clean.
+run "for pid in \$(tmux list-panes -t fetch -F '#{pane_pid}' 2>/dev/null); do \
+kill -TERM -\"\$pid\" 2>/dev/null || kill -TERM \"\$pid\" 2>/dev/null; done; \
+tmux kill-session -t fetch 2>/dev/null; true"
 run "sleep 2"
+# DISAPPEARED, not merely absent — the distinction is the whole guard. Recovery normally runs when everything
+# has already died, so no tmux server is the ordinary case here and must not be an error; only a server that
+# was alive before step 1 and is gone after it means step 1 killed it. (When this script runs INSIDE tmux it
+# dies with the server and never reaches this line; run from a plain ssh shell, it reports.)
+if [ "$DRY" != 1 ] && [ "$srv_before" = 1 ] && ! tmux ls >/dev/null 2>&1; then
+  die "the tmux server was alive before step 1 and is gone after it — step 1 killed it, so nothing below \
+would have run. This is the 2026-08-20 failure mode; check that step 1 is not matching the server's own argv."
+fi
 
 log "2/5 rewinding the triedb"
 # --allow-dirty because the replay died mid-batch, which is exactly when the dirty flag is set; without it the
