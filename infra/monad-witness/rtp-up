@@ -32,7 +32,7 @@
 #  It DOES rebuild monad's binary when it does not match the checkout: BUILD_MONAD=1 is the default, and
 #  that repair is one deterministic command. BUILD_MONAD=0 turns it back into an error with instructions.
 #
-#   ./rtp-up [--real] [--dry-run] [--purge] [--keep-mock] [--cron] [--recover] [--stop]
+#   ./rtp-up [--real] [--dry-run] [--purge] [--keep-mock] [--cron] [--recover] [--bootstrap] [--stop]
 #
 #     --real       prove on a REAL ZisK cluster instead of the model. REQUIRES PROVER=<gpu box>.
 #                  Also: runs the per-ELF `cargo-zisk remote setup` (without --hints — the Monad guest
@@ -49,6 +49,13 @@
 #     --cron       also install the daily archive-logs cron on the box
 #     --recover    if logs/ALERT is present, run reorg-recover first instead of refusing to start. Same code
 #                  path the supervisor takes on its own; MARGIN=<n> is forwarded to it.
+#     --bootstrap  bring the ZisK cluster up on the prover before proving, instead of refusing to start:
+#                  ships infra/zisk-infra/cluster/ there and runs up.sh, which decides what is missing and
+#                  returns only once a worker is REGISTERED. On a rented box that is already installed and
+#                  merely stopped, seconds. On a bare one it installs system deps, rustup, ziskup and the
+#                  STARK proving key — 15-60 min, and ~64 GB of disk. Without this flag a missing cluster is
+#                  a refusal, because rtp-up's contract is "up in two minutes" and an unannounced hour is
+#                  not that. up.sh is idempotent, so passing it on an already-healthy prover costs one probe.
 #     --stop       tear the whole thing down instead (box sessions, tunnel, mock, prover channels)
 #
 # It also patches the fetcher for `newHeads` notifications (and installs websocket-client on the box for
@@ -480,7 +487,7 @@ TIP_DIRECT="${TIP_DIRECT:-1}"
 BLOCK_DB_TIMEOUT="${BLOCK_DB_TIMEOUT:-30}"
 BOX_REPO="${BOX_REPO:-\$HOME/zkvm-bench}"
 
-DRY=0 PURGE=0 KEEP_MOCK=0 CRON=0 STOP=0 RECOVER=0
+DRY=0 PURGE=0 KEEP_MOCK=0 CRON=0 STOP=0 RECOVER=0 BOOTSTRAP=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)   DRY=1; shift ;;
@@ -489,6 +496,7 @@ while [ $# -gt 0 ]; do
     --real)      PROVE_REAL=1; shift ;;
     --cron)      CRON=1; shift ;;
     --recover)   RECOVER=1; shift ;;
+    --bootstrap) BOOTSTRAP=1; shift ;;
     --stop)      STOP=1; shift ;;
     -h|--help)   sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; /^set -uo/d'; exit 0 ;;
     *)           echo "rtp-up: unknown argument '$1' (see --help)" >&2; exit 2 ;;
@@ -548,11 +556,23 @@ sweep_leftovers() {
     [ -n "$pat" ] || continue
     # </dev/null on every ssh in this loop: ssh reads stdin, and stdin here IS the pattern list. Without it
     # the first iteration swallows the rest of the list and the sweep silently checks one pattern out of seven.
-    n="$(onbox_q "pgrep -cf \"$pat\"" </dev/null | tr -d ' \n')"
+    # THE TMUX SERVER IS EXCLUDED FROM BOTH THE COUNT AND THE KILL, and that is not defensive tidiness.
+    # tmux leaves the CREATING session's command in the server process's own argv, so a server born from the
+    # `tap` session carries `witness-tap` there — and `pkill -f "[w]itness-tap"` then kills the SERVER, which
+    # takes every other session with it, prove-farm included. Cost an hour on 2026-08-21: a second `rtp-up`
+    # start swept at 18:48:57, the tap and prove-farm died in the same second (prove-farm mid-collection, right
+    # after a proof that had already verified), and the watchdog brought back only the tap. Same defect as
+    # reorg-recover's step 1 and witness-follow's cmd_stop — but this is the one place that cannot use a pane
+    # pid, because this sweep exists precisely to kill what NO session owns any more, so its targets have no
+    # pane. Hence: ask tmux for the server's pid and skip it, rather than narrowing a pattern that cannot be
+    # narrowed — the server's argv is whatever the first session's command happened to be.
+    n="$(onbox_q "srv=\$(tmux display-message -p '#{pid}' 2>/dev/null); pgrep -f \"$pat\" 2>/dev/null \
+| grep -vx \"\${srv:-0}\" | wc -l" </dev/null | tr -d ' \n')"
     case "$n" in ''|*[!0-9]*) n=0 ;; esac
     [ "$n" = 0 ] && continue
     say "box: $n process(es) matching $pat — killing"
-    onbox "pkill -f \"$pat\" || true" </dev/null
+    onbox "srv=\$(tmux display-message -p '#{pid}' 2>/dev/null); for p in \$(pgrep -f \"$pat\" 2>/dev/null); \
+do [ \"\$p\" = \"\${srv:-0}\" ] && continue; kill -TERM \"\$p\" 2>/dev/null; done; true" </dev/null
     killed=$((killed + n))
   done <<<"$boxpats
 $boxsoft"
@@ -1489,14 +1509,47 @@ unrelated to the block. Install ZisK there, or keep the prover on the Mac."
   if [ "$PROVE_REAL" = 1 ]; then
     step "Real prover on $PROVER_TARGET: cluster liveness + per-ELF setup"
     if [ "$DRY" != 1 ]; then
-      onprover_q "PATH=\$HOME/.zisk/bin:\$PATH command -v cargo-zisk >/dev/null 2>&1" \
-        || die "no cargo-zisk on $PROVER_TARGET — run infra/zisk-infra/cluster/00-install-once.sh there first."
-      # The coordinator, not just the host. A dead coordinator makes every block fail one at a time, ~40 s
-      # apart, with a transport error that reads like a network problem.
-      onprover_q "curl -sf -m 5 -o /dev/null $COORDINATOR_HEALTH" \
-        || die "the ZisK coordinator on $PROVER_TARGET is not answering at $COORDINATOR_HEALTH.
-   Start it there:  cd ~/zisk-infra/cluster && ./start.sh
-   Then wait for the worker to register (4-12 min: ~30 GB allocated per GPU)."
+      # WHAT IS MISSING FIRST, and only then what to do about it. Both of these states are exactly what
+      # cluster/up.sh resolves, and it returns only once a worker is REGISTERED — so the real question is not
+      # which error to print, it is whether the operator is willing to wait for an install.
+      # The coordinator check, not just the host: a dead coordinator makes every block fail one at a time,
+      # ~40 s apart, with a transport error that reads like a network problem.
+      have_zisk=1;  onprover_q "PATH=\$HOME/.zisk/bin:\$PATH command -v cargo-zisk >/dev/null 2>&1" || have_zisk=0
+      have_coord=1; onprover_q "curl -sf -m 5 -o /dev/null $COORDINATOR_HEALTH" || have_coord=0
+      if [ "$have_zisk" = 0 ] || [ "$have_coord" = 0 ]; then
+        missing=""
+        [ "$have_zisk" = 0 ] && missing="no cargo-zisk"
+        [ "$have_coord" = 0 ] && missing="${missing:+$missing and }no coordinator at $COORDINATOR_HEALTH"
+        if [ "$BOOTSTRAP" != 1 ]; then
+          die "$PROVER_TARGET is not ready to prove: $missing.
+     Re-run with --bootstrap and this script ships infra/zisk-infra/cluster/ there and runs up.sh, which
+     decides what is missing and does not return until a worker is registered. Cost: seconds if the box is
+     installed and merely stopped, 15-60 min and ~64 GB of disk if it is bare. up.sh is idempotent."
+        fi
+        step "Bootstrapping the cluster on $PROVER_TARGET (--bootstrap)"
+        say "$missing — shipping cluster/ and running up.sh"
+        say "  a bare box installs for 15-60 min here (system deps, rustup, ziskup, the ~54 GB STARK key); an"
+        say "  installed-but-stopped one takes seconds. Stopping a rented instance keeps that work, destroying"
+        say "  it does not — the per-ELF cache and the proving key are ~64 GB and get regenerated from scratch."
+        # THE WHOLE DIRECTORY, not just up.sh: on a genuinely bare box there is no start.sh and no
+        # 00-install-once.sh for it to call, and up.sh does `cd "$(dirname "$0")"` then invokes its neighbours
+        # by relative path. Shipping one file would work only on a box that had already been set up once —
+        # which is the case this flag exists to stop being the only one that works.
+        onbox "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET 'mkdir -p $PROVER_HOME/zisk-infra'"
+        onbox "scp -r -q -o BatchMode=yes -P $PROVER_PORT $BOX_REPO/infra/zisk-infra/cluster \
+$PROVER_TARGET:$PROVER_HOME/zisk-infra/"
+        # No timeout of ours around it: every wait inside up.sh is a loop on its own condition with a deadline,
+        # and cutting it mid-install is how you get the half-extracted proving key its header warns about.
+        onprover "cd $PROVER_HOME/zisk-infra/cluster && bash up.sh 2>&1 | tail -40"
+        # AND RE-CHECK. up.sh returning 0 is its claim; these two probes are the ones that sent us here, and
+        # they are what every block after this depends on.
+        onprover_q "PATH=\$HOME/.zisk/bin:\$PATH command -v cargo-zisk >/dev/null 2>&1" \
+          || die "up.sh finished but there is still no cargo-zisk on $PROVER_TARGET. Read its output above."
+        onprover_q "curl -sf -m 5 -o /dev/null $COORDINATOR_HEALTH" \
+          || die "up.sh finished but the coordinator still does not answer at $COORDINATOR_HEALTH. Read its \
+output above, and $PROVER_HOME/zisk-infra/cluster/logs/coordinator.log on the prover."
+        say "bootstrap done"
+      fi
       say "coordinator answering at $COORDINATOR_HEALTH"
     fi
     # Ship the ELF ahead of the first block, from the box's clone, into the SAME workspace path prove_remote

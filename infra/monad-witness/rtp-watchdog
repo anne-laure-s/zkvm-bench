@@ -239,8 +239,23 @@ if [ -z "$missing" ] && [ "$prove_down" = 1 ]; then
 fi
 
 if [ -z "$missing" ]; then
+  # THE PROVER IS CONSIDERED HERE TOO, and it was not until 2026-08-21. `missing` covers only the TIP sessions,
+  # so a dead prove session with a healthy producer left this branch exiting 0 in silence — the prover's own
+  # restart lived exclusively in the branch below, which needs a tip session to ALSO be missing. Measured cost:
+  # prove-farm died at 18:48:56, the tick at 18:50 restored the tap and refused the prover (the in-flight guard,
+  # correctly, on a run dir younger than 180 s), and then 13 consecutive ticks looked at a healthy producer and
+  # said nothing while every sampled block was produced and abandoned. 68 minutes of coverage for a guard that
+  # would have cleared on the very next tick.
+  if [ "$prove_down" = 1 ]; then
+    say "the producer is healthy but the prove session is down — restarting it from $PROVE_CMD_FILE"
+    if restart_prover; then
+      say "  prover restarted; witnesses will be picked up on the next scan"
+      [ "$DRY" = 1 ] || echo "$(date +%s)" >> "$STATE"
+    fi
+    exit 0
+  fi
   # Everything up. Say nothing on the happy path: this runs 288 times a day and a quiet log is a readable one.
-  [ "$DRY" = 1 ] && say "all of$TIP_SESSIONS up$([ $prove_down = 1 ] && echo ' (prove is down — restarting it from '"$PROVE_CMD_FILE"')')"
+  [ "$DRY" = 1 ] && say "all of$TIP_SESSIONS up"
   exit 0
 fi
 
