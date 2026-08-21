@@ -28,7 +28,8 @@ identify WHAT was proven and show on the leaderboard:
 
 Plus ONE endpoint the real ethproofs.org does not have, because only the producer knows it:
 
-  POST /status          {chain_tip, [last_witness, queue_files, cluster_id, vm, guest, source]}
+  POST /status          {chain_tip, [last_witness, queue_files, queue_retained, cluster_id, vm, guest, source]}
+  POST /reorg           {failing_block, rewound_to, [margin, orphaned, cluster_id, ts]}  (from reorg-recover)
 
 The three lifecycle POSTs above say what happened to ONE proof; they cannot say where the pipeline is as
 a whole, and above all nobody tells this server what the CHAIN's head is — so "how far behind are we?",
@@ -68,6 +69,12 @@ class Store:
         self.ids = {}            # (cluster, block) -> stable proof_id
         self.next_id = 1
         self.pipelines = {}      # cluster (or "*") -> last producer heartbeat (POST /status)
+        # REORGS, kept in their own log. They are not submissions and must not be replayed as such, but the
+        # leaderboard is unreadable without them: a run that stops for ten minutes and resumes on a block it
+        # had already proved looks like a bug, and it is the chain changing its mind. reorg-recover is the only
+        # component that knows both that one happened and what it invalidated, so it is the one that posts.
+        self.reorgs = []         # [{cluster_id, failing_block, rewound_to, margin, orphaned, ts}, …]
+        self.reorgs_path = os.path.join(d, "reorgs.jsonl")
         self._replay()
         self._load_status()
 
@@ -82,7 +89,38 @@ class Store:
                 self.next_id += 1
             return self.ids[key]
 
+    def record_reorg(self, body):
+        """One reorg, appended and kept. Never fatal: a dashboard that loses a marker is a worse dashboard,
+        not a broken pipeline."""
+        rec = {"ts": body.get("ts") or now_iso(),
+               "cluster_id": body.get("cluster_id"),
+               "failing_block": body.get("failing_block"),
+               "rewound_to": body.get("rewound_to"),
+               "margin": body.get("margin"),
+               "orphaned": body.get("orphaned")}
+        with self.lock:
+            self.reorgs.append(rec)
+            try:
+                with open(self.reorgs_path, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+            except OSError:
+                pass
+        return rec
+
+    def _replay_reorgs(self):
+        if not os.path.exists(self.reorgs_path):
+            return
+        with open(self.reorgs_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        self.reorgs.append(json.loads(line))
+                    except ValueError:
+                        continue
+
     def _replay(self):
+        self._replay_reorgs()
         if not os.path.exists(self.jsonl):
             return
         with open(self.jsonl) as f:
@@ -518,6 +556,13 @@ class Handler(BaseHTTPRequestHandler):
                   f"cluster={hb.get('cluster_id')} tip={hb.get('chain_tip')} "
                   f"witness={hb.get('last_witness')} queue={hb.get('queue_files')}{ret_note}")
             return self._reply(200, {"ok": True})
+        if self.path.rstrip("/") == "/reorg":
+            # Posted by reorg-recover, the only party that knows a rewind happened and how deep it went.
+            rr = STORE.record_reorg(body)
+            print(f"{now_iso()}  ← /reorg           cluster={rr.get('cluster_id')} "
+                  f"block={rr.get('failing_block')} rewound_to={rr.get('rewound_to')} "
+                  f"orphaned={rr.get('orphaned')}")
+            return self._reply(200, {"ok": True})
         if self.path.rstrip("/") == "/proofs/queued":
             STORE.record("queued", body); print(f"{now_iso()}  ← /proofs/queued   {mk}cluster={cluster} {who}block={block}")
             return self._reply(200, {"proof_id": STORE.pid(cluster, block)})
@@ -778,6 +823,10 @@ class Handler(BaseHTTPRequestHandler):
                 "td:first-child,th:first-child,.l{text-align:left}.q{color:#999}.p{color:#c60}.d{color:#080}.r{color:#c00}"
                 "tr.run td{background:#f0f0f0;border-top:3px solid #666;font:13px ui-monospace,monospace;"
                 "padding:6px 8px}tr.run .w{color:#c60}"
+                # A reorg is not a run boundary and must not look like one: same monospace line, but amber and
+                # dashed, so the eye reads "the chain moved" rather than "a new campaign started".
+                "tr.reorg td{background:#fff6e5;border-top:2px dashed #c60;color:#7a4a00;"
+                "font:13px ui-monospace,monospace;padding:5px 8px}"
                 ".bt{color:#666;font:12px ui-monospace,monospace}"
                 # The row is tinted and the offending number is the loud part: what missed is the e2e, and
                 # reading WHY means looking along that row at prove and queue.
@@ -804,6 +853,37 @@ class Handler(BaseHTTPRequestHandler):
         for _g in run_groups(rows):
             seq.append(run_header(_g))
             seq.extend(_g)
+        # REORG MARKERS, placed by time and not by block. The rows are newest-first, a reorg happened at an
+        # instant, so it belongs between the last row after it and the first row before it. Without this the
+        # table shows a run pausing and then re-proving blocks it had already proved, which reads as a bug in
+        # the prover and is the chain changing its mind. Placed here rather than inside run_groups because a
+        # reorg does not end a run: the same campaign carries on across it, and the median still applies.
+        if STORE.reorgs:
+            marked, out = set(), []
+            for _r in seq:
+                _t = None if isinstance(_r, str) else _ts(_r.get("ts"))
+                for _i, _rg in enumerate(STORE.reorgs):
+                    _rt = _ts(_rg.get("ts"))
+                    if _i in marked or _rt is None or _t is None or _t > _rt:
+                        continue
+                    marked.add(_i)
+                    _orph = _rg.get("orphaned")
+                    _bits = [f"⤺ <b>reorg</b> at {(_rg.get('ts') or '')[11:19]}",
+                             f"block <b>{_rg.get('failing_block')}</b> would not apply",
+                             f"rewound to {_rg.get('rewound_to')}"]
+                    if _rg.get("margin") is not None:
+                        _bits.append(f"margin {_rg['margin']}")
+                    if _orph:
+                        _bits.append(f"<b>{_orph}</b> proof(s) invalidated")
+                    out.append(f"<tr class=reorg><td class=l colspan=21>{'  ·  '.join(_bits)}</td></tr>")
+                out.append(_r)
+            # Any reorg older than every row on the page still deserves its line, at the bottom.
+            for _i, _rg in enumerate(STORE.reorgs):
+                if _i not in marked:
+                    out.append(f"<tr class=reorg><td class=l colspan=21>⤺ <b>reorg</b> at "
+                               f"{(_rg.get('ts') or '')[11:19]}  ·  block <b>{_rg.get('failing_block')}</b> "
+                               f"would not apply  ·  rewound to {_rg.get('rewound_to')}</td></tr>")
+            seq = out
         for r in seq:
             if isinstance(r, str):
                 body.append(r)

@@ -211,6 +211,21 @@ else
     && log "    $dropped row(s) dropped — those blocks will be proved again from their canonical witness"
 fi
 
+# TELL THE DASHBOARD, before removing the evidence. Nothing else can: the mock sees submissions, never the
+# rewind that invalidated some of them, so a run that pauses and then re-proves blocks it already proved reads
+# as a prover bug. Best-effort by the same rule as the tap's heartbeat — a dashboard is never worth failing a
+# recovery for. It goes to localhost on this box because the tunnel forwards that port to the operator's Mac.
+if [ "$DRY" = 1 ]; then
+  log "    (dry run — would POST the reorg to the dashboard on :${MOCK_PORT:-8547})"
+else
+  curl -sf -m 5 -X POST -H 'Content-Type: application/json' \
+    -d "{\"failing_block\":$fblock,\"rewound_to\":$target,\"margin\":$margin,\
+\"orphaned\":${dropped:-0},\"cluster_id\":\"${CLUSTER:-}\"}" \
+    "http://localhost:${MOCK_PORT:-8547}/reorg" >/dev/null 2>&1 \
+    && log "    dashboard notified" \
+    || log "    dashboard not reachable on :${MOCK_PORT:-8547} — the marker is lost, the recovery is not"
+fi
+
 log "5/5 removing the ALERT"
 run "rm -f '$ALERT'"
 
