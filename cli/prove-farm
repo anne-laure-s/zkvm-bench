@@ -187,7 +187,9 @@ LOGDIR="$RUNDATA/prove-farm-logs"; mkdir -p "$LOGDIR"
 trap 'echo >&2; log "interrupted — stopping…"; exit 130' INT TERM
 
 # Already proven OK for this block+guest? (re-runs skip successes, retry FAILs / new blocks)
-MANIFEST="${MANIFEST:-$HOME/witness-manifest.csv}"   # the tap's own clock, for too_old below
+# WITNESS_MANIFEST, not a new name: the producer's manifest already reaches this script under that variable
+# (rtp-up exports it, and submit_one reads it at line ~536 for exactly the same t_block). One path, one name.
+MANIFEST="${WITNESS_MANIFEST:-$HOME/witness-manifest.csv}"
 MAX_AGE="${MAX_AGE:-0}"                             # 0 = off; rtp-up passes PROVE_EVERY x 12
 
 # too_old — this block's own window has already closed, so proving it cannot land inside it. NOT THE SAME

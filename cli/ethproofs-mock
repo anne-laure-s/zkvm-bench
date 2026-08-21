@@ -737,7 +737,14 @@ class Handler(BaseHTTPRequestHandler):
             ident = " · ".join(str(x) for x in (g[0].get("cluster_id"), g[0].get("vm"), g[0].get("guest")) if x)
             bits = [f"<b>{ident}</b>", f"{first} → {last}"]
             if real:
-                bits.append(f"{len(real)} proof(s), median prove <b>{med}</b>, {ver} ✓" + (f", {rej} ✗" if rej else ""))
+                # The median stays the headline — a run is judged on it — with the range beside it, because a
+                # median alone hides the spread that decides whether a cadence holds. On this guest the two
+                # ends are 2x apart (heavy blocks prove in ~51 s against ~24 s), and it is the MAX that has to
+                # fit the window, not the median. Shown only with more than one proof: a single one's range is
+                # itself.
+                span = f" ({ms[0] / 1000:.1f}–{ms[-1] / 1000:.1f})" if len(ms) > 1 else ""
+                bits.append(f"{len(real)} proof(s), median prove <b>{med}</b>{span}, {ver} ✓"
+                            + (f", {rej} ✗" if rej else ""))
                 # HOW MANY MISSED THEIR WINDOW, and out of how many the question could be asked. A count alone
                 # is unreadable across runs of different length, and a ratio alone hides how thin it is — 1/2
                 # and 60/120 are both "50%". The denominator is the DECIDABLE rows, not all of them: a proof
