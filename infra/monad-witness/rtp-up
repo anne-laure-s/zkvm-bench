@@ -65,7 +65,7 @@
 #                   place the user, the real hostname AND the sshd port all exist. Everything the prover dials
 #                   uses them; everything the Mac dials keeps using $BOX.
 #               RPC=<url>  (the chain, for the public-value checks on both sides)
-#               MOCK_STORE=/tmp/ethproofs-rtp  MOCK_SECS=2.12  MOCK_PER_MSTEP=0.0364  MOCK_SPEED=2.5  MOCK_JITTER=0.5
+#               MOCK_STORE=<repo>/run-data/ethproofs-rtp  MOCK_SECS=2.12  MOCK_PER_MSTEP=0.0364  MOCK_SPEED=2.5  MOCK_JITTER=0.5
 #               HEAD_TAG=latest  CONFIRMATIONS=0 (the head — real time)  RUNNER_DIR=$HOME/zisk-mock
 #               CATCHUP_TARGET=10 (blocks)  CATCHUP_POLL=30 (s)
 #                   Catch-up ends when the gap closes or when the replay stops advancing — never on a clock, so
@@ -137,7 +137,10 @@ RPC="${RPC:-http://chi-001.devcore4.com:8545}"
 # behaviour. Set = it is copied to the box under its own sha and passed as ELF= in the prove invocation, so
 # nothing is committed to try a guest and the two cannot be confused: the filename IS the checksum.
 GUEST_ELF="${GUEST_ELF:-}"
-MOCK_STORE="${MOCK_STORE:-/tmp/ethproofs-rtp}"
+# NOT /tmp. macOS purges it on reboot, and this directory is the only ledger of a campaign — 95 proofs of
+# real ZisK work were sitting in /tmp/ethproofs-rtp with nothing but uptime protecting them. run-data/ is
+# already git-ignored (.gitignore:96) and survives, which is the whole requirement.
+MOCK_STORE="${MOCK_STORE:-$MAC_REPO/run-data/ethproofs-rtp}"
 MOCK_SECS="${MOCK_SECS:-2.12}"        # least-squares fit on the 11 measured 16x5090 blocks:
 MOCK_PER_MSTEP="${MOCK_PER_MSTEP:-0.0364}"  #   secs = 2.12 + 0.0364 x Msteps  (+-0.2 s)
 # Real blocks are 330-600 Msteps = 14-24 s, above the 12 s slot, so the queue could never drain. 2.5 is the
@@ -1897,19 +1900,47 @@ fi
 step "Starting the producer (fetch · replay+witnesses · tap)"
 # A sampling cadence must never be invisible: it changes what `coverage` means, and a silent 1-in-N would read
 # as a pipeline dropping blocks. Announce it with the slot arithmetic that justifies it.
+# measured_prove — what this configuration has actually done, from the box's own ledger. Prints
+# "<n> <median> <p90> <max>" in seconds, or "0" when there is nothing to report.
+#
+# THE PROJECTION IT REPLACES was a least-squares fit on 11 blocks measured on a 16x5090 cluster, divided by
+# the GPU count as if proving scaled linearly in GPUs, applied to a guest it was never measured on, and blind
+# to the network. Three transpositions and a straight line: it printed 116 s where this box measures 23.5 s.
+# A number that wrong is not a hint, it is a hazard — it invites raising PROVE_EVERY to cover a cost that
+# does not exist. The fit stays where it belongs, driving the MOCK prover's modelled sleep.
+#
+# Only real modes count (mock rows are modelled) and only this guest. Rows with no mode are older entries
+# whose median is 2.5 s — execution, not proving — so they are excluded rather than silently averaged in.
+measured_prove(){
+  local vals n med p90 mx
+  vals="$(onbox_q "cut -d, -f3,4,5,6 $BOX_REPO/run-data/prove-farm.csv 2>/dev/null \
+| grep '^$GUEST,prove' | grep ',ok,' | cut -d, -f4 | sort -n" 2>/dev/null)"
+  n="$(printf '%s\n' "$vals" | grep -c '[0-9]' || true)"
+  [ "${n:-0}" -lt 3 ] && { echo 0; return; }
+  med="$(printf '%s\n' "$vals" | sed -n "$(( (n + 1) / 2 ))p")"
+  p90="$(printf '%s\n' "$vals" | sed -n "$(( n * 9 / 10 > 0 ? n * 9 / 10 : 1 ))p")"
+  mx="$(printf '%s\n' "$vals" | tail -1)"
+  printf '%s %.0f %.0f %.0f\n' "$n" "$med" "$p90" "$mx"
+}
+
 if [ "$PROVE_EVERY" -gt 1 ]; then
   say "cadence: proving every $PROVE_EVERY blocks (those where block % $PROVE_EVERY == 0)"
   say "  the prover gets $((PROVE_EVERY * 12)) s per sampled block instead of 12 s"
   say "  coverage will read ~$((100 / PROVE_EVERY))% and that is the CEILING, not a shortfall"
   if [ "$PROVE_REAL" = 1 ]; then
-    # The service figures quoted in mock mode are the MOCK's (model / MOCK_SPEED). In real mode nothing has been
-    # measured yet, so quote the projection and label it as one rather than reuse a number from another prover.
-    say "  PROJECTED on $PROVE_GPUS GPU (fit x 16/$PROVE_GPUS, never measured on this guest):"
-    say "$(awk -v f="$MOCK_SECS" -v p="$MOCK_PER_MSTEP" -v g="$PROVE_GPUS" \
-      -v md="$GUEST_MS_MED" -v mn="$GUEST_MS_MEAN" -v p9="$GUEST_MS_P90" -v mx="$GUEST_MS_MAX" 'BEGIN{
-      s=p*16/g; printf "    median %d Ms -> %.0f s · mean %d -> %.0f s · p90 %d -> %.0f s · worst %d -> %.0f s",
-      md, f+s*md, mn, f+s*mn, p9, f+s*p9, mx, f+s*mx }')"
-    say "  the first real blocks REPLACE these. If the worst case exceeds $((PROVE_EVERY * 12)) s, raise PROVE_EVERY."
+    # MEASURED, or nothing at all. The mock's figures are the model's by construction; the real prover's are
+    # on disk in the box's own ledger, and there is no third source worth printing.
+    set -- $( [ "$DRY" = 1 ] && echo 0 || measured_prove )
+    if [ "${1:-0}" != 0 ]; then
+      say "  measured on this box, $PROVE_GPUS GPU, $1 proof(s): median ${2}s · p90 ${3}s · max ${4}s"
+      if [ "$4" -gt "$((PROVE_EVERY * 12))" ]; then
+        say "  the slowest of those EXCEEDS the $((PROVE_EVERY * 12)) s budget — those blocks miss their window"
+      else
+        say "  all of them fit the $((PROVE_EVERY * 12)) s budget"
+      fi
+    else
+      say "  service on this box is UNMEASURED — the first proofs decide the cadence, nothing here predicts it"
+    fi
   else
     say "  measured mock service is 12.0 s median, 15.0 s p90"
   fi
@@ -2098,7 +2129,8 @@ ${PROVER_LOG_FILES:+PROVER_LOG_FILES='$PROVER_LOG_FILES' }${PROVER_LOG_TAIL:+PRO
 ${PULL_VIA:+PULL_VIA=$PULL_VIA }WITNESS_PUMP=$RUNNER_DIR/witness-pump PUMP_SOCK=$PUMP_SOCK \
 REMOTE_SUBMIT=$RUNNER_DIR/ethproofs-submit WITNESS_MANIFEST=\$HOME/witness-manifest.csv \
 cli/prove-farm --guest monad-zisk $PROVE_MODE_FLAGS --remote $PROVER_TARGET --port $PROVER_PORT \
---interval 1 --watch --newest-first --no-prefetch --ethproofs-url $EP_URL${EP_TOKEN:+ --ethproofs-token $EP_TOKEN} \
+--interval 1 --watch --newest-first --max-age $((PROVE_EVERY * 12)) --no-prefetch \
+--ethproofs-url $EP_URL${EP_TOKEN:+ --ethproofs-token $EP_TOKEN} \
 --ethproofs-cluster $EP_CLUSTER --rpc $RPC 2>&1 | tee -a $PROVE_LOG"
 onbox "cat > \$HOME/.rtp-prove-cmd <<'RTPEOF'
 $prove_cmd
@@ -2150,8 +2182,10 @@ if [ "$PROVE_REAL" = 1 ]; then
 
    FIRST THING TO DO once a few blocks have landed — the number that does not exist yet:
      grep -o 'prove=[0-9.]*' $PROVE_LOG | tail -20
-   Projected was $(awk -v f="$MOCK_SECS" -v p="$MOCK_PER_MSTEP" -v g="$PROVE_GPUS" -v mn="$GUEST_MS_MEAN" 'BEGIN{printf "%.0f", f+p*16/g*mn}') s on the mean block ($PROVE_GPUS GPU). If the real figure differs, the
-   cadence derived above is wrong: re-derive PROVE_EVERY from it, and record it in AGENT-NOTES.md.
+     measured  = $(set -- $(measured_prove); [ "${1:-0}" != 0 ] \
+&& echo "median ${2}s · p90 ${3}s · max ${4}s over $1 proof(s) on this box" \
+|| echo "nothing yet — the first proofs are the only figure that counts")
+     cadence   = PROVE_EVERY=$PROVE_EVERY, so $((PROVE_EVERY * 12)) s per sampled block
    tear down:  $0 --stop
 EOF
 else

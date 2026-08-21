@@ -136,6 +136,7 @@ while [ $# -gt 0 ]; do
     --no-prefetch)       PREFETCH=0; shift ;;
     --no-submit)         NO_SUBMIT=1; shift ;;               # prove without delivering, deliberately
     --newest-first)      NEWEST_FIRST=1; shift ;;          # prove nearest the tip first (RTP policy)
+    --max-age)           MAX_AGE="$2"; shift 2 ;;           # skip a block already past its window (0=off)
     --mock)              MOCK=1; shift ;;                   # mock-cluster: fake the prover (no box) — plumbing test
     --mock-secs)         MOCK_SECS="${2:?}"; shift 2 ;;     # simulated proving time (0 = instant)
     --mock-jitter)       MOCK_JITTER="${2:?}"; shift 2 ;;   # noise: ± bound (uniform) or std dev (normal)
@@ -186,6 +187,37 @@ LOGDIR="$RUNDATA/prove-farm-logs"; mkdir -p "$LOGDIR"
 trap 'echo >&2; log "interrupted — stopping…"; exit 130' INT TERM
 
 # Already proven OK for this block+guest? (re-runs skip successes, retry FAILs / new blocks)
+MANIFEST="${MANIFEST:-$HOME/witness-manifest.csv}"   # the tap's own clock, for too_old below
+MAX_AGE="${MAX_AGE:-0}"                             # 0 = off; rtp-up passes PROVE_EVERY x 12
+
+# too_old — this block's own window has already closed, so proving it cannot land inside it. NOT THE SAME
+# QUESTION as witness-tap's SKIP_AFTER, which counts BLOCKS behind the tip. The two agree only while the chain
+# advances: during a stall — a reorg recovery, a node restart — the tip stops moving and a block stays "close
+# to the tip" while its clock keeps running. Measured 2026-08-21: block 25803840 sat through a reorg recovery
+# and was picked 10 blocks behind the tip (inside SKIP_AFTER=15) at 174 s of age against a 60 s window, then
+# spent 31 s of GPU on a result that could not count.
+#
+# CERTAINTY ONLY, no model: the test is "is this block already past its deadline", which needs no estimate of
+# how long its proof would take. A block at 50 s that will take 25 s is a different, model-dependent judgement,
+# and this file is not where a projection gets reintroduced.
+#
+# t_block comes from the tap's manifest — the producer's own clock, the same source the leaderboard judges
+# lateness on. No manifest, no row, or MAX_AGE=0 means the question cannot be asked, and cannot-be-asked never
+# skips: coverage is not dropped on missing data.
+too_old(){
+  [ "${MAX_AGE:-0}" -gt 0 ] || return 1
+  [ -r "$MANIFEST" ] || return 1
+  local tb age
+  tb="$(awk -F, -v b="$1" '$1==b {print $2; exit}' "$MANIFEST" 2>/dev/null)"
+  case "$tb" in ''|*[!0-9]*) return 1 ;; esac
+  age=$(( $(date +%s) - tb ))
+  [ "$age" -gt "$MAX_AGE" ] || return 1
+  # LOGGED every time. A silent skip reads as a block that was never produced, and the abandoned count IS the
+  # coverage figure — hiding it would make the pipeline look better than it is.
+  log "  skip $1 — ${age}s old against a ${MAX_AGE}s window; its slot goes to a block that can still make it"
+  return 0
+}
+
 is_proven(){ awk -F, -v b="$1" -v g="$GUEST" '$2==b && $3==g && $5=="ok"{f=1} END{exit !f}' "$OUT" 2>/dev/null; }
 
 # report.json (shared prove contract) -> "prove_secs<TAB>total_secs<TAB>proof_bytes" (jq if present, else grep).
@@ -222,7 +254,11 @@ scan_unproven(){
   { if [ "${#BLOCKS[@]}" -gt 0 ] && [ "$WATCH" != 1 ]; then printf '%s\n' "${BLOCKS[@]}"
     else find "$WDIR" -maxdepth 1 -name "$CHAIN_ID-*.bin" 2>/dev/null \
            | sed -E "s|.*/$CHAIN_ID-([0-9]+)\.bin\$|\1|"; fi
-  } | grep -E '^[0-9]+$' | $SORT | while IFS= read -r b; do is_proven "$b" || echo "$b"; done
+  } | grep -E '^[0-9]+$' | $SORT | while IFS= read -r b; do
+      is_proven "$b" && continue
+      too_old "$b" && continue
+      echo "$b"
+    done
 }
 
 # mock_prove — the prover-seam STAND-IN: emit a valid run record locally, no cluster/box. Completes the

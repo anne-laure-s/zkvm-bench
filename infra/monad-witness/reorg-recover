@@ -53,6 +53,16 @@ CLI="${CLI:-$MONAD_DIR/build/cmd/monad-cli}"
 REPO="${REPO:-$HOME/zkvm-bench}"
 RUNDATA="${RUNDATA:-$REPO/run-data}"
 FARM_CSV="${FARM_CSV:-$RUNDATA/prove-farm.csv}"
+# The framed queue — the THIRD store that holds post-target state, and the one this script forgot. block_db
+# and prove-farm.csv were trimmed from the start; the witnesses already framed into the prover's queue were
+# not, so a rewind left inputs describing the pre-reorg chain sitting there for --newest-first to pick up.
+# Seen on 2026-08-21: rewind to 25803784, and 25803840's pre-reorg input was proved 45 s later. It verified,
+# because margin 64 was conservative and that block had not actually changed — but nothing in the pipeline
+# knew that, and a block that HAD changed would have burned a GPU slot on an orphan, caught only by the
+# public-values gate at submission, after the spend.
+GUEST="${GUEST:-monad-zisk}"
+QUEUE="${QUEUE:-$REPO/guests/$GUEST/fixtures}"
+CHAIN_ID="${CHAIN_ID:-1}"
 MARGIN="${MARGIN:-64}"
 MAX_MARGIN="${MAX_MARGIN:-4096}"
 ALERT="$MONAD_DIR/logs/ALERT"
@@ -197,6 +207,30 @@ fi
 # un-proved, the tap re-offers them, and the canonical witness is proved. The run records are left alone: they
 # are an audit trail of what actually ran, and rewriting history there would hide the reorg rather than record
 # it.
+log "3b/5 clearing framed inputs > $target from $QUEUE (they describe the pre-reorg chain)"
+if [ ! -d "$QUEUE" ]; then
+  log "    no $QUEUE — nothing framed"
+else
+  # The strict tag form only: the queue also holds `<tag>.pv.bin` public values and `.post_state_root`
+  # sidecars, and the tap's own queue_files() filters the same way. Sidecars of a cleared input go with it;
+  # the `.exec-report.json` files are left alone, as everywhere else — they outlive their witness by design.
+  qn=0
+  for f in "$QUEUE/$CHAIN_ID-"*.bin; do
+    [ -e "$f" ] || continue
+    b="$(basename "$f" .bin)"; b="${b#"$CHAIN_ID-"}"
+    case "$b" in ''|*[!0-9]*) continue ;; esac
+    [ "$b" -gt "$target" ] || continue
+    if [ "$DRY" = 1 ]; then
+      qn=$((qn + 1))
+    else
+      rm -f "$QUEUE/$CHAIN_ID-$b.bin" "$QUEUE/$CHAIN_ID-$b.post_state_root" "$QUEUE/$CHAIN_ID-$b.pv.bin"
+      qn=$((qn + 1))
+    fi
+  done
+  log "    $qn framed input(s) $([ "$DRY" = 1 ] && echo "would be cleared" || echo "cleared") — the tap \
+re-frames them from the canonical witness"
+fi
+
 log "4/5 dropping blocks > $target from $FARM_CSV (their proofs describe orphaned blocks)"
 if [ ! -f "$FARM_CSV" ]; then
   log "    no $FARM_CSV — nothing to invalidate"

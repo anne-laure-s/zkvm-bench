@@ -78,6 +78,27 @@ class Store:
         self._replay()
         self._load_status()
 
+    def census(self):
+        """One line describing what this store actually holds. Printed at startup because the store is chosen
+        by a flag and getting it wrong is silent: a restart without --store lands on the default directory,
+        which on this machine holds three thousand mock rows from July, and the leaderboard then fills with
+        them while the live campaign writes nowhere the reader is looking. Cost half an hour on 2026-08-21.
+        Counts, clusters, and the newest timestamp are exactly what makes that visible at a glance."""
+        rows = list(self.state.values())
+        if not rows:
+            return "empty"
+        mock = sum(1 for r in rows if r.get("mock"))
+        clusters = {}
+        for r in rows:
+            clusters[r.get("cluster_id")] = clusters.get(r.get("cluster_id"), 0) + 1
+        top = ", ".join(f"{k}:{v}" for k, v in sorted(clusters.items(), key=lambda kv: -kv[1])[:4])
+        newest = max((r.get("ts") or "") for r in rows)
+        line = f"{len(rows) - mock} real, {mock} mock · {top} · newest {newest}"
+        # The warning that would have caught it: a store the live run is not the majority of.
+        if mock > (len(rows) - mock):
+            line += "\n                MOSTLY MOCK — is this the store you meant? rtp-up uses --store $MOCK_STORE"
+        return line
+
     def pid(self, cluster, block):
         # Stable proof_id per (cluster, block) — the SAME identity ethproofs uses. Run each prover as its
         # own cluster so rsp vs zisk don't share a key (cli/prove-farm defaults the cluster to the guest).
@@ -717,6 +738,19 @@ class Handler(BaseHTTPRequestHandler):
             bits = [f"<b>{ident}</b>", f"{first} → {last}"]
             if real:
                 bits.append(f"{len(real)} proof(s), median prove <b>{med}</b>, {ver} ✓" + (f", {rej} ✗" if rej else ""))
+                # HOW MANY MISSED THEIR WINDOW, and out of how many the question could be asked. A count alone
+                # is unreadable across runs of different length, and a ratio alone hides how thin it is — 1/2
+                # and 60/120 are both "50%". The denominator is the DECIDABLE rows, not all of them: a proof
+                # with no t_block cannot be judged, and cannot-be-judged must not be silently scored as on
+                # time. When some are undecidable the count says so rather than shrinking the denominator in
+                # silence. The window itself is named, because "over" means nothing without it.
+                dec = [x for x in real if validation_secs(x) is not None]
+                if dec:
+                    lt = sum(1 for x in dec if late(x))
+                    txt = f"<b>{lt}</b>/{len(dec)} over the {deadline:.0f} s window ({100.0 * lt / len(dec):.0f}%)"
+                    bits.append(f"<span class=w>{txt}</span>" if lt else txt)
+                if len(dec) < len(real):
+                    bits.append(f"{len(real) - len(dec)} undecidable (no block time)")
             if mocks:
                 bits.append(f"<span class=w>{len(mocks)} mock</span>")
             return f"<tr class=run><td class=l colspan=21>{'  ·  '.join(bits)}</td></tr>"
@@ -960,6 +994,7 @@ server DOES do on /proved is VERIFY the submitted proof (mock by default — see
   pipeline  : GET /status (where each pipeline is + lag vs the chain) — the producer feeds it the tip
               with POST /status {{chain_tip, last_witness, queue_files, cluster_id}}
   store     : {args.store}   (submissions.jsonl + proofs/)
+                {STORE.census()}
   auth      : {auth}     ·  {n} block(s) recorded so far
   verify    : {verify}
   pub values: {pvcheck}
