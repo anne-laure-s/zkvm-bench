@@ -25,18 +25,29 @@
 #
 #   ./witness-follow plan  [catchup|tip]     print the exact commands (default; nothing is started)
 #   ./witness-follow start [catchup|tip]     start the tmux sessions for that phase
+#   ./witness-follow supervise               the unattended tip producer, in the FOREGROUND and forever: start
+#                                            the fetcher if it is gone, run the tip replay, repair a reorg with
+#                                            ./reorg-recover, restart a crash that left no ALERT, and return on
+#                                            logs/STOP. `start tip` runs exactly this inside the replay-tip
+#                                            session — it is not a separate mode, and it does not start the tap.
 #   ./witness-follow status                  where everything is (read-only)
 #   ./witness-follow stop                    SIGTERM the replay/tap (leaves the fetcher alone)
 #   ./witness-follow sessions [catchup|tip]  print the tmux sessions that phase owns (read-only). ./rtp-watchdog
 #                                            asks for them rather than keeping a second copy of the list.
 #
 # Config (env): MONAD_DIR REPO WITNESS_DIR BLOCK_DB DB RPC NTHREADS MAX_BATCH MIN_FOLLOW_BATCH
-#               PY ETHPROOFS_URL CLUSTER PROVE_EVERY KEEP_RECENT SKIP_AFTER
+#               PY ETHPROOFS_URL CLUSTER PROVE_EVERY KEEP_RECENT SKIP_AFTER SETTLE_SECS
+#                                          the tap's own knobs, forwarded to it by tap_cmd and by nothing else.
 #               HEAD_TAG CONFIRMATIONS   (block-by-block — see README)
 #               SUPERVISE_MAX_CRASHES SUPERVISE_BACKOFF SUPERVISE_HEALTHY_SECS
 #                                          the tip supervisor restarts a crash that left no ALERT (20 tries,
 #                                          10 s apart, budget reset after 300 s of healthy running). A
 #                                          deliberate `stop` writes logs/STOP and is never fought.
+#               TIP_START_WAIT             how long `supervise` waits for its start block to reach block_db
+#                                          before refusing to start monad at all (600 s by default — see
+#                                          wait_for_start_block for why starting anyway costs hours).
+#               MANIFEST                   `status` only: which manifest to count rows in. Left unset it is
+#                                          derived from WITNESS_DIR the way ./witness-tap derives it.
 #               FETCH_POLL TAP_INTERVAL REPLAY_POLL   (polling latency: 6 s, 6 s and 12 s by default,
 #                                          waiting in the end-to-end budget for no benefit)
 #               TIP_DIRECT=1 BLOCK_DB_TIMEOUT=30    at the tip, TIP_DIRECT=1 runs ONE long-lived monad that
@@ -330,12 +341,17 @@ ${FETCH_POLL:+FETCH_POLL=$FETCH_POLL }./witness-follow supervise >> ~/replay-sup
 
 cmd_stop() {
   local s
-  # Tell the supervisor this was deliberate. A stop and a crash are otherwise indistinguishable:
-  # run_replay.py's SIGTERM handler does sys.exit(1), and an unhandled exception exits 1 too, and
-  # NEITHER writes an ALERT. Without this marker the supervisor can only either fight `stop` or ignore
-  # crashes; with it, it distinguishes them (see cmd_supervise).
+  # Tell the supervisor this was deliberate. On the run_replay.py path (TIP_DIRECT=0) a stop and a crash are
+  # otherwise indistinguishable: run_replay.py's SIGTERM handler does sys.exit(1), and an unhandled exception
+  # exits 1 too, and NEITHER writes an ALERT. Without this marker the supervisor can only either fight `stop`
+  # or ignore crashes; with it, it distinguishes them (see cmd_supervise).
+  #
+  # The DIRECT path (TIP_DIRECT=1, the default) does NOT go quiet like that: run_tip_once writes logs/ALERT
+  # itself on any non-zero rc, and the SIGTERM below reaches monad, so a deliberate stop can leave an ALERT
+  # whose body is a monad SIGTERM tail. The supervisor then takes its ALERT branch — which never looks at
+  # STOP — and hands it to ./reorg-recover, which refuses it for not being reorg-shaped.
   mkdir -p "$MONAD_DIR/logs" && : > "$MONAD_DIR/logs/STOP"
-  for s in replay-catchup replay-tip tap profile; do
+  for s in replay-catchup replay-tip tap; do
     tmux has-session -t "$s" 2>/dev/null || continue
     # SIGTERM the PANE's process group, not a cmdline pattern. `pkill -TERM -f "[w]itness-tap"` and friends
     # look targeted and are not: tmux 3.6 leaves the creating session's command in the SERVER's argv, so
@@ -392,6 +408,13 @@ case "${1:-plan}" in
   sessions) shift || true
             case "${1:-catchup}" in catchup|tip) ;; *) die "phase must be catchup or tip" ;; esac
             phase_sessions "${1:-catchup}" ;;
-  -h|--help) sed -n '2,31p' "$0" ;;
+  # 2..60 is the whole header, up to (not including) `set -uo pipefail`. It reaches past the usage list into
+  # the Config block on purpose: SETTLE_SECS, MANIFEST, TIP_START_WAIT and the SUPERVISE_* budget are only
+  # documented there, and a knob unreachable from --help is a knob nobody sets. Adjust the bound when the
+  # header grows.
+  # Bounded by the PATTERN, not by a line number: line 61 is `set -uo pipefail`, so `2,60p` was one added
+  # header line away from printing executable source as documentation. prove-farm's usage() already does it
+  # this way.
+  -h|--help) sed -n '2,/^set -uo/p' "$0" | sed '$d' ;;
   *) die "unknown command '${1}' (plan | start | supervise | status | stop | sessions)" ;;
 esac

@@ -2,10 +2,13 @@
 """cli/ethproofs-submit — stack-agnostic ethproofs submitter (the "submit" seam as a thin CLI).
 
 Takes a prove run record (proof.bin [or segments/] + report.json — the shared prove contract from
-cli/report-schema.md) and POSTs the 3-endpoint ethproofs lifecycle (queued -> proving -> proved) to
-an ethproofs API: cli/ethproofs-mock now, ethproofs.org later (same surface, config-only swap). Any
-prover that emits the shared report.json + a proof file can submit with NO stack-specific code —
-unlike RSP's bin/eth-proofs, which bundles witness+prove+submit into one process.
+cli/report-schema.md) and POSTs it to an ethproofs API: cli/ethproofs-mock now, ethproofs.org later
+(same surface, config-only swap). ONE endpoint by default — /proofs/proved — because --proved-only is
+on: the queued/proving posts would be stamped from here, at submission time, with timestamps that are
+neither (the flag carries the full rationale). --no-proved-only sends the whole 3-endpoint lifecycle
+(queued -> proving -> proved). Any prover that emits the shared report.json + a proof file can submit
+with NO stack-specific code — unlike RSP's bin/eth-proofs, which bundles witness+prove+submit into
+one process.
 
 Pairs with cli/prove-farm: `prove-farm --watch --ethproofs-url <url>` calls this after each proof, so
 the continuous pipeline is  witness-farm -> prove-farm -> ethproofs-submit  (three swappable seams).
@@ -13,7 +16,7 @@ The witness is fetched ONCE (by witness-farm); prove+submit reuse it with zero R
 
   cli/ethproofs-submit --run-dir <dir> --block <N> [--vm SP1] [--guest rsp] [--ethproofs-url http://localhost:8547]
                        [--token dev] [--cluster 1] [--cycles N | --steps N] [--public-inputs D]
-                       [--verifier-id 0x..] [--proving-time-ms N] [--minimal] [--proved-only] [--dry-run]
+                       [--verifier-id 0x..] [--proving-time-ms N] [--minimal] [--no-proved-only] [--dry-run]
 
 CANONICAL fields (report.json -> ethproofs /proofs/proved) — match EXACTLY what RSP bin/eth-proofs and
 ZisK api.rs send, so swapping to the real ethproofs.org is config-only:
@@ -118,7 +121,7 @@ def pv_named(run_dir):
         return None
 
 
-def verify_public_values(run_dir, block, manifest, rpc_url, dry):
+def verify_public_values(run_dir, block, manifest, rpc_url):
     """Refuse to submit a proof whose committed values are not the block's. -> (ok, note)
 
     THIS IS THE GATE THAT WAS MISSING. A guest reading a witness format it was not built for, or an ELF built
@@ -435,7 +438,7 @@ def main():
     # BEFORE any POST. Refusing after /proofs/queued would leave a lifecycle open on a proof that never
     # arrives, and the block would read as in-flight forever.
     ok, note = (True, "skipped (--no-pv-check)") if args.no_pv_check else \
-        verify_public_values(args.run_dir, block, args.manifest, args.rpc, args.dry_run)
+        verify_public_values(args.run_dir, block, args.manifest, args.rpc)
     print(f"ethproofs-submit: public values: {note}")
     if not ok:
         print(f"ethproofs-submit: REFUSING to submit block {block} — {note}", file=sys.stderr)

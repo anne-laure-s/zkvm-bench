@@ -168,7 +168,6 @@ def mode_send():
                 pass
             out.write(HDR.pack(-1))
             out.flush()
-    return 0
 
 
 # ── prover side: the long-lived pump ────────────────────────────────────────────────────────────────

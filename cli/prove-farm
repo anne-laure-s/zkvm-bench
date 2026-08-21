@@ -85,6 +85,85 @@
 # Outputs (run-data/, gitignored): run-data/prove-farm.csv, run-data/prove-farm-logs/. Run records
 # land under the stack's own results/ (written by run prove-cluster), same as a manual
 # `run prove-cluster`.
+#
+# EVERY FLAG. usage() reprints this header verbatim, so a flag absent from here is a flag no operator can
+# find — which is how --max-age, --no-prefetch and --rpc, the three the pipeline's own recorded invocation
+# (~/.rtp-prove-cmd, written by infra/monad-witness/rtp-up) passes, stayed undocumented. The parser below is
+# the authority; this list mirrors it.
+#   --guest <name>         guest from guests.registry (default rsp). --list prints the registry.
+#   --remote user@host     the cluster box. Required unless --mock.
+#   --port <n>             ssh port on the box.
+#   --mode <m>             proving mode, forwarded to the stack (zisk-infra defaults to prove-compressed).
+#                          The CSV's mode column is what the RUNNER recorded, not what was asked for here.
+#   --num-gpus <n>         forwarded to the stack, and records the GPU count in the cluster label below. It
+#                          does not bring GPUs up — the stack's cluster*/ scripts do that.
+#   --witness-dir <dir>    override the witness queue (default guests/<rung>/fixtures, else inputs/).
+#   --chain-id <id>        the queue's tag: <chain-id>-<block>.bin (default 1).
+#   --max-blocks <n>       one-shot runs: stop after n blocks (0 = no cap). A --watch run never stops.
+#   --watch                continuous consumer; one proof at a time.
+#   --interval <s>         --watch: idle re-scan when the queue is empty (default 2).
+#   --newest-first         prove nearest the tip first (RTP policy).
+#   --max-age <s>          abandon a block whose own window has already closed, 0 = off (see too_old — this
+#                          is a deadline test, not a projection). rtp-up passes PROVE_EVERY x 12.
+#   --prefetch             ship the next block's witness while this one proves. The default.
+#   --no-prefetch          exactly one transfer per block. What the RTP invocation passes: two bulk streams
+#                          on one 25 Mbit/s link took inputs to 24-34 s (see prefetch_next).
+#   --no-submit            prove without delivering, deliberately — the only way past the --watch guard that
+#                          refuses a farm with no --ethproofs-url.
+#   --mock, --mock-secs, --mock-jitter, --mock-per-mb, --mock-per-mstep, --mock-dist, --mock-speed,
+#   --mock-exec-fallback   the mock-cluster prover and its cost model — described at length above.
+#   --ethproofs-url <url>  also submit each finished proof there, via cli/ethproofs-submit.
+#   --ethproofs-token <t>  bearer token for that API (default: dev).
+#   --ethproofs-cluster <id>  override the derived "<n>gpu-<vm>" / "local-<vm>" id (real ethproofs assigns
+#                          one at registration).
+#   --rpc <url>            completes the public-value check: the manifest already carries the two state
+#                          roots, the RPC completes the block hash. It must be explicit for the
+#                          prover-side POST, where ssh does not carry the environment across.
+#   --list                 print the guest registry and exit.  -h | --help  this text.
+#
+# EVERY ENV KNOB. A flag always wins where both exist; --guest/--remote/--port/--mode/--num-gpus/
+# --witness-dir/--chain-id/--max-blocks/--interval and the --ethproofs-* trio are FLAG-ONLY (they are
+# assigned unconditionally below, so an environment value would be discarded).
+#   RUNDATA=<repo>/run-data        where prove-farm.csv and prove-farm-logs/ are written.
+#   WITNESS_MANIFEST=$HOME/witness-manifest.csv   the producer's manifest (witness-tap writes it). Two
+#                                  readers: too_old takes t_block from it, and submit_one ships this block's
+#                                  row and its parent's to ethproofs-submit. rtp-up exports it.
+#   MAX_AGE=0                      the default for --max-age (0 = off).
+#   RPC=                           the default for --rpc.
+#   REMOTE_WS=/workspace           the prover's workspace as the prover sees it. prefetch_next stages into
+#                                  $REMOTE_WS/inputs/; core.sh owns the same path on the prove path.
+#   REMOTE_SUBMIT=                 cli/ethproofs-submit ON THE PROVER. Set it and the POST is made there, so
+#                                  the proof never crosses the tunnel it was just pulled off (see
+#                                  submit_one). Empty or absent -> submit_one posts from here.
+#   SUBMIT_VIA_PROVER=1            0 forces the local POST. It is also the automatic fallback.
+#   PULL_VIA=                      this machine's ssh target AS SEEN FROM THE PROVER, so the prover pulls the
+#                                  witness itself over a direct connection instead of being pushed through
+#                                  the tunnel. Honoured by prefetch_next here and by core.sh on the prove path.
+#   PREFETCH_WAIT=8                seconds prefetch_next waits for the next witness to appear before giving
+#                                  up (a stale prefetch is worthless and holds a connection).
+#   PROVE_FARM_LOCK=$RUNDATA/prove-farm.watch.lock   the one-watcher lock; see the guard below for why two
+#                                  watchers on one prover workspace destroy each other's work.
+#   ELF=                           override the guest ELF. Read by infra/zisk-infra/run on the prove path AND
+#                                  by mock_plan for its emulation, on purpose: if the two diverged, the
+#                                  emulation would report steps for one guest and the proof come from another.
+#   MOCK_SECS=0 MOCK_JITTER=0 MOCK_PER_MB=0 MOCK_PER_MSTEP=0 MOCK_DIST=uniform MOCK_SPEED=1
+#   MOCK_EXEC_FALLBACK=0           the defaults for the matching --mock-* flags.
+#   ZISK_MOCK_PROOF_BYTES=390144   the local mock's proof size, 381 KiB = a ZisK compressed proof. Same name
+#                                  and same default as the remote mock, so both fakes are sized alike.
+#   NO_SUBMIT=0                    the default for --no-submit.
+# PASSED STRAIGHT THROUGH to the stack's prove-cluster: this script never reads them, it only has to be in
+# the environment that carries them to `run prove-cluster` (rtp-up sets them in ~/.rtp-prove-cmd; the two
+# log knobs only when non-empty).
+#   WITNESS_PUMP=                  infra/zisk-infra/witness-pump ON THE PROVER: one connection kept open
+#                                  across blocks instead of an scp per block (core.sh).
+#   PUMP_SOCK=~/.zisk-witness-pump.sock   the pump's unix socket on the prover. Keep the path short — a unix
+#                                  socket caps at ~104 bytes, and witness-pump refuses to serve above 100
+#                                  rather than let it fail as a bare "AF_UNIX path too long".
+#   REMOTE_RUNNER=zisk-runner      zisk-runner's path ON THE PROVER.
+#   PROVER_LOG_FILES=              logs on the PROVER whose tails ride back inside the artifact tarball that
+#                                  already crosses, PROVER_LOG_TAIL=200 lines each. It is set here, read by
+#                                  core.sh, and takes effect on the prover — hence a pass-through, and hence
+#                                  invisible to an operator who expects to set it where it acts.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -314,9 +393,19 @@ mock_duration(){  # $1 = witness bytes, $2 = steps (0 / absent = that term contr
 }
 
 # mock_plan <block> <log> — echoes "<secs> <emul>": how long the mock should take for this block, and how
-# much REAL time we already spent finding that out (emulating for its step count). Shared by BOTH mock
-# paths — the local mock-cluster and the mock prover on a real remote — so the cost model lives in exactly
-# one place and the remote is handed a single number to sleep.
+# much REAL time we already spent finding that out (emulating for its step count). ONE caller only:
+# mock_prove, i.e. the LOCAL mock-cluster path (--mock with no --remote).
+#
+# THE COST MODEL IS IMPLEMENTED TWICE, and this is not the copy production runs. The other one is the
+# ZISK_MOCK_* branch of infra/zisk-infra/zisk-runner: with `--mock --remote`, prove_one ships the model as
+# ZISK_MOCK_SECS/PER_MSTEP/SPEED/JITTER/DIST and the PROVER emulates, times and sleeps for itself (see
+# "WHERE THE EMULATION HAPPENS" in the header) — mock_plan is never called on that path. rtp-up's recorded
+# invocation always passes --remote, so the mock the campaign executes is the runner's, not this one. When a
+# duration looks wrong, edit the copy the run you are debugging actually took.
+#
+# They stay separate deliberately: this one is the stack-agnostic plumbing test — it needs no box and no
+# per-stack mock branch — and it is therefore the only mock available to a guest whose runner has no
+# ZISK_MOCK_* branch. Do not merge them into one.
 #
 # Everything informational goes to STDERR: stdout is the return value, and a log line leaking into it would
 # corrupt the duration.

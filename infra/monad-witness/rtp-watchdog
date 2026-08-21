@@ -9,7 +9,7 @@
 # perfectly well — it detects logs/ALERT, runs reorg-recover, restarts the producer. But it runs INSIDE the
 # `replay-tip` tmux session, which means it is a peer of what it supervises rather than above it. When the tmux
 # server itself goes away, the supervisor goes with it: no session, nobody watching, and the pipeline stays
-# down until a human notices. Seen 2026-08-16: the supervisor had reached `reorg-recover: 1/5 stopping the
+# down until a human notices. Seen 2026-08-16: the supervisor had reached `reorg-recover: 1/6 stopping the
 # fetcher` when the whole server vanished, and the pipeline sat idle for fourteen hours with the ALERT still in
 # place and the rewind never performed.
 #
@@ -18,8 +18,10 @@
 #
 # WHAT IT REFUSES TO DO
 #   * fight a deliberate stop — logs/STOP means a human stopped this on purpose, and it is left alone
-#   * race a recovery — a reorg-recover already running holds a lock, and this exits rather than interleave
-#     a second rewind with the first one's block_db trim
+#   * race a recovery — reorg-recover takes no lock of any kind, so the guard here is a cheap `pgrep` for a
+#     reorg-recover already running, and this exits rather than interleave a second rewind with the first
+#     one's block_db trim. Best-effort by construction: the pgrep sees a recovery already up, never one the
+#     supervisor is about to start
 #   * loop on a hard failure — restarts are rate-limited, and past the budget it goes quiet rather than
 #     restarting every five minutes forever against a cause it cannot fix
 #   * touch the catch-up phase — this watches the TIP. A backlog drain is a deliberate, supervised operation.
@@ -31,8 +33,12 @@ STATE="${WATCHDOG_STATE:-$HOME/.rtp-watchdog-state}"
 LOG="${WATCHDOG_LOG:-$HOME/rtp-watchdog.log}"
 LOCK="${WATCHDOG_LOCK:-$HOME/.rtp-watchdog.lock}"
 # Sessions the tip phase owns: asked of ./witness-follow below, because that is what creates them. `prove` is
-# the farm and is started by rtp-up, not by witness-follow, so its absence is reported but not repaired from
-# here — restarting a prover needs the Mac's environment. TIP_SESSIONS= overrides the list.
+# the farm and is started by rtp-up, not by witness-follow, so it is absent from that list — but its absence IS
+# repaired from here: restart_prover replays the invocation rtp-up recorded in $PROVE_CMD_FILE, which is why
+# nothing has to be rebuilt out of the Mac's environment. Three paths reach it — proofs produced with not one
+# submission beside them, the tip sessions up with `prove` gone, and the tail of a tip restart — and it kills
+# and re-creates the `prove` session itself. check_pump likewise repairs the prover's pump, over the exec
+# channel the prover dials. TIP_SESSIONS= overrides the list.
 MAX_RESTARTS="${WATCHDOG_MAX_RESTARTS:-6}"      # inside the window below
 WINDOW_SECS="${WATCHDOG_WINDOW_SECS:-3600}"
 DRY=0
@@ -86,11 +92,6 @@ REPO="${REPO:-$HOME/zkvm-bench}"
 RUNDATA="${RUNDATA:-$REPO/run-data}"
 RESULTS="${RESULTS:-$REPO/infra/zisk-infra/results}"
 SUBMIT_LOGS="${SUBMIT_LOGS:-$RUNDATA/prove-farm-logs}"
-# FIRST, because a dead pump explains most of what the checks below would otherwise misread: proofs that stop
-# arriving, a prover that looks broken, "proving but not delivering". Fixing the transport before judging the
-# prover keeps this script from restarting something that was never at fault.
-check_pump
-
 proved_recent=$(find "$RESULTS" -name report.json -newermt "-20 minutes" 2>/dev/null | wc -l | tr -d ' ')
 submit_recent=$(find "$SUBMIT_LOGS" -name 'submit-*.log' -newermt "-20 minutes" 2>/dev/null | wc -l | tr -d ' ')
 PROVE_CMD_FILE="${PROVE_CMD_FILE:-$HOME/.rtp-prove-cmd}"
@@ -146,6 +147,11 @@ key, which the hourly cron deletes. Restarting it from $PUMP_CMD_FILE."
     say "  the replay did not bring it back — see the prover's ~/witness-pump.log"
   fi
 }
+
+# FIRST, because a dead pump explains most of what the checks below would otherwise misread: proofs that stop
+# arriving, a prover that looks broken, "proving but not delivering". Fixing the transport before judging the
+# prover keeps this script from restarting something that was never at fault.
+check_pump
 TIP_ENV_FILE="${TIP_ENV_FILE:-$HOME/.rtp-tip-env}"
 
 # Restart the prover from the invocation rtp-up RECORDED, never from one rebuilt here. A watchdog that
@@ -234,7 +240,7 @@ fi
 
 if [ -z "$missing" ]; then
   # Everything up. Say nothing on the happy path: this runs 288 times a day and a quiet log is a readable one.
-  [ "$DRY" = 1 ] && say "all of$TIP_SESSIONS up$([ $prove_down = 1 ] && echo ' (prove is down — rtp-up territory)')"
+  [ "$DRY" = 1 ] && say "all of$TIP_SESSIONS up$([ $prove_down = 1 ] && echo ' (prove is down — restarting it from '"$PROVE_CMD_FILE"')')"
   exit 0
 fi
 

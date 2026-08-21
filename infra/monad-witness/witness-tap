@@ -56,16 +56,21 @@ Timestamps (manifest.csv). Everything except t_block is this box's clock — del
 latency is measured on ONE clock and never mixes in the laptop's:
 
   block            the block number
-  t_block          the block header's own timestamp, from the RPC (chain time; empty for non-promoted)
+  t_block          the block header's own timestamp, from the RPC (chain time). The lookup is gated on the
+                   CADENCE, not on promotion: a `stale` row — selected, then found too far behind to be worth
+                   framing — carries it alongside promoted=0. It is empty only for a block the cadence never
+                   selected, which includes one the warm-up suppressed (the warm-up clears the cadence flag).
   t_avail          mtime of the block_db file — when the fetcher had the block locally
   t_witness        mtime of the .witness — when the replay finished executing the block
   t_queued         when the framed input landed in the prover queue
   bytes            witness size
   post_state_root  the expected root, the anchor for `run verify EXPECTED_ROOT=…`
   promoted         1 if it was framed into the queue, 0 if it was not (too far behind)
-  block_hash       the header hash, from the same RPC call as t_block (empty for non-promoted). With the
-                   two roots it completes the ground truth for cli/check-pv, which verifies every value the
-                   guest commits before a proof is submitted.
+  warmup           1 if the cadence selected this block and the warm-up suppressed the queueing anyway, so a
+                   promoted=0 here is explicable and not a block the prover missed
+  block_hash       the header hash, from the same RPC call as t_block, so it is filled and empty on exactly
+                   the same blocks as t_block. With the two roots it completes the ground truth for
+                   cli/check-pv, which verifies every value the guest commits before a proof is submitted.
 
 Deliberately NOT here: proving and submission timings. Those come from prove-farm's report.json and the
 mock's submissions.jsonl; joining the three is the latency report, not this loop's job.
@@ -76,6 +81,9 @@ Config (env, all optional except the paths' defaults being sane on the devcore b
   PROVE_EVERY=1 (RTP; 100 = ethproofs sampling)       INTERVAL=6
   KEEP_RECENT=10 (never touched, may be in flight)      SKIP_AFTER=100 (un-proved -> abandoned)
   KEEP_SAMPLE=1000 (benchmark corpus)   KEEP_BIG_MB=14   KEEP_SLOW_SECS=45  (outliers worth profiling)
+  WARMUP_BLOCKS=1 (first selected block produced but NOT queued; 0 disables)  SETTLE_SECS=2 (still writing)
+  KEPT_MAX_GB=20 (cap on the parked collection; 0 = unbounded)   KEPT_DIR=<queue>/kept
+  CHAIN_ID=1 (the queue's tag: <CHAIN_ID>-<block>.bin)
   ETHPROOFS_URL=               CLUSTER=  VM=ZisK  GUEST=monad-zisk  SOURCE=<hostname>
 
   ./witness-tap [--once] [--dry-run]
@@ -269,8 +277,17 @@ def append_manifest(row):
         w.writerow(row)
 
 def safe_unlink(path, dry):
-    """Only ever remove a <digits>.<witness|post_state_root> file INSIDE WITNESS_DIR. This is the one
-    destructive operation in the pipeline; keep it boring and provable."""
+    """Only ever remove a <digits>.<witness|post_state_root> file INSIDE WITNESS_DIR; keep it boring and
+    provable.
+
+    There are three deletions in this file — this one, `drop_queue_entry` in the queue and `sweep_kept` in
+    KEPT — and only this one takes a path from its caller, which is why only this one has to re-derive the
+    directory and re-match the name before unlinking. The invariant that makes the other two safe without
+    routing them through here: neither is ever handed a path. `drop_queue_entry` builds every path itself
+    out of QUEUE, CHAIN_ID, an int block number and a suffix from a literal tuple; `sweep_kept` deletes
+    only paths that came from `kept_entries()`, which admits a name inside KEPT solely when it matches
+    ^<CHAIN_ID>-<digits>.(bin|post_state_root)$ — so anything an operator parked in there by hand is not a
+    candidate. An arbitrary string cannot reach either unlink."""
     d, name = os.path.dirname(os.path.abspath(path)), os.path.basename(path)
     if d != WITNESS_DIR or not re.match(r"^\d+\.(witness|post_state_root)$", name):
         log(f"refusing to delete {path} (outside {WITNESS_DIR} or unexpected name)")
@@ -287,7 +304,7 @@ def safe_unlink(path, dry):
         log(f"warn: could not delete {name} ({e})")
         return False
 
-def promote(block, wit, root_src, dry):
+def promote(block, dry):
     """Frame the witness into the prover queue, reading it where it already is (--src-dir): one
     implementation of the ZisK input format (the guest's own gen-inputs), and no staging copy.
 
@@ -362,7 +379,11 @@ def keep_reason(b, last, size_bytes, status):
     return "unproved"
 
 def queued_blocks():
-    """Blocks that have a framed input, whether or not their raw witness still exists."""
+    """Blocks that have a framed input, whether or not their raw witness still exists.
+
+    Must match the exact tag form, NOT just "*.bin": the queue also holds `<tag>.pv.bin` public values
+    (execute_local writes its artefacts next to the input), and counting those inflated the number reported to
+    the dashboard. cli/prove-farm and witness-profile both filter on the strict form already."""
     out = set()
     if not os.path.isdir(QUEUE):
         return out
@@ -534,18 +555,6 @@ def sweep_kept(dry):
             f"Raise KEPT_MAX_GB, or archive the corpus off this box.")
     return evicted, freed, total - freed
 
-def queue_files():
-    """How many framed inputs sit in the queue.
-
-    Must match the exact tag form, NOT just "*.bin": the queue also holds `<tag>.pv.bin` public values
-    (execute_local writes its artefacts next to the input), and counting those inflated the number this
-    reports to the dashboard. cli/prove-farm and witness-profile both filter on the strict form already.
-
-    NOT the un-proven backlog either: prove-farm leaves an input in place until retention drops it. The
-    meaningful backlog signal is the LAG between last_witness and the last proved block."""
-    return len(queued_blocks()) if os.path.isdir(QUEUE) else 0
-
-
 def queue_split(status):
     """(pickable, retained) — the queue separated by whether the prover can still take the block.
 
@@ -554,7 +563,9 @@ def queue_split(status):
     a backlog it alarmed for nothing; read as a disk count it hid a real backlog. Two numbers, one meaning each.
     A block is retained rather than pickable when it is proved and keep_reason still wants its bytes — `big`,
     `slow`, `sample`, or simply `recent` — which is also why the pair is not derivable from the kept[] tally.
-    """
+
+    Neither number is the un-proven BACKLOG: prove-farm leaves an input in place until retention drops it. The
+    meaningful backlog signal is the LAG between last_witness and the last proved block."""
     pickable = retained = 0
     for b in queued_blocks():
         st, _ = status.get(b, (None, None))
@@ -564,15 +575,16 @@ def queue_split(status):
             pickable += 1
     return pickable, retained
 
-def heartbeat(tip, last_witness, pickable=None, retained=0):
+def heartbeat(tip, last_witness, pickable, retained):
     """Feed cli/ethproofs-mock's POST /status — the producer is the only party that knows the tip.
 
-    `queue_files` now carries the PICKABLE count, which is what a dashboard reader means by "queue"; the
-    proved-but-retained files travel beside it as `queue_retained` instead of being summed into it."""
+    The `queue_files` FIELD now carries the PICKABLE count, which is what a dashboard reader means by
+    "queue"; the proved-but-retained files travel beside it as `queue_retained` instead of being summed into
+    it. The field keeps its old name because the mock and the dashboard read it by that name."""
     if not ETHPROOFS_URL:
         return
     body = {"chain_tip": tip, "last_witness": last_witness,
-            "queue_files": queue_files() if pickable is None else pickable,
+            "queue_files": pickable,
             "queue_retained": retained,
             "vm": VM, "guest": GUEST, "source": SOURCE}
     if CLUSTER:
@@ -659,7 +671,7 @@ def cycle(seen, dry):
                 # coverage denominator must include it) but spend nothing on framing it.
                 stale += 1
             elif is_cadence:
-                t_queued = promote(b, wit, rootf, dry)
+                t_queued = promote(b, dry)
                 # Count the would-be work in a dry run too, else it always reports queued=0 and the
                 # preview looks like it does nothing.
                 promoted += 1 if (t_queued != "" or dry) else 0

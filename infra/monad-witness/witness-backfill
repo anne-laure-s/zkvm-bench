@@ -250,8 +250,6 @@ resolve_gen() {
 }
 
 # ---------------------------------------------------------------- the replay scripts
-REPLAY_DIR="$HERE/replay"
-
 # Copy this repo's run_replay.py / fetch_blocks.py to the box. Unconditional: they are deployment
 # artifacts and this checkout is where they live, so there is nothing to reconcile. Done in preflight
 # rather than at first use, which is phase 6 of 8 -- by then the reset has destroyed the triedb.

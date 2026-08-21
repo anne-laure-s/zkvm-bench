@@ -448,12 +448,10 @@ def public_values_verdict(block, body):
     if pv is not None:
         try:
             vals = cp.decode(pv)
-            source = "read from the proof"
         except ValueError:
             pv, vals = None, None
     if vals is None:
         vals = body.get("public_values")
-        source = "as sent by the submitter"
     if not isinstance(vals, dict) or not vals:
         return None, ("not sent by the submitter, and not readable from the proof "
                       f"(no {os.path.basename(PUBLICS_CMD)} — build it to arm this check)")

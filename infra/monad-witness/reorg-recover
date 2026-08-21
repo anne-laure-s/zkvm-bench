@@ -21,11 +21,15 @@
 #      --storage, NOT --db.
 #   3. TRIM block_db ABOVE THE REWIND POINT. Those blocks were fetched at CONFIRMATIONS=0 before the reorg
 #      settled, so some of them ARE the non-canonical ones. Rewinding without trimming just re-applies them.
-#   4. DROP THOSE BLOCKS FROM prove-farm.csv. A reorged block may already have been proved — the failure only
+#   4. CLEAR THE FRAMED QUEUE ABOVE THE REWIND POINT. The witnesses already framed into the prover's queue are
+#      the third store holding post-target state, and the one this script forgot: a rewind leaves inputs
+#      describing the pre-reorg chain sitting there for --newest-first to pick up. The QUEUE definition below
+#      carries the incident.
+#   5. DROP THOSE BLOCKS FROM prove-farm.csv. A reorged block may already have been proved — the failure only
 #      surfaces at a LATER block — so its proof describes an orphan, and prove-farm's is_proven() keys on the
 #      block number alone: it would skip the canonical witness and leave the orphan's proof at that height.
 #      Invalidating the prover's ledger over the same range is the other half of trimming block_db.
-#   5. Remove the ALERT last, so a crash midway leaves the marker in place rather than a half-repaired db that
+#   6. Remove the ALERT last, so a crash midway leaves the marker in place rather than a half-repaired db that
 #      looks healthy.
 #
 # ESCALATING MARGIN. A single-slot reorg needs a handful of blocks; but the divergence can predate the block
@@ -36,9 +40,9 @@
 #
 #   ./reorg-recover [--dry-run]
 #
-# Exit 0 = repaired (caller should restart the fetcher and the replay). Exit 1 = refused, and it says why:
-# no ALERT, an ALERT that is not a reorg, or the margin exhausted. It never guesses past MAX_MARGIN — beyond
-# that the history window itself is the limit and a snapshot rebuild is the honest answer.
+# Exit 0 = repaired (caller should restart the fetcher and the replay). Exit 1 = refused, and it says why: an
+# unrecognised argument, no ALERT, an ALERT that is not a reorg, or the margin exhausted. It never guesses past
+# MAX_MARGIN — beyond that the history window itself is the limit and a snapshot rebuild is the honest answer.
 set -uo pipefail
 
 MONAD_DIR="${MONAD_DIR:-$HOME/monad}"
@@ -47,7 +51,7 @@ DB="${DB:-$HOME/triedb.db}"
 MPT="${MPT:-$MONAD_DIR/build/category/mpt/monad-mpt}"
 CLI="${CLI:-$MONAD_DIR/build/cmd/monad-cli}"
 # DERIVED the way prove-farm derives it, never spelled out: it writes to $RUNDATA/prove-farm.csv with
-# RUNDATA defaulting to <repo>/run-data. A hand-written path here silently targets the wrong file — and step 4
+# RUNDATA defaulting to <repo>/run-data. A hand-written path here silently targets the wrong file — and step 5
 # reports "nothing to invalidate" when the file is absent, so a wrong path reads as a clean pass. Both spellings
 # of this ledger exist on the box, one of them stale by hours; guessing picked the stale one.
 REPO="${REPO:-$HOME/zkvm-bench}"
@@ -68,11 +72,24 @@ MAX_MARGIN="${MAX_MARGIN:-4096}"
 ALERT="$MONAD_DIR/logs/ALERT"
 STATE="$MONAD_DIR/logs/.reorg-recover-state"
 DRY=0
-[ "${1:-}" = "--dry-run" ] && DRY=1
 
 log(){ printf '%s reorg-recover: %s\n' "$(date +%H:%M:%S)" "$*"; }
 die(){ printf '%s reorg-recover: %s\n' "$(date +%H:%M:%S)" "$*" >&2; exit 1; }
 run(){ if [ "$DRY" = 1 ]; then printf '   $ %s\n' "$*"; else eval "$@"; fi; }
+
+# THERE IS ONE FLAG, AND ANYTHING ELSE IS A TYPO FOR IT. The dry-run switch is matched by name and nothing
+# else is tolerated, because a loose test — a lone equality against "--dry-run" — takes `--dryrun`, `--dry`
+# and `-n` for a REAL run: the operator asking to see what recovery would discard instead gets the triedb
+# rewound, block_db trimmed, the framed queue cleared and the ledger rewritten, and the first three of those
+# are not undoable by re-running anything. So an unrecognised argument dies here, the way witness-follow dies
+# on an unknown command. This has to sit below die() and above every check, so a typo costs nothing at all.
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1 ;;
+    *) die "unknown argument '$1' (--dry-run)" ;;
+  esac
+  shift
+done
 
 [ -f "$ALERT" ] || die "no $ALERT — nothing to recover (the replay stopped for another reason, or is running)"
 [ -x "$MPT" ]   || die "no monad-mpt at $MPT (look for it: find $MONAD_DIR -name '*mpt*' -type f -perm -u+x)"
@@ -136,13 +153,13 @@ if [ "$DRY" = 1 ]; then
   log "    (dry run — the escalation counter is left at $(cut -d' ' -f2 "$STATE" 2>/dev/null || echo unset))"
 fi
 # The counter is written at the END, not here. It records "a recovery RAN at this margin and the replay still
-# failed on this block", and only a run that reaches step 5 has earned that claim. Written up front, any death
+# failed on this block", and only a run that reaches step 6 has earned that claim. Written up front, any death
 # mid-recovery — the supervisor's tmux server going away during step 1, seen once — inflates the margin without
 # having rewound anything, so the next attempt discards hundreds of extra good blocks and re-fetches the whole
 # backlog to undo a divergence that is usually one block deep.
 
 srv_before=0; tmux ls >/dev/null 2>&1 && srv_before=1
-log "1/5 stopping the fetcher (it must not write while block_db is trimmed)$([ "$srv_before" = 0 ] \
+log "1/6 stopping the fetcher (it must not write while block_db is trimmed)$([ "$srv_before" = 0 ] \
 && echo ' — no tmux server running, so there is nothing to stop')"
 # NOT `pkill -f fetch_blocks.py`, and this is the whole reason the 2026-08-20 overnight run ended here.
 # tmux 3.6 leaves the CREATING session's command in the SERVER process's argv, so a server born running the
@@ -168,7 +185,7 @@ if [ "$DRY" != 1 ] && [ "$srv_before" = 1 ] && ! tmux ls >/dev/null 2>&1; then
 would have run. This is the 2026-08-20 failure mode; check that step 1 is not matching the server's own argv."
 fi
 
-log "2/5 rewinding the triedb"
+log "2/6 rewinding the triedb"
 # --allow-dirty because the replay died mid-batch, which is exactly when the dirty flag is set; without it the
 # rewind refuses on the one occasion it is always needed.
 run "'$MPT' --storage '$DB' --rewind-to $target --yes --allow-dirty" \
@@ -186,7 +203,7 @@ fi
 # and it: the fetcher restarts above the hole, never fills it, and the replay sits at `available ==
 # last_executed` with thousands of unreachable blocks stacked above a gap it cannot cross. Contiguity is what
 # makes block_db usable at all, so the trim keeps it contiguous even when that is expensive.
-log "3/5 trimming block_db above $target (they may be the non-canonical ones)"
+log "3/6 trimming block_db above $target (they may be the non-canonical ones)"
 if [ "$DRY" = 1 ]; then
   printf '   $ %s\n' "ls $BLOCK_DB | awk '\$1+0 > $target' | xargs rm -f   ($(ls "$BLOCK_DB" 2>/dev/null | awk -v t="$target" '$1+0 > t' | wc -l | tr -d ' ') file(s))"
 else
@@ -196,23 +213,12 @@ else
   [ -s "$drop" ] && ( cd "$BLOCK_DB" && xargs -a "$drop" rm -f )
 fi
 
-# A reorged block may ALREADY have been proved: the failure only surfaces at a later block, so the divergent
-# one can be through the prover and on the leaderboard before anything looks wrong. Its proof describes an
-# orphan. After the rewind, re-execution produces a NEW witness for the SAME block number — and prove-farm's
-# is_proven() keys on the number alone, so it would skip the canonical version and leave the orphan's proof
-# standing at that height. Against the real ethproofs, where a proof's identity is (cluster, block_number),
-# that is a wrong proof at a given height, not merely untidy.
-#
-# So invalidate the same range in the prover's ledger that we just invalidated on disk. Those blocks become
-# un-proved, the tap re-offers them, and the canonical witness is proved. The run records are left alone: they
-# are an audit trail of what actually ran, and rewriting history there would hide the reorg rather than record
-# it.
-log "3b/5 clearing framed inputs > $target from $QUEUE (they describe the pre-reorg chain)"
+log "4/6 clearing framed inputs > $target from $QUEUE (they describe the pre-reorg chain)"
 if [ ! -d "$QUEUE" ]; then
   log "    no $QUEUE — nothing framed"
 else
   # The strict tag form only: the queue also holds `<tag>.pv.bin` public values and `.post_state_root`
-  # sidecars, and the tap's own queue_files() filters the same way. Sidecars of a cleared input go with it;
+  # sidecars, and the tap's own queued_blocks() filters the same way. Sidecars of a cleared input go with it;
   # the `.exec-report.json` files are left alone, as everywhere else — they outlive their witness by design.
   qn=0
   for f in "$QUEUE/$CHAIN_ID-"*.bin; do
@@ -231,7 +237,18 @@ else
 re-frames them from the canonical witness"
 fi
 
-log "4/5 dropping blocks > $target from $FARM_CSV (their proofs describe orphaned blocks)"
+# A reorged block may ALREADY have been proved: the failure only surfaces at a later block, so the divergent
+# one can be through the prover and on the leaderboard before anything looks wrong. Its proof describes an
+# orphan. After the rewind, re-execution produces a NEW witness for the SAME block number — and prove-farm's
+# is_proven() keys on the number alone, so it would skip the canonical version and leave the orphan's proof
+# standing at that height. Against the real ethproofs, where a proof's identity is (cluster, block_number),
+# that is a wrong proof at a given height, not merely untidy.
+#
+# So invalidate the same range in the prover's ledger that we just invalidated on disk. Those blocks become
+# un-proved, the tap re-offers them, and the canonical witness is proved. The run records are left alone: they
+# are an audit trail of what actually ran, and rewriting history there would hide the reorg rather than record
+# it.
+log "5/6 dropping blocks > $target from $FARM_CSV (their proofs describe orphaned blocks)"
 if [ ! -f "$FARM_CSV" ]; then
   log "    no $FARM_CSV — nothing to invalidate"
 elif [ "$DRY" = 1 ]; then
@@ -260,10 +277,10 @@ else
     || log "    dashboard not reachable on :${MOCK_PORT:-8547} — the marker is lost, the recovery is not"
 fi
 
-log "5/5 removing the ALERT"
+log "6/6 removing the ALERT"
 run "rm -f '$ALERT'"
 
-# Now that all five steps are through, record the margin this attempt used. If the replay fails on the SAME
+# Now that all six steps are through, record the margin this attempt used. If the replay fails on the SAME
 # block again, the next run reads this and doubles — which is the only evidence that the fork predates what the
 # failure reported. A run that died before here leaves no trace, so it is retried at the same margin.
 if [ "$DRY" != 1 ]; then

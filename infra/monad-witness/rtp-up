@@ -64,7 +64,16 @@
 #                   Both derived from `ssh -G $BOX` — this Mac's own resolution of the alias, which is the only
 #                   place the user, the real hostname AND the sshd port all exist. Everything the prover dials
 #                   uses them; everything the Mac dials keeps using $BOX.
+#               BOX_REPO=$HOME/zkvm-bench  this repo's clone ON THE BOX. A literal `$HOME`, deliberately left
+#                   unexpanded so the box's own shell resolves it — every box-side command cd's into it.
 #               RPC=<url>  (the chain, for the public-value checks on both sides)
+#               GUEST=monad-zisk  the guest prove-farm is pointed at, and the key its rows carry in the box's
+#                   run-data/prove-farm.csv — which is where the measured service times are read from.
+#               GUEST_ELF=<path on THIS MAC>  prove THIS ELF instead of the one committed in the box's clone.
+#                   Absolute, relative to this repo, or a bare generation name under guests/monad/gen/. It is
+#                   copied to the box as ~/rtp-guest-<sha16>.elf (the filename IS the checksum) and passed as
+#                   ELF= to the prove invocation, so nothing has to be committed to try a guest. In real mode
+#                   it is also what `cargo-zisk remote setup` keys. Unset = the committed ELF.
 #               MOCK_STORE=<repo>/run-data/ethproofs-rtp  MOCK_SECS=2.12  MOCK_PER_MSTEP=0.0364  MOCK_SPEED=2.5  MOCK_JITTER=0.5
 #               HEAD_TAG=latest  CONFIRMATIONS=0 (the head — real time)  RUNNER_DIR=$HOME/zisk-mock
 #               CATCHUP_TARGET=10 (blocks)  CATCHUP_POLL=30 (s)
@@ -74,7 +83,14 @@
 #               TIP_DIRECT=1  BLOCK_DB_TIMEOUT=30   ONE long-lived monad at the tip. TIP_DIRECT=0 reverts to
 #                   a fresh monad PER BLOCK, which pays every per-process cost per block — that is what the
 #                   pipeline exists to avoid. Needs a binary from al/rtp; step 5b verifies it.
+#               MONAD_BRANCH=al/rtp  the branch the box's monad must be checked out on. A wrong branch is
+#                   FATAL (a checkout is a decision); a binary that does not carry the checked-out commit is
+#                   rebuilt, since BUILD_MONAD=1. MONAD_BRANCH= (empty) skips both checks, and TIP_DIRECT=1
+#                   depends on them. MONAD_DIR_BOX=$HOME/monad is where on the box it looks.
 #               PROVE_REAL / PROVE_GPUS=1        --real, and how many GPUs the cluster has (naming + cadence)
+#               PROVE_MARGIN=1.15  margin on the worst-case service time that is PRINTED at start-up, and on
+#                   the cadence it suggests. Advice only — PROVE_EVERY is never derived. 1.15 covers this
+#                   guest carrying ~8 % more ZisK COST per step than the guest the fit was measured on.
 #               EP_URL / EP_TOKEN / EP_CLUSTER   where proofs are submitted (default: the local mock)
 #               COORDINATOR_URL=http://127.0.0.1:7000  COORDINATOR_HEALTH=http://127.0.0.1:9090/health
 #                   the ZisK coordinator as the PROVER sees it — used for the per-ELF setup and the
@@ -84,11 +100,22 @@
 #               PROVER_LOG_FILES  logs ON THE PROVER whose tails ride back with the artifacts, space-separated
 #                   (e.g. "~/prove.log /tmp/zisk-coordinator.log"). PROVER_LOG_TAIL=200 lines each. They land
 #                   in the result tarball as prover.log. Empty = nothing extra crosses.
+#               PUMP_CHANNELS   how many parallel streams one witness is split across. Unset = MEASURED, by
+#                   netprofile on the link that actually carries the witnesses (from this Mac when the prover
+#                   IS this Mac, from the prover otherwise), falling back to 1 when the probe returns nothing
+#                   usable. A value set here PINS the number; whether it also skips the probe depends on the
+#                   path: the remote-prover branch skips it outright, the Mac-is-the-prover branch still probes
+#                   (a link change is information) and only declines to apply the result. NETPROFILE_DB and
+#                   NETPROFILE_SSH_OPTS are set by this script for that probe — neither is read from this
+#                   Mac's environment.
 #               KEPT_MAX_GB     cap on the box's parked-witness collection, in GB (witness-tap's default is
 #                   20; 0 = unbounded). The sampled corpus is never evicted, so a cap below its size is
 #                   reported rather than enforced.
 #               KZG_STRICT=0    make step 5b's lazy-trusted-setup check fatal instead of a warning. Off by
 #                   default: an unpatched binary still produces correct witnesses, just ~2 s/block slower.
+#               MARGIN          forwarded to reorg-recover, and ONLY under --recover — nothing else here
+#                   reads it. Unset = reorg-recover's own default, which doubles on its own when a rewind
+#                   turns out to be too shallow.
 #               SKIP_AFTER      how far behind the tip an un-proved block is abandoned, in BLOCKS.
 #                   Derived as SKIP_AFTER_WINDOWS x PROVE_EVERY (floor 12): a block gets that many of its own
 #                   windows and no more. SKIP_AFTER_WINDOWS=3 by default; set either one to override.
@@ -140,6 +167,10 @@ GUEST_ELF="${GUEST_ELF:-}"
 # NOT /tmp. macOS purges it on reboot, and this directory is the only ledger of a campaign — 95 proofs of
 # real ZisK work were sitting in /tmp/ethproofs-rtp with nothing but uptime protecting them. run-data/ is
 # already git-ignored (.gitignore:96) and survives, which is the whole requirement.
+# THE GUEST, named once. It was a literal in the prove-farm invocation (line ~2131) and a bare `$GUEST` in
+# measured_prove — which under `set -u` killed that command substitution's subshell, so the reader silently
+# returned "nothing measured" and the cadence block printed UNMEASURED on a box with 200 proofs on disk.
+GUEST="${GUEST:-monad-zisk}"
 MOCK_STORE="${MOCK_STORE:-$MAC_REPO/run-data/ethproofs-rtp}"
 MOCK_SECS="${MOCK_SECS:-2.12}"        # least-squares fit on the 11 measured 16x5090 blocks:
 MOCK_PER_MSTEP="${MOCK_PER_MSTEP:-0.0364}"  #   secs = 2.12 + 0.0364 x Msteps  (+-0.2 s)
@@ -160,13 +191,14 @@ PROVE_GPUS="${PROVE_GPUS:-1}"
 
 # ── the CURRENT guest's step distribution, in Msteps ────────────────────────────────────────────────
 # Measured with ziskemu on the generation `guests/monad/current` points at. Source:
-# profiling/results/compare-jd.json, axis `jd-vs-r4`, side `a` (monad-jd-zisk), 504 blocks.
-# KEEP THESE IN STEP WITH THE GUEST. r4+jd is 0.79x zisk-reth on steps, where the generation before it
+# profiling/results/compare-jd.json, axis `jd-vs-r4`, side `a` (monad-jd-zisk), 504 blocks:
+#   mean 196 · median 186 · p90 303 · max 527
+# Only the MAX is a knob, because it is the only one anything reads — the projected worst case printed
+# beside the cadence. The other three are the measurement, recorded here and nowhere else: they were
+# knobs for a projection that measured_prove now supersedes (see its comment, further down).
+# KEEP THIS IN STEP WITH THE GUEST. r4+jd is 0.79x zisk-reth on steps, where the generation before it
 # was 1.46x — the guest got ~1.8x cheaper (median 333 -> 186 Msteps). A stale value here does not fail,
 # it silently costs coverage: carried at the old max of 896 the derived cadence was 1:44 where 1:26 fits.
-GUEST_MS_MEAN="${GUEST_MS_MEAN:-196}"
-GUEST_MS_MED="${GUEST_MS_MED:-186}"
-GUEST_MS_P90="${GUEST_MS_P90:-303}"
 GUEST_MS_MAX="${GUEST_MS_MAX:-527}"
 # Margin on the derived cadence. The fit is in STEPS, but ZisK's own work unit is COST, and the two do
 # not move together across guests: r4 is 0.795x zisk-reth on steps and 0.861x on COST, i.e. this guest
@@ -194,6 +226,12 @@ REPLAY_POLL="${REPLAY_POLL:-0.3}"
 # The tap skips a witness younger than this so it never frames a half-written one. 2 s was cautious and
 # showed up whole in wit->queue; monad writes a witness in one pass, so 0.5 s is enough margin.
 SETTLE_SECS="${SETTLE_SECS:-0.5}"
+# The catch-up loop's two knobs: how close to the chain head counts as "at the tip" (in BLOCKS), and how often
+# the gap is polled while it closes (in seconds). Defaulted here, with every other knob, so --help's list and
+# the code cannot disagree about what an unset value means. What ENDS that loop is a replay that stops
+# advancing and never a clock — the rationale for that is at the loop itself.
+CATCHUP_TARGET="${CATCHUP_TARGET:-10}"
+CATCHUP_POLL="${CATCHUP_POLL:-30}"
 # PROVE EVERY N BLOCKS. N counts BLOCKS, not seconds — every other knob up to here is a duration, so the unit
 # is worth stating twice. The selection itself lives in witness-tap (`is_cadence = b % PROVE_EVERY == 0`), and
 # witness-follow forwards the value to it.
@@ -297,7 +335,7 @@ fi
 # IS the Mac (PROVER unset). With a remote prover the two homes differ — on a vast.ai GPU box it is /root —
 # and today's mock path papers over it by using the Mac's absolute path on the remote host: it "works" because
 # mkdir creates it, but the runner then lives at /Users/<you>/zisk-mock on a Linux box, and every `~/...`
-# instruction printed about that host is wrong. Real mode resolves the prover's own $HOME instead (6d).
+# instruction printed about that host is wrong. Real mode resolves the prover's own $HOME instead (6c).
 # RESOLVED BEFORE THE MODE BLOCK, because the mode block reads it: RUNNER_DIR must not default to this Mac's
 # $HOME when the prover is elsewhere, and EP_CLUSTER must name that prover. Resolved after them, the alias
 # worked for the ssh calls and silently did nothing for either — a remote prover staging into /Users/<me>.
@@ -311,7 +349,7 @@ PROVER="${PROVER:-${REMOTE:-}}"
 # The mock path is deliberately LEFT AS IS: it is a working deployment, and changing where it stages files is
 # not part of making real proving work. The same fix applies there whenever someone wants it.
 if [ "$PROVE_REAL" = 1 ]; then
-  # Empty = "resolve against the prover's $HOME in 6d". A value passed in by the user is used verbatim.
+  # Empty = "resolve against the prover's $HOME in 6c". A value passed in by the user is used verbatim.
   RUNNER_DIR="${RUNNER_DIR:-}"
   PROVER_WS="${PROVER_WS:-}"
   PUMP_SOCK="${PUMP_SOCK:-/tmp/zisk-pump-real.sock}"
@@ -550,14 +588,17 @@ PROVPATS
   # whole sweep exists because a process nobody could see kept running. A survivor is not cosmetic, and not only
   # for prove-farm: a second run_replay.py is a second writer on one triedb, a second fetcher a second writer on
   # one block_db, and a surviving witness-pump keeps the socket the new host cannot then serve. Every pattern the
-  # kill used is re-checked, so on `start` any of them is fatal — continuing would rebuild the situation we just
-  # came to clear. On `stop` there is nothing left to protect, so it warns.
+  # kill used is re-checked EXCEPT the pump's box-side relays — the `boxsoft` list is killed and not waited for,
+  # for the reason given where it is killed, and the die() below says so out loud. A survivor of any of the
+  # others is fatal on `start`: continuing would rebuild the situation we just came to clear. On `stop` there is
+  # nothing left to protect, so it warns.
   [ "$DRY" = 1 ] && return 0
   # pkill is ASYNCHRONOUS: it delivers a signal and returns. A `witness-pump send` with an open ssh channel and
   # a 7 MB transfer in flight, or a python process unwinding one, routinely needs more than a second. Every
-  # pattern is now fatal on `start`, so a single check would turn a slow exit into a refused run — which is a
-  # new way to not start, not a guard. So POLL, and re-check only what is still there: a pattern that clears on
-  # try 3 was never a survivor. Nothing here waits on the ordinary case, which clears on the first try.
+  # re-checked pattern is fatal on `start`, so a single check would turn a slow exit into a refused run —
+  # which is a new way to not start, not a guard. So POLL, and re-check only what is still there: a pattern
+  # that clears on try 3 was never a survivor. Nothing here waits on the ordinary case, which clears on the
+  # first try.
   local pending="$boxpats" still="" survivors="" try
   for try in 1 2 3 4 5; do
     sleep 1
@@ -694,7 +735,7 @@ esac
 
 # ── 1. the mock prover's runner, outside the TCC-protected tree ─────────────────────────────────────
 # Only when the prover IS this Mac. For a remote prover the staging needs the box's clone, which is not
-# updated until step 7 — so it happens there instead (7c), over the same box->prover path the run will use.
+# updated until step 6 — so it happens there instead (6c), over the same box->prover path the run will use.
 if [ -z "$PROVER" ]; then
   step "Staging the mock prover's runner in $RUNNER_DIR"
   run "mkdir -p '$RUNNER_DIR'"
@@ -951,7 +992,6 @@ tun_usable(){
 # did), then start one. Step 5 below verifies the result end to end and dies if it is not usable.
 if tun_usable; then
   say "the tunnel on $TUN_SSH_PORT already carries the box's own key — kept, not restarted"
-  TUN_KEPT=1
 else
 run "pkill -f 'rtp-up-tunnel' 2>/dev/null; pkill -f 'R $TUN_SSH_PORT:127.0.0.1:22' 2>/dev/null; true"
 # The box side can also hold the port after a dropped session. NOT `pkill -f "sshd.*$TUN_SSH_PORT"`: an sshd
@@ -1059,7 +1099,7 @@ that host's authorized_keys — the same way step 2 does it for this Mac."
   case "$bashv" in *"version 3."*) say "  (bash 3.2: emulation time is measured to the second — ±1s of noise)";; esac
 fi
 
-# ── 6. the box: code, producer, prover ─────────────────────────────────────────────────────────────
+# ── the box: code, producer, prover ────────────────────────────────────────────────────────────────
 # ── 5b. the monad BINARY must match the monad SOURCE, on the RTP branch ────────────────────────────
 #
 # This cost an hour of misdiagnosis. The producer's behaviour comes from a compiled binary, and nothing in the
@@ -1268,6 +1308,7 @@ elif [ "$DRY" != 1 ] && [ "$TIP_DIRECT" = 1 ]; then
   say "    Either drop MONAD_BRANCH= or run with TIP_DIRECT=0."
 fi
 
+# ── 6. the box's clone: it must hold what this run needs ───────────────────────────────────────────
 step "Updating the box's clone"
 onbox "cd $BOX_REPO && git pull --ff-only 2>&1 | tail -2"
 if [ "$DRY" != 1 ]; then
@@ -1293,7 +1334,7 @@ if [ "$DRY" != 1 ]; then
   fi
 fi
 
-# ── the guest ELF, when it is not the committed one ────────────────────────────────────────────────
+# ── 6b. the guest ELF, when it is not the committed one ────────────────────────────────────────────
 BOX_ELF=""
 if [ -n "$GUEST_ELF" ]; then
   step "Guest ELF override"
@@ -1365,8 +1406,23 @@ if [ -n "$PROVER" ]; then
   # channels above all — applies to a MOCK prover on a remote box just as much. Left in the real branch, a
   # remote mock run printed `onprover: command not found` six times and carried on (there is no `set -e`),
   # so the channels never started and nothing in the output said the run was degraded.
-  onprover(){ onbox "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET '$*'"; }
-  onprover_q(){ onbox_q "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET '$*'"; }
+  # _pq — THE SINGLE-QUOTE RULE, HELD ONCE. Everything these two send travels inside the '...' the box's own
+  # ssh gets, so one apostrophe anywhere in the payload closes that argument and the prover receives a
+  # TRUNCATED command — that is how a supervised forward loop once arrived as `bash -c exec`, and the two
+  # "DOUBLE QUOTES INSIDE, always" notes further down are the same rule restated at the call sites that were
+  # bitten by it. Seventeen call sites obeying a convention is a convention that gets dropped at the
+  # eighteenth, and it gets dropped silently: nothing errors, the remote command is just shorter than what
+  # was written. `'\''` is the standard escape — close the quote, emit a literal one, reopen. A payload with
+  # no apostrophe passes through byte for byte, which is every payload here today; the notes stay because
+  # writing double quotes is still the right habit, and because an escape only helps a string it can see:
+  # a `\$HOME` left for the box's own shell to expand is escaped by nobody.
+  # SUBSTITUTED IN A VARIABLE, never through $( ) — command substitution strips every trailing newline, so a
+  # payload ending in one would arrive at the prover a byte shorter than it left. No current payload ends in a
+  # newline, which is exactly why this would have gone unnoticed until the first heredoc-shaped one did.
+  onprover(){   local s=$*; s=${s//\'/\'\\\'\'}
+                onbox   "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET '$s'"; }
+  onprover_q(){ local s=$*; s=${s//\'/\'\\\'\'}
+                onbox_q "ssh -o BatchMode=yes -p $PROVER_PORT $PROVER_TARGET '$s'"; }
   # THE PROVER'S HOST KEY, ON THE BOX — and this one comes FIRST, because the very next thing that happens is
   # the box dialling the prover with BatchMode=yes. A fresh prover is unknown to the box, ssh will not prompt,
   # and the dial dies on `Host key verification failed` before any later check can say why.
@@ -1463,7 +1519,7 @@ unrelated to the block. Install ZisK there, or keep the prover on the Mac."
 --coordinator $COORDINATOR_URL 2>&1 | tail -5"
   fi
 
-  # ── the persistent channels, on a REAL prover ────────────────────────────────────────────────────
+  # ── 6e. the persistent channels, on a REAL prover ────────────────────────────────────────────────
   # THE KEY IS ONLY NEEDED AT STARTUP, and that is the whole design. Without this, a real run leans on
   # box->prover ssh for every single block: one connection per witness, per artifact fetch, per submission —
   # and the box's hourly cron (`find ~/.ssh -type f -name id_* -delete`) takes that key away, so the campaign
@@ -1672,7 +1728,7 @@ infra/zisk-infra/witness-pump run 'set -o pipefail; echo up'" | grep -q up && ok
        (PUMP_SHELL=<path> is for a box whose bash is somewhere unusual, not for an old copy.)"
   fi
 
-  # ── the submission endpoint, AS THE PROVER SEES IT ───────────────────────────────────────────────
+  # ── 6f. the submission endpoint, AS THE PROVER SEES IT ───────────────────────────────────────────
   # The prover POSTs the proof itself ("posted BY the prover — the proof never crosses the tunnel"), so
   # ETHPROOFS_URL is resolved on the PROVER. With a mock on this Mac that URL is localhost:$MOCK_PORT, which on
   # a real prover is the PROVER's own localhost with nothing behind it: every block's prover-side submit fails
@@ -1717,7 +1773,7 @@ ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCount
   esac
 fi
 
-# ── 6b. the fetcher: newHeads subscription instead of polling ──────────────────────────────────────
+# ── 6g. the fetcher: newHeads subscription instead of polling ──────────────────────────────────────
 # Must happen BEFORE the catch-up, which is what starts the fetcher. And if either the patch or the library
 # is newly in place, the RUNNING fetcher is still the old code — so the session is killed to force a restart.
 # Continuing with a silently unpatched fetcher would mean none of this has any effect and nothing says so.
@@ -1820,14 +1876,14 @@ echo \"\${A:-0} \${L:-0} \${T:-0}\"
 "; }
 
 if [ "$DRY" = 1 ]; then
-  say "[dry-run] would start the catch-up replay and poll until the gap is <= ${CATCHUP_TARGET:-10} blocks"
+  say "[dry-run] would start the catch-up replay and poll until the gap is <= $CATCHUP_TARGET blocks"
 else
   onbox "cd $BOX_REPO/infra/monad-witness && HEAD_TAG=$HEAD_TAG CONFIRMATIONS=$CONFIRMATIONS FETCH_POLL=$FETCH_POLL REPLAY_POLL=$REPLAY_POLL ./witness-follow start catchup 2>&1 | sed 's/^/   /'"
   # NO WALL-CLOCK DEADLINE. What must stop this loop is a replay that is not advancing, and `stall` below is that
   # test: three polls without progress, escalated to reading logs/ALERT so the cause is named rather than hunted.
   # A duration cannot distinguish a stuck replay from a healthy long one, and the only runs it ends are the
   # healthy slow ones — a backlog of 154 k blocks is ~6 h of legitimate work at the measured batch rate.
-  target="${CATCHUP_TARGET:-10}"; poll="${CATCHUP_POLL:-30}"
+  target="$CATCHUP_TARGET"; poll="$CATCHUP_POLL"
   stall=0; prev=""
   while :; do
     read -r avail last tip <<<"$(box_gap)"
@@ -2128,7 +2184,7 @@ prove_cmd="cd $BOX_REPO && ${BOX_ELF:+ELF=$BOX_ELF }REMOTE_WS=$PROVER_WS REMOTE_
 ${PROVER_LOG_FILES:+PROVER_LOG_FILES='$PROVER_LOG_FILES' }${PROVER_LOG_TAIL:+PROVER_LOG_TAIL=$PROVER_LOG_TAIL }\
 ${PULL_VIA:+PULL_VIA=$PULL_VIA }WITNESS_PUMP=$RUNNER_DIR/witness-pump PUMP_SOCK=$PUMP_SOCK \
 REMOTE_SUBMIT=$RUNNER_DIR/ethproofs-submit WITNESS_MANIFEST=\$HOME/witness-manifest.csv \
-cli/prove-farm --guest monad-zisk $PROVE_MODE_FLAGS --remote $PROVER_TARGET --port $PROVER_PORT \
+cli/prove-farm --guest $GUEST $PROVE_MODE_FLAGS --remote $PROVER_TARGET --port $PROVER_PORT \
 --interval 1 --watch --newest-first --max-age $((PROVE_EVERY * 12)) --no-prefetch \
 --ethproofs-url $EP_URL${EP_TOKEN:+ --ethproofs-token $EP_TOKEN} \
 --ethproofs-cluster $EP_CLUSTER --rpc $RPC 2>&1 | tee -a $PROVE_LOG"
@@ -2141,8 +2197,7 @@ onbox "tmux kill-session -t prove 2>/dev/null && echo '   · restarting prove (a
 [ "$CRON" = 1 ] && { step "Installing the daily log archiver on the box"
   onbox "(crontab -l 2>/dev/null | grep -v archive-logs; echo '17 4 * * * \$HOME/zkvm-bench/infra/monad-witness/archive-logs >> \$HOME/archive-logs.log 2>&1') | crontab - && crontab -l | tail -1"; }
 
-# ── 7. where to look ───────────────────────────────────────────────────────────────────────────────
-# ── 6c. the safety net ─────────────────────────────────────────
+# ── 8. the safety net ──────────────────────────────────────────────────────────────────────────────
 # LAST, and unconditional on the real path. Every recording above announces itself as something
 # "rtp-watchdog replays it" — and nothing here ever hired the watchdog that would. That gap has a measured
 # cost: on 2026-08-20 the pipeline stopped at 19:57 (reorg-recover's step 1 killed the tmux server) and
@@ -2158,6 +2213,7 @@ if [ "$PROVE_REAL" = 1 ]; then
   onbox "cd $BOX_REPO/infra/monad-witness && ./rtp-watchdog --install"
 fi
 
+# ── 9. where to look ───────────────────────────────────────────────────────────────────────────────
 step "Up. What to watch"
 cat <<EOF
    on $BOX:
