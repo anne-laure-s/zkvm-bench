@@ -219,6 +219,66 @@ wait_for_start_block() {
   done
 }
 
+# wait_for_runway — and do not launch monad before the blocks it will run THROUGH are there either.
+#
+# wait_for_start_block is necessary and was not sufficient, and the difference cost two outages on 2026-08-21
+# (21:21 and 00:53, both `monad exited 134` on `Could not query <N> from blockdb after waiting 30s`). What
+# happens after a rewind: reorg-recover trims block_db above the target, the fetcher has to re-download those
+# blocks AND keep following the tip, and monad replays at ~5.5 blocks/s (0.18 s each, measured). So monad
+# starts correctly on a start block that IS present, executes straight through the re-fetch window — 131
+# blocks on 21:21, from 25807233 to 25807363 — CATCHES UP WITH THE FETCHER'S FRONTIER, and dies on the 30 s
+# --block-db-timeout at the first block that has not landed yet.
+#
+# The abort is the expensive part, not the wait: it writes an ALERT that names no failing block, so
+# reorg-recover refuses it ("this is not a reorg"), the supervisor stops, and the producer stays down until a
+# human looks. A reorg recovery that succeeds thus manufactures a failure it cannot itself repair.
+#
+# So: require a contiguous RUNWAY from the start block before handing control to monad. Bounded by the chain
+# tip, because after a shallow rewind near the tip there is no 256-block runway to wait for and there never
+# will be. The tip comes from the fetcher's own last log line (`latest-0 <N>`); a parse failure SKIPS the wait
+# rather than blocking the producer, the same rule wait_for_start_block follows — this guard exists to prevent
+# an abort, not to become a new way to never start.
+wait_for_runway() {
+  local runway="${TIP_START_RUNWAY:-256}" limit="${TIP_START_WAIT:-600}" waited=0
+  local flog="${FETCH_LOG:-$HOME/fetch.log}" tip need last b missing
+  [ "$runway" -gt 0 ] 2>/dev/null || return 0
+  last="$("$MONAD_DIR/build/cmd/monad-cli" --db "$DB" --version latest_finalized 2>&1 |
+          sed -n 's/.*latest_finalized_block_id=\([0-9][0-9]*\).*/\1/p' | tail -1)"
+  case "$last" in ''|*[!0-9]*) return 0 ;; esac
+  tip="$(sed -n 's/.*latest-0 \([0-9][0-9]*\).*/\1/p' "$flog" 2>/dev/null | tail -1)"
+  case "$tip" in ''|*[!0-9]*)
+    echo "supervise: cannot read the chain tip from $flog — starting without the runway wait"; return 0 ;;
+  esac
+  need=$(( last + runway )); [ "$need" -gt "$tip" ] && need="$tip"
+  [ "$need" -le "$last" ] && return 0
+  while :; do
+    missing=""
+    b=$((last + 1))
+    while [ "$b" -le "$need" ]; do
+      [ -s "$BLOCK_DB/$b" ] || { missing="$b"; break; }
+      b=$((b + 1))
+    done
+    [ -z "$missing" ] && {
+      [ "$waited" -gt 0 ] && echo "supervise: block_db is contiguous $((last + 1))..$need (waited ${waited}s) \
+— the fetcher has caught up, starting the tip producer"
+      return 0
+    }
+    if [ "$waited" -ge "$limit" ]; then
+      echo "supervise: block_db still has a hole at $missing after ${limit}s (need $((last + 1))..$need)."
+      echo "supervise:   NOT starting monad: it would replay past the fetcher and abort on --block-db-timeout,"
+      echo "supervise:   leaving an ALERT that names no failing block and that reorg-recover refuses."
+      echo "supervise:   Check 'tmux capture-pane -p -t fetch' and $flog."
+      return 1
+    fi
+    [ "$waited" = 0 ] && echo "supervise: waiting for the fetcher to refill $((last + 1))..$need \
+(hole at $missing) before starting monad"
+    sleep 2; waited=$((waited + 2))
+    # The tip moves while we wait; re-read it so `need` tracks a chain that is still advancing.
+    tip="$(sed -n 's/.*latest-0 \([0-9][0-9]*\).*/\1/p' "$flog" 2>/dev/null | tail -1)"
+    case "$tip" in ''|*[!0-9]*) : ;; *) need=$(( last + runway )); [ "$need" -gt "$tip" ] && need="$tip" ;; esac
+  done
+}
+
 run_tip_once() {
   if [ "$TIP_DIRECT" = 0 ]; then
     echo "supervise: tip replay via run_replay.py (TIP_DIRECT=0 — one monad process per batch)"
@@ -227,6 +287,7 @@ run_tip_once() {
   local log rc; log="$MONAD_DIR/logs/monad-tip-$(date +%Y%m%d-%H%M%SZ).log"
   mkdir -p "$MONAD_DIR/logs" "$WITNESS_DIR"
   wait_for_start_block || return 1
+  wait_for_runway      || return 1
   echo "supervise: tip producer direct, one long-lived process -> $log"
   echo "supervise:   needs a monad built from al/rtp; nothing here verifies that (rtp-up step 5b does). On any"
   echo "supervise:   other binary --block-db-timeout exits 107 — use TIP_DIRECT=0, which needs no particular one."

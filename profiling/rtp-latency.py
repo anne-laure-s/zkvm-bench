@@ -48,7 +48,10 @@ def read_manifest(path):
             out[b] = {"t_block": num("t_block"), "t_avail": num("t_avail"),
                       "t_witness": num("t_witness"), "t_queued": num("t_queued"),
                       "bytes": num("bytes"), "root": (row.get("post_state_root") or "").strip(),
-                      "promoted": (row.get("promoted") or "").strip() == "1"}
+                      "promoted": (row.get("promoted") or "").strip() == "1",
+                      # `warmup` is absent from manifests written before witness-tap grew the column, and a
+                      # missing cell must read as "not a warm-up" rather than crash on an old file.
+                      "warmup": (row.get("warmup") or "").strip() == "1"}
     return out
 
 def read_runs(results_dir, chain_id, guest):
@@ -245,12 +248,33 @@ def main():
     # in ~20-70 s against a 12 s slot, so with --newest-first most blocks are skipped by design. The
     # fraction actually proved is therefore as much a result as the per-block latency: a 2 s latency on
     # 10% of blocks is not real-time proving.
-    lo, hi = min(rows[0]["block"], min(man)), max(man)
-    arrived = [b for b in man if lo <= b <= hi]
+    # The window is the manifest's own span: a proved block is by construction a manifest block (`blocks` is
+    # built from man's keys and only ever filtered), so no proof can sit outside it.
+    lo, hi = min(man), max(man)
+    arrived = list(man)
     if arrived:
         pct = 100.0 * len(rows) / len(arrived)
         print(f"coverage: {len(rows)}/{len(arrived)} block(s) proved over {lo}..{hi} ({pct:.0f}%)"
               + (" — mock proofs, so this measures the plumbing's reach, not a prover's" if mocks else ""))
+
+        # THE DENOMINATOR ABOVE STAYS EVERY BLOCK THAT ARRIVED — that is the RTP question, and at
+        # PROVE_EVERY=N it reads ~1/N by design (the CEILING, not a shortfall). Removing a warm-up block
+        # from it would be noise on a denominator of hundreds and would blur what the figure means.
+        #
+        # What a warm-up block must not do is read as a MISS, so the honest second figure is against the
+        # blocks that were actually QUEUED. It excludes off-cadence blocks and warm-ups alike, because
+        # neither was ever offered to the prover — this is the prover's own reach rather than the pipeline's.
+        # (`promoted` was already parsed and never used; this is what it is for.)
+        queued = [b for b in arrived if man[b]["promoted"]]
+        if queued:
+            qpct = 100.0 * len([b for b in queued if b in {r["block"] for r in rows}]) / len(queued)
+            print(f"  of the {len(queued)} block(s) actually queued: {qpct:.0f}% proved"
+                  f"  <- the prover's reach; the line above is the pipeline's")
+        warm = [b for b in arrived if man[b]["warmup"]]
+        if warm:
+            print(f"  {len(warm)} warm-up block(s) produced but never queued ({', '.join(str(b) for b in warm[:5])}"
+                  f"{'…' if len(warm) > 5 else ''}) — the first block of a producer pays its one-time costs,"
+                  f" so it is deliberately not proved. Not a miss.")
     if real:
         p = sorted(x["pipeline"] for x in real)
         print(f"pipeline latency (witness → proof in hand), {len(real)} real proof(s): "

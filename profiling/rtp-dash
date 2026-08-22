@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""rtp-dash — a live view of the RTP pipeline's per-leg timings, in compare.html's idiom.
+
+    ./rtp-dash --box nyc-003                     one shot -> profiling/results/rtp-live.html
+    ./rtp-dash --box nyc-003 --watch 20          rewrite it every 20 s
+    ./rtp-dash --csv /path/to/rows.csv           skip the box, read a CSV already in hand
+
+RUNS ON THIS MAC, reads on the box. The manifest and the run records live on the producer, so the joins
+have to happen there; the page has to be openable here. So this drives `rtp-latency.py --csv` over ssh and
+keeps only the joined rows. One source of truth for the joins, which stay in rtp-latency.py.
+
+NO SERVER, and that is the point: the page carries `<meta http-equiv="refresh">` and is rewritten in place,
+so `open`ing the file once is the whole setup. Fetching a JSON side-car would be tidier and would need a
+local HTTP server, because a file:// page cannot fetch a file:// sibling.
+
+WHAT IT REFUSES TO CONFLATE. In a `--mock` campaign the prover's DURATION is modelled from the emulated step
+count (`prove_secs = MOCK_SECS + MOCK_PER_MSTEP x Msteps`, divided by MOCK_SPEED), while everything around it
+is real: the chain wait, the replay, the framing and both transfers are measured. So `prove` and every total
+containing it are marked MODELLED and rendered in the dim hue, and the measured legs are not. A dashboard that
+showed one median for all of them would be presenting a sleep as a proving time.
+
+DISPERSION IS p90, NOT σ. These legs are bimodal, not gaussian — transport alternates between the persistent
+channel and its scp fallback, and a standard deviation over two modes describes neither. p90 answers the
+question that decides the pipeline: does the block fit its 12 s slot.
+"""
+import argparse, csv, io, os, statistics, subprocess, sys, time
+
+# The legs, in pipeline order. `modelled` marks what a mock run does not measure.
+LEGS = [
+    ("node",      "chain → visible",   "the block exists and the fetcher can see it",           False),
+    ("witness",   "replay + dump",     "execute the block and write its witness",               False),
+    ("queue",     "framing",           "the tap frames it into the prover queue",               False),
+    ("transport", "transport",         "witness to the prover and artefacts back",              False),
+    ("prove_secs", "prove",            "the prover itself",                                     True),
+    ("service",   "service",           "queued → proved, the prover's whole share",             True),
+    ("pipeline",  "pipeline",          "witness → proof in hand",                               True),
+    ("e2e",       "end to end",        "block exists → proof in hand",                          True),
+]
+SLOT = 12.0  # one mainnet block. The number every leg is ultimately judged against.
+
+def fetch_rows(box, guest, manifest, results):
+    """Run the joiner on the box and bring back its CSV, preceded by one AGE line.
+
+    The AGE line carries the box's own epoch and the manifest's last `t_queued`, both taken THERE. Data age is
+    then a subtraction between two clocks that are the same clock. Comparing this page's local time against the
+    box's log timestamps does not work and is actively misleading: nyc-003 runs on New York time, so a pipeline
+    that stopped 13 minutes ago reads as six hours dead from a machine on CEST.
+
+    The joiner's own stdout (its human table) is discarded; the contract we depend on is --csv, which
+    DictWriter-s every key of every row."""
+    remote = (
+        # t_queued is field 5 of the manifest, and the last non-empty one is the freshest block the tap framed.
+        # printf "%d", NOT print: awk formats a bare number with OFMT, so an epoch like 1786720701.23 comes out
+        # as "1.78672e+09" and any later truncation reads it as the year 1970 plus one second.
+        "q=$(awk -F, 'NR>1 && $5!=\"\" {v=$5} END{printf \"%d\\n\", v}' " + manifest + "); "
+        "echo \"AGE $(date +%s) $q\"; "
+        # PER-PROCESS temp file, never a fixed /tmp/rtp-dash.csv. The usage above documents --watch, so two
+        # dashboards pointed at one box are an expected configuration, and on a shared path each one's `rm -f`
+        # deletes the other's join mid-flight. That failure renders as the empty-CSV card, which makes it
+        # indistinguishable from "nothing has joined yet" — the one state this page must report truthfully.
+        # mktemp hands back a file that is already empty, so the old leading `rm -f` has nothing left to do.
+        "c=$(mktemp /tmp/rtp-dash.XXXXXX) || exit 0; "
+        # NOT chained on the joiner's exit status. It raises IndexError on `rows[0]` when nothing joins — a
+        # fresh generation, or right after `rtp-up --purge` — and an `&&` there turns "no blocks yet", which is
+        # a legitimate state this page must display, into a dashboard that shows nothing at all.
+        f"cd ~/zkvm-bench && profiling/rtp-latency.py --manifest {manifest} "
+        f"--results {results} --guest {guest} --csv \"$c\" >/dev/null 2>&1; "
+        "[ -s \"$c\" ] && cat \"$c\"; rm -f \"$c\"; exit 0"
+    )
+    out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", box, remote],
+                         capture_output=True, text=True, timeout=300)
+    # The AGE line alone is a complete answer: it says the producer is alive and nothing has joined yet.
+    if out.returncode != 0 or not out.stdout.strip():
+        raise RuntimeError(f"could not reach {box}: rc={out.returncode} {out.stderr.strip()[:200]}")
+    age = None
+    text = out.stdout
+    if text.startswith("AGE "):
+        head, _, text = text.partition("\n")
+        try:
+            _, now_s, last_s = head.split()
+            if int(last_s) > 0:
+                age = int(now_s) - int(last_s)
+        except ValueError:
+            pass
+    return list(csv.DictReader(io.StringIO(text))), age
+
+def nums(rows, key):
+    v = []
+    for r in rows:
+        s = (r.get(key) or "").strip()
+        if not s:
+            continue
+        try:
+            v.append(float(s))
+        except ValueError:
+            pass
+    return sorted(v)
+
+def stats(v):
+    if not v:
+        return None
+    n = len(v)
+    p90 = v[min(n - 1, int(round(0.9 * (n - 1))))]
+    return {"n": n, "median": statistics.median(v), "p90": p90, "min": v[0], "max": v[-1],
+            "over": sum(1 for x in v if x > SLOT)}
+
+def esc(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+CSS = """
+:root{--ink:#0a0c12;--panel:#11141e;--panel2:#161b28;--line:#242b3c;--fg:#e7eaf2;--muted:#8b93a7;
+ --dim:#59627a;--gold:#e8b04b;--blue:#5b8def;--red:#e2564a;--green:#4bbf8a;
+ --accent:#b09cf7;--accent-dim:#9d92c9;
+ --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+ --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ink);color:var(--fg)}
+.wrap{max-width:1180px;margin:0 auto;padding:34px 26px 60px;color:var(--fg);font-family:var(--sans);
+ background-image:radial-gradient(900px 380px at 82% -8%,rgba(91,141,239,.10),transparent 60%)}
+.eyebrow{font-size:11px;letter-spacing:.20em;text-transform:uppercase;color:var(--accent);
+ font-family:var(--mono);font-weight:600;margin:0 0 10px}
+h1{font-size:clamp(26px,4vw,40px);line-height:1.04;margin:0 0 10px;font-weight:680;letter-spacing:-.02em}
+.sub{color:var(--muted);font-size:13.5px;margin:0 0 26px;line-height:1.6}
+.sub code,code{font-family:var(--mono);color:#c3ccdf;font-size:12.5px}
+h2{font-family:var(--mono);font-size:14px;font-weight:650;letter-spacing:.02em;margin:34px 0 12px;
+ color:var(--fg);text-transform:uppercase;letter-spacing:.13em}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(196px,1fr));border-top:1px solid var(--line);
+ border-left:1px solid var(--line)}
+.card{background:var(--panel);padding:14px 16px;border-right:1px solid var(--line);
+ border-bottom:1px solid var(--line)}
+.card .k{font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--dim);font-family:var(--mono)}
+.card .v{font-family:var(--mono);font-size:22px;font-weight:600;margin-top:6px;font-variant-numeric:tabular-nums;
+ letter-spacing:-.02em}
+.card .u{font-size:11px;color:var(--muted);margin-left:3px;font-weight:400}
+.card .u.blk{display:block;margin:5px 0 0;line-height:1.45}
+.card.hero{background:var(--panel2)}.card.hero .v{font-size:30px;color:var(--accent)}
+.card.modelled .v{color:var(--dim)}
+.tag{font-family:var(--mono);font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;
+ padding:1px 5px;border:1px solid var(--line);border-radius:3px;color:var(--dim);margin-left:6px}
+table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px;
+ font-variant-numeric:tabular-nums}
+th{text-align:right;color:var(--dim);font-weight:600;font-size:10px;letter-spacing:.11em;
+ text-transform:uppercase;padding:8px 9px;border-bottom:1px solid var(--line)}
+th:first-child,td:first-child{text-align:left}
+td{text-align:right;padding:6px 9px;border-bottom:1px solid rgba(36,43,60,.55);color:#c3ccdf}
+tr:hover td{background:var(--panel)}
+.over{color:var(--red)}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:16px;margin:6px 0 4px}
+.chart{background:var(--panel);border:1px solid var(--line);padding:14px 16px 10px}
+.chart .k{font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--dim);
+ font-family:var(--mono)}
+.chartsub{color:var(--muted);font-size:11.5px;margin:5px 0 8px;line-height:1.5}
+.ok{color:var(--green)}
+.foot{color:var(--dim);font-size:11.5px;font-family:var(--mono);margin-top:30px;line-height:1.7}
+"""
+
+# The one mark colour, and it is not a taste call: validated with the data-viz six checks against this page's
+# card surface (#11141e, dark) — lightness band, chroma floor, contrast >= 3:1 all PASS. The palette's own
+# --accent and --dim were tried first and fail as MARKS: --dim reads gray (chroma 0.04) at 2.86:1 contrast, and
+# --accent sits outside the dark lightness band AND is only ΔE 12.1 from --blue, under the 15 floor where full
+# colour vision stops telling two marks apart. So BOTH histograms use this hue, and measured-vs-modelled is
+# carried by a hatch and a tag instead — secondary encoding, never a second unvalidated hue.
+MARK = "#5b8def"
+
+def histogram(vals, title, subtitle, modelled, bins=30, w=560, h=182):
+    """A histogram, because the question is the SHAPE. These legs are bimodal — transport sits on the
+    persistent channel or on its scp fallback, nothing in between — and a median over two humps names a value
+    that never occurs. One series, so no legend: the title names it."""
+    if len(vals) < 2:
+        return f'<p class="sub">{esc(title)}: not enough data yet.</p>'
+    # CLIPPED AT p95, and the overflow is stated rather than dropped. These tails are not merely long, they
+    # are fat: a transport window measured here ran median 15.2s, p90 35.8s, p99 124.5s, max 658.2s. A
+    # full-range axis puts most blocks in the first few pixels and hides the shape the chart exists to show,
+    # and clipping at p99 barely helps when p99 is a fifth of the max. p95 keeps the body legible; the count
+    # beyond it and the true maximum are labelled on the axis, because a clip is only a lie when it is silent.
+    lo = vals[0]
+    hi = vals[min(len(vals) - 1, int(round(0.95 * (len(vals) - 1))))]
+    over_n = sum(1 for v in vals if v > hi)
+    vmax = vals[-1]
+    if hi <= lo:
+        hi = lo + 1e-6
+    edges = [lo + (hi - lo) * i / bins for i in range(bins + 1)]
+    counts = [0] * bins
+    for v in vals:
+        k = min(bins - 1, int((min(v, hi) - lo) / (hi - lo) * bins))
+        counts[k] += 1
+    top = max(counts) or 1
+    med = statistics.median(vals)
+    p90 = vals[min(len(vals) - 1, int(round(0.9 * (len(vals) - 1))))]
+    pad_l, pad_b, pad_t = 34, 38, 14
+    pw, ph = w - pad_l - 10, h - pad_b - pad_t
+    x = lambda v: pad_l + (v - lo) / (hi - lo) * pw
+    bw = pw / bins
+
+    p = [f'<svg viewBox="0 0 {w} {h}" width="100%" role="img" aria-label="{esc(title)}">']
+    if modelled:  # texture, not hue: the same validated colour carries both charts
+        p.append(f'<defs><pattern id="hatch" width="5" height="5" patternTransform="rotate(45)" '
+                 f'patternUnits="userSpaceOnUse"><line x1="0" y1="0" x2="0" y2="5" stroke="{MARK}" '
+                 f'stroke-width="2.6"/></pattern></defs>')
+    fill = "url(#hatch)" if modelled else MARK
+    # Recessive baseline. No grid: one baseline and two annotated marks carry everything here.
+    p.append(f'<line x1="{pad_l}" y1="{pad_t+ph}" x2="{w-10}" y2="{pad_t+ph}" stroke="#242b3c" stroke-width="1"/>')
+    for i, c in enumerate(counts):
+        if not c:
+            continue
+        bh = max(2.0, c / top * ph)
+        bx, by = x(edges[i]) + 1, pad_t + ph - bh          # +1/-2 on width: the 2px surface gap between bars
+        p.append(f'<rect x="{bx:.1f}" y="{by:.1f}" width="{max(1.0, bw-2):.1f}" height="{bh:.1f}" '
+                 f'fill="{fill}" rx="2"><title>{edges[i]:.2f}–{edges[i+1]:.2f}s · {c} block(s)</title></rect>')
+    # Two annotations that can land on top of each other when the distribution is tight: the second drops a
+    # line when they are within 66px, which is cheaper than a collision solver and always legible.
+    close = abs(x(min(p90, hi)) - x(med)) < 66
+    for i, (val, lab, dash) in enumerate(((med, "median", ""), (min(p90, hi), "p90", "3 3"))):
+        xv = x(val)
+        p.append(f'<line x1="{xv:.1f}" y1="{pad_t}" x2="{xv:.1f}" y2="{pad_t+ph}" stroke="#e7eaf2" '
+                 f'stroke-width="1.5" stroke-dasharray="{dash}" opacity=".62"/>')
+        anchor = "start" if xv < pad_l + 40 else ("end" if xv > w - 46 else "middle")
+        p.append(f'<text x="{xv:.1f}" y="{pad_t - 1 + (10 if (close and i) else 0)}" fill="#8b93a7" '
+                 f'font-size="9.5" font-family="ui-monospace,monospace" text-anchor="{anchor}">'
+                 f'{lab} {val:.2f}</text>')
+    if lo <= SLOT <= hi:   # the slot is the only threshold that means anything here
+        p.append(f'<line x1="{x(SLOT):.1f}" y1="{pad_t}" x2="{x(SLOT):.1f}" y2="{pad_t+ph}" stroke="#e2564a" '
+                 f'stroke-width="1.5" opacity=".75"/>')
+        p.append(f'<text x="{x(SLOT):.1f}" y="{pad_t+ph-4}" fill="#e2564a" font-size="9.5" '
+                 f'font-family="ui-monospace,monospace" text-anchor="middle">12s</text>')
+    p.append(f'<text x="{pad_l}" y="{pad_t+ph+13}" fill="#59627a" font-size="9.5" '
+             f'font-family="ui-monospace,monospace" text-anchor="start">{lo:.1f}s</text>')
+    right = (f'{hi:.1f}s  +{over_n} beyond, max {vmax:.0f}s' if over_n else f'{hi:.1f}s')
+    p.append(f'<text x="{w-10}" y="{pad_t+ph+13}" fill="#59627a" font-size="9.5" '
+             f'font-family="ui-monospace,monospace" text-anchor="end">{esc(right)}</text>')
+    p.append(f'<text x="{pad_l}" y="{pad_t+ph+24}" fill="#59627a" font-size="9.5" '
+             f'font-family="ui-monospace,monospace">n={len(vals)}</text>')
+    p.append('</svg>')
+    tag = '<span class="tag">modelled</span>' if modelled else ""
+    return (f'<div class="chart"><div class="k">{esc(title)}{tag}</div>'
+            f'<p class="chartsub">{esc(subtitle)}</p>{"".join(p)}</div>')
+
+def card(label, st, modelled, note=""):
+    if not st:
+        return (f'<div class="card"><div class="k">{esc(label)}</div>'
+                f'<div class="v">—</div><span class="u blk">no data</span></div>')
+    cls = "card modelled" if modelled else "card"
+    tag = '<span class="tag">modelled</span>' if modelled else ""
+    over = ""
+    if st["over"]:
+        pct = 100.0 * st["over"] / st["n"]
+        over = f'<span class="u blk">{st["over"]}/{st["n"]} over {SLOT:.0f}s · {pct:.0f}%</span>'
+    return (f'<div class="{cls}"><div class="k">{esc(label)}{tag}</div>'
+            f'<div class="v">{st["median"]:.2f}<span class="u">s median</span></div>'
+            f'<span class="u blk">p90 {st["p90"]:.2f}s · max {st["max"]:.2f}s · n={st["n"]}</span>'
+            f'{over}{note}</div>')
+
+def age_banner(age, refresh):
+    """The one thing a live page must never do is look alive in front of a stopped pipeline. Threshold is
+    generous — 4x the 12 s slot — so a normal gap between blocks never cries wolf."""
+    if age is None:
+        return ('<div class="card" style="border:1px solid var(--line);margin:0 0 18px">'
+                '<div class="k">data age</div><div class="v">unknown</div>'
+                '<span class="u blk">no framed block in the manifest</span></div>')
+    stale = age > 4 * SLOT
+    hue = "var(--red)" if stale else "var(--green)"
+    word = "STOPPED?" if stale else "live"
+    unit = f"{age}s" if age < 600 else f"{age // 60} min"
+    return (f'<div class="card" style="border:1px solid {hue};margin:0 0 18px">'
+            f'<div class="k">data age · {word}</div>'
+            f'<div class="v" style="color:{hue}">{unit}<span class="u">since the last framed block</span></div>'
+            f'<span class="u blk">measured on the producer\'s own clock, not this machine\'s — they are in '
+            f'different timezones. Page rewritten every {refresh}s; if this number grows past it, the pipeline '
+            f'is not producing and the figures below are a snapshot of a stopped run.</span></div>')
+
+def render(rows, box, guest, refresh, gen, age):
+    # THE SUMMARY IS COMPUTED ON REAL ROWS whenever there are any. rtp-latency.py excludes mock rows from
+    # every statistic it prints — a modelled duration is not a measurement — and this page was mixing them.
+    # Consequence, measured on this store: a 200-row window holding 141 mocks and 59 real proofs reported an
+    # "end to end" median of 13.0 s that belonged to the mock prover's sleep, while the real campaign was
+    # running at 24-54 s. The TABLE below still lists every row, mocks dimmed; only the medians change.
+    real = [r for r in rows if (r.get("mock") or "").strip().lower() not in ("true", "1", "yes")]
+    stat_rows = real or rows
+    modelled = not real                       # nothing real to summarise: the figures ARE the model
+    set_aside = len(rows) - len(stat_rows)
+    if modelled:
+        legend = (' Legs marked <span class="tag">modelled</span> contain the mock prover\'s derived sleep, not'
+                  ' a measured proving time — the chain wait, the replay, the framing and both transfers are'
+                  ' real.')
+    elif set_aside:
+        legend = (f' The figures are the {len(stat_rows)} REAL proof(s) in this window; {set_aside} mock row(s)'
+                  ' are listed below but kept out of every statistic, because a modelled duration is not a'
+                  ' measurement.')
+    else:
+        legend = ""
+    body = [f'<div class="wrap"><p class="eyebrow">RTP · live</p>',
+            f'<h1>Pipeline latency, leg by leg</h1>',
+            f'<p class="sub">{len(rows)} joined block(s) from <code>{esc(box)}</code>, guest '
+            f'<code>{esc(guest)}</code>{gen}. Rewritten every {refresh}s; the page reloads itself.{legend}</p>',
+            age_banner(age, refresh)]
+
+    # No joined block is a STATE, not an error: a fresh generation, or the first minutes after --purge. The
+    # age banner above already says whether the producer is alive, which is the question in that moment.
+    if not rows:
+        body.append('<div class="card" style="margin:0 0 18px"><div class="k">no joined block yet</div>'
+                    '<div class="v">—</div><span class="u blk">the manifest and the run records have nothing '
+                    'in common yet. Expected right after <code>rtp-up --purge</code>, or while the first '
+                    'block of a new generation is still being proved.</span></div></div>')
+        return (f'<!doctype html><meta charset="utf-8"><title>RTP live · {esc(guest)}</title>'
+                f'<meta http-equiv="refresh" content="{refresh}"><style>{CSS}</style>' + "".join(body))
+
+    st = {k: stats(nums(stat_rows, k)) for k, _, _, _ in LEGS}
+    e2e, tr = st.get("e2e"), st.get("transport")
+    body.append('<div class="grid">')
+    if e2e:
+        tag = '<span class="tag">modelled</span>' if modelled else ""
+        aside = f" \u00b7 {set_aside} mock row(s) set aside" if set_aside else ""
+        body.append(f'<div class="card hero"><div class="k">end to end{tag}</div>'
+                    f'<div class="v">{e2e["median"]:.1f}<span class="u">s median</span></div>'
+                    f'<span class="u blk">p90 {e2e["p90"]:.1f}s \u00b7 n={e2e["n"]}{aside}</span></div>')
+    if tr:
+        body.append(f'<div class="card hero"><div class="k">transport</div>'
+                    f'<div class="v">{tr["median"]:.2f}<span class="u">s median</span></div>'
+                    f'<span class="u blk">p90 {tr["p90"]:.2f}s · the one leg wholly ours to fix</span></div>')
+    body.append('</div>')
+
+    body.append('<h2>Every leg</h2><div class="grid">')
+    # `leg_modelled` is the static claim ("this leg contains the prover's duration"); `modelled` is whether
+    # the numbers on this page actually came from a mock. Tagging on the first alone labelled a measured
+    # 24 s prove as modelled — the opposite of what the tag is for.
+    for key, label, why, leg_modelled in LEGS:
+        body.append(card(label, st[key], leg_modelled and modelled, f'<span class="u blk">{esc(why)}</span>'))
+    body.append('</div>')
+
+    tail = rows[-25:]
+    # Transport and prove first, and as distributions: they are what the operator is asked about, and a
+    # median alone hides the two regimes each of them actually has.
+    body.append('<h2>Distribution</h2><div class="charts">')
+    body.append(histogram(nums(stat_rows, "transport"), "transport",
+                          "witness out, artefacts back. Two humps mean the persistent channel is serving "
+                          "some blocks and falling back to scp on the others.", False))
+    # Both histograms take the SUMMARISED rows, and the prove caption says which thing it is showing. Drawing
+    # the mock's sleep and the prover's real work in one distribution would give a bimodal picture whose two
+    # humps are not the two modes the reader is looking for.
+    body.append(histogram(nums(stat_rows, "prove_secs"), "prove",
+                          ("the mock prover's derived sleep, not a measured proving time: it tracks the "
+                           "emulated step count, so its spread is the block-size spread.") if modelled else
+                          ("measured proving time on the real prover, one point per block — its spread is the "
+                           "block-size spread, and its tail is what a cadence has to cover."), modelled))
+    body.append('</div>')
+
+    body.append('<h2>Last 25 blocks</h2><table><tr><th>block</th>')
+    for _, label, _, _ in LEGS:
+        body.append(f'<th>{esc(label.split()[0])}</th>')
+    body.append('</tr>')
+    for r in reversed(tail):
+        body.append(f'<tr><td>{esc(r.get("block",""))}</td>')
+        for key, _, _, _ in LEGS:
+            s = (r.get(key) or "").strip()
+            try:
+                x = float(s)
+                cls = ' class="over"' if (key == "e2e" and x > SLOT) else ""
+                body.append(f'<td{cls}>{x:.2f}</td>')
+            except ValueError:
+                body.append('<td>—</td>')
+        body.append('</tr>')
+    body.append('</table>')
+
+    body.append(f'<p class="foot">Generated {time.strftime("%Y-%m-%d %H:%M:%S")} · joins by '
+                f'<code>rtp-latency.py</code> on {esc(box)} · dispersion is p90 rather than σ because these '
+                f'legs are bimodal (transport alternates between the persistent channel and its scp fallback), '
+                f'and a σ over two modes describes neither.</p></div>')
+    return (f'<!doctype html><meta charset="utf-8"><title>RTP live · {esc(guest)}</title>'
+            f'<meta http-equiv="refresh" content="{refresh}">'
+            f'<style>{CSS}</style>' + "".join(body))
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--box", help="producer host; omit only with --csv")
+    ap.add_argument("--guest", default="monad-zisk")
+    ap.add_argument("--manifest", default="~/witness-manifest.csv")
+    ap.add_argument("--results", default="infra/zisk-infra/results")
+    ap.add_argument("--csv", help="read rows from this CSV instead of asking the box")
+    ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                 "results", "rtp-live.html"))
+    ap.add_argument("--watch", type=int, metavar="SECS", help="rewrite every SECS until interrupted")
+    ap.add_argument("--generation", default="", help="generation name, for the subtitle")
+    # WINDOWED BY DEFAULT, and it matters. The manifest is the whole history: the catch-up, every earlier
+    # campaign, and rows whose run records predate timing.json. Aggregating all of it puts a 26-hour replay
+    # leg and a four-hour service leg in the same median as the live run, and the figure then describes no
+    # campaign at all. The window is blocks, not time, because the manifest is ordered by block and a
+    # wall-clock cut would need every row's timestamp parsed to find the boundary.
+    ap.add_argument("--last", type=int, default=200, metavar="N",
+                    help="aggregate only the last N joined blocks (0 = the whole history)")
+    a = ap.parse_args()
+    if not a.box and not a.csv:
+        ap.error("--box or --csv is required")
+
+    refresh = a.watch or 30
+    gen = f", generation <code>{esc(a.generation)}</code>" if a.generation else ""
+    while True:
+        try:
+            if a.csv:
+                allrows, age = list(csv.DictReader(open(a.csv, newline=""))), None
+            else:
+                allrows, age = fetch_rows(a.box, a.guest, a.manifest, a.results)
+            rows = allrows[-a.last:] if a.last else allrows
+            win = (f", last {len(rows)} of {len(allrows)}" if a.last and len(allrows) > len(rows)
+                   else f", all {len(allrows)}")
+            os.makedirs(os.path.dirname(a.out), exist_ok=True)
+            tmp = a.out + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(render(rows, a.box or a.csv, a.guest, refresh, gen + win, age))
+            os.replace(tmp, a.out)   # atomic: the browser never reads a half-written page
+            print(f"{time.strftime('%H:%M:%S')} wrote {a.out} ({len(rows)} row(s))")
+        except Exception as e:
+            print(f"{time.strftime('%H:%M:%S')} {type(e).__name__}: {e}", file=sys.stderr)
+        if not a.watch:
+            return
+        time.sleep(a.watch)
+
+if __name__ == "__main__":
+    main()
