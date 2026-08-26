@@ -16,13 +16,18 @@ key got wrong and this does not:
 Loading is lazy and per block: a run over 50 blocks reads 50 small files instead of a 155 MB dict.
 Writing is per block and merge-then-write, so two runs touching different blocks never contend.
 """
+import fcntl
 import hashlib
 import json
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-DEFAULT_ROOT = os.path.join(HERE, 'cache')
+# The key of a cached measurement is the ELF's sha256 and nothing else, so two
+# runs of the same ELF under different ZisK emulator versions collide. A
+# campaign on a new runtime therefore gets its own root: mixing two cost
+# models in one table is the failure this guards against.
+DEFAULT_ROOT = os.environ.get('COMPARE_CACHE_ROOT') or os.path.join(HERE, 'cache')
 
 RUN, PROFILE, PROFILE_FULL = 'run', 'profile', 'profile_full'
 
@@ -226,26 +231,39 @@ class Cache:
             os.makedirs(self.blocks_dir, exist_ok=True)
         for blk in sorted(self._dirty):
             cur = self._blocks[blk]
-            try:
-                with open(self._path(blk)) as fh:
-                    disk = json.load(fh)
-            except Exception:
-                disk = {'v': 1, 'block': int(blk), 'chain': {}, 'builds': {}}
-            disk.setdefault('chain', {}).update(cur.get('chain', {}))
-            for ident, slot in cur.get('builds', {}).items():
-                d = disk.setdefault('builds', {}).setdefault(ident, {})
-                # A slot cleared in memory (its input changed) must not be resurrected by the merge:
-                # drop the disk copy's measurements when the fingerprints disagree.
-                if d.get('input') and slot.get('input') and \
-                        d['input'].get('id') != slot['input'].get('id'):
-                    d.clear()
-                d.update(slot)
-            disk['v'], disk['block'] = 1, int(blk)
-            tmp = self._path(blk) + '.tmp'
-            with open(tmp, 'w') as fh:
-                json.dump(disk, fh)
-            os.replace(tmp, self._path(blk))
-            self._blocks[blk] = disk
+            # The read-merge-write below has to be ATOMIC against other runs, not merely ordered.
+            # Without a lock two processes both read, both merge, and the second write drops
+            # whatever the first added after its read -- silently, which is the worse failure. The
+            # louder one is what actually stopped a run here: a fixed `.tmp` name let one process
+            # rename the other's temporary out from under it, and os.replace raised
+            # FileNotFoundError mid-measurement. The name is per-process now as well.
+            lockp = self._path(blk) + '.lock'
+            with open(lockp, 'a') as _lk:
+                fcntl.flock(_lk, fcntl.LOCK_EX)
+                try:
+                    try:
+                        with open(self._path(blk)) as fh:
+                            disk = json.load(fh)
+                    except Exception:
+                        disk = {'v': 1, 'block': int(blk), 'chain': {}, 'builds': {}}
+                    disk.setdefault('chain', {}).update(cur.get('chain', {}))
+                    for ident, slot in cur.get('builds', {}).items():
+                        d = disk.setdefault('builds', {}).setdefault(ident, {})
+                        # A slot cleared in memory (its input changed) must not be resurrected by
+                        # the merge: drop the disk copy's measurements when the fingerprints
+                        # disagree.
+                        if d.get('input') and slot.get('input') and \
+                                d['input'].get('id') != slot['input'].get('id'):
+                            d.clear()
+                        d.update(slot)
+                    disk['v'], disk['block'] = 1, int(blk)
+                    tmp = f'{self._path(blk)}.{os.getpid()}.tmp'
+                    with open(tmp, 'w') as fh:
+                        json.dump(disk, fh)
+                    os.replace(tmp, self._path(blk))
+                    self._blocks[blk] = disk
+                finally:
+                    fcntl.flock(_lk, fcntl.LOCK_UN)
         self._dirty.clear()
         if self._index_dirty:
             os.makedirs(self.root, exist_ok=True)
