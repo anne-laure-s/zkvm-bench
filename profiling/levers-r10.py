@@ -41,7 +41,7 @@ SPEND = [
 ]
 
 TRIED = [
-    {'id': 'dirtymark', 'verdict': 'CANDIDATE', 'branch': 'measured, not attempted',
+    {'id': 'dirtymark', 'verdict': 'DEFERRED', 'branch': 'measured, not attempted',
      't': 'Every upsert descent pays a hash-map erase to invalidate one cached hash',
      'num': '754,759 steps a block — 0.63 % of the guest, measured by outlining the call',
      'w': "The per-PC heat map shows one concentration in upsert_node: fifteen instructions at "
@@ -63,7 +63,12 @@ TRIED = [
             "<code>offset&nbsp;&gt;&gt;&nbsp;2</code> is proportional to blob size and a flat hash "
             "store over that domain regressed 0.66 %. Overlay ids are dense only after subtracting "
             "OVERLAY_BASE. A mark must split the domains, carry its init cost against a 0.63 % "
-            "ceiling, cover every mutation and clear only after a successful recomputation."},
+            "ceiling, cover every mutation and clear only after a successful recomputation."
+            "<br><br><b>Split by domain, the rule decides against it.</b> blob 7,869 calls a block "
+            "and 0.65 %; overlay <b>10 calls</b> and 279 steps; null 195 and 6,160. The half with no "
+            "risk is worth nothing, and all of the ceiling is in the domain whose bitmap regressed "
+            "0.66 % last time. Deferred to the prefix-order/constructor prototype, which "
+            "materialises dense indices anyway and may retire the question."},
     {'id': 'viewresult', 'verdict': 'REFUTED', 'branch': 'measured, not attempted',
      't': 'Return a NibblesView from upsert_node instead of an owning Nibbles',
      'num': 'ceiling 35-55 k steps a block — 0.03-0.05 % of the guest',
@@ -325,9 +330,12 @@ NEXT = {
              "35 k whose removal is a soundness trade the code argues against itself.",
              "ANSWERED — upsert_node: one concentration, hashes_.erase's backward shift, ~110 k. "
              "See the dirtymark candidate.",
+             "DONE — dirtymark split by domain: the overlay half is worth 279 steps a block, so the "
+             "0.65 % is entirely blob-domain and the rule says do not build it in this format.",
              "NEXT — the OffsetTrie constructor at 5.98 M, and encode_rlp<true> SEPARATELY: the "
              "priming reconstruction lives in that second symbol, so the constructor's heat map "
-             "alone will not split the 4.99 M.",
+             "alone will not split the 4.99 M. pcheat already refuses `--symbol encode_rlp` as "
+             "ambiguous, which is the right failure.",
              "ALSO OPEN — nibble_mismatch is its own line at 278,590 a block; and sroot_ as a 2-4 "
              "entry cache, after measuring reuse distance."],
 }
