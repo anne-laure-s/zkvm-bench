@@ -22,7 +22,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # ── the base, and the axes this document speaks about ────────────────────────────────────────────
 BASE = {
     'branch': 'al/zkvm-r10',
-    'tip': 'a11c8b93c',
+    'tip': '72f457d7b',
     'corpus': 'canonical-2026-08-25815000-25815199-d49075fa3 (200 blocks)',
     'runtime': 'ziskos 1.1.0-alpha',
     'vs': 'r10-vs-ziskethone',
@@ -41,6 +41,21 @@ SPEND = [
 ]
 
 TRIED = [
+    {'id': 'pathbytes', 'verdict': 'CONFIRMED', 'branch': 'al/zkvm-r10 (landed 72f457d7b)',
+     't': 'A node\'s path was appended one nibble at a time, and paths are 56-59 nibbles',
+     'num': '−1.1 % steps / −0.5 % COST — 1,063,188 steps a block, 72 % of what the function cost',
+     'w': "append_path ran set_nibble in a loop: 57 shifts and 57 byte read-modify-writes a call. "
+          "<b>1,080 steps a call</b> over 1,372 calls a block, by far the worst cost per call in the "
+          "trie layer -- against 235.5 for upsert_node and 376.4 for find_original.",
+     'fix': "The destination is byte-aligned by construction, so the run is a byte run: a memcpy when "
+            "the source starts on a byte boundary, one uniform 4-bit shift when it does not, and the "
+            "odd tail nibble written on its own. This is the r4 <code>nibbytes</code> lever's fix, in "
+            "a function that lever did not reach.",
+     'rem': "Gated by an exhaustive check -- every length, both source parities, 2,048 cases, and it "
+            "catches all three plausible slips put to it -- plus 200 of 200 roots. NOT by the rv64 "
+            "self-test: that runs the revert semantics, never reaches node encoding, and gc-sections "
+            "drops append_path from its binary. Anything touching offset_trie.cpp needs its own "
+            "exhaustive check; the self-test covers the state layer only."},
     {'id': 'readmemo', 'verdict': 'CONFIRMED', 'branch': 'al/zkvm-r10 (landed a11c8b93c)',
      't': 'The read paths hashed an address the memo already held',
      'num': '−0.7 % steps / −0.4 % COST — 686,058 steps a block, the largest of the state levers',
@@ -142,18 +157,28 @@ TRIED = [
 
 # ── what the measurements point at next ─────────────────────────────────────────────────────────
 NEXT = {
-    't': 'Trie node lookup — upsert_node, find_original, append_path',
+    't': 'Trie node lookup — upsert_node and find_original, with append_path now done',
     'num': '5.03 M steps a block on the 3-block profile; the whole state-access gap is 11.39 M',
     'why': "The rows axis is closed: every remaining lookup class is at or under 0.5 %, and the "
            "largest of them is only partly reducible. This is 40 times the budget of the lever that "
            "was next in line. ziskethone has no separable counterpart -- its equivalent work is "
            "inside eval_node and reduce_branch, counted as node building -- so it gets no ratio, "
            "and inventing one from its zero would repeat finding 142.",
-    'plan': ["Count calls and unit cost of upsert_node, find_original and append_path.",
-             "Determine how much they overlap within one operation.",
-             "Measure how many find_original calls resolve a node already resolved.",
-             "Try a direct link to the original node first, the analogue of the account orig_.",
-             "Only then touch append_path or the node container."],
+    'plan': ["DONE — calls and unit cost: upsert_node 8,074 a block at 235.5 steps, append_path "
+             "1,372 at 1,080, find_original 3,781 at 376.4 over a mean descent of 6.23 nodes, so 60 "
+             "steps a node step.",
+             "DONE — overlap: append_path is called from append_ext, append_acct, append_storage and "
+             "clone_acct, all node builders inside upsert_node's operation. One upsert in six builds "
+             "a node with a path.",
+             "DONE — redundant descents: the accounting closes exactly, 665 read_account plus 666 "
+             "sroot_ misses plus 2,450 slot descents = 3,781. The one-entry sroot_ cache misses "
+             "27 % of read_storage calls, so 666 re-descents from the root, about 250 k steps a "
+             "block. Widening it pays the probe on every call, as the account memo did -- measure "
+             "the probe before building it.",
+             "DONE — append_path, out of order: its cost per call said so and the fix was already "
+             "in the tree.",
+             "NEXT — find_original's descent itself: 23,550 node steps a block at 60 steps each. "
+             "Then upsert_node at 1.90 M, and the node container."],
 }
 
 
