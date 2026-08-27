@@ -117,10 +117,20 @@ FAMILIES = [
     # precompile), BLS12-381. MEASURED WHY THIS MATTERS: substrate_bn::U256::mul was 97.6% of rsp's
     # "256-bit arithmetic" family, so that family was comparing Monad's word arithmetic against
     # reth's pairing precompile — apples to oranges, and it produced a 0.63x that meant nothing.
+    # ziskethone's pairing tower is namespaced `zeg::bn::` / `zeg::bls::`, which matches neither
+    # `bn254` nor `bls12_?381`, and its functions are named for the algorithm (miller_loop,
+    # final_exp, fp12_mul, cyclo_square) rather than for the curve. MEASURED: 1,675,181 steps/block
+    # — 47% of that guest's whole `other` family — sat unclassified, and it made the family read
+    # 0.79x when it is 0.43x. Neither guest has a pairing precompile: both build the Fp2->Fp6->Fp12
+    # tower in guest code over the same ZisK Fp2 ops, with identical group-level counts, so this
+    # family is a real like-for-like comparison of the tower once the names are matched.
     ('elliptic-curve crypto',  r'secp256k1|ecrecover|ecdsa|(?<![a-z0-9])k256|recover_?block'
                                r'|compute_sender|substrate_bn|bn254|bls12_?381|pairing|modexp|modpow'
                                r'|num_bigint|monty|EvmCrypto|crypto_bigint'
-                               r'|zisklib.*bigint|bigint::|p256|elliptic_curve'),
+                               r'|zisklib.*bigint|bigint::|p256|elliptic_curve'
+                               # ziskethone's tower, by namespace and by algorithm name
+                               r'|zeg::(?:bn|bls)::|miller_loop|final_exp|fp12|fp6_mul|fp2_mul'
+                               r'|cyclo|kzg_verify'),
     # Byte/bit manipulation is NOT arithmetic: `__bswapdi2` was 41-47% of the arithmetic family on
     # the Monad side, so counting it there inflated that ratio by roughly its share.
     # ⚠️ NOT COMPARABLE BETWEEN GUESTS. `__bswapdi2` is an OUTLINED libgcc function that C++ calls;
@@ -138,21 +148,35 @@ FAMILIES = [
                                r'|count_ones|leading_zeros|trailing_zeros|clz|ctz'),
     ('256-bit arithmetic',     r'mulmod|addmod|submod|div_rem|div_result|udivti3|umodti3|uint256'
                                r'|intx|u256|Uint<256'),
-    # Witness decoding is its own family, and must precede state/trie: the guests use different
-    # witness formats (bincode/serde vs RLP), so folding one into "trie" and leaving the other in
-    # "other" compared nothing. Measured: Monad decodes its witness with LESS work (0.42x).
-    ('witness decoding',       r'bincode|serde|parse_metadata|(?<![a-z])rlp|decode'),
     # PartialNode / PartialTrieDb are trie node types: Boost.Outcome wrappers around them are trie
     # work, and without naming them here ~half the abstraction family was mis-filed trie work.
     # State ACCESS belongs here too, not just trie structure: Monad's BlockState/State readers were
     # ~54% of its `other` family while reth's equivalents sat in trie — an asymmetry that made `other`
     # look like a Monad-specific 6.8x cost.
+    #
+    # ⚠️ ORDERED BEFORE `witness decoding`, AND THAT PLACEMENT IS THE POINT. Trie node RLP
+    # construction is Merkle work, but its symbols carry `rlp` in the name
+    # (`OffsetTrie::encode_rlp<true/false>`, `node_rlp_span`, `child_ref_compute`), so the decoding
+    # pattern below used to claim it first: 10.01 M steps/block, 91 % of that family and 8.9 % of the
+    # whole guest, reported to the reader under a label that means "parsing the input container".
+    # ziskethone builds its node RLP inside build_branch_node/build_leaf_node, which always landed
+    # here, so the two guests' Merkle work sat in two different families and neither ratio meant
+    # anything on its own. With trie first, this family IS the Merkle layer on both sides.
     ('state / trie',           r'trie|mpt|SparseState|PartialTrieDb|PartialNode|nibble|proof'
                                r'|account_state|current_account|StateDelta|storage_at|BlockState'
                                r'|AccountState|get_storage|read_storage|read_code|access_storage'
                                r'|pop_accept|can_merge|State::merge|BranchData|LeafValue|sload|sstore'
                                  r'|set_storage|State::~State|destruct_touched|destruct_suicides'
-                                 r'|copy_code|State::push|sender_has_balance|transfer_balances'),
+                                 r'|copy_code|State::push|sender_has_balance|transfer_balances'
+                                 # ziskethone's equivalents: the trie is built by free functions in
+                                 # state_root.cpp, and state is reached through flat indexed arrays.
+                                 r'|build_branch_node|build_leaf_node|reduce_branch|eval_node'
+                                 r'|hex_prefix|ZiskStateDB|Storages|Accounts::|DynamicStorage'
+                                 r'|Journal::'
+                                 # `build_branch_node|build_leaf_node` are not substrings of
+                                 # `build_node` or `build_phantom_leaf_node`, and `StateRoot::` is
+                                 # not `trie`/`mpt` — 243,936 steps/block of theirs fell to `other`.
+                                 r'|build_node|build_phantom|StateRoot::|calculate_new_state_root'),
     # `evmc` must not be bare: `std::basic_string<unsigned char, evmc::byte_traits<…>>` is a
     # C++ string type, and it was 26.5% of Monad's EVM family while reth's equivalent buffer
     # (Vec<u8>/Bytes) sat in containers — an asymmetry worth ~0.24x on the interpreter ratio.
@@ -165,22 +189,71 @@ FAMILIES = [
                                 # and a bracket class here also tripped a nested-set warning.
                                 r'|Receipt|BlockExecutor|run::run|envelope|bloom|rsp_client'
                                 r'|client::main|execute_witness|ExecuteTransaction'
-                                r'|get_tx_context|alloy_consensus|EthPrimitives'),
+                                r'|get_tx_context|alloy_consensus|EthPrimitives'
+                                r'|set_3_bits'
+                                # Receipt and log RLP is block-body work, but its symbols carry
+                                # `rlp`, so `witness decoding` claimed them until this family was
+                                # ordered ahead of it: 743 k steps/block, 0.66 % of the guest,
+                                # filed under a label that means "parsing the input container".
+                                r'|encode_receipt|encode_log|encode_topics'
+                                # ziskethone: the demangled driver is `zeg::zeg::run(unsigned char
+                                # const*, ...)`, so `run::run` never matched it; and intrinsic gas,
+                                # transaction parsing and the fee helpers had no pattern at all.
+                                # 926,128 steps/block, which made this family read 1.04x when it
+                                # is 0.35x — i.e. hid that we are already 3x ahead here.
+                                r'|zeg::run\(|compute_intrinsic_gas|Transactions::|ConsensusInfo'
+                                r'|fake_exponential|PreviousBlocks|process_withdrawal'),
+    # What is left here is genuine decoding, and it is small. Kept as its own family because the
+    # guests use different witness formats (bincode/serde vs RLP), so folding one into "trie" and
+    # leaving the other in "other" would compare nothing. Ordered AFTER state/trie AND after
+    # block/consensus, so that neither trie node RLP nor receipt RLP is filed here on the strength
+    # of an `rlp` in the name. Measured over 95 blocks of 25815000-25815199, what is left is
+    # 0.25 M steps/block, 0.22 % of the guest: parse_string_metadata, decode_transaction_list,
+    # decode_transaction_eip2718 and the generic encode_string2.
+    ('witness decoding',       r'bincode|serde|parse_metadata|(?<![a-z])rlp|decode'
+                               r'|parse_execution_witness'),
     # Runtime plumbing with no domain meaning: locks, drop glue, sorting.
     ('runtime plumbing',       r'critical_section|drop_in_place|quicksort|sort::|panic|fmt::'
                                r'|__float(?:un)?[sd]i|__fix(?:uns)?[sd]f|float::(?:mul|add|div|sub)'
                                r'|__(?:mul|add|div|sub)[sd]f3|__cxa_guard|black_box|sys_rand|memchr'),
     ('EVM interpreter',        r'interpreter|revm|Intercode|opcode|execute_block|push<|swap<'
                                r'|dup<|evmc::(?!byte_traits)|alloy_evm|MainnetHandler'
-                               r'|runtime::(?:codecopy|calldatacopy|call|Context::from)|resolve_delegation'),
+                               r'|runtime::(?:codecopy|calldatacopy|call|Context::from)|resolve_delegation'
+                               # evmone (the ziskethone guest's EVM): its opcode handlers are
+                               # inlined into ONE computed-goto dispatcher, so there are no
+                               # per-opcode symbols to match — dispatch_cgoto alone was 44% of that
+                               # guest, and with nothing here matching it, the template arguments in
+                               # its signature sent the whole interpreter to containers.
+                               r'|evmone|dispatch_cgoto|instr::core|grow_memory'
+                               # Precompile dispatch is interpreter work, but the demangled name
+                               # opens with its `std::optional<...>` return type, so the module-
+                               # anchored container pattern claimed it — 0.6M steps/block.
+                               r'|resolve_precompile'
+                               # ziskethone reaches its VM through an evmc2 C-ABI trampoline whose
+                               # parameters are `evmc_vm*`/`evmc_host_interface*` — underscores, so
+                               # the `evmc::` namespace anchor does not match.
+                               r'|w_execute2'),
     # SYMMETRY MATTERS HERE. This family first carried only C++ vocabulary (std::/boost::/unordered),
     # so Rust's equivalent machinery — RawVec growth, Vec/Box/iterator adapters, bytes:: — fell into
     # "memory" or "other" instead. That asymmetry alone inflated the Monad/reth ratio ~9x (60.3x vs
     # 6.9x on the same profiles). Keep both vocabularies, or the number is about the patterns rather
     # than the guests.
-    ('containers / abstraction', r'std::|boost::|ankerl|hashbrown|immer|unordered|vector|map|hash'
-                                 r'|raw_vec|RawVec|::vec::|Vec<|smallvec|arrayvec|bytes::|Box<'
-                                 r'|iter::|indexmap'),
+    # ⚠️ ANCHORED ON PURPOSE. Bare `std::`/`vector`/`map`/`hash` matched the TEMPLATE ARGUMENTS of
+    # any symbol, so a C++ guest whose own vocabulary this table did not carry had its hot code
+    # claimed here: evmone's interpreter read as 57.7M/block of "containers" against Monad's 10.2M,
+    # and the EVM family read 8.5x in the wrong direction. The library names now have to own the
+    # symbol (the profile's leading module token); container MEMBERS stay unanchored because they
+    # are unambiguous wherever they appear. Both vocabularies, per the note above.
+    ('containers / abstraction', r'^(?:std|boost|ankerl|hashbrown|immer|indexmap|smallvec'
+                                 r'|arrayvec|bytes|alloc)::'
+                                 r'|segmented_vector|unordered_dense|unordered_(?:map|set)'
+                                 r'|hamts::champ|raw_vec|RawVec|::vec::|Vec<|smallvec|arrayvec'
+                                 r'|Box<|iter::(?:Map|Filter|Zip|Chain|Rev)'
+                                 # A hash MAP's hasher, named: `hash` unanchored is what claimed
+                                 # foreign interpreters, but dropping it entirely loses the hasher,
+                                 # which is 6.6% of the C++ guest.
+                                 r'|seeded_fast_hash|fast_hash|wyhash|ahash|fxhash|siphash'
+                                 r'|DefaultHasher|Hasher::'),
     ('memory / allocation',    r'memcpy|memmove|memset|memcmp|alloc|dealloc|Heap|free|malloc|tlsf'
                                r'|operator new|operator delete'),
 ]
@@ -244,16 +317,30 @@ def _aggregate(data, top=200):
     stable that hotspot is). Used by `profile --aggregate` and by `diff`. No call-tree."""
     entries = [e for e in data.values() if isinstance(e, dict)]
     n = len(entries) or 1
-    perentry = [{f['name']: f['count'] for f in e.get('functions', [])} for e in entries]
+    # Keyed by (module, name) and SUMMED, not by name into a dict comprehension. Demangled names are
+    # truncated to 90 characters upstream, so template instantiations that differ only past that
+    # collide -- and a comprehension keeps the last of them and silently drops the rest. Measured on
+    # the Monad guest at --top 5000: two interpreter::push<> instantiations landed on one key and
+    # 15.9 M steps a block, 15 % of the guest, vanished. The same bug at --top 200 is smaller only
+    # because fewer symbols reach the collision.
+    def _byfn(e):
+        d = {}
+        for f in e.get('functions', []):
+            k = (f.get('module', 'other'), f['name'])
+            d[k] = d.get(k, 0) + f['count']
+        return d
+    perentry = [_byfn(e) for e in entries]
     fmod = {}
     for e in entries:
-        for f in e.get('functions', []): fmod.setdefault(f['name'], f.get('module', 'other'))
+        for f in e.get('functions', []):
+            fmod.setdefault((f.get('module', 'other'), f['name']), f.get('module', 'other'))
     funcs = []
-    for nm in fmod:
-        vals = [pe.get(nm, 0) for pe in perentry]
+    for key in fmod:
+        nm = key[1]
+        vals = [pe.get(key, 0) for pe in perentry]
         mean = sum(vals) / n
         cv = (statistics.pstdev(vals) / mean) if (mean and len(vals) > 1) else 0.0
-        funcs.append({'name': nm, 'module': fmod[nm], 'count': round(mean), 'cv': round(cv, 3)})
+        funcs.append({'name': nm, 'module': fmod[key], 'count': round(mean), 'cv': round(cv, 3)})
     funcs.sort(key=lambda x: -x['count'])
     modtot = {}
     for e in entries:
@@ -303,7 +390,6 @@ def render_html(data, args):
 # ─────────────────────────────── backend: zisk ──────────────────────────────────
 
 _lab = re.compile(r'^[0-9a-f]{8,}\s+<(.+)>:')
-_cnt = re.compile(r'^\s*[0-9a-f]{8}:\s+(\d+)\s')
 
 def _zisk_run(emu, elf, inp, extra, disasm=None, out=None):
     cmd = [emu, '-e', elf, '-i', inp] + extra
@@ -327,8 +413,13 @@ def _zisk_report(txt):
            for m in re.finditer(r'║\s*([a-z0-9_]+)\s+[█░]+\s+([\d,]+)\s+([\d.]+)%\s*║', txt)]
     return meta, cats, ops[:12]
 
-def _zisk_disasm(path, top):
-    cur = '(prologue)'; agg = {}
+# One structured pass over a --disasm file, so nothing downstream has to know the format. Yields
+# (symbol, pc, steps, opcode, text) per counted line: `.L` labels do not change the owning symbol,
+# because ZisK emits them for its own micro-operations as well as for real block boundaries.
+_pcline = re.compile(r'^\s*([0-9a-f]{8}):\s+(\d+)\s+(\S*)\s*(.*)$')
+
+def zisk_disasm_pcs(path):
+    cur = '(prologue)'
     with open(path, 'r', errors='replace') as fh:
         for line in fh:
             m = _lab.match(line)
@@ -336,8 +427,15 @@ def _zisk_disasm(path, top):
                 n = m.group(1)
                 if not n.startswith('.L'): cur = n
                 continue
-            c = _cnt.match(line)
-            if c: agg[cur] = agg.get(cur, 0) + int(c.group(1))
+            c = _pcline.match(line)
+            if c:
+                yield (cur, int(c.group(1), 16), int(c.group(2)),
+                       c.group(3) or '(uop)', c.group(4).strip())
+
+def _zisk_disasm(path, top):
+    agg = {}
+    for cur, _pc, steps, _op, _txt in zisk_disasm_pcs(path):
+        agg[cur] = agg.get(cur, 0) + steps
     tot = sum(agg.values())
     modtot = {}                                    # full per-module totals over ALL functions
     for n, c in agg.items():

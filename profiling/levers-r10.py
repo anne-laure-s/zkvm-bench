@@ -41,6 +41,20 @@ SPEND = [
 ]
 
 TRIED = [
+    {'id': 'dirtymark', 'verdict': 'CANDIDATE', 'branch': 'measured, not attempted',
+     't': 'Every upsert descent pays a hash-map erase to invalidate one cached hash',
+     'num': 'about 110,000 steps a block — 14 % of upsert_node, 0.14 % of the guest',
+     'w': "The per-PC heat map shows one concentration in upsert_node: fifteen instructions at "
+          "8006aa78-8006aab8, 7,387 executions a block. It is <code>hashes_.erase(id)</code>, and "
+          "specifically unordered_dense's backward-shift deletion -- checked against the container's "
+          "source rather than guessed: the bucket is two uint32s (the <code>slli ×8</code>), the shift "
+          "copies both fields down (<code>[+0]</code> and <code>[+4]</code> loaded and stored), and "
+          "<code>dist_inc = 1U&lt;&lt;8</code> is the <code>addiw −256</code>.",
+     'fix': "Not the erase but the structure: an invalidation that only has to be REMEMBERED does not "
+            "need a backward shift. Ids are dense offsets and overlay indices, so a dirty mark keyed "
+            "by id answers hash()'s question in O(1).",
+     'rem': "The only concentrated cost the heat map found anywhere in the access path. Everything "
+            "else in both trie functions is flat."},
     {'id': 'viewresult', 'verdict': 'REFUTED', 'branch': 'measured, not attempted',
      't': 'Return a NibblesView from upsert_node instead of an owning Nibbles',
      'num': 'ceiling 35-55 k steps a block — 0.03-0.05 % of the guest',
@@ -295,9 +309,16 @@ NEXT = {
              "DONE — upsert_node's returned path, the EXT path copy and the leaf split: all three "
              "closed by counting. 1,250 allocations a block against an allocator costing 0.03 % of "
              "the guest.",
-             "BLOCKED — both trie functions now need per-basic-block attribution to go further. "
-             "hotspots.py gives function granularity; the per-opcode table is not instruction "
-             "counts. That tooling gap is the next thing to fix, not another lever.",
+             "DONE — the attribution exists: studies/pcheat.py, an exact per-PC heat map with "
+             "three gates. The claimed tooling gap was a mistake of mine, comparing the .disasm "
+             "counters against the per-opcode table's OPS+FROPS.",
+             "ANSWERED — find_original: flat, and its one concentration is a bounds-check assert at "
+             "35 k whose removal is a soundness trade the code argues against itself.",
+             "ANSWERED — upsert_node: one concentration, hashes_.erase's backward shift, ~110 k. "
+             "See the dirtymark candidate.",
+             "NEXT — the OffsetTrie constructor at 5.98 M, and encode_rlp<true> SEPARATELY: the "
+             "priming reconstruction lives in that second symbol, so the constructor's heat map "
+             "alone will not split the 4.99 M.",
              "ALSO OPEN — nibble_mismatch is its own line at 278,590 a block; and sroot_ as a 2-4 "
              "entry cache, after measuring reuse distance."],
 }
@@ -316,8 +337,10 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 .card{border:1px solid #e5e5e5;border-left-width:4px;border-radius:5px;padding:13px 15px;margin:0 0 13px}
 .CONFIRMED{border-left-color:#1a7f37;background:#f6fef8}.REFUTED{border-left-color:#b02020;background:#fff7f7}
 .DEFERRED{border-left-color:#a06000;background:#fffdf5}
+.CANDIDATE{border-left-color:#1f5fa8;background:#f5f9ff}
 .v{font-size:11px;font-weight:700;letter-spacing:.4px;padding:1px 6px;border-radius:3px;color:#fff}
 .CONFIRMED .v{background:#1a7f37}.REFUTED .v{background:#b02020}.DEFERRED .v{background:#a06000}
+.CANDIDATE .v{background:#1f5fa8}
 .t{font-weight:600;margin:6px 0 3px}.n{font-variant-numeric:tabular-nums;color:#333;font-size:13px;margin:0 0 8px}
 .b{color:#333;font-size:13.5px;margin:6px 0}.b b{color:#000}
 code{background:#f2f2f2;padding:1px 4px;border-radius:3px;font-size:12.5px}
@@ -339,7 +362,7 @@ ol{font-size:13.5px;color:#333}
                  f"<td class=num>{a-b:+,}</tr>")
     h.append("</table>")
 
-    order = {'CONFIRMED': 0, 'REFUTED': 1, 'DEFERRED': 2}
+    order = {'CONFIRMED': 0, 'CANDIDATE': 1, 'REFUTED': 2, 'DEFERRED': 3}
     h.append("<h2>measured on this base</h2>")
     for L in sorted(TRIED, key=lambda x: (order[x['verdict']], x['id'])):
         h.append(f"<div class='card {L['verdict']}'><span class=v>{L['verdict']}</span> "
