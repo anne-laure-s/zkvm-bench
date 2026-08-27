@@ -41,6 +41,34 @@ SPEND = [
 ]
 
 TRIED = [
+    {'id': 'keycursor', 'verdict': 'REFUTED', 'branch': 'measured, reverted',
+     't': 'Walk the descent with a cursor instead of rebuilding the key view at every branch',
+     'num': '1.000× on 200 blocks — +8,914 steps, a hair worse',
+     'w': "BRANCH is 86.3 % of the descent's node steps and each one rebuilt the key through "
+          "<code>substr(1)</code> to read a single nibble. Predicted 193-386 k on the reasoning that "
+          "a 16-byte view rebuild costs memory traffic.",
+     'fix': "It does not. NibblesView is trivially copyable and lives in registers, so substr(1) "
+            "adjusts two fields and the compiler was already doing exactly that. Reverted; the tree "
+            "reproduces the previous ELF byte for byte.",
+     'rem': "Gated before being judged: a differential build ran BOTH descents on every call over "
+            "200 blocks and aborted on any disagreement — stricter than the roots, which only catch "
+            "a divergence that reaches the root. Its control: with the cursor deliberately not "
+            "advancing, the guest writes 256 zero bytes instead of three roots, so the asserts were "
+            "live."},
+
+    {'id': 'pairchild', 'verdict': 'REFUTED', 'branch': 'not attempted — closed by disassembly',
+     't': 'Read a branch\'s child NodeIds in pairs and select a half',
+     'num': 'the read is already three instructions',
+     'w': "A comment in the OffsetTrie constructor prices a slot at nine instructions to read, "
+          "because the 4-byte wire field never lands aligned.",
+     'fix': "That comment is about <code>b.children()</code> widening all 16 fields for the "
+            "constructor's validation, and that code ALREADY reads them as eight words. In the "
+            "descent the arm disassembles to <code>slli</code>, <code>add</code>, <code>lwu</code> — "
+            "one unaligned 4-byte load. A paired read costs more, not less.",
+     'rem': "Closed without an A/B, which is what putting the disassembly before the experiment is "
+            "for. What remains unexplained is the gap between ~15 instructions in the traced path "
+            "and 58.7 steps a node step; the per-opcode table cannot settle it (its OPS+FROPS total "
+            "6.17e9 against 81 M steps), so there is no evidence for a specific BRANCH lever yet."},
     {'id': 'nibpack', 'verdict': 'CONFIRMED', 'branch': 'al/zkvm-r10 (landed 2cf634720)',
      't': 'Path comparison fell back to a nibble walk whenever the two parities differed',
      'num': '−0.4 % steps / −0.1 % COST — 414,934 steps a block',
@@ -217,10 +245,14 @@ NEXT = {
              "DONE — find_original's distribution: BRANCH is 86.3 % of node steps and compares "
              "nothing, EXT 0.3 %, leaves 13.4 %. Of the comparisons, 45.5 % had mismatched parity "
              "and walked 67,264 nibbles a block. Fixed by the packed primitive above.",
-             "NEXT — the BRANCH step itself: 19,324 a block, 86 % of the descent, and untouched. It "
-             "reads one nibble, indexes a child and shortens the key; whether that is 20 steps or "
-             "60 decides whether there is anything left here.",
-             "AFTER — upsert_node at 1.90 M and 235.5 steps a call, and the node container."],
+             "DONE — BRANCH: both named candidates closed. The view rebuild measures 1.000× and "
+             "the child read is already three instructions. 58.7 steps a node step against ~15 "
+             "instructions traced remains unexplained, and needs per-basic-block attribution the "
+             "tooling does not provide.",
+             "NEXT — upsert_node, now 1,744,809 a block after the packed primitive took 394 k out of "
+             "it. Not yet decomposed.",
+             "ALSO OPEN — nibble_mismatch is its own line at 278,590 a block; and sroot_ as a 2-4 "
+             "entry cache, after measuring reuse distance."],
 }
 
 
