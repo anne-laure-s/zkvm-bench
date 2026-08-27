@@ -43,7 +43,7 @@ SPEND = [
 TRIED = [
     {'id': 'dirtymark', 'verdict': 'CANDIDATE', 'branch': 'measured, not attempted',
      't': 'Every upsert descent pays a hash-map erase to invalidate one cached hash',
-     'num': 'about 110,000 steps a block — 14 % of upsert_node, 0.14 % of the guest',
+     'num': '754,759 steps a block — 0.63 % of the guest, measured by outlining the call',
      'w': "The per-PC heat map shows one concentration in upsert_node: fifteen instructions at "
           "8006aa78-8006aab8, 7,387 executions a block. It is <code>hashes_.erase(id)</code>, and "
           "specifically unordered_dense's backward-shift deletion -- checked against the container's "
@@ -53,8 +53,17 @@ TRIED = [
      'fix': "Not the erase but the structure: an invalidation that only has to be REMEMBERED does not "
             "need a backward shift. Ids are dense offsets and overlay indices, so a dirty mark keyed "
             "by id answers hash()'s question in O(1).",
-     'rem': "The only concentrated cost the heat map found anywhere in the access path. Everything "
-            "else in both trie functions is flat."},
+     'rem': "The heat map priced only its backward-shift loop at 110 k; outlining the call into a "
+            "noinline wrapper and subtracting an empty one gives <b>6.8x that</b>, spread over hash, "
+            "probe, compare and shift. 0.56-0.70 % across five blocks.<br><br>The empty arm also "
+            "shows the whole guest 3.6 M cheaper, of which only 491 k is the mechanism: the other "
+            "~3.1 M is hash recomputation the invalidation CAUSES, which is load-bearing. A cheaper "
+            "mark collects the 0.63 % and none of that.<br><br>The obvious implementation is the one "
+            "that already failed: blob ids are SPARSE offsets, so a table indexed by "
+            "<code>offset&nbsp;&gt;&gt;&nbsp;2</code> is proportional to blob size and a flat hash "
+            "store over that domain regressed 0.66 %. Overlay ids are dense only after subtracting "
+            "OVERLAY_BASE. A mark must split the domains, carry its init cost against a 0.63 % "
+            "ceiling, cover every mutation and clear only after a successful recomputation."},
     {'id': 'viewresult', 'verdict': 'REFUTED', 'branch': 'measured, not attempted',
      't': 'Return a NibblesView from upsert_node instead of an owning Nibbles',
      'num': 'ceiling 35-55 k steps a block — 0.03-0.05 % of the guest',

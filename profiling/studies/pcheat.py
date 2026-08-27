@@ -31,22 +31,30 @@ def parse(path):
     return per
 
 
-def range_total(disasm, elf, symbol):
+def range_total(disasm, elf, exact_name):
     """The same symbol's steps, attributed by ADDRESS RANGE from nm instead of by label tracking.
     Two independent attributions of the same quantity, which is what makes gate 3 a check rather
-    than a restatement."""
+    than a restatement.
+
+    Matched on the EXACT demangled name, not a substring: template instantiations differ only in
+    their arguments, and taking the first nm line containing a substring would silently price a
+    different instantiation's range. Anything other than exactly one match is an error, not a
+    fallback."""
     nm = os.path.expanduser('~/riscv_gcc_multilib/bin/riscv64-unknown-elf-nm')
     if not os.path.exists(nm):
-        return None
-    p = subprocess.run([nm, '-S', elf], capture_output=True, text=True)
-    lo = hi = None
+        return None, 'nm unavailable'
+    p = subprocess.run([nm, '-SC', elf], capture_output=True, text=True)
+    hits = []
     for l in p.stdout.splitlines():
-        f = l.split()
-        if len(f) >= 4 and symbol in f[3]:
-            lo = int(f[0], 16); hi = lo + int(f[1], 16); break
-    if lo is None:
-        return None
-    return sum(steps for _s, pc, steps, _o, _t in _hs.zisk_disasm_pcs(disasm) if lo <= pc < hi)
+        f = l.split(None, 3)
+        if len(f) >= 4 and f[3].strip() == exact_name:
+            hits.append((int(f[0], 16), int(f[1], 16)))
+    if len(hits) != 1:
+        return None, f'{len(hits)} nm symbols exactly named that'
+    lo, size = hits[0]
+    hi = lo + size
+    return sum(steps for _s, pc, steps, _o, _t in _hs.zisk_disasm_pcs(disasm)
+               if lo <= pc < hi), None
 
 
 def addr2line(elf, pcs):
@@ -85,49 +93,55 @@ def main():
     a = ap.parse_args()
 
     per = parse(a.disasm)
+    ok = True
 
     # ── gate 1: every PC in the file sums to STEPS ──────────────────────────────────────────────
     total = sum(c for pcs in per.values() for _, c, _, _ in pcs)
-    ok1 = total == a.steps
-    print(f"gate 1  all PCs = STEPS        {total:,} vs {a.steps:,}  {'OK' if ok1 else 'MISMATCH'}")
+    ok &= total == a.steps
+    print(f"gate 1  all PCs = STEPS        {total:,} vs {a.steps:,}  {'OK' if total == a.steps else 'MISMATCH'}")
+
+    # ── resolve each requested substring to exactly one symbol ──────────────────────────────────
+    chosen = []
+    for want in a.symbol:
+        names = [n for n in per if want in n]
+        if len(names) != 1:
+            print(f"gate 0  {want[:28]:28} {len(names)} symbols match that substring  MISMATCH")
+            ok = False
+            continue
+        chosen.append((want, names[0], per[names[0]]))
 
     # ── gate 2: the per-symbol totals match hotspots.py's own aggregation ───────────────────────
-    ref_tot, ref_funcs, _ = _hs._zisk_disasm(a.disasm, 10 ** 9)
+    _tot, ref_funcs, _mod = _hs._zisk_disasm(a.disasm, 10 ** 9)
     ref = {f['name']: f['count'] for f in ref_funcs}
-    ok2 = True
-    for want in a.symbol:
-        for name, pcs in per.items():
-            if want in name:
-                mine = sum(c for _, c, _, _ in pcs)
-                theirs = ref.get(_hs.demangle(name)[:90])
-                match = (theirs is not None and mine == theirs)
-                ok2 &= match
-                print(f"gate 2  {want[:28]:28} {mine:,} vs hotspots {theirs if theirs is not None else '(absent)'}"
-                      f"  {'OK' if match else 'MISMATCH'}")
-    if not (ok1 and ok2):
+    # ── gate 3: and the SAME total attributed independently, by nm address range ────────────────
+    gate3 = {}
+    for want, name, pcs in chosen:
+        mine = sum(c for _, c, _, _ in pcs)
+        theirs = ref.get(_hs.demangle(name)[:90])
+        m2 = (theirs is not None and mine == theirs)
+        ok &= m2
+        print(f"gate 2  {want[:28]:28} {mine:,} vs hotspots "
+              f"{theirs if theirs is not None else '(absent)'}  {'OK' if m2 else 'MISMATCH'}")
+        rng, err = range_total(a.disasm, a.elf, name)
+        m3 = (rng == mine)
+        ok &= m3
+        gate3[name] = (rng, err)
+        print(f"gate 3  {want[:28]:28} {mine:,} vs nm range "
+              f"{rng if rng is not None else '(' + str(err) + ')'}  {'OK' if m3 else 'MISMATCH'}")
+
+    if not ok:
         print("\nA gate failed: the numbers below would not be reconcilable, so nothing is printed.")
         return 1
 
-    for want in a.symbol:
-        for name, pcs in sorted(per.items()):
-            if want not in name:
-                continue
+    for want, name, pcs in chosen:
             sym_total = sum(c for _, c, _, _ in pcs)
             lines = addr2line(a.elf, [pc for pc, _, _, _ in pcs])
 
             print(f"\n{'=' * 100}\n{_hs.demangle(name)[:96]}\n  {sym_total:,} steps over {len(pcs)} PCs")
 
-            # ── by source line ──────────────────────────────────────────────────────────────────
             byline = collections.Counter()
             for pc, c, _, _ in pcs:
                 byline[lines.get(pc, '?')] += c
-            # ── gate 3: the same total, attributed independently ─────────────────────────────────
-            rng = range_total(a.disasm, a.elf, want)
-            if rng is None:
-                print("  gate 3  SKIPPED — nm unavailable, so there is no independent attribution")
-            else:
-                print(f"  gate 3  label vs nm range    {sym_total:,} vs {rng:,}  "
-                      f"{'OK' if rng == sym_total else 'MISMATCH'}")
             print(f"\n  by source line:")
             for src, c in byline.most_common(12):
                 print(f"    {c:12,}  {100 * c / sym_total:5.1f}%  {src}")
