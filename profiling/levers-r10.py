@@ -22,7 +22,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # ── the base, and the axes this document speaks about ────────────────────────────────────────────
 BASE = {
     'branch': 'al/zkvm-r10',
-    'tip': '2cf634720',
+    'tip': '494b1bbd6',
     'corpus': 'canonical-2026-08-25815000-25815199-d49075fa3 (200 blocks)',
     'runtime': 'ziskos 1.1.0-alpha',
     'vs': 'r10-vs-ziskethone',
@@ -41,6 +41,30 @@ SPEND = [
 ]
 
 TRIED = [
+    {'id': 'lazychildren', 'verdict': 'CONFIRMED', 'branch': 'al/zkvm-r10 (landed 494b1bbd6)',
+     't': 'upsert built a branch\'s whole child array to read one entry',
+     'num': '−0.3 % steps / −0.2 % COST — 254,967 steps a block',
+     'w': "The BranchView arm materialised sixteen unaligned 4-byte reads into 64 bytes of stack, "
+          "then used one entry. The array is needed only when the slot was empty, because only then "
+          "is the branch rewritten -- and the slot is already occupied on <b>97.1 %</b> of descents, "
+          "6,608 of 6,802 a block.",
+     'fix': "The occupied path reads one child and returns straight out of the recursion, never "
+            "touching b again. The empty path still reads all sixteen and reads them BEFORE "
+            "recursing: b points into the overlay's bytes and the recursion put_*s into that same "
+            "overlay.",
+     'rem': "Predicted 330-460 k from the descent count and three instructions a read; 23 % under, "
+            "so gcc was already eliding part of the array -- it could, since only one index was read "
+            "on that path. Second time in a day that a reconstruction which looked expensive was "
+            "partly free already."},
+
+    {'id': 'nullhasherase', 'verdict': 'REFUTED', 'branch': 'measured, not attempted',
+     't': 'upsert_node erases a hash for NULL_ID, an id that can never have one',
+     'num': '190 calls a block of 8,836 — 5,700-11,400 steps, under 0.01 % of the guest',
+     'w': "hashes_.erase(id) runs at the top of every upsert_node, including the calls that pass "
+          "NULL_ID to let the callee allocate a fresh leaf.",
+     'fix': "Nothing: the wasted calls are 2.2 % of a cheap operation.",
+     'rem': "Measured rather than reasoned about, which is the only reason it can be dismissed with "
+            "a number instead of an opinion."},
     {'id': 'keycursor', 'verdict': 'REFUTED', 'branch': 'measured, reverted',
      't': 'Walk the descent with a cursor instead of rebuilding the key view at every branch',
      'num': '1.000× on 200 blocks — +8,914 steps, a hair worse',
@@ -66,9 +90,11 @@ TRIED = [
             "descent the arm disassembles to <code>slli</code>, <code>add</code>, <code>lwu</code> — "
             "one unaligned 4-byte load. A paired read costs more, not less.",
      'rem': "Closed without an A/B, which is what putting the disassembly before the experiment is "
-            "for. What remains unexplained is the gap between ~15 instructions in the traced path "
-            "and 58.7 steps a node step; the per-opcode table cannot settle it (its OPS+FROPS total "
-            "6.17e9 against 81 M steps), so there is no evidence for a specific BRANCH lever yet."},
+            "for. Note a withdrawn claim: I set ~15 traced instructions against 58.7 steps a node "
+            "step as if they conflicted. 58.7 is find_original's whole self cost over all node "
+            "steps -- per-call prologue, leaves, EXT, checks and the loop included -- so a BRANCH "
+            "step's own cost is below it and unmeasured. find_original is ON HOLD, not cleared: two "
+            "candidates refuted, the function not exonerated."},
     {'id': 'nibpack', 'verdict': 'CONFIRMED', 'branch': 'al/zkvm-r10 (landed 2cf634720)',
      't': 'Path comparison fell back to a nibble walk whenever the two parities differed',
      'num': '−0.4 % steps / −0.1 % COST — 414,934 steps a block',
@@ -245,12 +271,13 @@ NEXT = {
              "DONE — find_original's distribution: BRANCH is 86.3 % of node steps and compares "
              "nothing, EXT 0.3 %, leaves 13.4 %. Of the comparisons, 45.5 % had mismatched parity "
              "and walked 67,264 nibbles a block. Fixed by the packed primitive above.",
-             "DONE — BRANCH: both named candidates closed. The view rebuild measures 1.000× and "
-             "the child read is already three instructions. 58.7 steps a node step against ~15 "
-             "instructions traced remains unexplained, and needs per-basic-block attribution the "
-             "tooling does not provide.",
-             "NEXT — upsert_node, now 1,744,809 a block after the packed primitive took 394 k out of "
-             "it. Not yet decomposed.",
+             "ON HOLD — BRANCH: both named candidates refuted, the view rebuild at 1.000× and the "
+             "child read already three instructions. A BRANCH step's own cost is still unmeasured; "
+             "it needs per-basic-block attribution the tooling does not provide.",
+             "DONE — upsert_node's branch arm: the child array is skipped on the 97.1 % of descents "
+             "that do not rewrite the branch. Worth 254,967 steps a block.",
+             "NEXT — what is left of upsert_node after that, and its leaf-split path, which no "
+             "measurement has touched.",
              "ALSO OPEN — nibble_mismatch is its own line at 278,590 a block; and sroot_ as a 2-4 "
              "entry cache, after measuring reuse distance."],
 }
