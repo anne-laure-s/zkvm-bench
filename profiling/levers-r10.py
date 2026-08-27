@@ -22,7 +22,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # ── the base, and the axes this document speaks about ────────────────────────────────────────────
 BASE = {
     'branch': 'al/zkvm-r10',
-    'tip': '72f457d7b',
+    'tip': '2cf634720',
     'corpus': 'canonical-2026-08-25815000-25815199-d49075fa3 (200 blocks)',
     'runtime': 'ziskos 1.1.0-alpha',
     'vs': 'r10-vs-ziskethone',
@@ -41,6 +41,43 @@ SPEND = [
 ]
 
 TRIED = [
+    {'id': 'nibpack', 'verdict': 'CONFIRMED', 'branch': 'al/zkvm-r10 (landed 2cf634720)',
+     't': 'Path comparison fell back to a nibble walk whenever the two parities differed',
+     'num': '−0.4 % steps / −0.1 % COST — 414,934 steps a block',
+     'w': "operator== compared whole bytes when both sides sat at the same parity and its own comment "
+          "said the rest: <i>mismatched parity keeps the nibble walk</i>. That is <b>45.5 %</b> of the "
+          "descent's path comparisons -- blob paths are byte-aligned, the key turns odd after an odd "
+          "number of branch steps -- and the walk examines <b>67,264 nibbles a block</b>, because a "
+          "comparison mostly runs to the end rather than failing early (the short-circuit saves only "
+          "16 % against the full length). starts_with inherited the fallback; common_prefix_length, in "
+          "upsert_node and erase_node, had no fast path at all.",
+     'fix': "All three ask one question -- how far do the runs agree -- so <code>nibble_mismatch</code> "
+            "answers it and the others derive from it. 16 nibbles at a time as a big-endian word, an "
+            "odd start aligned by a 4-bit shift, and the first difference read out of the XOR as "
+            "leading zeros / 4.",
+     'rem': "Predicted 300-400 k from the walk side before measuring; 414,934 with the same-parity "
+            "side and common_prefix_length included, neither instrumented. COST moves a quarter as "
+            "much as steps: the cost model weights nibble work lightly, so this kind of lever will "
+            "always read smaller in COST than in steps.<br><br>Gated against THIS header, not a "
+            "replica: 487,344 cases, both parities each side, every length, a difference at every "
+            "position, the derived operations checked too, under ASan with exact-sized buffers -- "
+            "which disproved the padding requirement an earlier draft of the comment asserted. Five "
+            "injected slips, five caught."},
+
+    {'id': 'srootprime', 'verdict': 'CONFIRMED', 'branch': 'al/zkvm-r10 (landed 834996844)',
+     't': 'read_account reached the account leaf, which carries its storage root, and dropped it',
+     'num': '−50,505 steps a block',
+     'w': "The next read_storage for the same address descended from the root again to find what the "
+          "previous descent had already passed through.",
+     'fix': "Prime the existing one-entry cache from the leaf, NULL_ID included for an absent "
+            "account. No invalidation, for the reason the cache never had any: it holds a PRE-STATE "
+            "root read from the blob, and commit's mutations land in an overlay find_original does "
+            "not consult.",
+     'rem': "The ceiling was 666 re-descents a block and this removes <b>127</b>: the other 539 are "
+            "EVICTIONS, not an empty cache. So sroot_'s problem is capacity, and widening it is a "
+            "different lever paying a probe on all 2,450 calls -- finding 145's caution applies. "
+            "Predicted 47,752 steps, measured 50,505: the first prediction of the round to land, "
+            "because its ceiling came from a measured delta in call counts."},
     {'id': 'pathbytes', 'verdict': 'CONFIRMED', 'branch': 'al/zkvm-r10 (landed 72f457d7b)',
      't': 'A node\'s path was appended one nibble at a time, and paths are 56-59 nibbles',
      'num': '−1.1 % steps / −0.5 % COST — 1,063,188 steps a block, 72 % of what the function cost',
@@ -177,8 +214,13 @@ NEXT = {
              "the probe before building it.",
              "DONE — append_path, out of order: its cost per call said so and the fix was already "
              "in the tree.",
-             "NEXT — find_original's descent itself: 23,550 node steps a block at 60 steps each. "
-             "Then upsert_node at 1.90 M, and the node container."],
+             "DONE — find_original's distribution: BRANCH is 86.3 % of node steps and compares "
+             "nothing, EXT 0.3 %, leaves 13.4 %. Of the comparisons, 45.5 % had mismatched parity "
+             "and walked 67,264 nibbles a block. Fixed by the packed primitive above.",
+             "NEXT — the BRANCH step itself: 19,324 a block, 86 % of the descent, and untouched. It "
+             "reads one nibble, indexes a child and shortens the key; whether that is 20 steps or "
+             "60 decides whether there is anything left here.",
+             "AFTER — upsert_node at 1.90 M and 235.5 steps a call, and the node container."],
 }
 
 
