@@ -49,8 +49,13 @@ def range_total(disasm, elf, exact_name):
         f = l.split(None, 3)
         if len(f) >= 4 and f[3].strip() == exact_name:
             hits.append((int(f[0], 16), int(f[1], 16)))
+    # Aliases: the same function can be listed more than once at the SAME address and size (a
+    # constructor's C1/C2 variants, folded by the linker). Distinct instantiations have distinct
+    # addresses, so deduplicating by range keeps the check that matters and drops the one that does
+    # not.
+    hits = sorted(set(hits))
     if len(hits) != 1:
-        return None, f'{len(hits)} nm symbols exactly named that'
+        return None, f'{len(hits)} distinct nm ranges exactly named that'
     lo, size = hits[0]
     hi = lo + size
     return sum(steps for _s, pc, steps, _o, _t in _hs.zisk_disasm_pcs(disasm)
