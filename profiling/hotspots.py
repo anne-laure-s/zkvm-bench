@@ -258,15 +258,29 @@ FAMILIES = [
                                r'|operator new|operator delete'),
 ]
 
+# What the taxonomy is allowed to read. FAMILIES was tuned against names the profiler used to
+# truncate at 90 characters, and it still has to be: measured on one block, classifying the FULL
+# demangled name instead moves 1,422 symbols, and the largest movers are wrong -- every
+# `vm::interpreter::push<...>` and friends leave `EVM interpreter` for `256-bit arithmetic`, about
+# 13 M steps of it, because the traits text past character 90 matches the arithmetic pattern.
+#
+# So identity and classification are deliberately different projections of the same symbol: the data
+# keeps the whole name, so distinct instantiations never merge (the 90-char cut collapsed 610 names
+# into 88 keys), and the classifier keeps the window it was calibrated on. Widening the taxonomy to
+# full names means re-tuning it, which is its own job with its own before/after.
+FAMILY_WINDOW = 90
+
+
 @functools.lru_cache(maxsize=None)
 def family(name):
-    """Which kind of work a symbol represents — see FAMILIES.
+    """Which kind of work a symbol represents — see FAMILIES and FAMILY_WINDOW.
 
     Memoised because it is pure (FAMILIES is a module constant, never mutated) and because the same
     symbols recur in every block: folding the whole profile cache classifies ~1.3 M names drawn from
     only ~860 distinct ones. Uncached that is ~58 s of regex — up to one `re.search` per family per
     call, over demangled C++ names — against ~0.2 s memoised. That 290x is why family counts do not
     need a cache of their own: the fold was never the cost, the classifier was."""
+    name = name[:FAMILY_WINDOW] if len(name) > FAMILY_WINDOW else name
     for fam, pat in FAMILIES:
         if re.search(pat, name, re.I): return fam
     return 'other'
@@ -440,7 +454,11 @@ def _zisk_disasm(path, top):
     modtot = {}                                    # full per-module totals over ALL functions
     for n, c in agg.items():
         m = module(n); modtot[m] = modtot.get(m, 0) + c
-    funcs = [{'name': demangle(n)[:90], 'module': module(n), 'count': c}
+    # Full demangled name as the IDENTITY. Truncating here merged distinct template instantiations
+    # that agree on their first 90 characters -- the two match<Cases<...child_ref<true|false>...>>
+    # bodies landed on one symbol, and the merge is silent. Display truncation belongs to whatever
+    # renders, not to the data.
+    funcs = [{'name': demangle(n), 'module': module(n), 'count': c}
              for n, c in sorted(agg.items(), key=lambda x: -x[1])[:top]]
     return tot, funcs, modtot
 
@@ -607,7 +625,7 @@ def _sp1_gecko(gecko_path, top, tree_prune=0.003):
     fname = [None] * len(frames); fmod = [None] * len(frames)
     for i, f in enumerate(frames):
         dm = demap[strings[f[loc]]]
-        fname[i] = demangle(dm)[:90]; fmod[i] = module(dm)
+        fname[i] = demangle(dm); fmod[i] = module(dm)
     # frame chain (root->leaf) per stack via DP over prefix (prefix index always precedes)
     chain = [None] * len(stacks)
     for i, st in enumerate(stacks):
