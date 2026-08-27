@@ -29,7 +29,16 @@ ROOT = os.path.dirname(HERE)
 # models in one table is the failure this guards against.
 DEFAULT_ROOT = os.environ.get('COMPARE_CACHE_ROOT') or os.path.join(HERE, 'cache')
 
-RUN, PROFILE, PROFILE_FULL = 'run', 'profile', 'profile_full'
+# RUN is unversioned: steps and COST are raw measurements and their meaning has not changed.
+# The two PROFILE kinds are versioned by SYMBOL SCHEMA, because a cached profile's identity is the ELF
+# plus the input and nothing else -- so after the collector stopped truncating demangled names at 90
+# characters, the same ELF would have kept serving truncated-name profiles to a pipeline that now
+# depends on whole names, and an aggregate could have mixed the two schemas without a word. The old
+# entries stay on disk and stay readable under their old kind for historical campaigns; they just
+# cannot be reached by the new pipeline.
+RUN = 'run'
+PROFILE, PROFILE_FULL = 'profile_v2', 'profile_full_v2'
+PROFILE_V1, PROFILE_FULL_V1 = 'profile', 'profile_full'   # truncated-name era, read-only
 
 
 class Cache:

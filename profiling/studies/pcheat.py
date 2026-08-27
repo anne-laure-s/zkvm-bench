@@ -31,35 +31,37 @@ def parse(path):
     return per
 
 
-def range_total(disasm, elf, exact_name):
-    """The same symbol's steps, attributed by ADDRESS RANGE from nm instead of by label tracking.
-    Two independent attributions of the same quantity, which is what makes gate 3 a check rather
-    than a restatement.
+def range_total(disasm, elf, first_pc):
+    """The same symbol's steps, attributed by nm ADDRESS RANGE instead of by label tracking. Two
+    independent attributions of the same quantity, which is what makes gate 3 a check rather than a
+    restatement.
 
-    Matched on the EXACT demangled name, not a substring: template instantiations differ only in
-    their arguments, and taking the first nm line containing a substring would silently price a
-    different instantiation's range. Anything other than exactly one match is an error, not a
-    fallback."""
+    Located by the symbol's first PC, never by name: ziskemu's demangler and nm's disagree on the
+    same symbol -- for one match instantiation they produce 1,097 and 869 characters, differing on
+    where the return type goes -- so string equality across the two tools is unattainable. An
+    address falls in exactly one function.
+
+    Aliases fold: a constructor's C1/C2 variants are listed twice at the same address and size, so
+    ranges are deduplicated. Anything other than exactly one containing range is an error."""
     nm = os.path.expanduser('~/riscv_gcc_multilib/bin/riscv64-unknown-elf-nm')
     if not os.path.exists(nm):
         return None, 'nm unavailable'
-    p = subprocess.run([nm, '-SC', elf], capture_output=True, text=True)
-    hits = []
+    p = subprocess.run([nm, '-S', elf], capture_output=True, text=True)
+    hits = set()
     for l in p.stdout.splitlines():
-        f = l.split(None, 3)
-        if len(f) >= 4 and f[3].strip() == exact_name:
-            hits.append((int(f[0], 16), int(f[1], 16)))
-    # Aliases: the same function can be listed more than once at the SAME address and size (a
-    # constructor's C1/C2 variants, folded by the linker). Distinct instantiations have distinct
-    # addresses, so deduplicating by range keeps the check that matters and drops the one that does
-    # not.
-    hits = sorted(set(hits))
+        f = l.split()
+        if len(f) >= 4:
+            try:
+                lo, size = int(f[0], 16), int(f[1], 16)
+            except ValueError:
+                continue
+            if size and lo <= first_pc < lo + size:
+                hits.add((lo, size))
     if len(hits) != 1:
-        return None, f'{len(hits)} distinct nm ranges exactly named that'
-    lo, size = hits[0]
-    hi = lo + size
+        return None, f'{len(hits)} nm ranges contain 0x{first_pc:x}'
+    lo, size = hits.pop()
     return sum(steps for _s, pc, steps, _o, _t in _hs.zisk_disasm_pcs(disasm)
-               if lo <= pc < hi), None
+               if lo <= pc < lo + size), None
 
 
 def addr2line(elf, pcs):
@@ -122,12 +124,12 @@ def main():
     gate3 = {}
     for want, name, pcs in chosen:
         mine = sum(c for _, c, _, _ in pcs)
-        theirs = ref.get(_hs.demangle(name)[:90])
+        theirs = ref.get(_hs.demangle(name))
         m2 = (theirs is not None and mine == theirs)
         ok &= m2
         print(f"gate 2  {want[:28]:28} {mine:,} vs hotspots "
               f"{theirs if theirs is not None else '(absent)'}  {'OK' if m2 else 'MISMATCH'}")
-        rng, err = range_total(a.disasm, a.elf, name)
+        rng, err = range_total(a.disasm, a.elf, min(pc for pc, _c, _o, _t in pcs))
         m3 = (rng == mine)
         ok &= m3
         gate3[name] = (rng, err)
