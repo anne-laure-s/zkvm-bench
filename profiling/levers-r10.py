@@ -41,6 +41,22 @@ SPEND = [
 ]
 
 TRIED = [
+    {'id': 'viewresult', 'verdict': 'REFUTED', 'branch': 'measured, not attempted',
+     't': 'Return a NibblesView from upsert_node instead of an owning Nibbles',
+     'num': 'ceiling 35-55 k steps a block — 0.03-0.05 % of the guest',
+     'w': "The returned path is always a sub-view of the caller's key, so the owning Nibbles looked "
+          "like an allocation per upsert. The arm counts say it is <b>1,250</b> a block, not 8,074: "
+          "the four terminal arms sum to exactly 1.00 per logical upsert, and BranchView -- 84.2 % of "
+          "calls -- only passes the result up.",
+     'fix': "The allocation is real: upsert_node calls <code>_Znam</code> at seven sites in the "
+            "disassembly, which is the check the plan required before attributing any ceiling. Its "
+            "cost is not. <code>operator new[]</code> is 32,463 steps a block across the WHOLE guest "
+            "(0.03 %), delete[] another 2,164.",
+     'rem': "Two follow-ons closed with it. The EXT arm runs 24 times a block in total -- 22 followed, "
+            "2 split -- so its unconditional path copy is 24 allocations; the leaf-split path is 98 "
+            "calls. What remains of upsert_node's 1.49 M sits in the recursion itself, with no named "
+            "construct holding it: the same place find_original is, needing the same per-basic-block "
+            "attribution the tooling lacks."},
     {'id': 'lazychildren', 'verdict': 'CONFIRMED', 'branch': 'al/zkvm-r10 (landed 494b1bbd6)',
      't': 'upsert built a branch\'s whole child array to read one entry',
      'num': '−0.3 % steps / −0.2 % COST — 254,967 steps a block',
@@ -276,8 +292,12 @@ NEXT = {
              "it needs per-basic-block attribution the tooling does not provide.",
              "DONE — upsert_node's branch arm: the child array is skipped on the 97.1 % of descents "
              "that do not rewrite the branch. Worth 254,967 steps a block.",
-             "NEXT — what is left of upsert_node after that, and its leaf-split path, which no "
-             "measurement has touched.",
+             "DONE — upsert_node's returned path, the EXT path copy and the leaf split: all three "
+             "closed by counting. 1,250 allocations a block against an allocator costing 0.03 % of "
+             "the guest.",
+             "BLOCKED — both trie functions now need per-basic-block attribution to go further. "
+             "hotspots.py gives function granularity; the per-opcode table is not instruction "
+             "counts. That tooling gap is the next thing to fix, not another lever.",
              "ALSO OPEN — nibble_mismatch is its own line at 278,590 a block; and sroot_ as a 2-4 "
              "entry cache, after measuring reuse distance."],
 }
