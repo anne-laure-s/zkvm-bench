@@ -41,6 +41,23 @@ opt_of() {  # opt_of NAME -> the value, after any override
     for _kv in $OVERRIDES; do [ "${_kv%%=*}" = "$1" ] && _v=${_kv#*=}; done
     printf '%s' "$_v"
 }
+# The option list lives in the guest's CMakeLists, in the other repository. If
+# it grows one this script does not know, the reference build would silently
+# omit it -- which is the failure this script exists to prevent, arriving by a
+# different door. So read the truth from there and refuse to guess.
+CML="$MONAD/zkvm/guest/CMakeLists.txt"
+[ -f "$CML" ] || { echo "error: no guest CMakeLists at $CML" >&2; exit 1; }
+MISSING=""
+for k in $(sed -n 's/^[[:space:]]*option(\(MONAD_ZKVM_[A-Z_]*\).*/\1/p' "$CML"); do
+    echo "$DEFAULTS" | tr ' ' '\n' | grep -q "^$k=" || MISSING="$MISSING $k"
+done
+if [ -n "$MISSING" ]; then
+    echo "error: the guest declares options this script has no policy for:$MISSING" >&2
+    echo "       add each to DEFAULTS with the value the reference guest wants," >&2
+    echo "       then re-run. Refusing to build a guest that is missing one." >&2
+    exit 1
+fi
+
 OVERRIDES=""
 for kv in "$@"; do
     k=${kv%%=*}
