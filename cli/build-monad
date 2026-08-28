@@ -37,9 +37,13 @@
 #   --name <n>      guest directory + ELF basename under guests/ (required)
 #   --branch <b>    branch to take the commit from
 #   --commit <c>    exact commit (default: tip of --branch)
-#   --workdir <d>   where to put a throwaway worktree (default: a temp dir, removed on exit)
-#   --keep          keep that worktree — its cargo target/ makes the next build of the same
-#                   commit fast, where a fresh one is a cold build of the whole dependency tree
+#   --workdir <d>   where to put the throwaway worktree (default: a temp dir, removed on exit)
+#   --keep          keep it — its cargo target/ makes the next build of the same commit fast,
+#                   where a fresh one recompiles the whole dependency tree
+#   --reuse         build in an existing CLEAN worktree already on the commit, if there is one.
+#                   Fast, and unsafe while anyone else is working: it writes into that worktree's
+#                   cargo target/. Off by default for that reason — several worktrees of this tree
+#                   are usually in flight at once, on commits that move.
 #
 # Env: RISCV_TOOLCHAIN_DIR (default ~/.local/xPacks/zisk-dma-gcc-15.2.0) · CARGO_ZISK · MONAD_URL
 set -euo pipefail
@@ -57,7 +61,7 @@ PROFILE_SINCE=89b8a6b15e324fd8af78449d2aa4b5fee612545e
 die()   { echo "build-monad: $*" >&2; exit 2; }
 usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^#//; s/^ //'; exit "${1:-0}"; }
 
-NAME="" BRANCH="" COMMIT="" WORKDIR="" KEEP=0
+NAME="" BRANCH="" COMMIT="" WORKDIR="" KEEP=0 REUSE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --name)    NAME="${2:?}";    shift 2 ;;
@@ -65,6 +69,7 @@ while [[ $# -gt 0 ]]; do
     --commit)  COMMIT="${2:?}";  shift 2 ;;
     --workdir) WORKDIR="${2:?}"; shift 2 ;;
     --keep)    KEEP=1;           shift ;;
+    --reuse)   REUSE=1;          shift ;;
     -h|--help) usage 0 ;;
     *) die "unknown argument '$1' (see --help)" ;;
   esac
@@ -115,23 +120,43 @@ git -C "$CLONE" show "$SHA:zkvm/guest/CMakeLists.txt" | grep -q MONAD_ZKVM_OFFIC
   builds are reproduced from their lineage's own profiling/series/<lineage>-buildenv.tsv."
 
 # ── a tree to build in ───────────────────────────────────────────────────────────────────
-# Reuse a clean worktree already sitting on the commit before making one: it usually has a warm
-# cargo target/, and a fresh worktree is a cold build of the whole dependency tree. Clean matters
-# because the profile stamps the commit into the binary and refuses a dirty tree — that stamp
-# would otherwise name a commit the binary was not built from.
-SRC="" DIRTY=""
+# A throwaway worktree by default, and that is the point rather than a shortcut: this tree usually
+# has a dozen worktrees in flight, on commits that move under you, and a build writes into its
+# worktree's cargo target/. Reusing someone's checkout to save a cold compile is how two sessions
+# start thrashing one target directory — measured once here as a build that failed on a dep-info
+# file another build had just removed.
+#
+# --reuse opts back in when you know nothing else is running. It takes only a CLEAN worktree: the
+# official profile stamps the commit into the binary and refuses a dirty tree, so a dirty match
+# would fail late with a message about someone else's uncommitted work.
+SRC="" DIRTY="" REUSABLE=""
 while read -r cand; do
   [[ -n "$cand" ]] || continue
   [[ "$(git -C "$cand" rev-parse HEAD 2>/dev/null)" == "$SHA" ]] || continue
-  if [[ -z "$(git -C "$cand" status --porcelain 2>/dev/null)" ]]; then SRC="$cand"; break; fi
-  DIRTY="$DIRTY $cand"
+  if [[ -z "$(git -C "$cand" status --porcelain 2>/dev/null)" ]]; then
+    [[ -n "$REUSABLE" ]] || REUSABLE="$cand"
+  else
+    DIRTY="$DIRTY $cand"
+  fi
 done < <(git -C "$CLONE" worktree list --porcelain | sed -n 's/^worktree //p')
 
 CLEANUP=""
-if [[ -n "$SRC" ]]; then
-  echo "== reusing the clean worktree already at $SHORT: $SRC"
+if [[ -n "${MONAD:-}" ]]; then
+  # An explicit MONAD is an instruction: build there, or say why not.
+  SRC="$MONAD"
+  [[ "$(git -C "$SRC" rev-parse HEAD 2>/dev/null)" == "$SHA" ]] \
+    || die "MONAD=$SRC is not at $SHORT — check it out there, or drop MONAD and let one be made."
+  [[ -z "$(git -C "$SRC" status --porcelain 2>/dev/null)" ]] \
+    || die "MONAD=$SRC has uncommitted changes; the official profile would stamp a commit the
+  binary was not built from. Commit or stash there first."
+  echo "== building in the worktree you named: $SRC"
+elif [[ "$REUSE" == 1 && -n "$REUSABLE" ]]; then
+  echo "== --reuse: building in $REUSABLE (its cargo target/ is shared — make sure nothing else is)"
+  SRC="$REUSABLE"
 else
-  [[ -z "$DIRTY" ]] || echo "== worktrees at $SHORT have uncommitted changes, skipping them:$DIRTY"
+  [[ "$REUSE" != 1 ]] || echo "== --reuse: no clean worktree at $SHORT, making one"
+  [[ -z "$REUSABLE" || "$REUSE" == 1 ]] || echo "== not touching $REUSABLE (--reuse to build there)"
+  [[ -z "$DIRTY" ]] || echo "== worktrees at $SHORT have uncommitted changes:$DIRTY"
   SRC="${WORKDIR:-$(mktemp -d -t monad-$SHORT)}"
   echo "== adding a worktree at $SHORT: $SRC"
   rm -rf "$SRC"
