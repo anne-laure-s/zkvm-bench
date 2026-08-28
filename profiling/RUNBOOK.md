@@ -21,6 +21,7 @@ with fewer axes rather than an error.
 | any `zisk` axis, `hotspots --backend zisk`, `ev.sh` | **`ziskemu`** | `~/.zisk/bin/ziskemu`, installed by `ziskup`. `--emu` overrides |
 | any `sp1` axis | **`sp1-runner`**, plain release build | `infra/sp1-infra/sp1-runner/target/release/sp1-runner`. `--runner` overrides |
 | `hotspots --backend sp1`, `compare.py --deep` on an sp1 axis, **and the per-family columns (on by default)** | **`sp1-runner`, profiling build** | same crate, `target-prof/release/` — a *second* build, not the same binary |
+| any axis naming `ziskethone` or a Monad `r10` build | **the two guest ELFs**, each with its own patched GCC | next section — they are not `cli/gen-elf --guest zisk-reth`'s business |
 
 Installing them, from a fresh clone — the ZisK emulator first (it is the whole `zisk` side), then the
 two `sp1-runner` builds:
@@ -44,6 +45,77 @@ Go library this binary never uses (see [`sp1-runner/README.md`](../infra/sp1-inf
 
 ---
 
+## Building the two ZisK guests
+
+The current headline ZisK comparison is a Monad build against **ziskethone**, upstream's C++ reference guest.
+Both sides are built, neither by `cli/gen-elf --guest zisk-reth`, and each has a **different patched
+GCC** — upstream's `-mzisk-dma` patch targets 14.3, while the Monad interpreter needs
+`__attribute__((musttail))`, which arrived in GCC 15. They are not interchangeable:
+
+| guest | GCC under `$XPACKS_DIR` (default `~/.local/xPacks`) | who builds it for you |
+|---|---|---|
+| `ziskethone` | `xpack-riscv-none-elf-gcc-14.3.0-1` + `zisk-dma-gcc-14.3.0` | the DMA compiler is built on demand by upstream's own driver; only the xPack is a prerequisite |
+| Monad | `zisk-dma-gcc-15.2.0` | nobody — build it with `profiling/experiments/zisk-dma-gcc15/build-gcc15.sh` |
+
+```bash
+cd ..
+./cli/gen-elf --guest ziskethone -- --check     # build, verify the sha256, install nothing
+./cli/gen-elf --guest ziskethone                # ... and install guests/ziskethone/ziskethone.elf
+
+./cli/build-monad --name monad-r10-zisk --branch al/zkvm-r10          # --commit defaults to the tip
+./cli/build-monad --name monad-r10-zisk --commit c59b7ab05            # or an exact one
+./cli/gen-elf     --guest monad-r10-zisk                              # rebuild the recorded commit
+```
+
+**ziskethone is byte-reproducible and the check is an equality.** It embeds no path strings, so a
+build in a temp directory yields the same bytes as the shipped one. `guests/ziskethone/ziskethone.build.json`
+is the record — the two pins (the `third_party/ziskethone` submodule *and* the `zisk-eth-client`
+driver that sets its flags), the two toolchains, the sha256 to reproduce — and the recipe restates
+none of it. Editing that file is how you change the build.
+
+> ⚠️ **Upstream ships two builds under one name and the slow one is not a reference.** 
+> `guests/ziskethone/ziskethone.elf` is the **shipped** build (`39ad249e2e50ee17`, pin `2bb899a`,
+> branch `perf/dma-precompiles`). To obtain the other one deliberately, point `source.upstream_branch` + `commit` at
+> `7e6c702` and run `build.sh --check`.
+
+**A Monad guest sets no flag here, by design.** `cli/build-monad` asks `zkvm/guest/CMakeLists.txt` for
+its own profile and lets it decide everything:
+
+```
+MONAD_ZKVM_CMAKE_DEFINES=MONAD_ZKVM_OFFICIAL_PROFILE=ON;MONAD_ZKVM_GIT_COMMIT=<sha>
+```
+
+That profile **forces** its option set into the CMake cache and fails on a contradicting `-D`, on a
+compiler that is not GCC 15.2.0, on a non-ZisK target, and on a missing commit stamp. Measured:
+passing the seven options explicitly (as the tree's own `zkvm/zisk/build-official.sh` does) yields a
+**byte-identical** ELF, so restating them buys nothing. The record is
+`guests/<name>/<name>.build.json`, written by the tree's `audit-official-build.py` rather than by
+hand, which is why `cli/gen-elf --guest <name>` can rebuild the right commit without being told.
+
+Two things to know before reading a sha:
+
+- **`build-monad` never checks anything out for you.** `vendor/monad` is a working clone parked on
+  someone's branch. It looks for a worktree already *clean* on the commit (a warm `target/` makes it
+  fast), and otherwise adds a throwaway one — `--workdir` to place it, `--keep` to keep it.
+- **The file sha256 is not reproducible across build locations**, though the program is: rustc stamps
+  the build path into a `.symtab` symbol name (`zkvm_zisk.<hash>-cgu.0`). Two builds of one commit on
+  one machine differed in exactly those 16 bytes. It matters because `profiling/cache` is keyed by
+  file sha256, so the same guest built elsewhere is a cache **miss**, not a wrong build. Compare the
+  loadable image (`objcopy -O binary`) when you need to know whether two ELFs are the same program.
+
+**Building both guests is not enough to run the axis** — each side also needs an input for every
+block, and they are different artifacts from different producers: the Monad side reads
+`guests/monad/fixtures/<block>.witness` (a generation, minted on the devcore box), the ziskethone
+side reads `guests/ziskethone/fixtures/1-<block>.bin` (a ZEG0 container, transcoded or proxied). Both
+are in *Witnesses* below. A block missing on either side shortens the axis without a word.
+
+**Only `al/zkvm-r10` and later build this way.** `MONAD_ZKVM_OFFICIAL_PROFILE` arrived in
+`89b8a6b15`; before it the option set was chosen per commit, and those builds are reproduced from
+their lineage's own `profiling/series/<lineage>-buildenv.tsv`, not from a single recipe.
+`build-monad` says so and stops rather than guessing.
+
+---
+
 ## The short way: `cli/bench-pairs`
 
 Everything in the next section, driven for you. Name the comparisons you want and it works out what
@@ -52,7 +124,7 @@ already exists, does only the rest, and ends on a `compare.html`:
 ```bash
 ./cli/bench-pairs --host <box> \
     --pair monad-zisk:zisk-reth:zisk \
-    --pair al/zkvm-r3:sam/zkvm-zisk-sp1:zisk \
+    --pair al/zkvm-r10:al/zkvm-r9:zisk \
     --pair monad-sp1:rsp:sp1
 ```
 
@@ -121,8 +193,8 @@ anything else: the RPC is publicly reachable and the snapshot is copyable or re-
 Linux box with root, ~700 GB and the toolchains will do. A box that has never done this needs a
 half-day of setup on top. Both are in
 [`infra/monad-witness/README.md`](../infra/monad-witness/README.md#moving-to-a-devcore-box-that-has-never-done-this).
-The consequence for a report: **the block range travels with the box** — `25551991..25552494` needs
-the `25551990` snapshot — so a different machine usually means a different range, and two ranges are
+The consequence for a report: **the block range travels with the box** — `25815000..25815199` needs
+the `25814999` snapshot — so a different machine usually means a different range, and two ranges are
 not comparable to each other.
 
 **The pure-time column belongs to one host.** Work (steps/cycles) and prover cost (COST/PGU) are
@@ -142,7 +214,7 @@ averaged from the cache. One run per guest is enough; the point is the rate, not
 ```bash
 # frame the witness the way ev.sh does: LE64 length + payload + pad to 8
 python3 -c 'import sys,struct; d=open(sys.argv[1],"rb").read(); n=len(d); open(sys.argv[2],"wb").write(struct.pack("<Q",n)+d+b"\x00"*((-(8+n))%8))' \
-    guests/monad/current/witnesses/25551991.witness /tmp/w.bin
+    guests/monad/current/witnesses/25815000.witness /tmp/w.bin
 ```
 
 ZisK — the emulator reports the rate itself, so there is nothing to fit:
@@ -201,8 +273,8 @@ example of `axis.py add` + `compare.py`, then do the real thing in **§5**.
 cd ../infra/monad-witness                   # the producer side — NOT profiling/
 export HOST=<your-devcore-box>              # required, no default (see below)
 
-./witness-backfill plan al/zkvm-r4          # print every command, start nothing (the default verb)
-./witness-backfill run  al/zkvm-r4          # sync, build, replay, pull home
+./witness-backfill plan al/zkvm-r10         # print every command, start nothing (the default verb)
+./witness-backfill run  al/zkvm-r10         # sync, build, replay, pull home
 ./witness-backfill status                   # where the remote run is
 ```
 
@@ -222,7 +294,7 @@ Already have a loaded trie for this range from another branch? `again` rewinds i
 reloading the snapshot — ~66 min becomes seconds:
 
 ```bash
-AGAINST=offsettriedb-rework-2026-08 ./witness-backfill again al/zkvm-r4
+AGAINST=canonical-2026-08-25815000-25815199-d49075fa3 ./witness-backfill again al/zkvm-r10
 ```
 
 `again` needs [`patch-fixed-history.py`](../infra/monad-witness/patch-fixed-history.py) applied on the
@@ -251,7 +323,7 @@ have*, so old and new are measured on the same blocks. A fresh clone has no `cur
 range instead — it also accepts a file of block numbers, or a directory:
 
 ```bash
-BLOCKS=25551991-25552494 ./witness-backfill run al/zkvm-r4
+BLOCKS=25815000-25815199 ./witness-backfill run al/zkvm-r10
 ```
 
 The set must be **contiguous**; the tool refuses one with gaps rather than replay a range it cannot
@@ -305,8 +377,8 @@ ablations, a branch measured against a set it did not generate — and it has it
 
 ```bash
 cd ../../profiling
-./axis.py add r4-vs-reth --backend zisk \
-    --a-name monad-r4-zisk \
+./axis.py add r10-vs-reth --backend zisk \
+    --a-name monad-r10-zisk \
     --a-elf guests/monad/gen/<GEN>/elf/monad-zkvm-guest-zisk.elf --a-src monad \
     --b-name zisk-reth --b-elf guests/zisk-reth/zisk-reth.elf    --b-src bin
 ```
@@ -339,7 +411,7 @@ Bound the run to **your** generation's range. The numbers below are the publishe
 yours as `first..last`, and a block outside the bounds is dropped without a word:
 
 ```bash
-./compare.py --block-min 25551991 --block-max 25552494 --axis r4-vs-reth
+./compare.py --block-min 25815000 --block-max 25815199 --axis r10-vs-reth
 ```
 
 Writes **`results/compare.html`** — the deliverable — plus `results/compare.json` and
@@ -377,26 +449,27 @@ produced, and it is **not** selected — only its ELF is used, never its witness
 cd ../../profiling                          # from guests/monad/ (§3–§4 already left you here)
 # run the format check below FIRST — it is 30 s and nothing after it re-does it
 
-./axis.py add r4-vs-r3 --backend zisk \
-    --a-name monad-r4-zisk \
+./axis.py add r10-vs-r9 --backend zisk \
+    --a-name monad-r10-zisk \
     --a-elf guests/monad/gen/<NEW-GEN>/elf/monad-zkvm-guest-zisk.elf --a-src monad \
-    --b-name monad-r3-zisk \
+    --b-name monad-r9-zisk \
     --b-elf guests/monad/gen/<OLD-GEN>/elf/monad-zkvm-guest-zisk.elf --b-src monad
 
-./axis.py add r4-vs-r3-sp1 --backend sp1 \
-    --a-name monad-r4-sp1 \
+./axis.py add r10-vs-r9-sp1 --backend sp1 \
+    --a-name monad-r10-sp1 \
     --a-elf guests/monad/gen/<NEW-GEN>/elf/monad-zkvm-guest-sp1.elf --a-src monad \
-    --b-name monad-r3-sp1 \
+    --b-name monad-r9-sp1 \
     --b-elf guests/monad/gen/<OLD-GEN>/elf/monad-zkvm-guest-sp1.elf --b-src monad
 
-./compare.py --block-min <FIRST> --block-max <LAST> --axis r4-vs-r3 --axis r4-vs-r3-sp1
+./compare.py --block-min <FIRST> --block-max <LAST> --axis r10-vs-r9 --axis r10-vs-r9-sp1
 ```
 
 Writes the same four files as §4, `results/compare.html` first among them. `<FIRST>`/`<LAST>` are your
 generation's own bounds — step 1 printed them, and `PROVENANCE.md` records them.
 
-`opt-self` in `AXES` is exactly this shape, already declared: `./axis.py show opt-self` is the shortest
-way to see one before writing your own.
+`rowlink-vs-typedj` in `AXES` is exactly this shape, already declared — two Monad builds of one
+lineage, one backend: `./axis.py show rowlink-vs-typedj` is the shortest way to see one before
+writing your own.
 
 > The `--a-elf` path is only ever a **location**. If the old build is not a generation's canonical pair
 > — you copied it off the box, or it is an ablation — park it under `guests/monad-variants/<name>/` and
@@ -466,42 +539,37 @@ sits; the two share one cache, so a block either has measured is never re-execut
 
 ### The canonical report
 
+The current campaign compares the **Monad r10 guest against ziskethone**, over the 200-block corpus
+`canonical-2026-08-25815000-25815199-d49075fa3`:
+
 ```bash
-./compare.py --block-min 25551991 --block-max 25552607 \
-             --axis zisk --axis sp1 --axis cur-zisk --axis cur-sp1
+./compare.py --block-min 25815000 --block-max 25815199 --axis r10tip-vs-ziskethone
 ```
 
 Writes `results/compare.json`, `compare.html`, `compare-summary.html`, `compare-summary.md`.
+
+**Both bounds, always.** `--block-min` drops the two one-off blocks (`25229951`, `25229957`) that
+still sit in `guests/monad/inputs/` from ~600k blocks earlier and that the ziskethone side happens to
+have inputs for: letting them in moves the geometric mean from **0.602× to 0.199×**. `--block-max`
+pins the top so the set stays fixed as the RTP pipeline keeps minting witnesses at the tip.
 
 Each axis summary records `a_ident` / `b_ident` — the **sha256 of the build that was actually
 measured**, not of the one the axis names. A name is a label and an ELF path is a location; neither
 says which binary produced a number, and a guest under active work is rebuilt over its own path. This
 is derived from the run, so it cannot disagree with it.
 
-> ⚠️ **Today two of these four are duplicates.** `zisk`/`sp1` follow `use-gen` (see *Compare two
-> versions*, step 2) and the selected generation installs the very build the `cur-*` axes name — they
-> both resolve `gen/<GEN>/elf/` — so `zisk` ≡ `cur-zisk` and `sp1` ≡ `cur-sp1`, and the run ends on the
-> `one build, several labels` warning. That is the report telling the truth, not a bug to silence:
-> the four sections are two comparisons. The pair is kept because **`levers.py` resolves `zisk` and
-> `sp1` by name** (and refuses n < 300), so dropping them from the command breaks it. Until that is
-> re-pointed, read the duplicate sections as one, and check `a_ident` in the JSON before quoting two
-> figures as if they came from two builds.
-
-**Why four axes are named.** `compare.py`'s own default is two — `cur-zisk` and `cur-sp1` — so a bare
-`./compare.py` produces a report `levers.py` cannot use: it also reads the `zisk` and `sp1` axes.
-Nothing in the CLI enforces this; the four are spelled out because the *report* needs them, not
-because the tool asks.
-
-**Why both bounds.** `--block-min` drops the older, unrelated blocks that sit in
-`guests/monad/inputs/`; `--block-max` pins the top so the published set stays fixed as the RTP
-pipeline keeps minting new witnesses at the tip. Today the corpus ends below the max and it changes
-nothing — that is the point: the day it grows, the report does not silently grow with it. This is the
-exact command `levers.py` prints in its own reports as the way to reproduce them, so the two must
-match.
-
-That is why this max (`25552607`) sits above the one used in *Compare two versions* (`25552494`, the
-generation's actual last block). Both select the same blocks today; the canonical one is a pin that
-must not move, the other is a range you read off your own generation.
+> ⚠️ **The four-axis report `zisk` + `sp1` + `cur-zisk` + `cur-sp1` no longer runs.** Those axes pit a
+> Monad build against a **reth** guest, whose `1-<block>.bin` inputs exist for the old 504-block range
+> (`25551991..25552607`) and not for the corpus selected today. Measured now: each of the four
+> resolves on **2 blocks**, and **0** with the bounds this section used to prescribe. `compare.py`
+> skips an axis it cannot run and exits 0, so that command produces an empty report rather than an
+> error.
+>
+> The same applies to what read them: **`levers.py` refuses n < 300** and speaks about the r4 base, so
+> it cannot run here either. Its successor for this base is **`levers-r10.py`**, which reads the
+> `r10tip-vs-ziskethone` axis instead. To bring the reth axes back you need a reth corpus over the
+> current range — `ALCHEMY_URL=... ./cli/witness-farm 25815000` (section *Witnesses*) — which is a
+> deliberate ~200-block mint, not a step of this report.
 
 Add `--quick` to skip ZisK's instrumented COST pass (~10× slower); everything already cached is
 still reported.
@@ -509,8 +577,8 @@ still reported.
 ### One axis, or a sample
 
 ```bash
-./compare.py --block-min 25551991 --block-max 25552607 --axis cur-zisk   # one axis, full set
-./compare.py --axis cur-zisk --limit 20 --quick          # a 20-block sample
+./compare.py --block-min 25815000 --block-max 25815199 --axis r10tip-vs-ziskethone   # one axis, full set
+./compare.py --axis r10tip-vs-ziskethone --limit 20 --quick   # a 20-block sample
 ```
 
 An `--axis` subset **merges** into `results/compare.json`: the axes you did not run stay in the file.
@@ -531,9 +599,9 @@ Rebuilds the HTML and the summary from an existing `--json` payload. Measures no
 ### Which blocks are off-pattern, and why
 
 ```bash
-./compare.py --block-min 25551991 --block-max 25552607 --axis cur-zisk --show-outliers 20
-./compare.py --axis cur-zisk --spread                     # what makes a block expensive
-./compare.py --block-min 25551991 --block-max 25552607 --axis cur-zisk --deep 5   # + module diff
+./compare.py --block-min 25815000 --block-max 25815199 --axis r10tip-vs-ziskethone --show-outliers 20
+./compare.py --axis r10tip-vs-ziskethone --spread         # what makes a block expensive
+./compare.py --block-min 25815000 --block-max 25815199 --axis r10tip-vs-ziskethone --deep 5   # + module diff
 ```
 
 `--deep N` appends a `hotspots.py` module diff, so the summary names *which modules* carry the gap.
@@ -552,8 +620,8 @@ instructions are different things. So a comparison is only meaningful inside one
 is what pins it there. `cur-zisk` and `cur-sp1` are the *same two guests* measured on two VMs: two
 axes, never one, and their numbers are never put in the same table.
 
-A guest can appear in many axes. `monad-r3-zisk` is the `a` side of `opt-zisk` and the `b` side of all
-thirteen ablation axes — same binary, thirteen questions.
+A guest can appear in many axes. `monad-r10-typedj-zisk` is the `a` side of `typedj-vs-overlay` and
+the `b` side of the ablation and lever axes that follow it — same binary, several questions.
 
 ### Backends: `zisk` and `sp1`, and nothing else
 
@@ -569,12 +637,12 @@ where OpenVM is comparable to the others (per block, per guest), and it is the o
 Axes live in the `AXES` dict at the top of `compare.py`:
 
 ```python
-'opt-zisk': {'backend': 'zisk', 'unit': 'steps',
-             'a': {'name': 'monad-r3-zisk',
-                   'elf':  'guests/monad-variants/r3/monad-r3-zisk.elf',
+'r10tip-vs-ziskethone': {'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r10-tip-zisk',
+                   'elf':  'guests/monad-r10-zisk/monad-r10-zisk.elf',
                    'src':  'monad'},
-             'b': {'name': 'zisk-reth',
-                   'elf':  'guests/zisk-reth/zisk-reth.elf',
+             'b': {'name': 'ziskethone',
+                   'elf':  'guests/ziskethone/ziskethone.elf',
                    'src':  'bin'}},
 ```
 
@@ -637,9 +705,9 @@ Then the axis, with two things different from a Monad side:
 
 ```bash
 cd profiling
-./axis.py add zisk-reth-vs-r3 --backend zisk \
-    --a-name zisk-reth     --a-elf guests/zisk-reth/zisk-reth.elf                --a-src bin \
-    --b-name monad-r3-zisk --b-elf guests/monad-variants/r3/monad-r3-zisk.elf    --b-src monad
+./axis.py add zisk-reth-vs-r10 --backend zisk \
+    --a-name zisk-reth      --a-elf guests/zisk-reth/zisk-reth.elf                       --a-src bin \
+    --b-name monad-r10-zisk --b-elf guests/monad-r10-zisk/monad-r10-zisk.elf             --b-src monad
 ```
 
 - **`--a-src bin`**, not `monad`. A reth guest reads its **own** `1-<block>.bin` from
@@ -663,11 +731,11 @@ disk** — a tracked file, so every one of these commands shows up in `git statu
 
 ```bash
 ./axis.py list                    # every axis, its builds, how many blocks it can run on
-./axis.py show cur-zisk           # one axis in detail
-./axis.py add kec2-vs-reth --backend zisk \
-    --a-name ab2-no-kec2 --a-elf guests/monad-variants/ab/ab2-no-kec2.elf --a-src monad \
-    --b-name zisk-reth   --b-elf guests/zisk-reth/zisk-reth.elf          --b-src bin
-./axis.py rm kec2-vs-reth
+./axis.py show r10tip-vs-ziskethone  # one axis in detail
+./axis.py add nofuse-vs-r10 --backend zisk \
+    --a-name r10-no-fuse    --a-elf profiling/series/elf/no-fuse.elf                --a-src monad \
+    --b-name monad-r10-zisk --b-elf guests/monad-r10-zisk/monad-r10-zisk.elf        --b-src monad
+./axis.py rm nofuse-vs-r10
 ```
 
 It refuses an ELF that is not there, a name already taken, an unknown `src`, and it warns loudly when
@@ -706,7 +774,7 @@ Removing an axis never discards a measurement: the cache is keyed by build conte
 "n=365 as expected" and "n=3 and nobody noticed". Both commands re-parse `compare.py` after editing
 and refuse to write if the result would not load.
 
-Then measure it over the published set: `./compare.py --block-min 25551991 --block-max 25552607 --axis <name>`. Nothing else — the cache keys on the
+Then measure it over the published set: `./compare.py --block-min 25815000 --block-max 25815199 --axis <name>`. Nothing else — the cache keys on the
 ELF's content, so an axis reusing a build another axis already measured is a cache hit from the first
 run. There is no priming step.
 
@@ -719,17 +787,23 @@ By hand, the entry is the dict shown above; the same rules apply, without the ch
 
 ## Witnesses — producing them, and where they go
 
-Three guests mint their own from an RPC; the Monad witnesses cannot be made here at all.
+Where an axis looks for them is not configured, it is derived from the side's `src` (see *Axes*):
+`bin` resolves `guests/<name>/fixtures/1-<block>.bin` then `guests/<name>/inputs/`, `monad` resolves
+`guests/monad/fixtures/<block>.witness` then `guests/monad/inputs/`. For a `bin` side the guest's
+**name is the lookup path** — rename it and the axis silently shortens to zero blocks.
+
+Three guests mint their own from an RPC, `ziskethone` is transcoded or proxied, and the Monad
+witnesses cannot be made here at all.
 
 ### reth guests (`rsp`, `zisk-reth`, `openvm-reth`)
 
 ```bash
 cd ..                                              # these run from the repo root
-./cli/gen-witness --guest zisk-reth --block 25552053   # one block, routed to that guest's stack
+./cli/gen-witness --guest zisk-reth --block 25815000   # one block, routed to that guest's stack
 ./cli/gen-witness --list
 
-ALCHEMY_URL=https://eth-mainnet.g.alchemy.com/v2/<key> ./cli/witness-farm 25551992
-ALCHEMY_URL=... GUESTS=openvm STRIDE=1 MAX_BLOCKS=503 ./cli/witness-farm 25551992
+ALCHEMY_URL=https://eth-mainnet.g.alchemy.com/v2/<key> ./cli/witness-farm 25815000
+ALCHEMY_URL=... GUESTS=openvm STRIDE=1 MAX_BLOCKS=200 ./cli/witness-farm 25815000
 ```
 
 `witness-farm` marches forward from a block and is resumable. Where each guest's witnesses land:
@@ -742,6 +816,44 @@ ALCHEMY_URL=... GUESTS=openvm STRIDE=1 MAX_BLOCKS=503 ./cli/witness-farm 2555199
 
 plus its ledger and logs under `run-data/`. `zisk-reth` needs a node exposing
 `debug_executionWitness`; `rsp` and `openvm-reth` take a standard archive RPC.
+
+### ziskethone — transcoded or proxied, never `witness-farm`
+
+Lands in **`guests/ziskethone/fixtures/1-<block>.bin`** (git-ignored per `guests/*/fixtures/`), one
+artifact per block and no `.hints` sibling — the ziskethone client is a native C++ input checker and
+emits none. The file is a `ZiskStdin`-framed **`ZEG0` container**: a u64-LE length, then a state trie
+the host has already pre-linearised into an opcode stream. Nothing like `zisk-reth`'s two bincode
+slices, so the two are not interchangeable even though both feed a ZisK guest.
+
+> ⚠️ **A ziskethone witness is only valid if its execution witness carried the 32-byte storage-slot
+> preimages**, not just the 20-byte addresses: the ZEG0 encoder needs the plaintext slot to write a
+> storage leaf's `position`. Without them the failure is silent and expensive — every storage leaf
+> degrades to a phantom leaf, so `numberOfStorages == 0`, the pre-execution root **still matches** the
+> trusted parent anchor, and every `SLOAD` reads zero. The only symptom is a wrong block hash at the
+> very end of the run. Two guards now refuse it up front (one in the encoder, one in the guest), so
+> you should never see the silent version; a witness collected through an **unfixed** proxy is the
+> case they catch.
+
+Two ways to make more, and `cli/witness-farm` is not one of them — its `zisk` arm builds an ELF and
+generates hints, neither of which a ZEG0 container needs, and N workers serialise on the cargo lock.
+
+```bash
+# offline, from an existing reth witness — no RPC, no quota, works for blocks too old to serve state
+vendor/zisk-eth-client/tools/reth-to-ziskethone/target/release/reth-to-ziskethone <input-or-dir> -o /tmp/zeg0
+for f in /tmp/zeg0/mainnet_*_zec_ziskethone.bin; do          # adopt the harness naming
+  b=$(basename "$f" | cut -d_ -f2); cp "$f" guests/ziskethone/fixtures/1-$b.bin
+done
+
+# live — Alchemy has no `debug` namespace, hence the patched proxy, then fan out input-gen
+RUST_LOG=info vendor/openvm-eth/target/release/openvm-rpc-proxy --rpc-url "$ALCHEMY_URL" \
+  --bind-address 127.0.0.1:8545 --rpc-retry-cu 8300 --preimage-cache-nibbles 7 \
+  --witness-cache-dir run-data/wcache
+```
+
+The proxy needs the `keys` fix in `cli/vendor-patches/openvm-eth.patch` — that is what makes it emit
+slot preimages. Set `--rpc-retry-cu` ~17 % **below** the account's CU/s limit: alloy's per-request
+estimate runs light, and a 429 that gets retried and lands is billed twice. Full procedure, the
+throughput table and the stale-cache trap: [`../guests/ziskethone/inputs/README.md`](../guests/ziskethone/inputs/README.md).
 
 ### Monad guest — not producible here
 
@@ -826,9 +938,9 @@ beside it.
 
 ```bash
 ./hotspots.py profile --backend zisk \
-    --elf ../guests/monad-variants/r3/monad-r3-zisk.elf \
-    -i ../guests/zisk-reth/fixtures/1-25552053.bin \
-    --out results/r3-25552053 --title "monad-r3 · 25552053"
+    --elf ../guests/monad-r10-zisk/monad-r10-zisk.elf \
+    -i ../guests/monad/execute-out/25815000.bin \
+    --out results/r10-25815000 --title "monad-r10 · 25815000"     # ev.sh writes execute-out/
 ```
 
 Writes `<out>/profile.json` + `<out>/index.html` — the hotspot icicle plus cost, opcode and category
@@ -854,9 +966,9 @@ breakdowns. `-i` repeats for several inputs, one tab each.
 
 ```bash
 ./hotspots.py compare --backend zisk \
-    --elf-before ../guests/monad-variants/ab/ab2-no-kec2.elf \
-    --elf-after  ../guests/monad-variants/r3/monad-r3-zisk.elf \
-    -i ../guests/zisk-reth/fixtures/1-25552053.bin --out results/kec2-lever
+    --elf-before ../profiling/series/elf/no-fuse.elf \
+    --elf-after  ../guests/monad-r10-zisk/monad-r10-zisk.elf \
+    -i ../guests/monad/execute-out/25815000.bin --out results/fuse-lever
 ```
 
 One command for before/after: profiles both and renders the delta. `--label-before` / `--label-after`
@@ -874,7 +986,7 @@ the terminal — this is what `compare.py --deep N` calls under the hood.
 ### Re-render without measuring
 
 ```bash
-./hotspots.py render --json results/r3-25552053/profile.json --out results/r3-25552053
+./hotspots.py render --json results/r10-25815000/profile.json --out results/r10-25815000
 ```
 
 Rebuilds the HTML from an existing `profile.json`. For template or `--meta` changes.
@@ -949,7 +1061,7 @@ every axis reads.
 ```bash
 cd ../guests/monad
 ./use-gen                              # list generations, mark the current one, show each format
-./use-gen offsettriedb-rework-2026-08  # select it and install its ELFs
+./use-gen zkvm-r8-canonical-25815000-25815199-0df7094a1   # select it and install its ELFs
 ./witness-fmt fixtures/<block>.witness # name a witness's wire format
 ```
 
