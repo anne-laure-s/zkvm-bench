@@ -88,8 +88,11 @@ execute_local() {
   echo "Input  : $INPUT"
   "$RUNNER" --elf "$ELF" --input "$INPUT" --mode execute \
     --public-values "$pv" --report "$report"
-  local commit_file="${ELF%.elf}.commit"
-  [[ -f "$commit_file" ]] && export REPORT_COMMIT="$(cat "$commit_file")"
+  # report.json's `commit` pins the work-unit to an ELF version; it comes from the guest's
+  # build record (cli/buildrec.sh), keyed on the ELF's own directory name.
+  . "$ROOT/../cli/buildrec.sh"
+  local rec; rec="$(brec_file "$(basename "$(dirname "$ELF")")")"
+  [[ -f "$rec" ]] && export REPORT_COMMIT="$(brec_get "$rec" commit)"
   _inject_report_meta "$report" ZisK "$INPUT"
   unset REPORT_COMMIT
   echo "Report : $report"

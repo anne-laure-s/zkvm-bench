@@ -22,7 +22,7 @@
 # Producers (guests/<name>/guest.sh provides build_elf / build_bin / gen_input / decode_pv):
 #   ./run build-elf GUEST=<name> [OPENVM_ETH_DIR=../../vendor/openvm-eth]
 #       -> cross-compiles the guest to ../../guests/<name>/<name>.elf (RISC-V; needs cargo-openvm; no GPU).
-#          OpenVM embeds this into the binary, so this is for parity/visibility + a .commit pin.
+#          OpenVM embeds this into the binary, so this is for parity/visibility + a build record.
 #   ./run build-bin GUEST=<name> [OPENVM_ETH_DIR=../../vendor/openvm-eth] [CUDA=1]
 #       -> builds openvm-reth-benchmark (CPU build by default; CUDA=1 for the box)
 #   ./run gen-input GUEST=<name> BLOCK=<n> [CHAIN_ID=1] [RPC_URL=…] [NO_REPORT=1]

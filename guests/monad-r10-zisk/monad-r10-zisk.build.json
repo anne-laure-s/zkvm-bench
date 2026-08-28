@@ -1,0 +1,29 @@
+{
+  "commit": "c59b7ab053d588c976007d44903b1a09ed442d7d",
+  "compiler": "/Users/anne-laure/.local/xPacks/zisk-dma-gcc-15.2.0/bin/riscv64-unknown-elf-g++",
+  "compiler_sha256": "24d91e3430673c5c76c3cf6f1206c473577a755d1a3651e24c4a416b53449a86",
+  "compiler_version": "15.2.0",
+  "elf": "guests/monad-r10-zisk/monad-r10-zisk.elf",
+  "elf_sha256": "ee62dda0f9abfca077948ae1949b888fc6f8c1d6803f6642bb3feaea09018974",
+  "evidence": {
+    "dma_read_sites": 9305,
+    "dma_write_sites": 179,
+    "elf_marker": "monad-zkvm-official-v1;dma=1;table_arg=1;keccakf_memo=1;fuse=1",
+    "keccak_fcall_get_sites": 2,
+    "keccak_fcall_set_sites": 2
+  },
+  "features": {
+    "dma": true,
+    "fuse": true,
+    "keccakf_memo": true,
+    "table_arg": true
+  },
+  "profile": "monad-zkvm-official-v1",
+  "required_flags": [
+    "-O3",
+    "-mtune=generic-ooo",
+    "-march=rv64ima_zbb_zbs_zbkb_zicsr",
+    "-mzisk-dma"
+  ],
+  "schema": 1
+}

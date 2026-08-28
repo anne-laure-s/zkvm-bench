@@ -4,7 +4,9 @@
 #
 #   name | infra_dir | run_guest | eth_var | vendor_dir | elf | witness | exec | description
 #
-# elf     : build (from vendor_dir) · presupplied (shipped in-repo)
+# elf     : build (from vendor_dir) · presupplied (shipped in-repo) ·
+#           record (guests/<name>/build.sh, driven by guests/<name>/<name>.build) ·
+#           monad  (cli/build-monad -> the monad tree's own zkvm/zisk/build-official.sh)
 # witness : rpc (standard archive RPC) · rpc-debug (needs a debug_executionWitness node) ·
 #           presupplied (shipped in-repo) · toy (not a block witness)
 # exec    : input (./run execute ELF INPUT) · block (./run execute BLOCK) · batch (guests/monad/ev.sh)
@@ -20,3 +22,10 @@ zisk       | infra/zisk-infra   | zisk-reth   | ZISK_ETH_DIR   | vendor/zisk-eth
 monad-sp1  | infra/sp1-infra    | monad-sp1   | -              | -                      | presupplied | presupplied | batch | Monad guest on SP1
 monad-zisk | infra/zisk-infra   | monad-zisk  | -              | -                      | presupplied | presupplied | batch | Monad guest on ZisK
 fibonacci  | infra/sp1-infra    | fibonacci   | -              | -                      | build       | toy         | input | SP1 example guest
+# The two sides of the ZisK headline comparison. Neither builds the way the reth guests do, and
+# they do not build the same way as each other: ziskethone is a C++ cmake guest behind an upstream
+# driver, pinned by a hand-written <name>.build record; a Monad guest is built by the monad tree's
+# own fail-closed recipe, and its <name>.build.json is written by that recipe's auditor. Add
+# another Monad build with `cli/build-monad --name <n> --branch <b>` plus a row here.
+ziskethone      | infra/zisk-infra | ziskethone      | - | vendor/zisk-eth-client | record | rpc-debug    | input | ZisK · ziskethone (upstream C++ reference)
+monad-r10-zisk  | infra/zisk-infra | monad-r10-zisk  | - | -                      | monad  | presupplied  | input | Monad guest, al/zkvm-r10 (input must be ziskos-framed)

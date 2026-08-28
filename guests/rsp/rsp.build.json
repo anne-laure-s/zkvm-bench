@@ -1,0 +1,6 @@
+{
+  "commit": "c2734ce58e5370cfb012789e32a5f091a0fe98b5",
+  "elf": "guests/rsp/rsp.elf",
+  "elf_sha256": "cb97b1f29f5c0a8e44cae82a75e8140ce29b229f6cf2739d1c746cc695ab5aa3",
+  "schema": 1
+}

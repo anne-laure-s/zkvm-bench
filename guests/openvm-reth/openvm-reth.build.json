@@ -1,0 +1,6 @@
+{
+  "commit": "0373b3b9d67056e30c99810bc868e433647a03a7",
+  "elf": "guests/openvm-reth/openvm-reth.elf",
+  "elf_sha256": "c8227540ba3b84d7b90a419659d2e1ca842ab74ecd7e47630cd9d7d4d72fb925",
+  "schema": 1
+}

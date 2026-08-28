@@ -25,8 +25,10 @@ guest_build_elf() {
   p="$(find "$rsp" -path '*/elf-compilation/*/release/rsp-client' -type f 2>/dev/null | head -n1)"
   [[ -n "$p" ]] || { echo "ERROR: built rsp-client ELF not found under $rsp" >&2; return 1; }
   cp "$p" "$ELF"
-  git -C "$rsp" rev-parse HEAD > "${ELF%.elf}.commit" 2>/dev/null || echo unknown > "${ELF%.elf}.commit"
-  echo "RSP commit: $(cat "${ELF%.elf}.commit")"
+  # The build record — one shape for every built ELF, see cli/buildrec.sh.
+  . "$ROOT/../cli/buildrec.sh"
+  brec_stamp "$(brec_file rsp)" "$ELF" "$(git -C "$rsp" rev-parse HEAD 2>/dev/null || true)"
+  echo "RSP commit: $(brec_get "$(brec_file rsp)" commit)"
 }
 
 # Generate the block witness LOCALLY (execute-only) and copy it to $INPUT.

@@ -1,0 +1,26 @@
+{
+  "commit": "2bb899ae0c08aa3670fde692765e0781b494484d",
+  "elf": "guests/ziskethone/ziskethone.elf",
+  "elf_sha256": "39ad249e2e50ee178add4eb34c71845b43ede3261d8bada11fa804a76c4ae40c",
+  "expect": {
+    "bytes": 1012320,
+    "dma_marker_sites_min": 100
+  },
+  "notes": [
+    "Upstream ships two builds under this name. This is the SHIPPED one: JUMPDEST precompile, -mzisk-dma, fused cgoto dispatch. `develop` (sha dd445f3f1a093a42, commit 7e6c702) has none of them and costs 1.348x these steps over the 200-block corpus; quoting a Monad gap against it understates it by about a third. To obtain it deliberately, set source.upstream_branch and commit to that one and run build.sh --check.",
+    "Byte-reproducible: the build embeds no path strings, so elf_sha256 is checked as an equality and a mismatch means an input moved. The Monad guests cannot make that promise -- rustc stamps the build path into a .symtab symbol -- so theirs is a finding, not a contract."
+  ],
+  "profile": "ziskethone-shipped",
+  "schema": 1,
+  "source": {
+    "driver": "crates/clients/ziskethone/guest/build-elf.sh",
+    "driver_commit": "c20fda3d2e7d69ba53c5e2c05ac00d7afb16788f",
+    "driver_repo": "vendor/zisk-eth-client",
+    "upstream_branch": "perf/dma-precompiles",
+    "upstream_url": "https://github.com/0xPolygonHermez/ziskethone.git"
+  },
+  "toolchain": {
+    "dma_gcc": "zisk-dma-gcc-14.3.0",
+    "xpack": "xpack-riscv-none-elf-gcc-14.3.0-1"
+  }
+}

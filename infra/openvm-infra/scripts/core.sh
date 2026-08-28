@@ -46,8 +46,9 @@ execute_local() {
     "$RUNNER" --mode execute --block "$BLOCK" --chain "$CHAIN_ID" ${RPC_URL:+--rpc "$RPC_URL"} \
       --public-values "$pv" --report "$report"
   local g="${GUEST:-openvm-reth}" commit_file
-  commit_file="$GUESTS_DIR/$g/$g.commit"
-  [[ -f "$commit_file" ]] && export REPORT_COMMIT="$(cat "$commit_file")"
+  . "$ROOT/../cli/buildrec.sh"
+  commit_file="$(brec_file "$g")"
+  [[ -f "$commit_file" ]] && export REPORT_COMMIT="$(brec_get "$commit_file" commit)"
   _inject_report_meta "$report" OpenVM "$g" "$BLOCK"
   unset REPORT_COMMIT
   echo "Report : $report"

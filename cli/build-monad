@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+#
+# build-monad — build a Monad ZisK guest at a commit, and file it as a guest of this repo.
+#
+#   ./cli/build-monad --name monad-r10-zisk --branch al/zkvm-r10
+#   ./cli/build-monad --name monad-r10-zisk --branch al/zkvm-r10 --commit c59b7ab05
+#   ./cli/build-monad --name r10-nibpack    --commit 6318098a9         # commit alone is enough
+#
+# --commit defaults to the tip of --branch. One of the two is required; --name decides where the
+# result lands (guests/<name>/<name>.elf).
+#
+# NO BUILD FLAG IS SET HERE, and none is restated. zkvm/guest/CMakeLists.txt is the source of
+# truth: MONAD_ZKVM_OFFICIAL_PROFILE=ON makes it FORCE its own option set into the cache
+# (`set(... CACHE BOOL ... FORCE)`) and FATAL_ERROR on a contradicting -D, on a compiler that is
+# not GCC 15.2.0, on a non-ZisK target, and on a missing commit stamp. So the whole contract from
+# out here is two defines:
+#
+#     MONAD_ZKVM_CMAKE_DEFINES=MONAD_ZKVM_OFFICIAL_PROFILE=ON;MONAD_ZKVM_GIT_COMMIT=<sha>
+#
+# Neither is a compilation choice — one asks for the profile, the other is the provenance the
+# profile requires. Everything else (-O3, -mtune=generic-ooo, -march=rv64ima_zbb_zbs_zbkb_zicsr,
+# -mzisk-dma, the fusions, the keccak memo) is the guest's business and stays there.
+#
+# The tree also ships zkvm/zisk/build-official.sh, which poses those two defines plus the seven
+# options the profile already forces. Measured: passing them or not gives a byte-identical ELF
+# (ee62dda0f9abfca0, same build signature), so they are inert — and a builder that restates what
+# CMake enforces is the duplication the profile exists to remove. This calls cargo-zisk directly.
+#
+# It does call the tree's zkvm/zisk/audit-official-build.py when it is there, which is a different
+# thing: an auditor READS CMakeCache and the generated profile back to check what CMake actually
+# did. Restating expectations is what makes it an independent check rather than a second opinion.
+# Its findings are filed as guests/<name>/<name>.build.json, the shared build record (cli/buildrec.sh)
+# — generated rather than maintained, so it cannot disagree with the binary, and it carries the
+# commit, so `cli/gen-elf --guest <name>` rebuilds from it without being told again.
+#
+# Options:
+#   --name <n>      guest directory + ELF basename under guests/ (required)
+#   --branch <b>    branch to take the commit from
+#   --commit <c>    exact commit (default: tip of --branch)
+#   --workdir <d>   where to put a throwaway worktree (default: a temp dir, removed on exit)
+#   --keep          keep that worktree — its cargo target/ makes the next build of the same
+#                   commit fast, where a fresh one is a cold build of the whole dependency tree
+#
+# Env: RISCV_TOOLCHAIN_DIR (default ~/.local/xPacks/zisk-dma-gcc-15.2.0) · CARGO_ZISK · MONAD_URL
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+CLONE="$ROOT/vendor/monad"
+CLONE_URL="${MONAD_URL:-https://github.com/category-labs/monad.git}"
+TC="${RISCV_TOOLCHAIN_DIR:-$HOME/.local/xPacks/zisk-dma-gcc-15.2.0}"
+CARGO_ZISK="${CARGO_ZISK:-$HOME/.zisk/bin/cargo-zisk}"
+# The commit that brought the official profile into the CMakeLists. Named so an older branch fails
+# with the reason instead of with a CMake error about an unknown option.
+PROFILE_SINCE=89b8a6b15e324fd8af78449d2aa4b5fee612545e
+
+die()   { echo "build-monad: $*" >&2; exit 2; }
+usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^#//; s/^ //'; exit "${1:-0}"; }
+
+NAME="" BRANCH="" COMMIT="" WORKDIR="" KEEP=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --name)    NAME="${2:?}";    shift 2 ;;
+    --branch)  BRANCH="${2:?}";  shift 2 ;;
+    --commit)  COMMIT="${2:?}";  shift 2 ;;
+    --workdir) WORKDIR="${2:?}"; shift 2 ;;
+    --keep)    KEEP=1;           shift ;;
+    -h|--help) usage 0 ;;
+    *) die "unknown argument '$1' (see --help)" ;;
+  esac
+done
+[[ -n "$NAME" ]] || die "--name is required (the guest directory under guests/)"
+[[ -n "$BRANCH" || -n "$COMMIT" ]] || die "one of --branch / --commit is required"
+
+# ── host plumbing ────────────────────────────────────────────────────────────────────────
+# Where the compiler is, not which one: the profile itself refuses anything that is not GCC
+# 15.2.0, so this only has to point at a toolchain. Both prefixes the xPacks install are accepted.
+[[ -x "$CARGO_ZISK" ]] || die "no cargo-zisk at $CARGO_ZISK (set CARGO_ZISK=)"
+if   [[ -x "$TC/bin/riscv64-unknown-elf-g++" ]]; then PREFIX=riscv64-unknown-elf-
+elif [[ -x "$TC/bin/riscv64-none-elf-g++"    ]]; then PREFIX=riscv64-none-elf-
+else die "no RISC-V g++ under $TC/bin
+  The official profile needs the patched GCC 15.2.0 (-mzisk-dma is not upstream); build one with
+  profiling/experiments/zisk-dma-gcc15/build-gcc15.sh, or point RISCV_TOOLCHAIN_DIR elsewhere."
+fi
+
+# ── the clone ────────────────────────────────────────────────────────────────────────────
+# vendor/monad is a working clone on a branch, not a pinned vendor — cli/install-vendors does not
+# manage it (see README). Create it if it is not there; never move it if it is, because it is
+# usually parked on someone's branch.
+if [[ ! -e "$CLONE/.git" ]]; then
+  echo "== no monad clone at vendor/monad — cloning $CLONE_URL"
+  git clone "$CLONE_URL" "$CLONE"
+fi
+
+resolve() { git -C "$CLONE" rev-parse --verify --quiet "$1^{commit}"; }
+
+REF="${COMMIT:-$BRANCH}"
+SHA="$(resolve "$REF" || true)"
+if [[ -z "$SHA" ]]; then
+  echo "== $REF unknown locally — fetching"
+  git -C "$CLONE" fetch --quiet --all --tags
+  SHA="$(resolve "$REF" || true)"
+  [[ -n "$SHA" ]] || die "$REF is not a commit or branch of $CLONE"
+fi
+SHORT="${SHA:0:9}"
+[[ -n "$COMMIT" ]] || echo "== $BRANCH is at $SHORT"
+
+git -C "$CLONE" cat-file -e "$SHA:zkvm/guest/CMakeLists.txt" 2>/dev/null \
+  || die "$SHORT has no zkvm/guest/CMakeLists.txt — is this the monad tree?"
+git -C "$CLONE" show "$SHA:zkvm/guest/CMakeLists.txt" | grep -q MONAD_ZKVM_OFFICIAL_PROFILE \
+  || die "$SHORT has no MONAD_ZKVM_OFFICIAL_PROFILE in zkvm/guest/CMakeLists.txt.
+  The profile arrived in ${PROFILE_SINCE:0:9} (\"zkvm: make official ZisK builds fail closed\").
+  Before it the option set was chosen per commit, not by the guest — there is no single recipe to
+  apply, and picking one here would be exactly the second opinion this tool refuses to be. Those
+  builds are reproduced from their lineage's own profiling/series/<lineage>-buildenv.tsv."
+
+# ── a tree to build in ───────────────────────────────────────────────────────────────────
+# Reuse a clean worktree already sitting on the commit before making one: it usually has a warm
+# cargo target/, and a fresh worktree is a cold build of the whole dependency tree. Clean matters
+# because the profile stamps the commit into the binary and refuses a dirty tree — that stamp
+# would otherwise name a commit the binary was not built from.
+SRC="" DIRTY=""
+while read -r cand; do
+  [[ -n "$cand" ]] || continue
+  [[ "$(git -C "$cand" rev-parse HEAD 2>/dev/null)" == "$SHA" ]] || continue
+  if [[ -z "$(git -C "$cand" status --porcelain 2>/dev/null)" ]]; then SRC="$cand"; break; fi
+  DIRTY="$DIRTY $cand"
+done < <(git -C "$CLONE" worktree list --porcelain | sed -n 's/^worktree //p')
+
+CLEANUP=""
+if [[ -n "$SRC" ]]; then
+  echo "== reusing the clean worktree already at $SHORT: $SRC"
+else
+  [[ -z "$DIRTY" ]] || echo "== worktrees at $SHORT have uncommitted changes, skipping them:$DIRTY"
+  SRC="${WORKDIR:-$(mktemp -d -t monad-$SHORT)}"
+  echo "== adding a worktree at $SHORT: $SRC"
+  rm -rf "$SRC"
+  git -C "$CLONE" worktree add --detach --quiet "$SRC" "$SHA"
+  [[ "$KEEP" == 1 ]] || CLEANUP="$SRC"
+fi
+# shellcheck disable=SC2064
+trap '[[ -z "$CLEANUP" ]] || { git -C "'"$CLONE"'" worktree remove --force "$CLEANUP" 2>/dev/null || rm -rf "$CLEANUP"; }' EXIT
+
+# ── build ────────────────────────────────────────────────────────────────────────────────
+echo "== building $NAME from $SHORT"
+(
+  cd "$SRC/zkvm/zisk"
+  export RISCV_TOOLCHAIN_DIR="$TC"
+  export CC_riscv64ima_zisk_zkvm_elf="$TC/bin/${PREFIX}gcc"
+  export CXX_riscv64ima_zisk_zkvm_elf="$TC/bin/${PREFIX}g++"
+  export MONAD_ZKVM_GIT_COMMIT="$SHA"
+  export MONAD_ZKVM_CMAKE_DEFINES="MONAD_ZKVM_OFFICIAL_PROFILE=ON;MONAD_ZKVM_GIT_COMMIT=$SHA"
+  "$CARGO_ZISK" build --release
+)
+
+REL="$SRC/zkvm/zisk/target/elf/riscv64ima-zisk-zkvm-elf/release"
+BUILT="$REL/monad-zkvm-zisk"
+[[ -f "$BUILT" ]] || die "cargo-zisk finished but left no ELF at $BUILT"
+
+# ── audit, with the tree's own auditor ───────────────────────────────────────────────────
+# Not ours, and not required to exist: it reads CMakeCache and the generated profile back to check
+# what CMake actually did — the compiler's sha, the required flags in the guest's own compile line,
+# the DMA and keccak-memo instruction counts, the Zbb/Zbs/Zbkb ELF attributes — and writes what it
+# asserted. A tree without one still gets a record: the shared writer fills the required keys, and
+# it simply carries `audited: false` instead of any evidence.
+. "$HERE/buildrec.sh"
+DEST="$ROOT/guests/$NAME"
+REC_OUT="$(brec_file "$NAME")"
+mkdir -p "$DEST"
+AUDITOR="$SRC/zkvm/zisk/audit-official-build.py"
+MANIFEST="$BUILT.build.json"
+if [[ -f "$AUDITOR" ]]; then
+  python3 "$AUDITOR" --elf "$BUILT" --build-root "$REL/build" --repo "$SRC" --manifest "$MANIFEST"
+else
+  echo "== $SHORT ships no audit-official-build.py — the record will say so"
+  printf '{"audited": false}\n' > "$MANIFEST"
+fi
+
+# ── file it ──────────────────────────────────────────────────────────────────────────────
+cp "$BUILT" "$DEST/$NAME.elf"
+# The record goes through the shared writer (cli/buildrec.sh), so this guest's record carries the
+# same required keys as every other one. What the auditor asserted on top — `evidence`, `features`,
+# `required_flags`, the compiler it hashed — is copied verbatim, because it is its word and not
+# ours. `elf` and `elf_sha256` are the exception: they are recomputed from the installed file,
+# since the auditor recorded the path it built at, which is a temp worktree half the time.
+python3 - "$MANIFEST" "$REC_OUT" <<'AUDIT'
+import json, sys
+src, dst = sys.argv[1:3]
+m = json.load(open(src))
+for k in ("elf", "elf_sha256", "schema", "commit"):
+    m.pop(k, None)
+json.dump(m, open(dst, "w"), indent=2, sort_keys=True)
+open(dst, "a").write("\n")
+AUDIT
+brec_stamp "$REC_OUT" "$DEST/$NAME.elf" "$SHA"
+
+echo
+echo "  commit    $SHA"
+echo "  sha256    $(shasum -a256 "$DEST/$NAME.elf" | cut -d' ' -f1)"
+echo "  elf       guests/$NAME/$NAME.elf"
+echo "  record    guests/$NAME/$NAME.build.json"

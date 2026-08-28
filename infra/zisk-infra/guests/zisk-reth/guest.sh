@@ -29,7 +29,7 @@ guest_tag() {
 }
 
 # Build the ZisK reth guest ELF -> $ELF. Records the zisk-eth-client commit so the
-# ELF and inputs can be pinned to the same version (mirrors RSP's .commit file).
+# ELF and inputs can be pinned to the same version (the shared build record, cli/buildrec.sh).
 guest_build_elf() {
   local dir="${ZISK_ETH_DIR:?set ZISK_ETH_DIR to your zisk-eth-client checkout}"
   local crate="${GUEST_CRATE_DIR:-$dir/bin/guests/stateless-validator-reth}"
@@ -49,8 +49,10 @@ guest_build_elf() {
   fi
   [[ -n "$p" && -f "$p" ]] || { echo "ERROR: built ZisK ELF not found in $reldir (set ZISK_ELF_NAME)" >&2; return 1; }
   cp "$p" "$ELF"
-  git -C "$dir" rev-parse HEAD > "${ELF%.elf}.commit" 2>/dev/null || echo unknown > "${ELF%.elf}.commit"
-  echo "zisk-eth-client commit: $(cat "${ELF%.elf}.commit")"
+  # The build record — one shape for every built ELF, see cli/buildrec.sh.
+  . "$ROOT/../cli/buildrec.sh"
+  brec_stamp "$(brec_file zisk-reth)" "$ELF" "$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
+  echo "zisk-eth-client commit: $(brec_get "$(brec_file zisk-reth)" commit)"
   echo "ELF built from: $p"
   echo "REMINDER: after shipping this ELF to the box (~/$(basename "$ELF")), run the per-ELF setup there —"
   echo "  distributed (benchmark): cargo-zisk remote setup -e ~/$(basename "$ELF") --hints --coordinator http://127.0.0.1:7000"

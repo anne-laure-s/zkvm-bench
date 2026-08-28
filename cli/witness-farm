@@ -191,7 +191,8 @@ if wants openvm; then
   # openvm-eth commit. Worth checking loudest exactly when the build was skipped, since then the
   # binary is whatever an earlier session left behind.
   _head="$(git -C "$OPENVM_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
-  _pin="$(cat "$ROOT/guests/openvm-reth/openvm-reth.commit" 2>/dev/null || echo unknown)"
+  . "$ROOT/cli/buildrec.sh"
+  _pin="$(brec_get "$(brec_file openvm-reth)" commit)"; _pin="${_pin:-unknown}"
   log "openvm-eth commit: ${_head:0:9} (binary built from ${_pin:0:9})"
   if [ "$_head" != "$_pin" ]; then
     log "⚠️  openvm-eth HEAD != the commit the binary was built from — the witness layout may not"

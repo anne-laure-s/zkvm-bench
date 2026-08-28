@@ -1,0 +1,6 @@
+{
+  "commit": "c20fda3d2e7d69ba53c5e2c05ac00d7afb16788f",
+  "elf": "guests/zisk-reth/zisk-reth.elf",
+  "elf_sha256": "979da60df5826c5eb1e178380d46d95235bc01ddd064a6e0bb387b90a418c0d3",
+  "schema": 1
+}

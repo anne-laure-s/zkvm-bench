@@ -80,7 +80,7 @@ occupancy from `nvidia-smi` during a proof.
 
 ## Environment / reproducibility
 Each run record carries `env.txt` (GPU model, driver, `cargo-zisk --version`). The ELF is pinned by
-`../../guests/zisk-reth/zisk-reth.commit`; re-run the per-ELF setup (`cargo-zisk remote setup` for the
+`../../guests/zisk-reth/zisk-reth.build.json`; re-run the per-ELF setup (`cargo-zisk remote setup` for the
 distributed path, `cluster/01-setup-elf.sh` for the local backend) whenever the ELF changes.
 
 ## CLI status (verified against installed v1.0.0-alpha)
@@ -99,5 +99,5 @@ MULTI-GPU (as actually run — supersedes the MPI-first assumption below):
 STILL TO CONFIRM ON THE BOX (the only unknowns left):
 - worker backend wiring: `--emulator` vs `--asm <file>` + the `-k <proving-key>` folder from `remote setup` (see `cluster/start.sh`: `WORKER_BACKEND`/`ASM_FILE`/`PROVING_KEY`).
 - that `logs/worker.log` (`--report-bindings`) shows MPI_NP ranks across all GPUs (not 1).
-- provingKey: 2.98 GB **download** but **≈30 GB+ EXTRACTED** on disk (measured 2026-06-30: `~/.zisk/provingKey` hit 30 GB and still filled a 32 GB box mid-const-tree-gen → full size is >30 GB). The const-tree files (Merkle trees over all AIRs/precompiles + recursion) are the bulk. **30 GB is IMPOSSIBLE; SP1's 30 GB does NOT transfer to ZisK.** Box disk budget: **≥64 GB** (key ~30-40 GB + ROM asm few GB + binaries/toolchain ~1.6 GB + proofs/logs + headroom). We do NOT fetch the 20.4 GB PLONK key (no on-chain).
+- provingKey: 2.98 GB **download** but **70 GB EXTRACTED** on disk (measured 2026-08-18, v1.0.0-alpha: `~/.zisk/provingKey` = 70 GB, and a 124 GB box sits at 69 GB used once installed). The const-tree files (Merkle trees over all AIRs/precompiles + recursion) are the bulk. **A 32 GB box is IMPOSSIBLE, and so is 64 GB; SP1's 30 GB does NOT transfer to ZisK.** Box disk budget: **≥128 GB** (key 70 GB + ROM asm few GB + binaries/toolchain ~1.6 GB + proofs/logs + headroom). We do NOT fetch the 20.4 GB PLONK key (no on-chain).
 - The `cargo-zisk prove` GPU flag exists only on the GPU build. Note: single-process ≈ 1 GPU holds only for the STOCK worker; with the patched worker a single process (`NO_MPI`) drives ALL GPUs — that's the path used.

@@ -5,20 +5,49 @@ stacks: the same artifacts are produced on the Mac ([`cli/gen-elf`](../cli/) · 
 which delegate to `infra/<stack>-infra/run`) and consumed by proving (`infra/<stack>-infra`) and by
 [`profiling/`](../profiling/). The regenerable outputs (compiled `*.elf`, block witnesses, and the
 `*.exec-report.json` execute reports) are git-ignored, as is the Monad `inputs/` (witnesses + roots);
-the `*.commit` pins and the pre-supplied Monad ELFs are versioned (see the root `.gitignore`).
+the `*.build.json` records and the pre-supplied Monad ELFs are versioned (see the root `.gitignore`).
 
 ## Layout of a guest
 
 ```
 guests/<name>/
 ├── <name>.elf            # the compiled guest
-├── <name>.commit         # source commit the ELF was built from (pin ELF + inputs together)
+├── <name>.build.json     # the build record — what this ELF is and where it came from
 └── inputs/               # per-block witnesses (+ <tag>.exec-report.json from `execute`), plus a
                           #   README: how to (re)generate them + a reference block
 ```
 
 > **Same-commit rule:** an input only matches an ELF built from the **same source commit** (the witness
-> layout can change). Regenerate both together when bumping the upstream; `<name>.commit` records it.
+> layout can change). Regenerate both together when bumping the upstream; the record's `commit` says
+> which one this ELF is.
+
+### The build record
+
+**One shape for every built ELF**, written by whatever built it and read through
+[`../cli/buildrec.sh`](../cli/buildrec.sh). Four keys are always there and always mean the same
+thing:
+
+| key | |
+|---|---|
+| `schema` | `1` |
+| `commit` | the source commit the ELF was built from, or `null` if unknown |
+| `elf` | repo-relative path of the ELF this record describes |
+| `elf_sha256` | sha256 of that ELF — the identity `profiling/cache` keys on — or `null` if it is not here |
+
+Anything a particular builder knows on top sits beside them and is preserved on rewrite: `source`
+holds the pins when one commit does not name the build (ziskethone needs two — its own submodule and
+the driver that sets its flags), `evidence` and `features` are what an upstream auditor asserted.
+
+It replaced five overlapping records: a bare `<name>.commit`, a sha table in
+[`monad-variants/README.md`](monad-variants/README.md), a `KEY=value` file for ziskethone and a JSON
+of its own for the Monad guests. They diverged in the direction of the arrow — one was read by its
+build as authority, another written by it as a finding — so nothing could answer *which build
+produced this number* without first knowing which guest it was asking about.
+
+Two records are deliberately **not** this, because they describe something other than one built ELF:
+`monad/gen/<G>/PROVENANCE.md` is a corpus plus the prose about which generations are mutually
+incompatible, and `profiling/series/<lineage>-index.tsv` is 82 builds of one lineage — a table, not
+82 files.
 
 ## The guests
 
@@ -35,7 +64,7 @@ guests/<name>/
 
 [`monad-variants/`](monad-variants/README.md) holds Monad guest builds that exist only to be put on
 an axis by `profiling/compare.py` — the baseline, the optimised line, the per-lever ablations, a
-superseded branch. They have no registry row, no `inputs/`, no `.commit`, and are never proved, so
+superseded branch. They have no registry row, no `inputs/`, no build record, and are never proved, so
 they are **not** guests and do not follow the layout above. Their ELFs are git-ignored like any other
 build output; `monad-variants/README.md` carries the sha256 of each, which is what actually has to
 survive a clone.

@@ -66,6 +66,8 @@ git -C "$OPENVM_ETH_DIR" fetch --depth 1 origin "$OPENVM_ETH_REV" 2>/dev/null ||
 git -C "$OPENVM_ETH_DIR" checkout -q "$OPENVM_ETH_REV" \
   || { echo "ERROR: cannot checkout openvm-eth $OPENVM_ETH_REV" >&2; exit 1; }
 mkdir -p "$ROOT/elfs"
+# A note-to-self on the box, not the guest's build record: that one lives in the repo at
+# guests/openvm-reth/openvm-reth.build.json (cli/buildrec.sh) and nothing on the box reads this.
 git -C "$OPENVM_ETH_DIR" rev-parse HEAD | tee "$ROOT/elfs/openvm-reth.commit"
 
 echo "== 3. multi-GPU patch (vendoring openvm + stark-backend, cargo [patch]) =="

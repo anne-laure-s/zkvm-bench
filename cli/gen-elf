@@ -2,10 +2,11 @@
 #
 # gen-elf — build the guest ELF for a guest, by delegating to that guest's stack.
 #
-# Thin root dispatcher over `infra/<stack>-infra/run build-elf`, driven by guests.registry
-# (via reg.sh). Guests whose ELF is pre-supplied (monad-*) return a clear error.
+# Thin root dispatcher driven by guests.registry (via reg.sh). Where it delegates depends on the
+# guest's `elf` mode: a stack's `infra/<stack>-infra/run build-elf`, the guest's own
+# guests/<name>/build.sh, or cli/build-monad. Guests whose ELF is pre-supplied return a clear error.
 #
-#   ./gen-elf --guest <name> [--eth-dir <checkout>]
+#   ./gen-elf --guest <name> [--eth-dir <checkout>] [-- <args for the guest's own recipe>]
 #   ./gen-elf --list
 #
 # The ELF lands in guests/<name>/<name>.elf. Building needs the guest's toolchain
@@ -20,18 +21,26 @@ die()   { echo "gen-elf: $*" >&2; exit 2; }
 usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; /^set -euo/d'; exit "${1:-0}"; }
 abs()   { case "$1" in /*) echo "$1";; *) echo "$ROOT/$1";; esac; }
 
-GUEST="" ETH_DIR=""
+GUEST="" ETH_DIR="" PASSTHRU=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --guest)   GUEST="${2:?}"; shift 2 ;;
     --eth-dir) ETH_DIR="${2:?}"; shift 2 ;;
     --list)    echo "guests (guests.registry):"; reg_list; exit 0 ;;
     -h|--help) usage 0 ;;
+    # Everything after `--` goes to the recipe of an elf:record / elf:monad guest. Rejected for
+    # the other modes rather than ignored: a flag that silently goes nowhere is how a --check
+    # turns into an install.
+    --)        shift; PASSTHRU=("$@"); break ;;
     *) die "unknown argument '$1' (see --help)" ;;
   esac
 done
 [[ -n "$GUEST" ]] || { echo "gen-elf: --guest is required" >&2; reg_list >&2; exit 1; }
 reg_lookup "$GUEST" || die "unknown guest '$GUEST' (run --list to see them)."
+
+if [[ ${#PASSTHRU[@]} -gt 0 && "$REG_ELF" != record && "$REG_ELF" != monad ]]; then
+  die "$GUEST ($REG_DESC): elf mode '$REG_ELF' takes no recipe arguments (got: ${PASSTHRU[*]})"
+fi
 
 case "$REG_ELF" in
   build)
@@ -43,6 +52,32 @@ case "$REG_ELF" in
     fi
     echo "== gen-elf: $GUEST ($REG_DESC) → guests/$REG_RUNG/$REG_RUNG.elf =="
     ( cd "$ROOT/$REG_INFRA" && ./run build-elf GUEST="$REG_RUNG" ${ethkv:+"$ethkv"} )
+    ;;
+  monad)
+    # A Monad guest. The flags are not ours and are not restated anywhere here: cli/build-monad
+    # defers to zkvm/zisk/build-official.sh in the monad tree, which poses the official profile
+    # and audits its own output. All this needs is WHICH commit — and the audit manifest that
+    # the last build filed beside the ELF says so, generated rather than maintained.
+    man="$ROOT/guests/$REG_RUNG/$REG_RUNG.build.json"   # the shared build record, cli/buildrec.sh
+    [[ -f "$man" ]] || die "$GUEST ($REG_DESC): no build manifest at guests/$REG_RUNG/$REG_RUNG.build.json.
+  Nothing records which commit this guest is, so there is nothing to reproduce. Build it once by naming one:
+      ./cli/build-monad --name $REG_RUNG --branch <branch> [--commit <sha>]"
+    . "$HERE/buildrec.sh"
+    commit="$(brec_get "$man" commit)"
+    [[ -n "$commit" ]] || die "$GUEST ($REG_DESC): $man records no commit — rebuild it by naming one."
+    echo "== gen-elf: $GUEST ($REG_DESC) → guests/$REG_RUNG/ · commit ${commit:0:9} (from its manifest) =="
+    exec "$HERE/build-monad" --name "$REG_RUNG" --commit "$commit" ${PASSTHRU:+"${PASSTHRU[@]}"}
+    ;;
+  record)
+    # The guest carries its own recipe, pinned by guests/<name>/<name>.build. Not a stack `run`
+    # verb: a C++ cmake guest behind an upstream driver does not build like the reth guests, and
+    # folding it into guest.sh would put its rules in a file that answers for every guest of that
+    # stack. Trailing arguments after `--` reach the recipe — `-- --check` verifies without
+    # installing.
+    recipe="$ROOT/guests/$REG_RUNG/build.sh"
+    [[ -x "$recipe" ]] || die "$GUEST ($REG_DESC): no build recipe at guests/$REG_RUNG/build.sh"
+    echo "== gen-elf: $GUEST ($REG_DESC) → guests/$REG_RUNG/ =="
+    exec "$recipe" ${PASSTHRU:+"${PASSTHRU[@]}"}
     ;;
   presupplied)
     die "$GUEST ($REG_DESC): ELF is pre-supplied (guests/monad/monad-zkvm-guest-*.elf), not built here."

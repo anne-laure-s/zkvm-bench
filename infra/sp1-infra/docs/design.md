@@ -240,7 +240,7 @@ EVM block inside the zkVM. It fits the opaque-input model exactly, which lets us
 
 > **Hard constraint:** the guest ELF and the input file must come from the **same RSP commit** — the
 > `EthClientExecutorInput` layout can change between versions. `build-elf` records the RSP commit in
-> `../../guests/rsp/rsp.commit`; regenerate both together when bumping RSP.
+> `../../guests/rsp/rsp.build.json`; regenerate both together when bumping RSP.
 
 ### Requirements
 

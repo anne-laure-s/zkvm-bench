@@ -40,8 +40,10 @@ guest_build_elf() {
   cp "$src" "$ELF"                                                       # guests/openvm-reth/openvm-reth.elf (visible artifact)
   mkdir -p "$dir/bin/reth-benchmark/elf"
   cp "$src" "$dir/bin/reth-benchmark/elf/openvm-stateless-guest"         # where the host binary embeds it
-  git -C "$dir" rev-parse HEAD > "${ELF%.elf}.commit" 2>/dev/null || echo unknown > "${ELF%.elf}.commit"
-  echo "openvm-eth commit: $(cat "${ELF%.elf}.commit")"
+  # The build record — one shape for every built ELF, see cli/buildrec.sh.
+  . "$ROOT/../cli/buildrec.sh"
+  brec_stamp "$(brec_file openvm-reth)" "$ELF" "$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
+  echo "openvm-eth commit: $(brec_get "$(brec_file openvm-reth)" commit)"
   echo "Guest ELF: $ELF ($(wc -c < "$ELF" | tr -d ' ') bytes, RISC-V)"
 }
 
@@ -63,8 +65,9 @@ guest_build_bin() {
       ${feats:+--features "$(IFS=,; echo "${feats[*]}")"} )
   local bin="$dir/target/release/openvm-reth-benchmark"
   [[ -x "$bin" ]] || { echo "ERROR: build produced no binary at $bin" >&2; return 1; }
-  git -C "$dir" rev-parse HEAD > "$GUESTS_DIR/$GUEST/$GUEST.commit" 2>/dev/null || echo unknown > "$GUESTS_DIR/$GUEST/$GUEST.commit"
-  echo "openvm-eth commit: $(cat "$GUESTS_DIR/$GUEST/$GUEST.commit")"
+  . "$ROOT/../cli/buildrec.sh"
+  brec_stamp "$(brec_file "$GUEST")" "$GUESTS_DIR/$GUEST/$GUEST.elf" "$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
+  echo "openvm-eth commit: $(brec_get "$(brec_file "$GUEST")" commit)"
   echo "Binary: $bin"
   echo "Use it:  OPENVM_BIN=$bin ./run execute BLOCK=$BLOCK RPC_URL=\$RPC_1"
 }

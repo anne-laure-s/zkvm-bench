@@ -12,7 +12,7 @@ REG_FILE="${REG_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/guests.regis
 
 reg_list() {
   awk -F'|' 'function t(s){gsub(/^[ \t]+|[ \t]+$/,"",s);return s}
-    !/^#/ && NF>=9 { printf "  %-11s elf:%-11s witness:%-11s exec:%-6s %s\n",
+    !/^#/ && NF>=9 { printf "  %-15s elf:%-11s witness:%-11s exec:%-6s %s\n",
       t($1), t($6), t($7), t($8), t($9) }' "$REG_FILE"
 }
 
