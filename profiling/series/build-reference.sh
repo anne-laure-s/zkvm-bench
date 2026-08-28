@@ -26,37 +26,34 @@ DMA_GCC="${ZISK_DMA_GCC:-$HOME/.local/xPacks/zisk-dma-gcc-15.2.0}"
 # Every performance option, with the value the reference guest wants. Anything
 # passed on the command line overrides one of these; an unknown name is a typo
 # and stops the build rather than being silently ignored.
+# The reference guest is not defined here. MONAD_ZKVM_OFFICIAL_PROFILE in the
+# guest's own CMakeLists forces ZISK_DMA, TABLE_ARG, FUSE and KECCAKF_MEMO on,
+# fails on a contradicting -D, forbids the diagnostic counters and refuses a
+# non-ZisK backend. Keeping a second copy of that policy here is how the two
+# drift; this script asks for the profile and lets the guest enforce it.
+#
+# An A/B arm is the exception: turning a lever off contradicts the profile by
+# construction, so that path spells the options out and takes the profile off.
 DEFAULTS="MONAD_ZKVM_ZISK_DMA=ON \
 MONAD_ZKVM_TABLE_ARG=ON \
 MONAD_ZKVM_FUSE=ON \
 MONAD_ZKVM_KECCAKF_MEMO=ON \
 MONAD_ZKVM_KECCAK_SITES=OFF \
-MONAD_ZKVM_SELFTEST=OFF \
-MONAD_ZKVM_OFFICIAL_PROFILE=OFF"
+MONAD_ZKVM_SELFTEST=OFF"
 
 # Plain strings, not an associative array: /bin/bash here is 3.2 and has none.
-opt_of() {  # opt_of NAME -> the value, after any override
+opt_of() {
     _v=""
     for _kv in $DEFAULTS; do [ "${_kv%%=*}" = "$1" ] && _v=${_kv#*=}; done
     for _kv in $OVERRIDES; do [ "${_kv%%=*}" = "$1" ] && _v=${_kv#*=}; done
     printf '%s' "$_v"
 }
-# The option list lives in the guest's CMakeLists, in the other repository. If
-# it grows one this script does not know, the reference build would silently
-# omit it -- which is the failure this script exists to prevent, arriving by a
-# different door. So read the truth from there and refuse to guess.
+
+# The guest may declare an option this script has never heard of. On the profile
+# path that is the profile's problem and it is visible in its own file; on the
+# A/B path it is ours, and an omission would silently build something else.
 CML="$MONAD/zkvm/guest/CMakeLists.txt"
 [ -f "$CML" ] || { echo "error: no guest CMakeLists at $CML" >&2; exit 1; }
-MISSING=""
-for k in $(sed -n 's/^[[:space:]]*option(\(MONAD_ZKVM_[A-Z_]*\).*/\1/p' "$CML"); do
-    echo "$DEFAULTS" | tr ' ' '\n' | grep -q "^$k=" || MISSING="$MISSING $k"
-done
-if [ -n "$MISSING" ]; then
-    echo "error: the guest declares options this script has no policy for:$MISSING" >&2
-    echo "       add each to DEFAULTS with the value the reference guest wants," >&2
-    echo "       then re-run. Refusing to build a guest that is missing one." >&2
-    exit 1
-fi
 
 OVERRIDES=""
 for kv in "$@"; do
@@ -65,11 +62,21 @@ for kv in "$@"; do
         { echo "error: unknown option '$k'" >&2; exit 1; }
     OVERRIDES="$OVERRIDES $kv"
 done
+if [ -n "$OVERRIDES" ]; then
+    MISSING=""
+    for k in $(sed -n 's/^[[:space:]]*option(\(MONAD_ZKVM_[A-Z_]*\).*/\1/p' "$CML"); do
+        [ "$k" = MONAD_ZKVM_OFFICIAL_PROFILE ] && continue
+        echo "$DEFAULTS" | tr ' ' '\n' | grep -q "^$k=" || MISSING="$MISSING $k"
+    done
+    [ -z "$MISSING" ] || {
+        echo "error: the guest declares options this A/B path cannot set:$MISSING" >&2
+        echo "       add each to DEFAULTS, then re-run." >&2; exit 1; }
+fi
 
 # Fail closed on the toolchain. A stock compiler rejects -mzisk-dma, so a build
 # that forgets ZISK_DMA_GCC would otherwise fall back to a guest without the
 # lowering and quietly measure it instead.
-if [ "$(opt_of MONAD_ZKVM_ZISK_DMA)" = ON ]; then
+if [ -z "$OVERRIDES" ] || [ "$(opt_of MONAD_ZKVM_ZISK_DMA)" = ON ]; then
     CXX="$DMA_GCC/bin/riscv-none-elf-g++"
     [ -x "$CXX" ] || { echo "error: no patched compiler at $DMA_GCC" >&2
                        echo "       build one with profiling/experiments/zisk-dma-gcc15/build-gcc15.sh" >&2
@@ -80,11 +87,25 @@ if [ "$(opt_of MONAD_ZKVM_ZISK_DMA)" = ON ]; then
     export RISCV_TOOLCHAIN_DIR="$DMA_GCC"
 fi
 
-DEFS=""
-for kv in $DEFAULTS; do
-    k=${kv%%=*}
-    DEFS="$DEFS${DEFS:+;}$k=$(opt_of "$k")"
-done
+if [ -z "$OVERRIDES" ]; then
+    # The profile is fail-closed and asks for its own provenance. A stamp taken
+    # from a dirty tree would name a commit the binary was not built from, so
+    # refuse rather than record a lie.
+    GITSHA=$(git -C "$MONAD" rev-parse HEAD 2>/dev/null) ||
+        { echo "error: $MONAD is not a git worktree" >&2; exit 1; }
+    [ -z "$(git -C "$MONAD" status --porcelain)" ] || {
+        echo "error: $MONAD has uncommitted changes; the official profile stamps" >&2
+        echo "       a commit into the guest and that stamp would be false." >&2
+        echo "       commit, stash, or use the A/B path with explicit options." >&2
+        exit 1; }
+    DEFS="MONAD_ZKVM_OFFICIAL_PROFILE=ON;MONAD_ZKVM_GIT_COMMIT=$GITSHA"
+else
+    DEFS="MONAD_ZKVM_OFFICIAL_PROFILE=OFF"
+    for kv in $DEFAULTS; do
+        k=${kv%%=*}
+        DEFS="$DEFS;$k=$(opt_of "$k")"
+    done
+fi
 export MONAD_ZKVM_CMAKE_DEFINES="$DEFS"
 # The guest's CMakeLists appends its own -march last, so this only has to agree.
 export MARCH="${MARCH:-rv64ima_zbb_zbs_zbkb_zicsr}"
