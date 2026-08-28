@@ -155,7 +155,8 @@ class Store:
                 except json.JSONDecodeError:
                     pass
 
-    def record(self, event, body, proof_bytes=None, verified=None, verify_reason=None):
+    def record(self, event, body, proof_bytes=None, verified=None, verify_reason=None,
+               verify_ms=None):
         cluster = body.get("cluster_id")
         guest = body.get("guest")
         block = body.get("block_number")
@@ -192,6 +193,10 @@ class Store:
             # server-side verdict (the SERVER verifies — see mock_verify). None until /proved.
             "verified": verified,
             "verify_reason": verify_reason,
+            # What reaching that verdict COST, in ms. The boolean alone could not answer "how long does
+            # verification take?", and a campaign's worth of proofs had to be re-verified by hand to get a
+            # figure. None when nothing was verified (a declared fake) — same three states as `verified`.
+            "verify_ms": verify_ms,
         }
         with self.lock:
             with open(self.jsonl, "a") as f:
@@ -617,15 +622,23 @@ class Handler(BaseHTTPRequestHandler):
             if magic_mock and not mock:   # server-detected fake (proof bytes carry the MOCK-PROOF magic)
                 mock = True; body["mock"] = True; mk = "[MOCK] "
             proof_path = os.path.join(STORE.proofs_dir, f"{cluster}-{block}.bin") if pb is not None else None
+            t_verify = time.perf_counter()
             ok, reason = mock_verify(pb, body, proof_path)   # the SERVER verifies (mock/real via --verify-cmd)
-            rec = STORE.record("proved", body, proof_bytes=pb, verified=ok, verify_reason=reason)
+            # Timed HERE and not inside mock_verify so the measure covers the whole seam: the --verify-cmd
+            # process and everything it does, not just the cryptographic check. On ZisK the wrapper around
+            # `cargo-zisk verify` costs about as much as the check itself, so timing the check alone would
+            # report half of what the server actually pays per proof.
+            verify_ms = None if ok is None else round((time.perf_counter() - t_verify) * 1000, 1)
+            rec = STORE.record("proved", body, proof_bytes=pb, verified=ok, verify_reason=reason,
+                               verify_ms=verify_ms)
             pid = STORE.pid(cluster, block)
             mark = ("verified ✓" if ok is True else
                     f"not verified ⊘ ({reason})" if ok is None else
                     f"REJECTED ✗ ({reason})")
             pi = f" pi={rec['public_inputs']}" if rec.get("public_inputs") else ""
+            vt = f" in {verify_ms}ms" if verify_ms is not None else ""
             print(f"{now_iso()}  ← /proofs/proved   {mk}cluster={cluster} {who}block={block}{pi} "
-                  f"time={rec['proving_time_ms']}ms work={rec['proving_cycles']} proof={pb}B  → stored proof_id={pid} · {mark}")
+                  f"time={rec['proving_time_ms']}ms work={rec['proving_cycles']} proof={pb}B  → stored proof_id={pid} · {mark}{vt}")
             return self._reply(200, {"proof_id": pid, "proof_bytes": pb, "verified": ok, "mock": mock})
         return self._reply(404, {"error": f"unknown endpoint {self.path}"})
 
