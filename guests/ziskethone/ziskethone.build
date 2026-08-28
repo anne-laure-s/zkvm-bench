@@ -1,0 +1,56 @@
+# ziskethone.build — what `ziskethone.elf` beside this file is, and how to make it again.
+#
+# This is the record AND the input to `./build.sh`: the script reads the values below and
+# restates none of them, so the file you read and the build that runs cannot disagree.
+# Format: `KEY=value`, one per line, `#` comments. No quoting, no spaces in values.
+#
+# ── which build this is, and why it matters ──────────────────────────────────────────────
+# ziskethone ships TWO builds that answer to the same name, and the wrong one is 1.348x the
+# steps of the right one over the 200-block corpus (median of per-block ratios). Quoting a
+# Monad gap against the slow one understates it by about a third, and it has already cost one
+# withdrawn finding.
+#
+#   SHIPPED  this file. Pin 2bb899a, branch perf/dma-precompiles: JUMPDEST precompile, the
+#            -mzisk-dma lowering, and the fused cgoto dispatch. The guest upstream actually
+#            ships, and the only competitive reference.
+#   develop  sha dd445f3f1a093a42, pin 7e6c702. None of the above. Not kept in this repo —
+#            point UPSTREAM_COMMIT at 7e6c702 and run ./build.sh --check to obtain it.
+#
+# ── the two pins ─────────────────────────────────────────────────────────────────────────
+# The identity of this ELF is two commits, not one, which is why there is no bare
+# `ziskethone.commit` beside it: the guest sources come from the ziskethone submodule, the
+# compiler flags from the zisk-eth-client driver that invokes them. Either one moving moves
+# the binary.
+UPSTREAM_URL=https://github.com/0xPolygonHermez/ziskethone.git
+UPSTREAM_COMMIT=2bb899ae0c08aa3670fde692765e0781b494484d
+UPSTREAM_BRANCH=perf/dma-precompiles
+DRIVER_REPO=vendor/zisk-eth-client
+DRIVER_COMMIT=c20fda3d2e7d69ba53c5e2c05ac00d7afb16788f
+DRIVER=crates/clients/ziskethone/guest/build-elf.sh
+
+# ── the toolchain ────────────────────────────────────────────────────────────────────────
+# Resolved under $XPACKS_DIR (default ~/.local/xPacks).
+#
+# XPACK is a hard prerequisite — install it yourself (xpack-dev-tools/riscv-none-elf-gcc, or
+# `vendor/zisk-eth-client/setup.sh`). DMA_GCC is not: the driver builds it on demand from
+# ziskethone's own cpp-guest/patches/gcc/build-toolchain.sh, which is idempotent, so a warm
+# prefix and a cold one produce the same bytes.
+#
+# 14.3.0 and NOT the 15.2.0 prefix that the Monad r10 guest uses: upstream's -mzisk-dma patch
+# targets 14.3, and Monad needs 15 only because its interpreter uses __attribute__((musttail)).
+# Two guests, two patched compilers, and they are not interchangeable.
+XPACK=xpack-riscv-none-elf-gcc-14.3.0-1
+DMA_GCC=zisk-dma-gcc-14.3.0
+
+# ── what the build must produce ──────────────────────────────────────────────────────────
+# The build embeds no path strings — a copy under /tmp with entirely different absolute paths
+# yields the same bytes — so this is an equality, not an approximation. `build.sh` refuses to
+# install anything that does not match.
+ELF=ziskethone.elf
+SHA256=39ad249e2e50ee178add4eb34c71845b43ede3261d8bada11fa804a76c4ae40c
+BYTES=1012320
+
+# The driver's own guard, restated here so a drop is visible without reading its log: the
+# -mzisk-dma lowering emits thousands of 0x813 markers inline, a stock build has 2 (the ziskos
+# mem* thunks). The exact count tracks the guest sources, so this is a floor, not a value.
+DMA_MARKERS_MIN=100
