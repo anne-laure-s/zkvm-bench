@@ -39,7 +39,7 @@ Outputs: a terminal summary (the one-glance view), plus --json / --html for the
 per-block detail. See README.md for the tool map and the framing rules.
 """
 
-import argparse, glob, hashlib, json, math, os, platform, re, statistics, subprocess, struct, sys, tempfile, time
+import argparse, glob, hashlib, html, json, math, os, platform, re, statistics, subprocess, struct, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -271,12 +271,397 @@ AXES = {
                    'src': 'monad'},
              'b': {'name': 'rsp', 'elf': 'guests/rsp/rsp.elf',
                    'src': 'bin'}},
+    # al/zkvm-r5 = Sam's tip bumped to ziskos 1.1 at the base, then our levers.
+    # Its baseline is the lineage's own first commit, so the axis and the series
+    # cannot drift apart. Measured under the 1.1 emulator: point
+    # COMPARE_CACHE_ROOT at a fresh root, the 1.0 numbers are not comparable.
+    'r5-vs-zisk-reth': {'ephemeral': 'r5 campaign 2026-08-18, ziskos 1.1',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r5-zisk', 'elf': 'guests/monad-variants/r4bump/monad-r4bump-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'zisk-reth', 'elf': 'guests/zisk-reth/zisk-reth-v0.11.0.elf',
+                   'src': 'bin'}},
+    'r5-vs-sam': {'ephemeral': 'r5 campaign 2026-08-18, ziskos 1.1',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r5-zisk', 'elf': 'guests/monad-variants/r4bump/monad-r4bump-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-sam-bumped-zisk', 'elf': 'guests/monad-variants/r5base/monad-r5base-zisk.elf',
+                   'src': 'monad'}},
+    'ablate-bswap-tip': {'ephemeral': 'is 5068dc668 still costing at the tip?',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'r5b-tip-without-bswap-inline', 'elf': 'profiling/series/elf/74d9293f8a4581a1.elf',
+                   'src': 'monad'},
+             'b': {'name': 'r5b-tip', 'elf': 'profiling/series/elf/aca82727de413bb1.elf',
+                   'src': 'monad'}},
+    'ablate-rlp48': {'ephemeral': 'does the word-wise RLP decode still pay under Zbb?',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'tip-without-rlp48', 'elf': 'profiling/series/elf/fd39fe8c27533b6d.elf',
+                   'src': 'monad'},
+             'b': {'name': 'tip', 'elf': 'profiling/series/elf/18b251d10b0f171e.elf',
+                   'src': 'monad'}},
+    'arith256-ops': {'ephemeral': 'does the arith256 routing show up as secp256k1 ops?',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'after-arith256', 'elf': 'profiling/series/elf/4391e76efc4ee470.elf',
+                   'src': 'monad'},
+             'b': {'name': 'before-arith256', 'elf': 'profiling/series/elf/5371352f01025ea1.elf',
+                   'src': 'monad'}},
+    'jd-guard': {'ephemeral': 'cost of checking the JUMPDEST bitmap covers the code',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'with-coverage-guard', 'elf': 'profiling/series/elf/jd-guard.elf',
+                   'src': 'monad'},
+             'b': {'name': 'without', 'elf': 'profiling/series/elf/fd39fe8c27533b6d.elf',
+                   'src': 'monad'}},
+    'ablate-offsets': {'ephemeral': 'upper bound on dropping the child-offset machinery',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'no-offset-validation', 'elf': 'profiling/series/elf/ablate-offsets.elf',
+                   'src': 'monad'},
+             'b': {'name': 'r8-tip', 'elf': 'profiling/series/elf/dd3589ddae639c54.elf',
+                   'src': 'monad'}},
+    'mul256': {'ephemeral': 'the truncating multiply through arith256, restored',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'r8-with-mul256', 'elf': 'profiling/series/elf/mul256.elf', 'src': 'monad'},
+             'b': {'name': 'r8-tip', 'elf': 'profiling/series/elf/dd3589ddae639c54.elf', 'src': 'monad'}},
+    'sealed-header': {'ephemeral': 'cost of sealing the computed root into the hashed header',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'sealed', 'elf': 'profiling/series/elf/sealed.elf', 'src': 'monad'},
+             'b': {'name': 'r8-tip', 'elf': 'profiling/series/elf/dd3589ddae639c54.elf', 'src': 'monad'}},
+    'r8-vs-sam': {'title': 'monad guest vs its base, both on ziskos 1.1',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r8-zisk', 'elf': 'profiling/series/elf/fd39fe8c27533b6d.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-sam-bumped-zisk', 'elf': 'profiling/series/elf/4dd3027f5cb81868.elf',
+                   'src': 'monad'}},
+    'r8-vs-zisk-reth': {'title': 'monad guest vs zisk-reth v0.11.0',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r8-zisk', 'elf': 'profiling/series/elf/fd39fe8c27533b6d.elf',
+                   'src': 'monad'},
+             'b': {'name': 'zisk-reth', 'elf': 'guests/zisk-reth/zisk-reth-v0.11.0.elf',
+                   'src': 'bin'}},
+    'r7-vs-sam': {'title': 'monad guest vs its base, both on ziskos 1.1',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r7-zisk', 'elf': 'profiling/series/elf/18b251d10b0f171e.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-sam-bumped-zisk', 'elf': 'profiling/series/elf/4dd3027f5cb81868.elf',
+                   'src': 'monad'}},
+    'r7-vs-zisk-reth': {'title': 'monad guest vs zisk-reth v0.11.0',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r7-zisk', 'elf': 'profiling/series/elf/18b251d10b0f171e.elf',
+                   'src': 'monad'},
+             'b': {'name': 'zisk-reth', 'elf': 'guests/zisk-reth/zisk-reth-v0.11.0.elf',
+                   'src': 'bin'}},
+    'chain-check': {'ephemeral': 'cost of binding the BLOCKHASH ancestors',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'with-ancestor-chain-check', 'elf': 'profiling/series/elf/18b251d10b0f171e.elf',
+                   'src': 'monad'},
+             'b': {'name': 'without', 'elf': 'profiling/series/elf/c6b750fa963b2186.elf',
+                   'src': 'monad'}},
+    'popcount-native': {'ephemeral': 'popcount routed to the native cpop under Zbb',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'popcount-cpop', 'elf': 'profiling/series/elf/popcount-native.elf',
+                   'src': 'monad'},
+             'b': {'name': 'tip-zbb-swar', 'elf': 'profiling/series/elf/zbb-only.elf',
+                   'src': 'monad'}},
+    'ablate-popcount-zbb': {'ephemeral': 'does the popcount force-include still pay under Zbb?',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'tip-without-force-include', 'elf': 'profiling/series/elf/c6b750fa963b2186.elf',
+                   'src': 'monad'},
+             'b': {'name': 'tip-zbb', 'elf': 'profiling/series/elf/zbb-only.elf',
+                   'src': 'monad'}},
+    'zbb': {'ephemeral': 'ZisK 1.1 wires Zbb/Zbs: what does -march buy?',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'r6-tip-zbb-zbs', 'elf': 'profiling/series/elf/zbb-only.elf',
+                   'src': 'monad'},
+             'b': {'name': 'r6-tip-rv64ima', 'elf': 'profiling/series/elf/74d9293f8a4581a1.elf',
+                   'src': 'monad'}},
+    'lever-bswap': {'ephemeral': 'why 5068dc668 flipped sign on ziskos 1.1',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'after-bswap-inline', 'elf': 'profiling/series/elf/97ae8042e648b300.elf',
+                   'src': 'monad'},
+             'b': {'name': 'before-bswap-inline', 'elf': 'profiling/series/elf/4dd3027f5cb81868.elf',
+                   'src': 'monad'}},
     'ablate-vs-r4': {'ephemeral': 'ablation: cost of attesting the storage tries',
              'backend': 'zisk', 'unit': 'steps',
              'a': {'name': 'monad-ablate-zisk', 'elf': 'guests/monad-variants/ablate-storageroot/monad-ablate-zisk.elf',
                    'src': 'monad'},
              'b': {'name': 'monad-zkvm-r4-gen-2026-08-9d7540181-zisk', 'elf': 'guests/monad/gen/zkvm-r4-gen-2026-08-9d7540181/elf/monad-zkvm-guest-zisk.elf',
                    'src': 'monad'}},
+    'abl-div': {'ephemeral': 'ablation sweep on r4, 2026-08-13',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-abl-div-zisk', 'elf': 'guests/monad-variants/abl-div/monad-abl-div-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-zkvm-r4-gen-2026-08-9d7540181-zisk', 'elf': 'guests/monad/gen/zkvm-r4-gen-2026-08-9d7540181/elf/monad-zkvm-guest-zisk.elf',
+                   'src': 'monad'}},
+    'abl-clz': {'ephemeral': 'ablation sweep on r4, 2026-08-13',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-abl-clz-zisk', 'elf': 'guests/monad-variants/abl-clz/monad-abl-clz-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-zkvm-r4-gen-2026-08-9d7540181-zisk', 'elf': 'guests/monad/gen/zkvm-r4-gen-2026-08-9d7540181/elf/monad-zkvm-guest-zisk.elf',
+                   'src': 'monad'}},
+    'abl-keyhash': {'ephemeral': 'ablation sweep on r4, 2026-08-13',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-abl-keyhash-zisk', 'elf': 'guests/monad-variants/abl-keyhash/monad-abl-keyhash-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-zkvm-r4-gen-2026-08-9d7540181-zisk', 'elf': 'guests/monad/gen/zkvm-r4-gen-2026-08-9d7540181/elf/monad-zkvm-guest-zisk.elf',
+                   'src': 'monad'}},
+    'abl-hashinline': {'ephemeral': 'ablation sweep on r4, 2026-08-13',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-abl-hashinline-zisk', 'elf': 'guests/monad-variants/abl-hashinline/monad-abl-hashinline-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-zkvm-r4-gen-2026-08-9d7540181-zisk', 'elf': 'guests/monad/gen/zkvm-r4-gen-2026-08-9d7540181/elf/monad-zkvm-guest-zisk.elf',
+                   'src': 'monad'}},
+    'abl-arena': {'ephemeral': 'ablation sweep on r4, 2026-08-13',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-abl-arena-zisk', 'elf': 'guests/monad-variants/abl-arena/monad-abl-arena-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-zkvm-r4-gen-2026-08-9d7540181-zisk', 'elf': 'guests/monad/gen/zkvm-r4-gen-2026-08-9d7540181/elf/monad-zkvm-guest-zisk.elf',
+                   'src': 'monad'}},
+    'abl-keccak': {'ephemeral': 'ablation sweep on r4, 2026-08-13',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-abl-keccak-zisk', 'elf': 'guests/monad-variants/abl-keccak/monad-abl-keccak-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-zkvm-r4-gen-2026-08-9d7540181-zisk', 'elf': 'guests/monad/gen/zkvm-r4-gen-2026-08-9d7540181/elf/monad-zkvm-guest-zisk.elf',
+                   'src': 'monad'}},
+    'abl-fmix': {'ephemeral': 'ablation sweep on r4, 2026-08-13',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-abl-fmix-zisk', 'elf': 'guests/monad-variants/abl-fmix/monad-abl-fmix-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-zkvm-r4-gen-2026-08-9d7540181-zisk', 'elf': 'guests/monad/gen/zkvm-r4-gen-2026-08-9d7540181/elf/monad-zkvm-guest-zisk.elf',
+                   'src': 'monad'}},
+    'abl-calldata': {'ephemeral': 'ablation sweep on r4, 2026-08-13',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-abl-calldata-zisk', 'elf': 'guests/monad-variants/abl-calldata/monad-abl-calldata-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-zkvm-r4-gen-2026-08-9d7540181-zisk', 'elf': 'guests/monad/gen/zkvm-r4-gen-2026-08-9d7540181/elf/monad-zkvm-guest-zisk.elf',
+                   'src': 'monad'}},
+    'abl-mulmod': {'ephemeral': 'ablation sweep on r4, 2026-08-13',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-abl-mulmod-zisk', 'elf': 'guests/monad-variants/abl-mulmod/monad-abl-mulmod-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-zkvm-r4-gen-2026-08-9d7540181-zisk', 'elf': 'guests/monad/gen/zkvm-r4-gen-2026-08-9d7540181/elf/monad-zkvm-guest-zisk.elf',
+                   'src': 'monad'}},
+    'abl-addmod': {'ephemeral': 'ablation sweep on r4, 2026-08-13',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-abl-addmod-zisk', 'elf': 'guests/monad-variants/abl-addmod/monad-abl-addmod-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-zkvm-r4-gen-2026-08-9d7540181-zisk', 'elf': 'guests/monad/gen/zkvm-r4-gen-2026-08-9d7540181/elf/monad-zkvm-guest-zisk.elf',
+                   'src': 'monad'}},
+    'trim-vs-r4': {'ephemeral': 'combined removal of arena/clz/hashinline',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-trim-zisk', 'elf': 'guests/monad-variants/trim/monad-trim-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-zkvm-r4-gen-2026-08-9d7540181-zisk', 'elf': 'guests/monad/gen/zkvm-r4-gen-2026-08-9d7540181/elf/monad-zkvm-guest-zisk.elf',
+                   'src': 'monad'}},
+    'r4jd-vs-zisk-reth': {'ephemeral': 'r4 with the jd lever, reference axes',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r4jd-zisk', 'elf': 'guests/monad-variants/r4jd/monad-r4jd-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'zisk-reth', 'elf': 'guests/zisk-reth/zisk-reth.elf',
+                   'src': 'bin'}},
+    'r4jd-vs-rsp': {'ephemeral': 'r4 with the jd lever, reference axes',
+             'backend': 'sp1', 'unit': 'cycles',
+             'a': {'name': 'monad-r4jd-sp1', 'elf': 'guests/monad-variants/r4jd/monad-r4jd-sp1.elf',
+                   'src': 'monad'},
+             'b': {'name': 'rsp', 'elf': 'guests/rsp/rsp.elf',
+                   'src': 'bin'}},
+    'r4jd-vs-base-zisk': {'ephemeral': "r4+jd vs Sam's baseline",
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r4jd-zisk', 'elf': 'guests/monad-variants/r4jd/monad-r4jd-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-storageroot-det-2026-08-zisk', 'elf': 'guests/monad/gen/storageroot-det-2026-08/elf/monad-zkvm-guest-zisk.elf',
+                   'src': 'monad'}},
+    'r4jd-vs-base-sp1': {'ephemeral': "r4+jd vs Sam's baseline",
+             'backend': 'sp1', 'unit': 'cycles',
+             'a': {'name': 'monad-r4jd-sp1', 'elf': 'guests/monad-variants/r4jd/monad-r4jd-sp1.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-storageroot-det-2026-08-sp1', 'elf': 'guests/monad/gen/storageroot-det-2026-08/elf/monad-zkvm-guest-sp1.elf',
+                   'src': 'monad'}},
+    'sam2-vs-reth': {'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-sam2-zisk', 'elf': 'guests/monad-variants/sambase2/monad-sambase2-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'zisk-reth', 'elf': 'guests/zisk-reth/zisk-reth.elf',
+                   'src': 'bin'}},
+    'sam2-vs-rsp': {'backend': 'sp1', 'unit': 'cycles',
+             'a': {'name': 'monad-sam2-sp1', 'elf': 'guests/monad-variants/sambase2/monad-sambase2-sp1.elf',
+                   'src': 'monad'},
+             'b': {'name': 'rsp', 'elf': 'guests/rsp/rsp.elf',
+                   'src': 'bin'}},
+    'r4jd2-vs-reth': {'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r4jd2-zisk', 'elf': 'guests/monad-variants/r4jd2/monad-r4jd2-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'zisk-reth', 'elf': 'guests/zisk-reth/zisk-reth.elf',
+                   'src': 'bin'}},
+    'r4jd2-vs-sam2': {'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r4jd2-zisk', 'elf': 'guests/monad-variants/r4jd2/monad-r4jd2-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-sam2-zisk', 'elf': 'guests/monad-variants/sambase2/monad-sambase2-zisk.elf',
+                   'src': 'monad'}},
+    'r4jd2-vs-rsp': {'backend': 'sp1', 'unit': 'cycles',
+             'a': {'name': 'monad-r4jd2-sp1', 'elf': 'guests/monad-variants/r4jd2/monad-r4jd2-sp1.elf',
+                   'src': 'monad'},
+             'b': {'name': 'rsp', 'elf': 'guests/rsp/rsp.elf',
+                   'src': 'bin'}},
+    'mtune-vs-reth': {'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-mtune-zisk', 'elf': 'guests/monad-variants/mtune/monad-mtune-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'zisk-reth', 'elf': 'guests/zisk-reth/zisk-reth.elf',
+                   'src': 'bin'}},
+    'mtune-vs-r4jd2': {'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-mtune-zisk', 'elf': 'guests/monad-variants/mtune/monad-mtune-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r4jd2-zisk', 'elf': 'guests/monad-variants/r4jd2/monad-r4jd2-zisk.elf',
+                   'src': 'monad'}},
+    'tip-vs-reth': {'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-tip-zisk', 'elf': 'guests/monad-variants/tip/monad-tip-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'zisk-reth', 'elf': 'guests/zisk-reth/zisk-reth.elf',
+                   'src': 'bin'}},
+    'tip-vs-sam': {'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-tip-zisk', 'elf': 'guests/monad-variants/tip/monad-tip-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-sam2-zisk', 'elf': 'guests/monad-variants/sambase2/monad-sambase2-zisk.elf',
+                   'src': 'monad'}},
+    'tip-vs-rsp': {'backend': 'sp1', 'unit': 'cycles',
+             'a': {'name': 'monad-tip-sp1', 'elf': 'guests/monad-variants/tip/monad-tip-sp1.elf',
+                   'src': 'monad'},
+             'b': {'name': 'rsp', 'elf': 'guests/rsp/rsp.elf',
+                   'src': 'bin'}},
+    'tip-vs-sam-sp1': {'backend': 'sp1', 'unit': 'cycles',
+             'a': {'name': 'monad-tip-sp1', 'elf': 'guests/monad-variants/tip/monad-tip-sp1.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-sam2-sp1', 'elf': 'guests/monad-variants/sambase2/monad-sambase2-sp1.elf',
+                   'src': 'monad'}},
+    'r4f2-vs-reth': {'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r4f2-zisk', 'elf': 'guests/monad-variants/r4final2/monad-r4f2-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'zisk-reth', 'elf': 'guests/zisk-reth/zisk-reth.elf',
+                   'src': 'bin'}},
+    'r4f2-vs-sam': {'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r4f2-zisk', 'elf': 'guests/monad-variants/r4final2/monad-r4f2-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-sam2-zisk', 'elf': 'guests/monad-variants/sambase2/monad-sambase2-zisk.elf',
+                   'src': 'monad'}},
+    'r4f2-vs-rsp': {'backend': 'sp1', 'unit': 'cycles',
+             'a': {'name': 'monad-r4f2-sp1', 'elf': 'guests/monad-variants/r4final2/monad-r4f2-sp1.elf',
+                   'src': 'monad'},
+             'b': {'name': 'rsp', 'elf': 'guests/rsp/rsp.elf',
+                   'src': 'bin'}},
+    'r4f2-vs-sam-sp1': {'backend': 'sp1', 'unit': 'cycles',
+             'a': {'name': 'monad-r4f2-sp1', 'elf': 'guests/monad-variants/r4final2/monad-r4f2-sp1.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-sam2-sp1', 'elf': 'guests/monad-variants/sambase2/monad-sambase2-sp1.elf',
+                   'src': 'monad'}},
+    'zbkb-vs-r8': {'ephemeral': 'does widening the guest -march by zbkb pay? drop once decided (2026-08-25)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r8-zbkb-zisk', 'elf': 'guests/monad-variants/r8-zbkb/monad-r8-zbkb-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r8-zisk', 'elf': 'guests/monad/gen/zkvm-r8-2026-08-0df7094a1/elf/monad-zkvm-guest-zisk.elf',
+                   'src': 'monad'}},
+    'memo-vs-r8': {'ephemeral': 'does the current_account_state memo + dirty skip pay? drop once decided (2026-08-25)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r8-memo-zisk', 'elf': 'guests/monad-variants/r8-memo/monad-r8-memo-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r8-zbkb-zisk', 'elf': 'guests/monad-variants/r8-zbkb/monad-r8-zbkb-zisk.elf',
+                   'src': 'monad'}},
+    'flatdirty-vs-r9': {'ephemeral': 'does the flat DirtyAccounts list pay? drop once decided (2026-08-26)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r9-flatdirty-zisk', 'elf': 'guests/monad-variants/r9-flatdirty/monad-r9-flatdirty-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r9-base-zisk', 'elf': 'guests/monad-variants/r9-base/monad-r9-base-zisk.elf',
+                   'src': 'monad'}},
+    'flatstate-vs-base': {'ephemeral': 'journal + flat warm set, steps 1-2 of the state flattening (2026-08-26)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r10-flatstate-zisk', 'elf': 'guests/monad-variants/r10-flatstate/monad-r10-flatstate-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r10-base-zisk', 'elf': 'guests/monad-variants/r10-base/monad-r10-base-zisk.elf',
+                   'src': 'monad'}},
+    'origflat-vs-warmset': {'ephemeral': 'flat original slot cache, step 3 of the state flattening (2026-08-26)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r10-origflat-zisk', 'elf': 'guests/monad-variants/r10-origflat/monad-r10-origflat-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r10-flatstate-zisk', 'elf': 'guests/monad-variants/r10-flatstate/monad-r10-flatstate-zisk.elf',
+                   'src': 'monad'}},
+    'overlay-vs-origflat': {'ephemeral': 'flat current overlay + per-slot journal, step 4 of the state flattening (2026-08-26)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r10-overlay-zisk', 'elf': 'guests/monad-variants/r10-overlay/monad-r10-overlay-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r10-origflat-zisk', 'elf': 'guests/monad-variants/r10-origflat/monad-r10-origflat-zisk.elf',
+                   'src': 'monad'}},
+    'typedj-vs-overlay': {'ephemeral': 'typed per-mutation journal replacing the whole-row snapshot, r10 gate 1 (2026-08-26)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r10-typedj-zisk', 'elf': 'guests/monad-variants/r10-typedj/monad-r10-typedj-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r10-overlay-zisk', 'elf': 'guests/monad-variants/r10-overlay/monad-r10-overlay-zisk.elf',
+                   'src': 'monad'}},
+    'ab-dirtydedup': {'ephemeral': 'ablation: DirtyAccounts::emplace without its dedup scan, to price it (2026-08-26)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'ab-nodedup-zisk', 'elf': 'guests/monad-variants/ab-nodedup/ab-nodedup-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r10-typedj-zisk', 'elf': 'guests/monad-variants/r10-typedj/monad-r10-typedj-zisk.elf',
+                   'src': 'monad'}},
+    'rowlink-vs-typedj': {'ephemeral': 'each current row points at its original row: one address hash instead of two (2026-08-26)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r10-rowlink-zisk', 'elf': 'guests/monad-variants/r10-rowlink/monad-r10-rowlink-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r10-typedj-zisk', 'elf': 'guests/monad-variants/r10-typedj/monad-r10-typedj-zisk.elf',
+                   'src': 'monad'}},
+    'rowpair-vs-rowlink': {'ephemeral': 'get_balance and record_balance_constraint_for_debit resolve both rows in one lookup (2026-08-26)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r10-rowpair-zisk', 'elf': 'guests/monad-variants/r10-rowpair/monad-r10-rowpair-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r10-rowlink-zisk', 'elf': 'guests/monad-variants/r10-rowlink/monad-r10-rowlink-zisk.elf',
+                   'src': 'monad'}},
+    'readmemo-vs-rowpair': {'ephemeral': 'reads answer from the one-entry memo instead of hashing the address (2026-08-26)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r10-readmemo-zisk', 'elf': 'guests/monad-variants/r10-readmemo/monad-r10-readmemo-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r10-rowpair-zisk', 'elf': 'guests/monad-variants/r10-rowpair/monad-r10-rowpair-zisk.elf',
+                   'src': 'monad'}},
+    'pathbytes-vs-readmemo': {'ephemeral': 'append_path writes byte runs instead of one nibble at a time (2026-08-27)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r10-pathbytes-zisk', 'elf': 'guests/monad-variants/r10-pathbytes/monad-r10-pathbytes-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r10-readmemo-zisk', 'elf': 'guests/monad-variants/r10-readmemo/monad-r10-readmemo-zisk.elf',
+                   'src': 'monad'}},
+    'srootprime-vs-pathbytes': {'ephemeral': 'read_account primes the one-entry storage-root cache from the leaf it already reached (2026-08-27)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r10-srootprime-zisk', 'elf': 'guests/monad-variants/r10-srootprime/monad-r10-srootprime-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r10-pathbytes-zisk', 'elf': 'guests/monad-variants/r10-pathbytes/monad-r10-pathbytes-zisk.elf',
+                   'src': 'monad'}},
+    'nibpack-vs-srootprime': {'ephemeral': 'one packed nibble-comparison primitive behind ==, starts_with and common_prefix_length (2026-08-27)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r10-nibpack-zisk', 'elf': 'guests/monad-variants/r10-nibpack/monad-r10-nibpack-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r10-srootprime-zisk', 'elf': 'guests/monad-variants/r10-srootprime/monad-r10-srootprime-zisk.elf',
+                   'src': 'monad'}},
+    'keycursor-vs-nibpack': {'ephemeral': 'find_original walks a cursor instead of rebuilding the key view at every branch (2026-08-27)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r10-keycursor-zisk', 'elf': 'guests/monad-variants/r10-keycursor/monad-r10-keycursor-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r10-nibpack-zisk', 'elf': 'guests/monad-variants/r10-nibpack/monad-r10-nibpack-zisk.elf',
+                   'src': 'monad'}},
+    'lazychildren-vs-nibpack': {'ephemeral': 'upsert_node reads one child instead of all sixteen when the slot is occupied (2026-08-27)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r10-lazychildren-zisk', 'elf': 'guests/monad-variants/r10-lazychildren/monad-r10-lazychildren-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'monad-r10-nibpack-zisk', 'elf': 'guests/monad-variants/r10-nibpack/monad-r10-nibpack-zisk.elf',
+                   'src': 'monad'}},
+    'r8-vs-ziskethone': {'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r8-zisk', 'elf': 'guests/monad-variants/r8-zbkb/monad-r8-zbkb-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'ziskethone', 'elf': 'vendor/zisk-eth-client/bin/guests/stateless-validator-ziskethone/elf/zec-ziskethone.elf',
+                   'src': 'bin'}},
+    'r9-vs-ziskethone': {'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r9-flatdirty-zisk', 'elf': 'guests/monad-variants/r9-flatdirty/monad-r9-flatdirty-zisk.elf',
+                   'src': 'monad'},
+             'b': {'name': 'ziskethone', 'elf': 'vendor/zisk-eth-client/bin/guests/stateless-validator-ziskethone/elf/zec-ziskethone.elf',
+                   'src': 'bin'}},
+    'r10tip-vs-ziskethone': {'ephemeral': 'al/zkvm-r10 tip via r10-buildenv.tsv (official profile)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r10-tip-zisk', 'elf': 'profiling/series/elf/abc3aa26baa56c38.elf',
+                   'src': 'monad'},
+             'b': {'name': 'ziskethone', 'elf': 'vendor/zisk-eth-client/bin/guests/stateless-validator-ziskethone/elf/zec-ziskethone.elf',
+                   'src': 'bin'}},
 }
 # The default run is the shipped guest only: adding the levers axes must not silently change what
 # `./compare.py` with no arguments reports.
@@ -361,9 +746,29 @@ def run_zisk(emu, elf, inp, src_kind, with_cost=False):
         txt = p.stdout + p.stderr
         cost, cats, kec, ops, opsn = None, None, None, None, None
         if with_cost:
-            q = subprocess.run([emu, '-e', elf, '-i', inp, '-X', '-S', '--sdk', '--opcodes'],
-                               capture_output=True, text=True)
+            # --save-stats alongside --opcodes: the displayed per-opcode table is a TOP TEN,
+            # and that truncation reads as a difference in work. A precompile that clears the
+            # tenth place in one guest and not in the other shows as a cost on one side and a
+            # zero on the other -- measured identical on both: secp256k1_add is 305,605,440 in
+            # this guest and 305,605,440 in the base it is compared against, and the compare
+            # reported the base at 0 for 26 blocks. The snapshot is the full table, so
+            # precompiles are read from it rather than from what fits on screen.
+            snap = inp + '.stats'
+            q = subprocess.run([emu, '-e', elf, '-i', inp, '-X', '-S', '--sdk', '--opcodes',
+                                '--save-stats', snap], capture_output=True, text=True)
             qt = q.stdout + q.stderr
+            pre, pren = {}, {}
+            try:
+                with open(snap) as fh:
+                    for line in fh:
+                        f = line.rstrip('\n').split(',')
+                        if len(f) >= 5 and f[0] == 'PRECOMPILES':
+                            pre[f[1]] = int(f[4]); pren[f[1]] = int(f[2])
+            except OSError:
+                pass
+            finally:
+                if os.path.exists(snap):
+                    os.remove(snap)
             mc = re.search(r'COST\s+([\d,]+)', qt)
             if mc: cost = int(mc.group(1).replace(',', ''))
             # Same pass also prints a COST DISTRIBUTION SUMMARY (Base/Main/Opcodes/Precompiles/
@@ -384,7 +789,7 @@ def run_zisk(emu, elf, inp, src_kind, with_cost=False):
             # dma_memcpy for copying, add/or/and/xor/sll for plain arithmetic, etc.
             ops = {m.group(1): int(m.group(2).replace(',', ''))
                    for m in re.finditer(r'║\s+([a-z_][a-z_0-9]*)\s+[█░]+\s+([\d,]+)\s+[\d.]+%', qt)}
-            ops = ops or None
+            ops = {**(ops or {}), **pre} or None
             # The same rows carry an "OPS + FROPS" column: the actual instruction COUNT. Keep it
             # separately — cost is NOT proportional to it (measured cost/op from 0.23 on `sll` to
             # 0.97 on `xor`, because the cheaper "frops" share differs per opcode), so a cost ratio
@@ -393,7 +798,7 @@ def run_zisk(emu, elf, inp, src_kind, with_cost=False):
                     for m in re.finditer(
                         r'║\s+([a-z_][a-z_0-9]*)\s+[█░]+\s+[\d,]+\s+[\d.]+%\s+║\s+([\d,]+)\s+[\d,]+',
                         qt)}
-            opsn = opsn or None
+            opsn = {**(opsn or {}), **pren} or None
     finally:
         if tmp and os.path.exists(tmp): os.remove(tmp)
     grab = lambda pat, cast=int: (cast(re.search(pat, txt).group(1)) if re.search(pat, txt) else None)
@@ -896,6 +1301,17 @@ def _cost_time_axes(axis, rows):
 _IDENT_CACHE = None
 
 
+def _shortid(ident):
+    """The ident as it should be READ: the bare hex, no `sha256:` noise, `?` when the ELF is gone.
+
+    Rendered next to every guest name because a name is not an identity. Four different r10 binaries
+    were reported under labels differing by one word in a single afternoon, and the only field that
+    told them apart was this one — which until now lived in the JSON and appeared nowhere a reader
+    would look. RUNBOOK already said to check it before quoting two figures as two builds; it did not
+    say where, because there was nowhere."""
+    return (ident or 'sha256:?').split(':', 1)[-1]
+
+
 def _ident_of(elf):
     """sha256 identity of an ELF, or None if it is absent. The same value the profile cache keys on.
 
@@ -1193,6 +1609,7 @@ def x(v):  return f"{v:.3f}×" if isinstance(v, (int, float)) else "—"
 def print_summary(s):
     u, A, B = s['unit'], s['a_name'], s['b_name']
     print(f"\n══ {s['axis'].upper()} · {A} vs {B} · n={s['n']} blocks ══")
+    print(f"  {'builds':22} {_shortid(s.get('a_ident')):>18} {_shortid(s.get('b_ident')):>18}")
     print(f"  {'':22} {A:>18} {B:>18} {'ratio':>10}")
     print(f"  {'median '+u:22} {n(s['a_median']):>18} {n(s['b_median']):>18} "
           f"{x(s['a_median']/s['b_median']):>10}")
@@ -1303,6 +1720,10 @@ section{margin-top:38px;border-top:1px solid var(--line);padding-top:26px}
 .axhead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:18px;scroll-margin-top:60px}
 .axhead .nm{font-family:var(--mono);font-size:20px;font-weight:650;letter-spacing:-.01em}
 .axhead .vs{color:var(--dim);font-size:13px;font-family:var(--mono)}
+/* the build sha beside each guest name: subordinate to the name, but selectable and
+   copyable, because the reader's next move is to grep it. */
+.sha{color:var(--muted);font-size:11px;letter-spacing:.02em;padding:1px 4px;
+ border:1px solid var(--line);border-radius:3px;user-select:all}
 /* separators via card borders, not a gap over a coloured backdrop, so a half-empty last row
    (narrow viewport) shows plain panel instead of a stray dark cell */
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));background:var(--panel);
@@ -1350,6 +1771,9 @@ table.cv td i{color:var(--muted);font-style:normal;font-size:11.5px}
 .hb.over{background:linear-gradient(180deg,var(--red),rgba(226,86,74,.3))}
 .hb{appearance:none;padding:0;border:0;font:inherit;cursor:pointer}
 .hb:hover{outline:1px solid var(--fg)}
+/* the prover-work histogram has no drill-down: do not offer a pointer or a hover ring */
+.histpw .hb{cursor:default}
+.histpw .hb:hover{outline:none}
 .hb:focus-visible{outline:2px solid var(--gold)}
 .hb.sel{outline:1.5px solid var(--fg);filter:brightness(1.3)}
 /* drill-down panel under a histogram */
@@ -1570,6 +1994,7 @@ const _med = a => { if (!a.length) return null; const v = [...a].sort((p, q) => 
 
 document.querySelectorAll('.hist').forEach(hist => {
   const ax = hist.dataset.ax;
+  if (!ax) return;                 // the prover-work histogram: bars only, no payload
   const D = JSON.parse(document.getElementById('hd-' + ax).textContent);
   const panel = document.getElementById('hp-' + ax);
   const width = (D.hi - D.lo) / D.nb;
@@ -1839,6 +2264,73 @@ def percall(axis, side_k, side, blocks, cache, rows, rx=_HASH_RE, counter=None):
     return (statistics.median(rats), min(rats), max(rats), (num / den2 if den2 else 0.0), len(rats))
 
 
+# Where the Merkle/RLP work goes, cut by SYMBOL and deliberately independent of the family
+# taxonomy. Two reasons it cannot lean on a family: the roles straddle the boundary (Monad's node RLP
+# is trie work whose symbols say `rlp`, and reordering the taxonomy moves the whole block between
+# families without changing a single instruction), and the point of this panel is precisely to cut
+# across it. Editing hotspots.FAMILIES instead would restate every report already published.
+#
+# Rows are per side and only shown when non-zero, so a guest is never credited with 0 for work it
+# does under names this split does not know: absence here means "not separable from these symbols",
+# which is what the note under the table says.
+RLP_ROLES = [
+    ('input container parse',
+     r'parse_string_metadata|parse_execution_witness|parse_metadata|decode_transaction'
+     r'|rlp_list|decode_item|ListIter|as_u64'),
+    # The pre-state pass: the constructor walks the blob, validates offsets and primes hashes, and
+    # encode_rlp<true> rebuilds each node's canonical RLP so it can be hashed. Both are the same pass.
+    ('pre-state priming: walk + RLP reconstruction',
+     r'OffsetTrie::OffsetTrie|encode_rlp<true>|child_ref_compute<true>'),
+    ('post-state RLP encoding',
+     r'encode_rlp<false>|child_ref_compute<false>|encode_rlp\(|node_rlp\('),
+    # ziskethone builds a node and its RLP in one pass, so it has no pre/post split to show.
+    ('trie node construction (single pass)',
+     r'build_branch_node|build_leaf_node|reduce_branch|eval_node|hex_prefix'),
+    ('transaction/receipt/header RLP',
+     r'encode_log|encode_topics|encode_receipt|encode_string|encode_block_header'
+     r'|process_single_auth'),
+    # The variant visitor both Monad passes go through. Its own row because folding it into either
+    # would misattribute it.
+    ('trie node dispatch (shared by both passes)', r'match<'),
+]
+
+# Two families that have to be read as ONE line against an evmone-based guest. evmone's intx
+# arithmetic is INLINED into dispatch_cgoto, so every 256-bit multiply, divide and compare it
+# performs is attributed to 'EVM interpreter', and '256-bit arithmetic' reports a near-zero that is
+# an ATTRIBUTION, not an absence of computation. Reported apart, our word arithmetic is being
+# compared against a zero the other guest does compute — the same failure the taxonomy already
+# documents for substrate_bn and for __bswapdi2. FAMILIES is deliberately untouched: which family a
+# symbol lands in is a naming question, and the instructions have not moved.
+MERGED_INTERP = ('EVM interpreter', '256-bit arithmetic')
+
+
+def _interp_merged(s):
+    """The comparable interpreter line: the two families of MERGED_INTERP, summed per side.
+
+    Returns the parts as well as the total, so the page can show what was merged and the reader can
+    check the sum rather than take it."""
+    fams = s.get('families')
+    if not fams:
+        return None
+    sa, sb = fams[0], fams[1]
+    parts = [(k, sa.get(k, 0), sb.get(k, 0)) for k in MERGED_INTERP if k in sa or k in sb]
+    if len(parts) < 2:
+        return None                      # one family missing: nothing to merge, and no claim to make
+    return {'parts': parts, 'a': sum(p[1] for p in parts), 'b': sum(p[2] for p in parts)}
+
+
+def _rlp_roles(got, n_):
+    """Per-role means over the same profiles the family sums come from. No family filter: see
+    RLP_ROLES. First matching pattern wins, so the list order is the precedence."""
+    per = {name: 0.0 for name, _ in RLP_ROLES}
+    for g in got:
+        for nm, c in g.get('fns', []):
+            for name, pat in RLP_ROLES:
+                if re.search(pat, nm):
+                    per[name] += c
+                    break
+    return {'rlp': {k: v / n_ for k, v in per.items()}}
+
 def profile_blocks(axis, side_k, blocks, cache):
     """Profile one guest over SEVERAL blocks and fold the mean into work families.
 
@@ -1921,7 +2413,8 @@ def profile_blocks(axis, side_k, blocks, cache):
             k = hs.family(nm); fams[k] = fams.get(k, 0) + c
     n_ = len(got)
     return {'fams': {k: v / n_ for k, v in fams.items()},
-            'total': sum(g['total'] for g in got) / n_, 'blocks': blocks, 'n': n_}
+            'total': sum(g['total'] for g in got) / n_, 'blocks': blocks, 'n': n_,
+            **_rlp_roles(got, n_)}
 
 def _hostinfo():
     """Where these numbers were produced. Work-units are machine-independent, but the exec-time
@@ -1935,6 +2428,47 @@ def _hostinfo():
     ram = f"{int(memb)/1024**3:.0f} GiB" if memb.isdigit() else '?'
     osn = f"{sh('sw_vers', '-productName')} {sh('sw_vers', '-productVersion')}".strip() or platform.platform()
     return f"{cpu} · {cores} cores · {ram} · {osn}"
+
+def _hist_pw(ratios):
+    """Distribution of the per-block PROVER-WORK ratio, to sit beside the work-unit one.
+
+    Bars only, deliberately no drill-down: every field the drill-down carries (aw/bw, per-Mgas,
+    per-tx, exec seconds) is counted in the WORK unit, so hanging it under prover-work bars would
+    put a steps table under a COST histogram — the same mislabelling the pane titles were fixed
+    for. Plain divs rather than buttons, so there is no dead click target, and the shared
+    drill-down JS skips this container because it carries no data-ax."""
+    lo, hi = min(ratios), max(ratios)
+    nb = 26
+    span = (hi - lo) or 1e-9
+    bins = [0] * nb
+    for r in ratios:
+        bins[min(nb - 1, int((r - lo) / span * nb))] += 1
+    top = max(bins) or 1
+    bars = []
+    for i, c in enumerate(bins):
+        c0, c1 = lo + span * i / nb, lo + span * (i + 1) / nb
+        cls = 'hb over' if c0 >= 1.0 else 'hb'
+        bars.append(f"<div class='{cls}' style='height:{max(1, round(100*c/top))}%' "
+                    f"title='{c} block(s) at {c0:.3f}×–{c1:.3f}×'></div>")
+    one = ""
+    if lo < 1.0 < hi:
+        one = f"<div class=one style='left:{100*(1.0-lo)/span:.2f}%'><span>1×</span></div>"
+    srt = sorted(ratios)
+    x = lambda v: f"{v:.3f}×"
+    p10 = srt[int(.10 * (len(srt) - 1))]
+    p90 = srt[int(.90 * (len(srt) - 1))]
+    med = statistics.median(srt)
+    # geometric, for the same reason ratio_gmean is: 2x and 0.5x must cancel
+    gm = math.exp(sum(math.log(r) for r in srt) / len(srt))
+    cv = (statistics.pstdev(srt) / med * 100) if med else 0.0
+    return (f"<div class='hist histpw'>{''.join(bars)}{one}</div>"
+            f"<div class=hax><span>{x(lo)}</span><span>{x(lo + span / 2)}</span><span>{x(hi)}</span></div>"
+            f"<div class=mk><span><i>middle block</i> {x(med)}</span>"
+            f"<span><i>geometric mean</i> {x(gm)}</span>"
+            f"<span><i>lowest 10%</i> under {x(p10)}</span>"
+            f"<span><i>highest 10%</i> over {x(p90)}</span>"
+            f"<span><i>swing</i> ±{cv:.1f}%</span></div>")
+
 
 def _hist(ratios, s, rows=None, gas_map=None, tx_map=None):
     """Distribution of the per-block ratio — the 'is the penalty consistent?' picture.
@@ -2314,6 +2848,11 @@ def _bars(items, A, B):
     return "".join(out)
 
 def write_html(path, summaries, allrows, gas_map=None, tx_map=None, summary_href=None):
+    # `e` is used by the merged-interpreter pane below and was never defined — that pane
+    # raised NameError the first time its condition held, which is why compare.html stopped
+    # being written. Nothing else in this function escapes, so this is the intended helper,
+    # not a change of behaviour.
+    e = html.escape
     gas_map = gas_map or {}; tx_map = tx_map or {}
     # The "one guest is the outlier" claim needs the other axis as a control, and _hist/_curve_note
     # only receive their own summary — hand them what they need rather than widen the signature.
@@ -2390,12 +2929,18 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None, summary_href
         ax = s['axis']; A, B, u = s['a_name'], s['b_name'], s['unit']
         rows = allrows[ax]
         ratios = sorted(r['a']['work'] / r['b']['work'] for r in rows.values() if r['b']['work'])
-        pwu, pwk = s.get('pw_unit'), ('cost' if ax == 'zisk' else 'pgu')
+        # `ax` is the axis NAME, so `ax == 'zisk'` was true for exactly one axis and every
+        # other ZisK axis got 'pgu' — a key its rows do not carry. Harmless while nothing
+        # read pwk; the prover-work histogram below does.
+        pwu = s.get('pw_unit')
+        pwk = 'cost' if AXES[ax]['backend'] == 'zisk' else 'pgu'
         pct = (s['ratio_median'] - 1) * 100
         h.append(f"<section id='ax-{ax}' data-axis='{ax}' "
                  f"data-backend='{AXES[ax]['backend'].upper()}' data-pair='{A} vs {B}'>")
         h.append(f"<div class=axhead><span class=nm>{ax.upper()}</span>"
-                 f"<span class=vs>{A} &nbsp;vs&nbsp; {B}</span></div>")
+                 f"<span class=vs>{A} <code class=sha>{_shortid(s.get('a_ident'))}</code>"
+                 f" &nbsp;vs&nbsp; "
+                 f"{B} <code class=sha>{_shortid(s.get('b_ident'))}</code></span></div>")
         # "N blocks between X and Y" reads as contiguous. It is not: a block runs only when BOTH
         # guests have an input, and the reth-side .bin is missing for ~10% of the span. State the
         # gap rather than let the reader assume. (Checked: the ratio is nearly independent of block
@@ -2477,16 +3022,42 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None, summary_href
         h.append(f"<div class=insight>{verdict}</div>")
         # distribution + metric bars
         h.append("<div class=grid2>")
-        h.append(f"<div class=pane><h2>how many blocks land at each ratio</h2>"
+        # NAME THE UNIT, in the title and in the legend. `ratios` is the WORK ratio
+        # (a['work']/b['work']); the prover-work ratio is a different number and on some axes it
+        # disagrees about the SIGN. Measured, r10tip vs ziskethone-develop: 172 of 200 blocks below
+        # 1x in steps against 51 of 200 in COST, so an unlabelled "cost less (172)" beside a
+        # "per-block COST median 1.017x" reads as a contradiction in the report's own numbers.
+        # "cost" was the worst possible word here, COST being the other metric on the page.
+        h.append(f"<div class=pane><h2>how many blocks land at each {u} ratio</h2>"
                  # green first, then red — same left-to-right order as the bars themselves
                  f"<div class=legend style='margin:2px 0 4px'>"
-                 f"<span><span class=sw style='background:var(--green)'></span>{A} cost less "
+                 f"<span><span class=sw style='background:var(--green)'></span>{A} uses fewer {u} "
                  f"({sum(1 for r in ratios if r < 1)})</span>"
-                 f"<span><span class=sw style='background:var(--red)'></span>{A} cost more "
+                 f"<span><span class=sw style='background:var(--red)'></span>{A} uses more {u} "
                  f"({sum(1 for r in ratios if r >= 1)})</span></div>{_hist(ratios, s, rows, gas_map, tx_map)}"
                  f"<p class=note>One tall narrow clump ⇒ the gap is a stable property of the two guests. "
                  f"A wide or two-peaked shape ⇒ it depends on what the block actually does, and the "
                  f"median alone hides that.</p></div>")
+        # The SAME blocks priced in prover work. Two panes rather than one toggled view, because the
+        # interesting case is when they disagree about which side of 1x they sit on: measured on
+        # r10tip vs ziskethone-develop, 172 of 200 blocks below 1x in steps against 51 of 200 in
+        # COST. One pane could only have shown one of those at a time.
+        if pwu:
+            pwr = sorted(r['a'][pwk] / r['b'][pwk] for r in rows.values()
+                         if r['a'].get(pwk) and r['b'].get(pwk))
+            if len(pwr) >= 5:
+                _lo = sum(1 for r in pwr if r < 1)
+                h.append(f"<div class=pane><h2>how many blocks land at each {pwu} ratio</h2>"
+                         f"<div class=legend style='margin:2px 0 4px'>"
+                         f"<span><span class=sw style='background:var(--green)'></span>{A} uses less "
+                         f"{pwu} ({_lo})</span>"
+                         f"<span><span class=sw style='background:var(--red)'></span>{A} uses more "
+                         f"{pwu} ({len(pwr) - _lo})</span></div>{_hist_pw(pwr)}"
+                         f"<p class=note>The same blocks, priced in {pwu} (trace area) instead of "
+                         f"{u}. If this shape sits on the other side of 1× from the one beside it, "
+                         f"what differs is the work MIX, not its amount — the verdict above says "
+                         f"which way. Bars here are not clickable: the per-block detail is counted "
+                         f"in {u}.</p></div>")
         items = [(f"median {u}", s['a_median'], s['b_median'], n),
                  (f"total {u}", s['a_total'], s['b_total'], n),
                  (f"{u} per Mgas", s.get('a_per_mgas'), s.get('b_per_mgas'), n)]
@@ -2966,6 +3537,62 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None, summary_href
                             f"kept per run); unmatched names go to <i>other</i>"
                             if s.get('fam_cov') else "")
                          + f".</p></div>")
+
+            # The interpreter, as ONE line. Placed before the RLP panes because the interpreter is
+            # the larger comparable gap once the two families are merged.
+            im = _interp_merged(s)
+            if im:
+                da, db = s.get('a_median') or 0, s.get('b_median') or 0
+                delta = im['a'] - im['b']
+                h.append(f"<div class=pane><h2>the interpreter, merged — "
+                         f"<span class=cA>{A}</span> vs <span class=cB>{B}</span></h2>"
+                         f"<p class=note style='margin:0 0 10px'>evmone inlines its <code>intx</code>"
+                         f" arithmetic into a single <code>dispatch_cgoto</code>, so a near-zero in "
+                         f"<b>256-bit arithmetic</b> is an attribution and not an absence of 256-bit "
+                         f"computation. Read apart, the two rows compare our word arithmetic against "
+                         f"a zero the other guest does compute; the <b>comparable</b> figure is their "
+                         f"sum.</p><table>"
+                         f"<tr><th>family<th>{e(A)}<th>{e(B)}<th>A−B</tr>")
+                for k, va, vb in im['parts']:
+                    h.append(f"<tr><td>{e(k)}<td class=num>{va:,.0f}<td class=num>{vb:,.0f}"
+                             f"<td class=num>{va - vb:+,.0f}")
+                sh = f" — {100 * delta / da:.1f}% of {e(A)}" if da else ""
+                h.append(f"<tr><td><b>comparable total</b><td class=num><b>{im['a']:,.0f}</b>"
+                         f"<td class=num><b>{im['b']:,.0f}</b>"
+                         f"<td class=num><b>{delta:+,.0f}</b></table>"
+                         f"<p class=note>Instructions per block, same scaling as the family table. "
+                         f"The delta is <b>{delta:+,.0f}</b>{sh}. This merge says where the work is "
+                         f"attributed, not what it costs per opcode: a per-opcode comparison "
+                         f"normalised by execution count is the measurement that splits it.</p>"
+                         f"</div>")
+
+            # Where the Merkle/RLP work goes, by symbol. Cut across the family taxonomy on
+            # purpose: which family a node-RLP symbol lands in is a naming question, and the answer
+            # has moved. The instructions have not.
+            if s.get('rlp_split'):
+                for side_k, lbl, cls in (('a', A, 'cA'), ('b', B, 'cB')):
+                    roles = ((s['rlp_split'].get(side_k) or {}).get('roles') or {})
+                    shown = [(r, v) for r, v in sorted(roles.items(), key=lambda kv: -kv[1]) if v > 0]
+                    if not shown:
+                        continue
+                    gtot = s.get('a_median') if side_k == 'a' else s.get('b_median')
+                    h.append(f"<div class=pane><h2>where the Merkle and RLP work goes — "
+                             f"<span class={cls}>{lbl}</span></h2>"
+                             f"<p class=note style='margin:0 0 10px'>Instructions per block by "
+                             f"<b>symbol</b>, over the same {len(s['families'][4])} profiled blocks "
+                             f"and the same scaling as the family table. Independent of the family "
+                             f"taxonomy: these roles straddle it.</p><table>"
+                             f"<tr><th>role<th>instructions/block<th>of this guest</tr>")
+                    for r, v in shown:
+                        gsh = f"{100 * v / gtot:.2f}%" if gtot else "—"
+                        h.append(f"<tr><td>{r}<td class=num>{v:,.0f}<td class=num>{gsh}")
+                    h.append(f"</table><p class=note>Only roles this guest actually spends in are "
+                             f"listed. A role absent here is <b>not zero</b> — it means the work is "
+                             f"not separable from this guest's symbols, or it does not organise its "
+                             f"code that way. In particular a single-pass node builder has no "
+                             f"pre-state/post-state split to show, and a generic RLP encoder shared "
+                             f"between trie nodes, receipts and the header cannot be apportioned "
+                             f"between them at all.</p></div>")
             if s.get('insn_ratios'):
                 # INSTRUCTION COUNTS, not cost. The cost view answered "what will proving charge",
                 # which is a different question and needed a `Main` row that merely restated the
@@ -3400,7 +4027,9 @@ def write_summary(path, md_path, summaries, allrows, full_href):
         head += f" · median {s['a_median']/1e6:,.0f}M vs {s['b_median']/1e6:,.0f}M {u}"
         if ta and tb:
             head += f" · exec {ta:.2f}s vs {tb:.2f}s"
-        md += [f"## {s['axis'].upper()} — {A} vs {B} (on {bk} · {s['n']} blocks {bs[0]}–{bs[-1]})",
+        md += [f"## {s['axis'].upper()} — {A} `{_shortid(s.get('a_ident'))}` vs "
+               f"{B} `{_shortid(s.get('b_ident'))}` "
+               f"(on {bk} · {s['n']} blocks {bs[0]}–{bs[-1]})",
                f"- {head}",
                f"- {strip(d['stab'])}"]
         if d['mix']:
@@ -3669,7 +4298,15 @@ def main():
         if rows and args.families:
             # Sample ACROSS the ratio distribution rather than at one point, so the mix is not
             # taken from a block that happens to be unusual in composition.
-            byr = sorted(rows, key=lambda b: rows[b]['a']['work'] / max(rows[b]['b']['work'], 1))
+            # Stratified on the B SIDE's work, not on the a/b ratio. The ratio was the better
+            # stratifier for one report read alone, but it made the sample follow the guest under
+            # test: two reports sharing a b side profiled that side on DIFFERENT blocks (15 of 50
+            # in common, monad-r8 vs monad-r9 against ziskethone), and because families are
+            # rescaled to the sample's mean block, every absolute figure for the UNCHANGED guest
+            # moved ~9 %. Two reports then contradict each other about a guest neither changed.
+            # Block size still correlates with composition, so this keeps the variance reduction
+            # the ratio gave; what it drops is the dependence on the a side.
+            byr = sorted(rows, key=lambda b: rows[b]['b']['work'])
             k = max(1, min(args.families, len(byr)))
             # Stratified: the MIDPOINT of k equal-population bins (10/30/50/70/90% for k=5), not
             # 0..100%. Taking the endpoints would give the two most extreme blocks a fifth of the
@@ -3705,6 +4342,10 @@ def main():
                 sa, ka = _scaled('a', fa)
                 sb, kb = _scaled('b', fb)
                 s['families'] = (sa, sb, fa['total'], fb['total'], picks)
+                # Scaled by the same k, so the role rows stay checkable against the family figure.
+                s['rlp_split'] = {k: {'roles': {r: v * kk for r, v in f['rlp'].items()},
+                                      }
+                                  for k, f, kk in (('a', fa, ka), ('b', fb, kb))}
                 # Coverage, not the raw attributed count: on SP1 the raw figure is a SAMPLE
                 # (3.4M next to a 670M table reads as a 200x inconsistency). What the reader needs
                 # is the share of real work the table accounts for — scale-free, so it means the
