@@ -3051,7 +3051,9 @@ def build_nonlevers(d, c, S, Z, P, cs):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--out', default=os.path.join(HERE, 'results', 'levers.html'))
+    ap.add_argument('--out', default=os.path.join(HERE, 'results', 'levers-r3.html'))
+    # Not results/levers.html: that is levers.py's output, and this script is
+    # archived. Sharing the default meant running it overwrote the live report.
     a = ap.parse_args()
     # Before anything is rendered: the source citations are the only content measurement never
     # revisits, so they are checked against the ELF that is actually selected. A guest generation

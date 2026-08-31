@@ -112,7 +112,14 @@ SHORT="${SHA:0:9}"
 
 git -C "$CLONE" cat-file -e "$SHA:zkvm/guest/CMakeLists.txt" 2>/dev/null \
   || die "$SHORT has no zkvm/guest/CMakeLists.txt — is this the monad tree?"
-git -C "$CLONE" show "$SHA:zkvm/guest/CMakeLists.txt" | grep -q MONAD_ZKVM_OFFICIAL_PROFILE \
+# Process substitution, not a pipe. Under `set -o pipefail`, `grep -q` exits at its first match
+# while `git show` is still writing; git takes SIGPIPE and the pipeline's status is that failure,
+# reported as "this commit has no official profile" — a statement about the commit, when the commit
+# is fine. It only bites once the file no longer fits the pipe buffer before grep leaves, so it grew
+# in with the guest's option list: measured in bash, 0 failures in 20 at 38,095 bytes (2b1b9c9ee),
+# 2 in 20 at 45,290 (0e3add729), and deterministic for whole builds by then. Measure this in BASH:
+# a first attempt tested it under zsh, which does not reproduce it, and wrongly cleared the pipe.
+grep -q MONAD_ZKVM_OFFICIAL_PROFILE <(git -C "$CLONE" show "$SHA:zkvm/guest/CMakeLists.txt") \
   || die "$SHORT has no MONAD_ZKVM_OFFICIAL_PROFILE in zkvm/guest/CMakeLists.txt.
   The profile arrived in ${PROFILE_SINCE:0:9} (\"zkvm: make official ZisK builds fail closed\").
   Before it the option set was chosen per commit, not by the guest — there is no single recipe to

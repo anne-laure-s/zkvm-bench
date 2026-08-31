@@ -146,8 +146,44 @@ FAMILIES = [
     # relocation of work that reth already spreads, not a cost reth avoids.
     ('byte/bit manipulation',  r'bswap|to_be_bytes|from_be_bytes|byteswap|htonl|ntohl|popcount'
                                r'|count_ones|leading_zeros|trailing_zeros|clz|ctz'),
-    ('256-bit arithmetic',     r'mulmod|addmod|submod|div_rem|div_result|udivti3|umodti3|uint256'
-                               r'|intx|u256|Uint<256'),
+    # ⚠️ ANCHORED ON PURPOSE, and this one was live for a long time. Bare `uint256` matched the
+    # PARAMETER LIST, and a C++ EVM interpreter passes the stack as `uint256_t const*` / `uint256_t*`
+    # in every handler's signature. Measured on block 25815100: `push`, `mstore`, `add` and the rest
+    # of `monad::vm::interpreter::` — 41.7 M steps, 48 % of that guest's block — were filed as
+    # "256-bit arithmetic", while evmone's whole interpreter is one `dispatch_cgoto` whose signature
+    # carries no such type and was filed correctly. The EVM family read 2,487,029 against 41,847,455,
+    # i.e. 0.059x, and the 256-bit family read 44,401,009 against 59,655. Both numbers were about the
+    # signatures, not the guests.
+    # The token now has to OWN the symbol: a member (`uint256_t::`), a namespace (`intx::`, `ruint::`)
+    # or a free operator on the type. Free functions that ARE 256-bit arithmetic are named.
+    # Measured after: monad EVM 44,177,624 (1.056x of ziskethone), 256-bit 983,456, `other` down from
+    # 1,093,931 to 229,514.
+    # What the anchoring moved on the OTHER guests, replayed over every profile in the cache (67
+    # builds) rather than asserted — two symbols on each, and both leave this family for a better
+    # one, which is why the change is kept:
+    #   rsp         4,162,474 cycles  `hashbrown::…HashMap<ruint::Uint<256usize,4usize…>` and its
+    #                                 RawTable -> `containers / abstraction`. A map KEYED by a U256
+    #                                 is container work; `Uint<256` bare used to claim it.
+    #   ziskethone    119,109 steps   `zeg::rlp::encode_u256` / `as_u256` -> `witness decoding`.
+    #                                 RLP framing of a word, not arithmetic on it; `u256` bare used
+    #                                 to claim it.
+    # Nothing else in the cache changes family. The 4,885 quoted below for ziskethone is the number
+    # AFTER those two left, so it is the one to compare against.
+    # ⚠️ NOT COMPARABLE against a guest whose interpreter is one inlined dispatcher. Once the
+    # anchoring above stops this family from swallowing the handlers, what is left is the standalone
+    # 256-bit helpers — 983,456 steps/block for monad against 4,885 for ziskethone, whose own word
+    # arithmetic is inside `dispatch_cgoto` and counted as EVM. The ratio is 201x and means nothing;
+    # read the EVM family, which is 1.056x. Same caveat as `byte/bit manipulation` above, and for the
+    # same reason: a family only compares when both guests emit symbols for it.
+    ('256-bit arithmetic',     r'mulmod|addmod|submod|div_rem|div_result|udivti3|umodti3'
+                               r'|uint256_t::|uint256::|intx::|ruint::|::u256::|Uint<256[^>]*>::'
+                               r'|operator\S*\((?:monad::)?uint256_t|monad::exp\('
+                               # Anchored like the rest: bare `checked_add`/`checked_mul` are the
+                               # names of every Rust primitive-integer overflow check, so they would
+                               # re-create on the Rust side exactly the signature-matching this
+                               # family was just cured of. Monad's are `monad::monad::checked_mul(
+                               # monad::uint256_t const&, …)`, the only such symbol in the cache.
+                               r'|monad::checked_mul|monad::checked_add|arith256'),
     # PartialNode / PartialTrieDb are trie node types: Boost.Outcome wrappers around them are trie
     # work, and without naming them here ~half the abstraction family was mis-filed trie work.
     # State ACCESS belongs here too, not just trie structure: Monad's BlockState/State readers were
@@ -176,7 +212,17 @@ FAMILIES = [
                                  # `build_branch_node|build_leaf_node` are not substrings of
                                  # `build_node` or `build_phantom_leaf_node`, and `StateRoot::` is
                                  # not `trie`/`mpt` — 243,936 steps/block of theirs fell to `other`.
-                                 r'|build_node|build_phantom|StateRoot::|calculate_new_state_root'),
+                                 r'|build_node|build_phantom|StateRoot::|calculate_new_state_root'
+                                 # Ours is enumerated method by method above, theirs is anchored by
+                                 # class -- so every State member added since fell to `other` while
+                                 # their equivalent stayed classified. Measured: rows_for_read,
+                                 # journal_warm_slot, access_account, journal_flag, recent_account,
+                                 # get_code_hash and pop_reject were 823,810 steps/block in `other`
+                                 # against 44,354 for the whole of ziskethone. Anchor ours by class
+                                 # too, fully qualified so a bare `State::` in a template argument
+                                 # cannot claim a container.
+                                 r'|monad::State::|monad::BlockState::|monad::AccountState::'
+                                 r'|monad::OriginalAccountState::'),
     # `evmc` must not be bare: `std::basic_string<unsigned char, evmc::byte_traits<…>>` is a
     # C++ string type, and it was 26.5% of Monad's EVM family while reth's equivalent buffer
     # (Vec<u8>/Bytes) sat in containers — an asymmetry worth ~0.24x on the interpreter ratio.
@@ -232,7 +278,16 @@ FAMILIES = [
                                # ziskethone reaches its VM through an evmc2 C-ABI trampoline whose
                                # parameters are `evmc_vm*`/`evmc_host_interface*` — underscores, so
                                # the `evmc::` namespace anchor does not match.
-                               r'|w_execute2'),
+                               r'|w_execute2'
+                               # Same enumeration-versus-anchor asymmetry as `state / trie` below:
+                               # `runtime::(codecopy|calldatacopy|call|Context::from)` names four
+                               # members, so `returndatacopy`, `log3`, `gas_price` and
+                               # `Context::exit` fell elsewhere. EvmcHost and is_precompile are the
+                               # host and precompile-dispatch halves of the same work — their
+                               # counterparts `w_execute2` and `resolve_precompile` are already
+                               # named here. 156,410 steps/block on 25815100.
+                               r'|monad::vm::runtime::|monad::vm::interpreter::|EvmcHost'
+                               r'|is_precompile'),
     # SYMMETRY MATTERS HERE. This family first carried only C++ vocabulary (std::/boost::/unordered),
     # so Rust's equivalent machinery — RawVec growth, Vec/Box/iterator adapters, bytes:: — fell into
     # "memory" or "other" instead. That asymmetry alone inflated the Monad/reth ratio ~9x (60.3x vs

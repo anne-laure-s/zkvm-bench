@@ -47,6 +47,11 @@ MONAD_ZKVM_TABLE_ARG=ON \
 MONAD_ZKVM_FUSE=ON \
 MONAD_ZKVM_KECCAKF_MEMO=ON \
 MONAD_ZKVM_KECCAK_SITES=OFF \
+MONAD_ZKVM_CHECK_SEQUENTIAL_MERGE=OFF \
+MONAD_ZKVM_NO_DIRTY_ACCOUNTS=ON \
+MONAD_ZKVM_NO_MERGE_CONSTRAINTS=ON \
+MONAD_ZKVM_VARCODE_CACHE=ON \
+MONAD_ZKVM_WIDE_MEMORY_SIZE=ON \
 MONAD_ZKVM_SELFTEST=OFF"
 
 # Plain strings, not an associative array: /bin/bash here is 3.2 and has none.
@@ -118,7 +123,7 @@ ELF="$HERE/elf/$OUT.elf"
 # the xPack installs. Nothing here is macOS- or Linux-specific: bash 3.2 (what
 # macOS ships) has no associative arrays, which is why the options above are
 # plain strings.
-TC="${RISCV_TOOLCHAIN_DIR:-/Users/anne-laure/riscv_gcc_multilib}"
+TC="${RISCV_TOOLCHAIN_DIR:-$HOME/riscv_gcc_multilib}"
 OBJDUMP=""
 for cand in "$TC/bin/riscv64-unknown-elf-objdump" "$TC/bin/riscv-none-elf-objdump" \
             riscv64-unknown-elf-objdump riscv-none-elf-objdump llvm-objdump; do
@@ -142,7 +147,7 @@ print(f"  ports DMA : movmem(0x813)={c[0x813]:,}  setmem(0x816)={c[0x816]:,}  "
       f"cmpmem(0x814)={c[0x814]:,}")
 PY
 echo "  options   : $DEFS"
-echo "  toolchain : ${RISCV_TOOLCHAIN_DIR:-/Users/anne-laure/riscv_gcc_multilib}"
+echo "  toolchain : ${RISCV_TOOLCHAIN_DIR:-$HOME/riscv_gcc_multilib}"
 # Unset is the normal case, and it is worth printing as such: the guest appends its own -march,
 # and a value here would fork the build signature. See the note beside the export above.
 echo "  march     : ${MARCH:-unset - the guest supplies its own}"

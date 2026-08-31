@@ -30,6 +30,7 @@ numbers.
 | `levers.py` | **what to fix in the Monad guest, ranked**, with a re-measure protocol per item | the profile cache + the ELF symbol table | its own report — *not* compare.py's, and it has a shelf life |
 | `rtp-latency.py` | end-to-end **latency** of the RTP pipeline, joined per block | witness manifest + run records + mock submissions | latency table (`--csv`) |
 | `axis.py` | **list, add, remove and retire** compare.py's axes (`prune` drops a campaign's ephemeral ones, `gc` drops those whose build was deleted), with the checks that catch a bad one before it measures | `compare.py`'s `AXES` + the inputs on disk | edits `AXES` in place; `list` / `show` print |
+| [`series/`](RUNBOOK.md#series--one-elf-per-commit-of-a-lineage) | **each commit of a branch against its own predecessor** — one ELF built per commit, so a lineage reads as a curve and an inert commit is visible as one. Not an A-vs-B: `compare.py` prices a build against a rival, this prices a *branch against itself* | a monad worktree (it builds), the corpus, `<lineage>-index.tsv` + `<lineage>-measure.tsv` | `results/series-<lineage>.html`; driven end to end by `series/run-r10.sh` |
 
 Three more produce an artifact that another tool reads, rather than a report of their own. They are
 easy to mistake for optional extras, so: if the file they write is missing, the consumer silently
@@ -46,6 +47,12 @@ drops a column or a series — it does not fail.
 > [`../guests/monad-variants/README.md`](../guests/monad-variants/README.md) § `levers/`). It lands
 > under `results/`, which is git-ignored, so **a fresh clone has nothing for them to read and they
 > cannot run there at all**. Everything downstream inherits that.
+
+`series/` has the same shape of dependency, and it is worth knowing before opening the directory: the
+scripts are tracked, everything they read and write is not (`series/elf/`, `<lineage>-index.tsv`,
+`<lineage>-measure.tsv` are git-ignored). A fresh clone gets the method and no data — and unlike the
+frozen set above, this one **is** regenerable: `run-r10.sh` rebuilds it from the branch, given a monad
+worktree and hours.
 
 Two axes running the same build share its measurements, with nothing to prime by hand: a slot is keyed
 by the sha256 of the ELF, so the axis never enters the key (see [`cache-format.md`](cache-format.md)).

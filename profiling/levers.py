@@ -1019,7 +1019,7 @@ REMAIN = [
                "0 result mismatches, 0 operand-order faults.",
     },
     {
-        'id': 'jdscan', 'share': 9.63, 'tag': 'BUILT',
+        'id': 'jdscan', 'share': 0.0, 'tag': 'REFUTED',
         't': 'The JUMPDEST scan reads two bytes per opcode where one will do',
         'w': "<code>Intercode::find_jumpdests</code> is the hottest function in the guest — "
              "<b>12,544,700 steps, 9.57 %</b> — because it visits every opcode of every distinct "
@@ -1028,7 +1028,14 @@ REMAIN = [
              "the 256-entry advance table, read the advance. <code>codelazy</code> established that "
              "none of this work can be skipped — the codes are all served — so the only thing left "
              "is the price per position.",
-        'fix': "An unsigned range test is the <i>same six instructions</i> with one load:<br>"
+        'fix': "<b>REVERTED in <code>b9b5c0833</code>: measured on ten blocks, this change "
+               "<i>costs</i> 0.132 % &mdash; 1,831,585 steps and 277,739,765 COST, losing on both "
+               "axes.</b> The premise below is wrong, not the arithmetic: the two shapes do not have "
+               "identical instruction counts. The range test's non-PUSH arm carries three branches "
+               "where the table carries one, and the table's second <code>lbu</code> is cheaper than "
+               "the branches needed to avoid it &mdash; which a per-position instruction count cannot "
+               "see. Kept below because the reasoning is worth not repeating.<br><br>"
+               "An unsigned range test is the <i>same six instructions</i> with one load:<br>"
                "<table><tr><th>arm</th><th>share</th><th>instructions</th></tr>"
                "<tr><td>non-PUSH</td><td>73.7 %</td><td><code>lbu / addi / bgeu / beq / addi / bltu</code></td></tr>"
                "<tr><td>PUSH</td><td>26.3 %</td><td><code>lbu / addi / bgeu / addi / add / bltu</code></td></tr></table>"
@@ -1079,7 +1086,7 @@ REMAIN = [
                "wrong state root. The counts had to be threaded, not cached.",
     },
     {
-        'id': 'popcnt', 'share': 0.96, 'tag': 'BUILT',
+        'id': 'popcnt', 'share': 0.36, 'tag': 'BUILT',
         't': 'immer calls libgcc\'s popcount 41,909 times a block, and twelve of its thirty instructions are constants',
         'w': "riscv64ima has no <code>cpop</code>, so every <code>__builtin_popcountll</code> is a "
              "call into libgcc. immer's HAMT makes one per level of every lookup and every insert: "
@@ -1089,25 +1096,81 @@ REMAIN = [
              "<code>fmixk</code> found in the hash. <code>bits::popcount64</code> had it too, which "
              "is exactly why its own note said it &ldquo;barely pays&rdquo;. That note was right "
              "about the measurement and wrong about the reason.",
-        'fix': "Fetch the constants and define the symbol in the guest: <b>19 instructions and four "
-               "loads against 30, 684 COST per call, 28.7 M, 0.14 %</b>. <b>BUILT</b> as "
-               "<code>659563030</code>.<br><br>"
-               "In the guest's libc shim rather than by patching a caller, because libgcc is a "
-               "static archive searched after it — the mechanism <code>malloc</code>/<code>free</code> "
-               "already use — and it composes with the immer hunk in "
-               "<code>third_party/patches</code>: if that is ever applied, immer inlines its own copy "
-               "and this goes uncalled. The fetch helper is now shared as <code>bits::imm64</code> "
-               "between <code>popcount64</code> and <code>fmix64</code>, 154,334 calls a block "
-               "between them.",
-        'rem': "<b>A passing build does not demonstrate this one works.</b> If link order ever put "
-               "libgcc first the override does nothing at all, results stay correct, and 0.14 % is "
-               "quietly not saved. The check is a disassembly of the shipped ELF — 19 instructions "
-               "with loads off a shared anchor is ours, 30 with three <code>lui</code> is libgcc's — "
-               "and it is written into the source beside the definition.<br><br>"
-               "It also nearly did not work at all: <code>uint64_t const k3 = imm64(...)</code> "
-               "folded the constant straight back to an immediate, because gcc constant-evaluates a "
-               "const-initialised local and that takes <code>if !consteval</code> down its false "
-               "branch. Any such trick has to be checked in the emitted code.",
+        'fix': "First attempt, <code>659563030</code>: fetch the constants and define "
+               "<code>__popcountdi2</code> in the guest's libc shim, so the call lands on 19 "
+               "instructions instead of 30. libgcc is a static archive searched after it — the "
+               "mechanism <code>malloc</code>/<code>free</code> already use. Estimated 0.14 %.<br><br>"
+               "<b>Don't take the call over — remove it.</b> <code>__builtin_popcountll</code> is an "
+               "ordinary identifier to the preprocessor, so a force-included header redefines it for "
+               "every guest C++ TU at once, third-party ones included, from a file this repository "
+               "owns. That is <code>zkvm/core/builtin_popcount.hpp</code>, wired in "
+               "<code>zkvm/guest/CMakeLists.txt</code>. <b>BUILT</b> as <code>d5797a0af</code>.<br><br>"
+               "<table><tr><th>build</th><th>STEPS</th><th>COST</th></tr>"
+               "<tr><td>+ unordered_dense hunk</td><td>118,695,720</td><td>18,884,245,287</td></tr>"
+               "<tr><td>+ immer submodule patch</td><td>117,870,371</td><td>18,812,345,445</td></tr>"
+               "<tr><td>+ this, immer vierge</td><td>117,870,371</td><td><b>18,812,345,445</b></td></tr></table>"
+               "<b>0.359 %, byte-identical to the forked submodule</b> — so the fork is not needed, "
+               "and the immer hunk is deleted from <code>third_party/patches</code>. immer is the "
+               "guest's <i>only</i> popcount traffic: <code>__popcountdi2</code> is now absent from "
+               "the linked image entirely.",
+        'rem': "<b>The second mask has to go back to being an immediate.</b> Pointed at "
+               "<code>bits::popcount64</code> the force-include reached 0.235 %, not 0.359 %. "
+               "<code>popcount64</code> deliberately refuses to hoist <code>imm64(POPC_K[1])</code> "
+               "into a <code>const</code> local, because gcc constant-evaluates a const-initialised "
+               "local through <code>if !consteval</code> and rebuilds the mask — 27 instructions "
+               "against 25. <b>Standalone that is right, and the isolated disassembly confirms it.</b> "
+               "In the guest it is backwards by <b>0.124 % of the block</b>: immer popcounts once per "
+               "level of a descent loop, a materialised constant is loop-invariant arithmetic that "
+               "LICM lifts out, and an <code>asm</code> load is not. One constant per <i>loop</i> "
+               "beats four loads per call. <code>popcount64_licm</code> is the loop-facing form and "
+               "<code>popcount64</code> stays as it is — both correct, for opposite reasons.<br><br>"
+               "A microbenchmark answers the question you asked it. That one measured a call; the "
+               "caller was a loop.<br><br>"
+               "<b>A passing build still does not demonstrate this works</b> — the check is that "
+               "<code>__popcountdi2</code> is absent from the shipped ELF, and the shim in "
+               "<code>libc.cpp</code> is now dead weight kept as the backstop if the force-include is "
+               "ever dropped.",
+    },
+    {
+        'id': 'loadfactor', 'share': 0.24, 'tag': 'BUILT',
+        't': 'The map multiplies its bucket count by 0.8f, on a machine with no FPU',
+        'w': "<code>ankerl::unordered_dense</code> stores <code>max_load_factor</code> as a "
+             "<code>float</code> and computes <code>num_buckets * 0.8f</code> on every rehash and "
+             "every size query. riscv64ima has no FPU, so each one is a call to "
+             "<code>__floatundisf</code> and <code>__mulsf3</code>: <b>368,154 steps</b> of soft-float "
+             "to multiply a power of two by four fifths.<br><br>"
+             "For the power-of-two bucket counts this map uses, <code>(n * 4) / 5</code> is the same "
+             "integer. Two sites, both <code>private:</code> members of <code>table&lt;&gt;</code>.",
+        'fix': "The change belongs in the header, and the header is a submodule pinned at "
+               "<code>martinus/unordered_dense</code>. <code>third_party/patches/</code> carried it as "
+               "a diff nothing applied, on the reasoning that a submodule is a separate repository so "
+               "no commit here can hold its contents.<br><br>"
+               "<b>True, and beside the point.</b> The file does not have to be edited in place. Read "
+               "the pinned header at configure time, rewrite the two expressions, write the derived "
+               "copy into the build tree, and put that copy ahead of the submodule on the include "
+               "path. <b>BUILT</b> as <code>fa3c6645e</code>, "
+               "<code>zkvm/guest/unordered_dense_no_float.cmake</code>.<br><br>"
+               "<table><tr><th>build</th><th>STEPS</th><th>COST</th></tr>"
+               "<tr><td>sous-module patché à la main</td><td>117,870,371</td><td>18,812,345,445</td></tr>"
+               "<tr><td>ceci, sous-module vierge</td><td>117,870,371</td><td><b>18,812,345,445</b></td></tr></table>"
+               "Byte-identical, submodule pristine, <b>0.236 % on its own</b> — 477,650 steps, "
+               "47,309,128 COST. <code>nm</code> on the shipped ELF finds no "
+               "<code>__floatundisf</code>, <code>__mulsf3</code> or <code>__fixunssfdi</code> at all.",
+        'rem': "<b>Guarded, because a silent no-match costs 0.236 % and changes nothing observable.</b> "
+               "Four fatal errors, each exercised against a doctored header rather than assumed: "
+               "missing submodule, either float site absent, and "
+               "<code>default_max_load_factor</code> no longer <code>0.8F</code> — the substitution is "
+               "only value-preserving at 0.8, and the setter is public API. Nothing in "
+               "<code>category/</code> or <code>zkvm/</code> calls the setter today.<br><br>"
+               "Two float conversions are left alone on purpose — <code>load_factor()</code> and the "
+               "<code>max_load_factor</code> setter, both public API the guest never calls — and there "
+               "is deliberately no warning about them: one that fires on every configure for provably "
+               "dead code is how warnings get ignored.<br><br>"
+               "<b>&ldquo;It lives in a submodule&rdquo; is a claim about git, not about the build.</b> "
+               "This hunk and the immer one sat unapplied for months behind that sentence and neither "
+               "needed a fork. A submodule pins <i>bytes on disk</i>; what the compiler reads is "
+               "decided by the include path, the preprocessor and configure-time codegen, all of which "
+               "this repository controls. <code>third_party/patches/</code> is deleted.",
     },
     {
         'id': 'blobfee', 'share': 0.76, 'tag': 'BUILT',
@@ -1183,8 +1246,8 @@ REMAIN = [
                "family boundary is what a decision turns on.",
     },
     {
-        'id': 'lazyhash', 'share': 8.5, 'tag': 'BUILT',
-        't': 'The OffsetTrie constructor hashes all 11,000 blob nodes, and execution erases half of them',
+        'id': 'lazyhash', 'share': 0.0, 'tag': 'REFUTED',
+        't': 'The priming sweep looked half-wasted &mdash; measured, removing it <i>costs</i> 0.6 %',
         'w': "Keccak is <b>34.78 % of the guest's COST</b> — 90,856 permutations — and nobody had "
              "split that by <i>who asks for it</i>. Every call site in the ELF, with the profile's "
              "count, accounts for all 30,171 calls:<br>"
@@ -1199,35 +1262,40 @@ REMAIN = [
              "Re-encoding the blob offline the way <code>encode_rlp</code> does gives the sweep's "
              "exact price: <b>31,021 permutations, 11.70 % of total COST</b> (8,747 branches at 3.29 "
              "each, 2,253 leaves and exts at 1).<br><br>"
-             "<b>And more than half of it is thrown away.</b> <code>upsert_node</code> and "
+             "<b>And more than half of it looked thrown away.</b> <code>upsert_node</code> and "
              "<code>put_node</code> both <code>hashes_.erase(id)</code> — a node whose <i>descendant</i> "
              "changed has a stale hash, and <code>put_node</code> keeps the id when it rewrites the "
              "bytes. <code>child_ref_compute&lt;false&gt;</code> then runs 6,042 times against "
-             "<code>fresh_id()</code>'s 162, so <b>~6,014 of the 11,000 primed hashes were erased "
-             "before anything read them</b>: ~19,600 permutations, <b>7.4 % of total COST</b>, plus "
-             "~2.9 M steps of wasted encoding.",
-        'fix': "<code>child_ref_compute</code> was <i>already</i> a lazy memoising hash — it encodes a "
-               "node, caches the digest, and its recursion bottoms out on cached entries, on the "
-               "digests the witness supplies, and on nodes under 32 B that the parent inlines. The "
-               "sweep buys exactly one thing: it keeps that recursion one level deep.<br><br>"
-               "<b>Delete it.</b> The recursion then goes as deep as the trie — one ~800 B frame per "
-               "level. The blob for this block is <b>18 levels</b> deep counting the storage tries "
-               "nested under account leaves (measured by walking it); the structural ceiling is "
-               "64 + 64, ~102 KB against ziskos's <b>1 MiB</b> stack. The constructor keeps every "
-               "structural check — extents, exact tiling, and every child id being a recorded node "
-               "start, which is what <code>find_original</code>'s &ldquo;node not found&rdquo; arm "
-               "rests on — and its codegen goes <b>1,914 &rarr; 440 instructions</b>.<br><br>"
-               "<b>BUILT</b> on <code>al/zkvm-r4-levers</code> as <code>f5bd05450</code>. With "
-               "<code>priming_pass</code> gone, <code>encode_rlp</code>/<code>child_ref</code>/"
-               "<code>child_ref_compute</code> stop being templates.",
-        'rem': "<b>NOT BUILT for the guest.</b> This is the largest single change on the branch and it "
-               "is in the soundness-critical file: it needs <code>test_offset_trie</code>, "
-               "<code>test_witness_generator</code> and a state-root diff over the corpus.<br><br>"
-               "The one abort that disappears is <code>child_ref_compute</code>'s &ldquo;unprimed "
-               "hash-referenced node (bad offset)&rdquo; — it fired only inside the sweep, and only "
-               "for a forward or garbage child offset, which the constructor's own check rejects "
-               "first. A blob node that no longer gets encoded is one that nothing reachable from the "
-               "post-state root references.",
+             "<code>fresh_id()</code>'s 162, so ~6,014 of the 11,000 primed hashes were erased before "
+             "anything read them: ~19,600 permutations, <b>7.4 % of total COST</b> on paper.",
+        'fix': "<code>child_ref_compute</code> is <i>already</i> a lazy memoising hash — it encodes a "
+               "node, caches the digest, and bottoms out on cached entries, on the digests the witness "
+               "supplies, and on nodes under 32 B that the parent inlines. The sweep appears to buy "
+               "exactly one thing: keeping that recursion one level deep. So: delete it.<br><br>"
+               "Everything about that change is sound. Every structural check survives — extents, "
+               "exact tiling, every child id being a recorded node start, which is what "
+               "<code>find_original</code>'s &ldquo;node not found&rdquo; arm rests on. The recursion "
+               "depth is safe: <b>18 levels</b> on this block against a 64+64 ceiling, ~102 KB of "
+               "~800 B frames against ziskos's 1 MiB stack. The codegen goes <b>1,914 &rarr; 440 "
+               "instructions</b>. The public output is <b>byte-identical</b>.<br><br>"
+               "It is also slower.<br>"
+               "<table><tr><th>build</th><th>STEPS</th><th>COST</th></tr>"
+               "<tr><td>with <code>f5bd05450</code> (lazy)</td><td>120,530,257</td><td>19,050,708,414</td></tr>"
+               "<tr><td>reverted</td><td>119,173,370</td><td><b>18,931,554,415</b></td></tr></table>"
+               "<b>&minus;119,153,999 COST, 0.595 % of the reference, in favour of keeping the "
+               "sweep.</b> Reverted in <code>83aeb3ad7</code>.",
+        'rem': "The permutation count is <b>identical, 90,856, both ways</b> — nothing was avoided. "
+               "Removing the sweep moves <code>child_ref_compute&lt;false&gt;</code> from 6,042 calls "
+               "to <b>16,733</b>: it absorbs the priming work exactly, and costs <i>more per node</i>, "
+               "because it re-walks children and re-enters the memo per level instead of hashing "
+               "bottom-up in one pass.<br><br>"
+               "<code>hashes_.erase(id)</code> proves an entry went <b>stale</b>. It does not prove "
+               "the entry was never read, and it does not prove the work behind it would not have to "
+               "be redone. The erase count measured churn, not waste — and no amount of static "
+               "reasoning distinguishes the two. This lever <b>moved</b> work and assumed the "
+               "destination was free; the levers that held all <i>remove</i> instructions from a path "
+               "that still runs. It survived review, a written rationale, an equivalence argument and "
+               "a commit, and died on the first end-to-end run.",
     },
     {
         'id': 'memcost', 'share': 1.50, 'tag': 'PRICED',

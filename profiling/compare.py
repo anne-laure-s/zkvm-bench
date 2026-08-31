@@ -649,18 +649,25 @@ AXES = {
     'r8-vs-ziskethone': {'backend': 'zisk', 'unit': 'steps',
              'a': {'name': 'monad-r8-zisk', 'elf': 'guests/monad-variants/r8-zbkb/monad-r8-zbkb-zisk.elf',
                    'src': 'monad'},
-             'b': {'name': 'ziskethone', 'elf': 'vendor/zisk-eth-client/bin/guests/stateless-validator-ziskethone/elf/zec-ziskethone.elf',
+             'b': {'name': 'ziskethone', 'elf': 'guests/ziskethone/ziskethone.elf',
                    'src': 'bin'}},
     'r9-vs-ziskethone': {'backend': 'zisk', 'unit': 'steps',
              'a': {'name': 'monad-r9-flatdirty-zisk', 'elf': 'guests/monad-variants/r9-flatdirty/monad-r9-flatdirty-zisk.elf',
                    'src': 'monad'},
-             'b': {'name': 'ziskethone', 'elf': 'vendor/zisk-eth-client/bin/guests/stateless-validator-ziskethone/elf/zec-ziskethone.elf',
+             'b': {'name': 'ziskethone', 'elf': 'guests/ziskethone/ziskethone.elf',
                    'src': 'bin'}},
+    # `tip` FOLLOWS the lineage: resolve_tip() reads the index at run time and requires its final
+    # row to be OK, so no sha here is ever maintained by hand. The `elf` below is only the last
+    # resolved value, kept so ./axis.py (which reads it directly) keeps working; it is overridden on
+    # every run and is not what gets measured. Which build a report DID measure is stamped on the
+    # section itself (`a_ident`), never inferred from this line.
     'r10tip-vs-ziskethone': {'ephemeral': 'al/zkvm-r10 tip via r10-buildenv.tsv (official profile)',
              'backend': 'zisk', 'unit': 'steps',
-             'a': {'name': 'monad-r10-tip-zisk', 'elf': 'profiling/series/elf/abc3aa26baa56c38.elf',
+             'a': {'name': 'monad-r10-tip-zisk', 'tip': 'profiling/series/r10-tip-index.tsv',
+                   'requires_env': 'MONAD_ZKVM_OFFICIAL_PROFILE=ON',
+                   'elf': 'profiling/series/elf/148f53c42c04310a.elf',
                    'src': 'monad'},
-             'b': {'name': 'ziskethone', 'elf': 'vendor/zisk-eth-client/bin/guests/stateless-validator-ziskethone/elf/zec-ziskethone.elf',
+             'b': {'name': 'ziskethone', 'elf': 'guests/ziskethone/ziskethone.elf',
                    'src': 'bin'}},
 }
 # The default run is the shipped guest only: adding the levers axes must not silently change what
@@ -1326,6 +1333,60 @@ def _ident_of(elf):
         return None
 
 
+def resolve_tip(index_rel, requires_env=None):
+    """The ELF built by a lineage's successful final row: `'tip': 'profiling/series/r10-tip-index.tsv'`.
+
+    A side declared this way needs no `'elf'` sha maintained by hand — and hand-maintaining it was
+    the one operation here that produced wrong numbers silently. A stale pin measures the PREVIOUS
+    tip under the new tip's label, and the `sed` people reached for instead rewrites all 23 series
+    paths, collapsing every ablation axis to a ratio of exactly 1.000x ("this lever does nothing").
+    Resolving removes the edit, so it removes both.
+
+    Nothing is lost in attribution: summarize() stamps each section with the sha256 of the ELF it
+    actually read (`a_ident`/`b_ident`), printed in the terminal, the page and the markdown. The
+    declaration says which build to take; the report says which one it got.
+
+    Deliberately NOT applied to the ablation and lever axes: those compare two *named* builds, and a
+    side that moved on its own would answer a different question under the old question's name.
+
+    Returns (repo-relative elf path, None) or (None, why not).
+    """
+    p = rp(index_rel)
+    if not os.path.exists(p):
+        return None, f"no lineage index at {index_rel}"
+    sha, commit, build_env, status = None, None, '', None
+    with open(p) as fh:
+        for line in fh:                       # the LAST row is the lineage tip; never fall back
+            f = line.rstrip("\n").split("\t")
+            if len(f) >= 3:
+                commit, status = f[1], f[2]
+                sha = f[3] if len(f) >= 4 and status == "OK" else None
+                build_env = "\t".join(f[5:]) if len(f) >= 6 else ''
+    if status != "OK" or not sha:
+        return None, (f"lineage tip {commit or '(unknown)'} has status {status or '(missing)'} — "
+                      "refusing to fall back to an older OK build")
+    if requires_env and requires_env not in build_env:
+        return None, (f"lineage tip {commit} lacks required build env {requires_env!r} — "
+                      "refusing to measure a default build under an official-profile label")
+    elf = f"profiling/series/elf/{sha}.elf"
+    if not os.path.exists(rp(elf)):
+        return None, f"{index_rel} names tip {sha}, but {elf} is not in the series cache"
+    return elf, None
+
+
+def tip_metadata(index_rel):
+    """Commit attribution carried by a generated lineage index."""
+    try:
+        with open(rp(index_rel)) as fh:
+            rows = [line.rstrip("\n").split("\t") for line in fh if line.strip()]
+    except OSError:
+        return {}
+    if not rows or len(rows[-1]) < 3 or rows[-1][2] != 'OK':
+        return {}
+    row = rows[-1]
+    return {'commit': row[1], 'subject': row[4] if len(row) >= 5 else ''}
+
+
 def summarize(axis, rows, gas_map=None):
     ax = AXES[axis]
     aw = [r['a']['work'] for r in rows.values()]; bw = [r['b']['work'] for r in rows.values()]
@@ -1342,6 +1403,8 @@ def summarize(axis, rows, gas_map=None):
     s = {'axis': axis, 'unit': ax['unit'], 'n': len(rows),
          'a_name': ax['a']['name'], 'b_name': ax['b']['name'],
          'a_ident': _ident_of(ax['a']['elf']), 'b_ident': _ident_of(ax['b']['elf']),
+         'a_commit': ax['a'].get('tip_commit'), 'b_commit': ax['b'].get('tip_commit'),
+         'a_subject': ax['a'].get('tip_subject'), 'b_subject': ax['b'].get('tip_subject'),
          'a_median': statistics.median(aw), 'b_median': statistics.median(bw),
          'a_mean': statistics.mean(aw), 'b_mean': statistics.mean(bw),
          'a_total': sum(aw), 'b_total': sum(bw),
@@ -1425,9 +1488,25 @@ def summarize(axis, rows, gas_map=None):
     if apw and bpw and len(apw) == len(bpw):
         s['pw_unit'] = 'COST' if pw == 'cost' else 'PGU'
         s['a_pw_median'], s['b_pw_median'] = statistics.median(apw), statistics.median(bpw)
-        pwr = [r['a'][pw] / r['b'][pw] for r in rows.values()
+        # PAIRS, not the two filtered lists: a block with a prover cost on one side only belongs to
+        # neither the ratio nor the pooled total, and deriving both from one list of pairs is what
+        # keeps `total ÷ total` over the same blocks as the three averages beside it.
+        pwp = [(r['a'][pw], r['b'][pw]) for r in rows.values()
                if r['a'].get(pw) and r['b'].get(pw)]
-        if pwr: s['pw_ratio_median'] = statistics.median(pwr)
+        pwr = [a / b for a, b in pwp]
+        if pwr:
+            s['pw_ratio_median'] = statistics.median(pwr)
+            # The same four averages as `work`. The averages pane exists to answer "which average is
+            # the headline"; the headline is quoted in both metrics, so the answer has to cover both.
+            # Computed here because this is where the per-block pairs already exist.
+            s['pw_n'] = len(pwr)
+            s['pw_ratio_gmean'] = statistics.geometric_mean(pwr)
+            s['pw_ratio_mean'] = statistics.mean(pwr)
+            s['pw_ratio_mean_inv'] = statistics.mean([b / a for a, b in pwp])
+            _bsum = sum(b for _a, b in pwp)
+            s['pw_ratio_pooled'] = (sum(a for a, _b in pwp) / _bsum) if _bsum else 0.0
+            s['pw_ratio_gsd'] = (math.exp(statistics.pstdev([math.log(r) for r in pwr]))
+                                 if len(pwr) > 1 else 1.0)
     # ── where the gap comes from ──────────────────────────────────────────────────────────
     # Per-block shares, then the MEDIAN of those — not the aggregate (big blocks would dominate)
     # and not the median-ratio block alone (its ratio is typical, its composition need not be:
@@ -1610,6 +1689,8 @@ def print_summary(s):
     u, A, B = s['unit'], s['a_name'], s['b_name']
     print(f"\n══ {s['axis'].upper()} · {A} vs {B} · n={s['n']} blocks ══")
     print(f"  {'builds':22} {_shortid(s.get('a_ident')):>18} {_shortid(s.get('b_ident')):>18}")
+    if s.get('a_commit') or s.get('b_commit'):
+        print(f"  {'commits':22} {(s.get('a_commit') or '—'):>18} {(s.get('b_commit') or '—'):>18}")
     print(f"  {'':22} {A:>18} {B:>18} {'ratio':>10}")
     print(f"  {'median '+u:22} {n(s['a_median']):>18} {n(s['b_median']):>18} "
           f"{x(s['a_median']/s['b_median']):>10}")
@@ -1772,10 +1853,10 @@ table.cv td i{color:var(--muted);font-style:normal;font-size:11.5px}
 .hb{appearance:none;padding:0;border:0;font:inherit;cursor:pointer}
 .hb:hover{outline:1px solid var(--fg)}
 /* the prover-work histogram has no drill-down: do not offer a pointer or a hover ring */
-.histpw .hb{cursor:default}
-.histpw .hb:hover{outline:none}
 .hb:focus-visible{outline:2px solid var(--gold)}
 .hb.sel{outline:1.5px solid var(--fg);filter:brightness(1.3)}
+.hb.empty{background:none;pointer-events:none}
+.hb.empty:hover{outline:none}
 /* drill-down panel under a histogram */
 .hp{margin-top:14px;border-top:1px solid var(--line);padding-top:12px;display:none}
 .hp.on{display:block}
@@ -1994,7 +2075,7 @@ const _med = a => { if (!a.length) return null; const v = [...a].sort((p, q) => 
 
 document.querySelectorAll('.hist').forEach(hist => {
   const ax = hist.dataset.ax;
-  if (!ax) return;                 // the prover-work histogram: bars only, no payload
+  if (!ax) return;                 // a histogram rendered without a payload
   const D = JSON.parse(document.getElementById('hd-' + ax).textContent);
   const panel = document.getElementById('hp-' + ax);
   const width = (D.hi - D.lo) / D.nb;
@@ -2429,53 +2510,21 @@ def _hostinfo():
     osn = f"{sh('sw_vers', '-productName')} {sh('sw_vers', '-productVersion')}".strip() or platform.platform()
     return f"{cpu} · {cores} cores · {ram} · {osn}"
 
-def _hist_pw(ratios):
-    """Distribution of the per-block PROVER-WORK ratio, to sit beside the work-unit one.
-
-    Bars only, deliberately no drill-down: every field the drill-down carries (aw/bw, per-Mgas,
-    per-tx, exec seconds) is counted in the WORK unit, so hanging it under prover-work bars would
-    put a steps table under a COST histogram — the same mislabelling the pane titles were fixed
-    for. Plain divs rather than buttons, so there is no dead click target, and the shared
-    drill-down JS skips this container because it carries no data-ax."""
-    lo, hi = min(ratios), max(ratios)
-    nb = 26
-    span = (hi - lo) or 1e-9
-    bins = [0] * nb
-    for r in ratios:
-        bins[min(nb - 1, int((r - lo) / span * nb))] += 1
-    top = max(bins) or 1
-    bars = []
-    for i, c in enumerate(bins):
-        c0, c1 = lo + span * i / nb, lo + span * (i + 1) / nb
-        cls = 'hb over' if c0 >= 1.0 else 'hb'
-        bars.append(f"<div class='{cls}' style='height:{max(1, round(100*c/top))}%' "
-                    f"title='{c} block(s) at {c0:.3f}×–{c1:.3f}×'></div>")
-    one = ""
-    if lo < 1.0 < hi:
-        one = f"<div class=one style='left:{100*(1.0-lo)/span:.2f}%'><span>1×</span></div>"
-    srt = sorted(ratios)
-    x = lambda v: f"{v:.3f}×"
-    p10 = srt[int(.10 * (len(srt) - 1))]
-    p90 = srt[int(.90 * (len(srt) - 1))]
-    med = statistics.median(srt)
-    # geometric, for the same reason ratio_gmean is: 2x and 0.5x must cancel
-    gm = math.exp(sum(math.log(r) for r in srt) / len(srt))
-    cv = (statistics.pstdev(srt) / med * 100) if med else 0.0
-    return (f"<div class='hist histpw'>{''.join(bars)}{one}</div>"
-            f"<div class=hax><span>{x(lo)}</span><span>{x(lo + span / 2)}</span><span>{x(hi)}</span></div>"
-            f"<div class=mk><span><i>middle block</i> {x(med)}</span>"
-            f"<span><i>geometric mean</i> {x(gm)}</span>"
-            f"<span><i>lowest 10%</i> under {x(p10)}</span>"
-            f"<span><i>highest 10%</i> over {x(p90)}</span>"
-            f"<span><i>swing</i> ±{cv:.1f}%</span></div>")
-
-
-def _hist(ratios, s, rows=None, gas_map=None, tx_map=None):
+def _hist(ratios, s, rows=None, gas_map=None, tx_map=None, pw_mode=False):
     """Distribution of the per-block ratio — the 'is the penalty consistent?' picture.
 
     Bars are clickable: each carries the blocks that landed in it, so the question the shape
     raises ("which blocks are those, and what have they got in common?") is answerable in place
-    instead of by cross-referencing the big table."""
+    instead of by cross-referencing the big table.
+
+    `pw_mode` renders the SAME picture for prover cost. It is a mode rather than a second function
+    because the drill-down must not simply be pointed at cost bars: every per-block figure it shows
+    has to be re-derived in the cost unit, or the panel puts a steps table under a COST histogram.
+    So in this mode the bucketing ratio, the `aw`/`bw` pair, and the per-tx and per-Mgas columns are
+    all prover cost, while the OTHER ratio rides along in `pr` — each histogram shows its own metric
+    first and the other one beside it. Everything else in an entry (gas, txs, keccak counts, the
+    trace-cost split, witness bytes) is a property of the block or of a side, not of a unit, and
+    carries over untouched."""
     lo, hi = min(ratios), max(ratios)
     nb = 26
     span = (hi - lo) or 1e-9
@@ -2490,12 +2539,18 @@ def _hist(ratios, s, rows=None, gas_map=None, tx_map=None):
     buckets = [[] for _ in range(nb)]
     for b, r0 in (rows or {}).items():
         if not r0['b'].get('work'): continue
-        rat = r0['a']['work'] / r0['b']['work']
         pa, pb = r0['a'].get(pwk), r0['b'].get(pwk)
+        if pw_mode and not (pa and pb): continue
+        # `av`/`bv` are the two numbers THIS histogram is about; `rat` the ratio it buckets on, and
+        # `oth` the other metric's ratio, shown as a second column.
+        av, bv = (pa, pb) if pw_mode else (r0['a']['work'], r0['b']['work'])
+        rat = av / bv
+        oth = ((r0['a']['work'] / r0['b']['work']) if r0['b'].get('work')
+               else None) if pw_mode else (round(pa / pb, 4) if (pa and pb) else None)
         g = r0['b'].get('gas') or r0['a'].get('gas') or gm.get(b)
         tx = r0['b'].get('txs') or r0['a'].get('txs') or tm.get(b)
-        e = {'b': int(b), 'r': round(rat, 4), 'aw': r0['a']['work'], 'bw': r0['b']['work'],
-             'g': g, 'tx': tx, 'pr': round(pa / pb, 4) if (pa and pb) else None,
+        e = {'b': int(b), 'r': round(rat, 4), 'aw': av, 'bw': bv,
+             'g': g, 'tx': tx, 'pr': round(oth, 4) if oth else None,
              # nsecs first: `secs` carries SP1's gas-estimation pass, which reverses which guest
              # looks faster on 26% of blocks here (block 25552073: 3.74s vs 5.26s gas-on says A wins,
              # 2.13s vs 2.03s honest says it loses). Same fix as the metric bar row.
@@ -2504,11 +2559,11 @@ def _hist(ratios, s, rows=None, gas_map=None, tx_map=None):
         if g and tx: e['gtx'] = round(g / tx)
         # per-side work per Mgas: strips block size out, so a bucket groups by efficiency
         if g:
-            e['awg'] = round(r0['a']['work'] / (g / 1e6))
-            e['bwg'] = round(r0['b']['work'] / (g / 1e6))
+            e['awg'] = round(av / (g / 1e6))
+            e['bwg'] = round(bv / (g / 1e6))
         if tx:                             # cost of an average transaction in this block
-            e['awt'] = round(r0['a']['work'] / tx)
-            e['bwt'] = round(r0['b']['work'] / tx)
+            e['awt'] = round(av / tx)
+            e['bwt'] = round(bv / tx)
         # ── what the block MADE the guests do ──
         # Both axes now carry a trace-cost split ('cats'): ZisK prints it, and for SP1 it is derived
         # from the same weights hotspots.py uses. So this is deliberately axis-agnostic.
@@ -2553,7 +2608,18 @@ def _hist(ratios, s, rows=None, gas_map=None, tx_map=None):
     for i, c in enumerate(bins):
         c0, c1 = lo + span * i / nb, lo + span * (i + 1) / nb
         cls = 'hb over' if c0 >= 1.0 else 'hb'
-        bars.append(f"<button class='{cls}' data-b='{i}' style='height:{max(1, round(100*c/top))}%' "
+        # An EMPTY bin draws nothing. The floor of 1% was applied to every bin, so a bucket holding
+        # no block was a stub the same height as one holding a block — the two readings a histogram
+        # most needs to keep apart. The element stays, because `flex:1` on it is what spaces the
+        # bars evenly; only its height and its hit target go.
+        if not c:
+            bars.append(f"<button class='{cls} empty' data-b='{i}' style='height:0' "
+                        f"title='no block at {c0:.3f}×–{c1:.3f}×'></button>")
+            continue
+        # 3% and not 1%: the floor exists so the rarest bin is still visible, and 1% of a 132px
+        # track is 1.3px — present, but not obviously so. Nothing is now competing with it at the
+        # bottom of the scale, so it can afford the room.
+        bars.append(f"<button class='{cls}' data-b='{i}' style='height:{max(3, round(100*c/top))}%' "
                     f"title='{c} block(s) at {c0:.3f}×–{c1:.3f}× — click for the list'></button>")
     mid = lo + span / 2
     # 1× is the meaningful threshold (parity), so mark it explicitly rather than leaving it to
@@ -2561,12 +2627,15 @@ def _hist(ratios, s, rows=None, gas_map=None, tx_map=None):
     one = ""
     if lo < 1.0 < hi:
         one = (f"<div class=one style='left:{100*(1.0-lo)/span:.2f}%'><span>1×</span></div>")
-    ax = s['axis']
+    # A distinct payload/panel id, so the two histograms of one axis do not overwrite each other's
+    # drill-down. The JS keys everything off this string.
+    ax = s['axis'] + ('-pw' if pw_mode else '')
     gvals = [e['g'] for bl in buckets for e in bl if e['g']]
     # Off-pattern blocks get the SAME per-block detail as a bucket: the outlier table is rendered
     # by the shared JS builder from these ids, so its columns can never drift from the drill-down's.
-    amed = statistics.median([r['a']['work'] for r in (rows or {}).values() if r['a'].get('work')] or [1])
-    bmed = statistics.median([r['b']['work'] for r in (rows or {}).values() if r['b'].get('work')] or [1])
+    _mk = pwk if pw_mode else 'work'
+    amed = statistics.median([r['a'][_mk] for r in (rows or {}).values() if r['a'].get(_mk)] or [1])
+    bmed = statistics.median([r['b'][_mk] for r in (rows or {}).values() if r['b'].get(_mk)] or [1])
     # Per-opcode detail, but ONLY for the blocks that can use it: the off-pattern ones plus the
     # median block they are compared against. Shipping it for all 372 would bloat the page for
     # data no click would ever reach.
@@ -2584,28 +2653,46 @@ def _hist(ratios, s, rows=None, gas_map=None, tx_map=None):
             o = r0[side].get('opsn') or r0[side].get('ops')
             if o: d[k] = o
         if d: ops[b] = d
-    payload = {'unit': s['unit'], 'A': s['a_name'], 'B': s['b_name'],
-               'pw': s.get('pw_unit'), 'ratioMedian': round(s['ratio_median'], 4),
+    # The two unit labels swap with the mode: `unit` names what this histogram measures and drives
+    # the "<unit> per tx" / "per Mgas" headers, `pw` names the ratio riding along in the `pr` column.
+    _u = (s.get('pw_unit') or s.get('cost_unit') or 'COST') if pw_mode else s['unit']
+    _o = s['unit'] if pw_mode else s.get('pw_unit')
+    _rm = (s.get('pw_ratio_median') if pw_mode else s['ratio_median']) or s['ratio_median']
+    payload = {'unit': _u, 'A': s['a_name'], 'B': s['b_name'],
+               'pw': _o, 'ratioMedian': round(_rm, 4),
                'gasMedian': statistics.median(gvals) if gvals else None,
                'lo': round(lo, 4), 'hi': round(hi, 4), 'nb': nb,
                'buckets': buckets,
                'outliers': outb, 'aMed': amed, 'bMed': bmed,
                'ops': ops, 'medBlock': int(medb) if medb else None}
+    # The markers describe THIS histogram's ratios, so they are taken from the list that was
+    # binned rather than from the summary's work-unit fields — otherwise the cost histogram would
+    # caption itself with the steps median.
+    _srt = sorted(ratios)
+    _md = statistics.median(_srt)
+    _gm = math.exp(sum(math.log(r) for r in _srt) / len(_srt))
+    _p10, _p90 = _srt[int(.10 * (len(_srt) - 1))], _srt[int(.90 * (len(_srt) - 1))]
+    # pstdev over the MEAN, which is what `cv` in the summary is: recomputing it over the
+    # median instead would quietly move a number the steps pane has always shown.
+    _mn = statistics.mean(_srt)
+    _cv = (statistics.pstdev(_srt) / _mn * 100) if (_mn and len(_srt) > 1) else 0.0
     return (f"<div class=hist data-ax='{ax}'>{''.join(bars)}{one}</div>"
             f"<div class=hax><span>{lo:.3f}×</span><span>{mid:.3f}×</span><span>{hi:.3f}×</span></div>"
-            f"<div class=mk><span><i>middle block</i> {x(s['ratio_median'])}</span>"
+            f"<div class=mk><span><i>middle block</i> {x(_md)}</span>"
             # The mean asked for by readers averaging benchmark ratios. Geometric, not arithmetic:
             # see the ratio_gmean comment in summarize().
             f"<span title='the average that is correct for ratios: it treats 2x and 0.5x as "
             f"cancelling, and the A/B and B/A figures are exact reciprocals — the arithmetic mean "
-            f"guarantees neither'><i>geometric mean</i> {x(s['ratio_gmean'])}</span>"
-            f"<span><i>lowest 10%</i> under {x(s['ratio_p10'])}</span>"
-            f"<span><i>highest 10%</i> over {x(s['ratio_p90'])}</span>"
-            f"<span><i>swing</i> ±{s['cv']:.1f}%</span></div>"
+            f"guarantees neither'><i>geometric mean</i> {x(_gm)}</span>"
+            f"<span><i>lowest 10%</i> under {x(_p10)}</span>"
+            f"<span><i>highest 10%</i> over {x(_p90)}</span>"
+            f"<span><i>swing</i> ±{_cv:.1f}%</span></div>"
             f"<script type='application/json' id='hd-{ax}'>{json.dumps(payload)}</script>"
             f"<div class=hp id='hp-{ax}'></div>"
             f"<p class=hint>▸ click any bar to list the blocks it holds</p>"
-            + _curve_note(s))
+            # The two-regime note is a statement about the WORK distribution's left tail, measured
+            # there; it is not re-derived for prover cost, so it stays on the histogram it describes.
+            + ("" if pw_mode else _curve_note(s)))
 
 def _near(ratios, med, w=.10):
     """Share of blocks within w of the median — measured, so the prose can't overstate clustering."""
@@ -2781,38 +2868,61 @@ def _averages(s):
     # two statistics a reader would actually choose between, geometric mean and median.
     _gap = abs(gm - med) / med * 100
     cls = lambda v: 'hi' if v >= 1 else 'lo'
+    # The SAME four statistics on the prover-cost ratios. The page quotes a headline in both metrics,
+    # so "which average is the headline" has two answers, and a pane that gave only one left the COST
+    # figure in the cards with nothing here to identify it. Absent when the axis carries no prover
+    # cost (--quick, or a backend run without it), and every cell falls back to a dash rather than
+    # the column disappearing — a missing number and a missing metric are different statements.
+    cu = s.get('pw_unit') or s.get('cost_unit') or 'COST'
+    cgm, cmed = s.get('pw_ratio_gmean'), s.get('pw_ratio_median')
+    cam, cpooled = s.get('pw_ratio_mean'), s.get('pw_ratio_pooled')
+    cami, cgsd = s.get('pw_ratio_mean_inv'), s.get('pw_ratio_gsd')
+    has_c = cmed is not None
+    cvals = [v for v in (cgm, cmed, cam, cpooled) if v]
+    cspread = (max(cvals) / min(cvals) - 1) * 100 if len(cvals) > 1 else 0.0
+    _cgap = abs(cgm - cmed) / cmed * 100 if (cgm and cmed) else 0.0
     rows = [
-        ('geometric mean', gm,
+        ('geometric mean', gm, cgm,
          f"<b>the average to quote for a set of ratios.</b> Multiplicative: 2× and 0.5× cancel, and "
          f"it gives the same answer whichever guest you divide by — swapped it reads {x(1 / gm)}, an "
-         f"exact reciprocal. One-sigma spread ×/÷ {gsd:.3f}"),
-        ('middle block (median)', med,
-         f"<b>the headline in the cards above.</b> Half the blocks sit either side; unmoved by the "
-         f"off-pattern blocks listed further down"),
-        ('arithmetic mean', am,
+         f"exact reciprocal. One-sigma spread ×/÷ {gsd:.3f}"
+         + (f" on {u}, ×/÷ {cgsd:.3f} on {cu}" if has_c and cgsd else "")),
+        ('middle block (median)', med, cmed,
+         f"<b>the headline in the cards above</b>, in both metrics. Half the blocks sit either "
+         f"side; unmoved by the off-pattern blocks listed further down"),
+        ('arithmetic mean', am, cam,
          f"<b>do not quote alone.</b> It depends on which guest you divide by: taken the other way "
          f"round it gives {x(ami)}, and {x(am)} × {x(ami)} = <b>{am * ami:.4f}</b> where an average "
-         f"of ratios must give exactly 1 (the geometric mean above does). The wider the spread, the "
-         f"worse it gets — far enough out, both directions read above 1 and each names the other "
-         f"guest as the dearer one. Kept here only so the number is not missing"),
-        ('total ÷ total', pooled,
-         f"<b>the whole set's {u}, {A} against {B}.</b> Weighted by block size, so the largest "
-         f"blocks dominate it — the right figure for total capacity, the wrong one for a typical "
-         f"block"),
+         f"of ratios must give exactly 1 (the geometric mean above does)"
+         + (f"; on {cu} the same product is <b>{cam * cami:.4f}</b>" if has_c and cam and cami else "")
+         + f". The wider the spread, the worse it gets — far enough out, both directions read above "
+         f"1 and each names the other guest as the dearer one. Kept here only so the number is not "
+         f"missing"),
+        ('total ÷ total', pooled, cpooled,
+         f"<b>the whole set's {u}"
+         + (f" and {cu}" if has_c else "")
+         + f", {A} against {B}.</b> Weighted by block size, so the largest blocks dominate it — the "
+         f"right figure for total capacity, the wrong one for a typical block"),
     ]
     # `table.cv` right-aligns its 2nd AND 3rd columns in the mono face (it was written for
     # number/number/prose). Here the 3rd column is prose, so it opts out inline rather than the
     # shared rule growing a per-table exception.
     _pr = "style='text-align:left;font-family:var(--sans)'"
-    body = "".join(f"<tr><td>{lbl}</td><td class={cls(v)}>{x(v)}</td>"
+    _cell = lambda v: (f"<td class={cls(v)}>{x(v)}</td>" if v else
+                       "<td class=na title='this axis carries no prover cost'>—</td>")
+    body = "".join(f"<tr><td>{lbl}</td><td class={cls(v)}>{x(v)}</td>{_cell(cv)}"
                    f"<td {_pr}><i>{why}</i></td></tr>"
-                   for lbl, v, why in rows)
+                   for lbl, v, cv, why in rows)
     return (f"<div class=pane><h2>which average of the per-block ratios</h2>"
             f"<p class=note style='margin:0 0 10px'>Every row summarises the same "
             f"<b>{s['n']} per-block ratios</b> ({u} of <span class=cA>{A}</span> ÷ "
-            f"<span class=cB>{B}</span>) — they differ because they answer different questions, not "
-            f"because any is wrong. On this axis they span <b>{spread:.1f}%</b> end to end.</p>"
-            f"<table class=cv><tr><th>statistic</th><th>ratio</th><th>what it answers</th></tr>"
+            f"<span class=cB>{B}</span>)"
+            + (f", and the <b>{s.get('pw_n', 0)}</b> {cu} ratios beside them" if has_c else "")
+            + f" — they differ because they answer different questions, not "
+            f"because any is wrong. On this axis they span <b>{spread:.1f}%</b> end to end"
+            + (f" on {u} and <b>{cspread:.1f}%</b> on {cu}" if has_c else "") + ".</p>"
+            f"<table class=cv><tr><th>statistic</th><th>{u}</th><th>{cu}</th>"
+            f"<th>what it answers</th></tr>"
             f"{body}</table>"
             f"<p class=note>Ratios are dimensionless and multiplicative, which is why the geometric "
             f"mean is the defensible average of a benchmark set and the arithmetic mean is not; the "
@@ -2826,6 +2936,14 @@ def _averages(s):
                f"Here the two differ by <b>{_gap:.1f}%</b> ({x(gm)} against {x(med)}), so on this "
                f"axis the choice is not load-bearing — which is a measurement, not a promise that "
                f"it holds on the next block set.")
+            # The same measured statement for the second metric. The two need not agree: prover cost
+            # weights the instruction mix differently from work, so a set can be tight in one and
+            # spread in the other, and reporting only the work gap would imply a verdict about COST
+            # that was never measured.
+            + ((f" On {cu} the gap is <b>{_cgap:.1f}%</b> ({x(cgm)} against {x(cmed)}), "
+                + ("so the same caution applies there." if _cgap >= 2 else
+                   "so the choice is not load-bearing there either."))
+               if has_c and cgm and cmed else "")
             + f"</p></div>")
 
 
@@ -2939,8 +3057,11 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None, summary_href
                  f"data-backend='{AXES[ax]['backend'].upper()}' data-pair='{A} vs {B}'>")
         h.append(f"<div class=axhead><span class=nm>{ax.upper()}</span>"
                  f"<span class=vs>{A} <code class=sha>{_shortid(s.get('a_ident'))}</code>"
+                 f"{(' <code class=sha>commit ' + html.escape(s['a_commit']) + '</code>') if s.get('a_commit') else ''}"
                  f" &nbsp;vs&nbsp; "
-                 f"{B} <code class=sha>{_shortid(s.get('b_ident'))}</code></span></div>")
+                 f"{B} <code class=sha>{_shortid(s.get('b_ident'))}</code>"
+                 f"{(' <code class=sha>commit ' + html.escape(s['b_commit']) + '</code>') if s.get('b_commit') else ''}"
+                 f"</span></div>")
         # "N blocks between X and Y" reads as contiguous. It is not: a block runs only when BOTH
         # guests have an input, and the reth-side .bin is missing for ~10% of the span. State the
         # gap rather than let the reader assume. (Checked: the ratio is nearly independent of block
@@ -3052,12 +3173,13 @@ def write_html(path, summaries, allrows, gas_map=None, tx_map=None, summary_href
                          f"<span><span class=sw style='background:var(--green)'></span>{A} uses less "
                          f"{pwu} ({_lo})</span>"
                          f"<span><span class=sw style='background:var(--red)'></span>{A} uses more "
-                         f"{pwu} ({len(pwr) - _lo})</span></div>{_hist_pw(pwr)}"
+                         f"{pwu} ({len(pwr) - _lo})</span></div>"
+                         f"{_hist(pwr, s, rows, gas_map, tx_map, pw_mode=True)}"
                          f"<p class=note>The same blocks, priced in {pwu} (trace area) instead of "
                          f"{u}. If this shape sits on the other side of 1× from the one beside it, "
                          f"what differs is the work MIX, not its amount — the verdict above says "
-                         f"which way. Bars here are not clickable: the per-block detail is counted "
-                         f"in {u}.</p></div>")
+                         f"which way. Bars are clickable, and every per-block figure behind them is "
+                         f"counted in {pwu} — the {u} ratio rides along as its own column.</p></div>")
         items = [(f"median {u}", s['a_median'], s['b_median'], n),
                  (f"total {u}", s['a_total'], s['b_total'], n),
                  (f"{u} per Mgas", s.get('a_per_mgas'), s.get('b_per_mgas'), n)]
@@ -4027,8 +4149,10 @@ def write_summary(path, md_path, summaries, allrows, full_href):
         head += f" · median {s['a_median']/1e6:,.0f}M vs {s['b_median']/1e6:,.0f}M {u}"
         if ta and tb:
             head += f" · exec {ta:.2f}s vs {tb:.2f}s"
-        md += [f"## {s['axis'].upper()} — {A} `{_shortid(s.get('a_ident'))}` vs "
-               f"{B} `{_shortid(s.get('b_ident'))}` "
+        _ac = f" · commit `{s['a_commit']}`" if s.get('a_commit') else ''
+        _bc = f" · commit `{s['b_commit']}`" if s.get('b_commit') else ''
+        md += [f"## {s['axis'].upper()} — {A} `{_shortid(s.get('a_ident'))}`{_ac} vs "
+               f"{B} `{_shortid(s.get('b_ident'))}`{_bc} "
                f"(on {bk} · {s['n']} blocks {bs[0]}–{bs[-1]})",
                f"- {head}",
                f"- {strip(d['stab'])}"]
@@ -4220,6 +4344,29 @@ def main():
     cache = load_cache()
     skipped = []           # axes dropped for a missing ELF — recapped at the end,
                            # because a warning printed before a two-hour run scrolls away
+    # Axes that follow a lineage tip resolve HERE, before any code reads their ELF path, so
+    # everything downstream — the existence check, the cache, the identity stamp — sees a plain
+    # resolved path and needs no notion of a tip. The `'elf'` still in the declaration is the last
+    # pin: informational, kept so ./axis.py keeps working, and overridden below.
+    for _ax in list(axes):
+        for _k in ('a', 'b'):
+            _side = AXES[_ax][_k]
+            if 'tip' not in _side:
+                continue
+            _elf, _why = resolve_tip(_side['tip'], _side.get('requires_env'))
+            if _elf is None:
+                print(f"skip {_ax}: {_side['name']} follows {_side['tip']} — {_why}")
+                skipped.append((_ax, [rp(_side['tip'])]))
+                axes.remove(_ax)
+                break
+            if _elf != _side.get('elf'):
+                print(f"[{_ax}] {_side['name']} follows {os.path.basename(_side['tip'])}: "
+                      f"{os.path.basename(_elf)}")
+            _side['elf'] = _elf
+            _meta = tip_metadata(_side['tip'])
+            _side['tip_commit'] = _meta.get('commit')
+            _side['tip_subject'] = _meta.get('subject')
+
     summaries, allrows, payload = [], {}, {}
 
     collected = []
@@ -4471,6 +4618,24 @@ def main():
             print(f"      note: {os.path.basename(args.html_out)} shows the {len(summaries)} axis/axes "
                   f"just run; {os.path.basename(args.json_out)} also holds {', '.join(_extra)}. "
                   f"Re-run those axes to refresh the report.")
+    # A SHORTENED axis is the other quiet failure mode, and the one no message covered: an axis
+    # resolves only the blocks that have an input on BOTH sides, so a single missing witness drops a
+    # block from that axis alone and the run reports a smaller n without a word. Nothing inside the
+    # run knows how many blocks the bounds *should* have yielded -- block numbers are not dense --
+    # so the axes of the run are compared against each other, and the widest is the reference.
+    if len(collected) > 1:
+        _widest = max(len(_b) for _a, _b, _r in collected)
+        _short = [(_a, _b) for _a, _b, _r in collected if len(_b) < _widest]
+        if _short:
+            _ref = {b for _a, _bs, _r in collected if len(_bs) == _widest for b in _bs}
+            print(f"\n  {len(_short)} axis/axes ran on FEWER blocks than the widest ({_widest}):")
+            for _ax, _bs in _short:
+                _miss = sorted(_ref - set(_bs))
+                _shown = ', '.join(str(m) for m in _miss[:6]) + (', …' if len(_miss) > 6 else '')
+                print(f"      {_ax}  n={len(_bs)}, missing {len(_miss)}: {_shown}")
+            print("      A block is dropped when EITHER side lacks an input for it, so the ratios above\n"
+                  "      do not all describe the same set. Mint the missing inputs (RUNBOOK § Witnesses).")
+
     # Recap the skips LAST. The warning is printed before a run that can take hours, so by the time
     # the reports land it has long scrolled off — and a report quietly covering fewer axes than were
     # asked for is exactly the kind of thing nobody notices until a number looks wrong.
