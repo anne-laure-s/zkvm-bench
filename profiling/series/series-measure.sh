@@ -67,15 +67,35 @@ selected=$(wc -l < "$RUN/selected" | tr -d ' ')
 echo "sample $OFF: $selected blocks, $n uncached pairs, $JOBS at a time"
 [ "$n" -gt 0 ] || exit 0
 one() {
-  local sha="$1" w="$2" d b s c
+  local sha="$1" w="$2" d b s c fast rc got want
   b=$(basename "$w" .witness); d="$RUN/$$"; mkdir -p "$d"
-  python3 "$HERE/frame.py" "$w" "$d/i.bin" || return
-  s=$("$EMU" -e "$HERE/elf/$sha.elf" -i "$d/i.bin" -m 2>&1 | grep -oE 'steps=[0-9]+' | head -1 | cut -d= -f2)
+  python3 "$HERE/frame.py" "$w" "$d/i.bin" || {
+    echo "MEASURE_FAIL sha=$sha block=$b reason=frame" >&2; return 1;
+  }
+  # Validate the execution itself instead of guessing from its size. Block
+  # 25815183 is a legitimate ~300k-step block, so the old 1M-step floor rejected
+  # it for almost every ELF. Conversely, an incompatible runtime can exit 0 and
+  # report steps while writing 256 zero bytes. The output root is already free
+  # from this same fast pass: require it to equal the corpus reference.
+  fast=$("$EMU" -e "$HERE/elf/$sha.elf" -i "$d/i.bin" -o "$d/o.bin" -m 2>&1); rc=$?
+  [ "$rc" -eq 0 ] || {
+    echo "MEASURE_FAIL sha=$sha block=$b reason=ziskemu-rc-$rc" >&2; return 1;
+  }
+  s=$(printf '%s\n' "$fast" | grep -oE 'steps=[0-9]+' | head -1 | cut -d= -f2)
+  [ -n "$s" ] || {
+    echo "MEASURE_FAIL sha=$sha block=$b reason=no-steps" >&2; return 1;
+  }
+  [ -f "${w%.witness}.post_state_root" ] || {
+    echo "MEASURE_FAIL sha=$sha block=$b reason=no-reference-root" >&2; return 1;
+  }
+  got=$(xxd -p -l32 "$d/o.bin" 2>/dev/null | tr -d '\n')
+  want=$(sed 's/^0x//' "${w%.witness}.post_state_root" | tr -d '\n')
+  if [ "${#got}" -ne 64 ] || [ "${#want}" -ne 64 ] || [ "$got" != "$want" ]; then
+    echo "MEASURE_FAIL sha=$sha block=$b reason=root-mismatch got=${got:-none} want=${want:-none}" >&2
+    return 1
+  fi
   c=$("$EMU" -e "$HERE/elf/$sha.elf" -i "$d/i.bin" -X -S --sdk --opcodes 2>&1 \
       | grep -oE 'COST[[:space:]]+[0-9,]+' | head -1 | grep -oE '[0-9,]+$' | tr -d ',')
-  # A guest that aborts still exits 0 and still prints a step count, so refuse
-  # anything implausibly small rather than record it as a measurement.
-  [ -n "$s" ] && [ "$s" -gt 1000000 ] || return
   printf '%s\t%s\t%s\t%s\n' "$sha" "$b" "$s" "${c:-NA}"
 }
 export -f one
