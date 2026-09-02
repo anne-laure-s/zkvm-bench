@@ -44,7 +44,12 @@ LOG=$(mktemp); trap 'rm -f "$LOG"' EXIT
 # `|| rc=$?` and not a bare call: under set -e a failing build would kill the
 # script before the diagnostic below could print, so the failure would be silent.
 rc=0
-~/.zisk/bin/cargo-zisk build --release > "$LOG" 2>&1 || rc=$?
+# Overridable for the same reason MONAD and RISCV_TOOLCHAIN_DIR are: the guest LINKS this
+# install's libziskclib.a, so the ZisK release is a build input like the compiler. Two
+# installs live side by side here (~/.zisk = 1.1.0-alpha, ~/.zisk-1.2 = 1.2.0-alpha) and a
+# hardcoded path makes a runtime A/B indistinguishable from a source change in the ELF.
+ZISK_DIR="${ZISK_DIR:-$HOME/.zisk}"
+"$ZISK_DIR/bin/cargo-zisk" build --release > "$LOG" 2>&1 || rc=$?
 if [ "$rc" -ne 0 ]; then
     echo "BUILD FAILED (cargo-zisk rc=$rc):"
     grep -iE 'error|undefined symbol|cannot|not found' "$LOG" | head -6

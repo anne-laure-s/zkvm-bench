@@ -175,7 +175,7 @@ for c in $COMMITS; do
       # the worktree before leaving; --no-commit stages the applied patch.
       git cherry-pick --no-commit "$BUILDFIX" || {
         echo "[$i] $s BUILDFIX_FAIL $BUILDFIX" >&2
-        git checkout -f -q --detach "$c" 2>/dev/null || true
+        git reset --hard -q "$c" 2>/dev/null || true
         exit 2
       }
     fi
@@ -190,15 +190,16 @@ for c in $COMMITS; do
       -u RISCV_TOOLCHAIN_DIR -u MARCH -u EXTRA \
       FORCE_REBUILD=1 ${benv[@]+"${benv[@]}"} \
       "$HERE/build.sh" "tmp-$s"; then
-      git checkout -f -q --detach "$c" 2>/dev/null || true
+      git reset --hard -q "$c" 2>/dev/null || true
       rm -f "$HERE/elf/tmp-$s.elf"
       echo "[$i] $s BUILD_FAIL $subj" >&2
       exit 2
   fi
   # A successful cherry-pick --no-commit leaves the fix staged. Reset both the
-  # worktree and index before the next commit; resetting only `-- .` left that
-  # staged state behind and made later failures depend on the previous build.
-  git checkout -f -q --detach "$c" 2>/dev/null || {
+  # worktree and index before the next commit. `checkout -f --detach "$c"` is
+  # not sufficient when HEAD is already $c: Git can leave the staged patch in
+  # place, making the next cherry-pick fail on CMakeLists.txt.
+  git reset --hard -q "$c" 2>/dev/null || {
     echo "[$i] $s CLEANUP_FAIL after build" >&2
     exit 2
   }

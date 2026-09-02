@@ -16,14 +16,16 @@ GEN="${GEN:-$(series_corpus zkvm-r4-gen-2026-08-9d7540181)}"
 E="${1:?elf}"; JOBS="${2:-6}"
 [ -f "$E" ] || { echo "no such elf: $E" >&2; exit 2; }
 [ -d "$GEN" ] || { echo "no such corpus: $GEN" >&2; exit 2; }
-export HERE E
+# Overridable: which RUNTIME verified a root is part of the verdict.
+EMU="${EMU:-$HOME/.zisk/bin/ziskemu}"
+export HERE E EMU
 RUN="$(mktemp -d)"; trap 'rm -rf "$RUN"' EXIT; export RUN
 one() {
   local w="$1" b d got want
   b=$(basename "$w" .witness); d="$RUN/$$"; mkdir -p "$d"
   [ -f "${w%.witness}.post_state_root" ] || { echo "NOREF $b"; return; }
   python3 "$HERE/frame.py" "$w" "$d/i.bin" || { echo "FRAME_FAIL $b"; return; }
-  ~/.zisk/bin/ziskemu -e "$E" -i "$d/i.bin" -o "$d/o.bin" >/dev/null 2>&1
+  "$EMU" -e "$E" -i "$d/i.bin" -o "$d/o.bin" >/dev/null 2>&1
   got=$(xxd -p -l32 "$d/o.bin" 2>/dev/null | tr -d '\n')
   want=$(sed 's/^0x//' "${w%.witness}.post_state_root")
   if [ "$got" = "$want" ]; then echo "OK $b"; else echo "DIFFER $b"; fi

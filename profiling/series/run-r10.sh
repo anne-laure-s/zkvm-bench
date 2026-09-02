@@ -46,28 +46,62 @@ MEASURE_GEN="$BENCH/guests/monad/gen/canonical-2026-08-25815000-25815199-d49075f
 MONAD_TREE="${SERIES_MONAD:-$(cd "$BENCH/.." && pwd)/monad-series}"
 SERIES_TOOLCHAIN_DIR="${SERIES_TOOLCHAIN_DIR:-${RISCV_TOOLCHAIN_DIR:-$HOME/.local/xPacks/zisk-dma-gcc-15.2.0}}"
 SERIES_STOCK_TOOLCHAIN_DIR="${SERIES_STOCK_TOOLCHAIN_DIR:-$HOME/riscv_gcc_multilib}"
-export SERIES_TOOLCHAIN_DIR SERIES_STOCK_TOOLCHAIN_DIR
+
+# ── The ZisK release, pinned here and forced into every stage ────────────────────────────────────
+# It is TWO inputs at once, and both have to move together or the run is incoherent:
+#   BUILD       the guest links this install's libziskclib.a, so the release is a build input like
+#               the compiler. Measured at commit 08735d46e: the 1.2 SDK build runs +2.89 % steps
+#               and +1.66 % COST against the 1.1 SDK build of the same source.
+#   MEASUREMENT ziskemu's cost model. 1.2.0-alpha prices a keccak permutation at 25x1538 where
+#               1.1.0-alpha charged 25x3022 -- every other category is unchanged to the byte -- so
+#               the same ELF reports ~20 % less COST under it.
+# Pinned rather than "whatever is on PATH" for the reason the compiler is: a runtime A/B must not be
+# indistinguishable from a source change. Override BOTH together to move the pin.
+SERIES_ZISK_DIR="${SERIES_ZISK_DIR:-$HOME/.zisk-1.2}"
+SERIES_ZISK_VERSION="${SERIES_ZISK_VERSION:-1.2.0-alpha}"
+# The names the stages read: build.sh takes ZISK_DIR, gate-roots*.sh and series-measure.sh take EMU.
+ZISK_DIR="$SERIES_ZISK_DIR"
+EMU="$SERIES_ZISK_DIR/bin/ziskemu"
+export SERIES_TOOLCHAIN_DIR SERIES_STOCK_TOOLCHAIN_DIR SERIES_ZISK_DIR SERIES_ZISK_VERSION ZISK_DIR EMU
 
 preflight_error() { echo "preflight: ERROR: $*" >&2; PREFLIGHT_ERRORS=$((PREFLIGHT_ERRORS+1)); }
+
+# A table carries the runtime it was produced under, in a stamp beside it. Refusing a mismatch is
+# the whole point: the ELF sha changes with the SDK, so a bumped run APPENDS rather than colliding,
+# and the table would silently hold two cost models -- a lineage whose COST column changes meaning
+# halfway down, with nothing on the page to say where. Delete the stamp and the table together to
+# start a runtime over; there is no in-place migration, because none of the old rows are valid.
+runtime_stamp() {
+  local f="$1" stamp="$1.runtime" had
+  [ -s "$f" ] || { printf '%s\n' "$SERIES_ZISK_VERSION" > "$stamp"; return 0; }
+  if [ ! -f "$stamp" ]; then
+    preflight_error "$(basename "$f") has rows but no .runtime stamp — it predates the pin. If it is \
+$SERIES_ZISK_VERSION data, run: echo $SERIES_ZISK_VERSION > $stamp"
+    return 0
+  fi
+  had=$(cat "$stamp")
+  [ "$had" = "$SERIES_ZISK_VERSION" ] || preflight_error \
+    "$(basename "$f") was measured under ZisK $had, the pin is $SERIES_ZISK_VERSION — \
+appending would mix two cost models in one table. Move it aside, or set SERIES_ZISK_VERSION=$had."
+}
 preflight() {
   PREFLIGHT_ERRORS=0
   command -v python3 >/dev/null 2>&1 || preflight_error "python3 is not installed"
-  if [ ! -x "$HOME/.zisk/bin/ziskemu" ]; then
-    preflight_error "no $HOME/.zisk/bin/ziskemu (install ZisK 1.1.0-alpha with ziskup)"
-  else
-    case $("$HOME/.zisk/bin/ziskemu" --version 2>&1) in
-      *1.1.0-alpha*) ;;
-      *) preflight_error "ziskemu is not the pinned 1.1.0-alpha runtime" ;;
-    esac
-  fi
-  if [ ! -x "$HOME/.zisk/bin/cargo-zisk" ]; then
-    preflight_error "no $HOME/.zisk/bin/cargo-zisk (install ZisK 1.1.0-alpha with ziskup)"
-  else
-    case $("$HOME/.zisk/bin/cargo-zisk" --version 2>&1) in
-      *1.1.0-alpha*) ;;
-      *) preflight_error "cargo-zisk is not the pinned 1.1.0-alpha runtime" ;;
-    esac
-  fi
+  # Both binaries of the SAME install, both asserted against the SAME pin: measuring with one
+  # release and linking against another is the incoherent run this is here to refuse.
+  for _b in ziskemu cargo-zisk; do
+    if [ ! -x "$SERIES_ZISK_DIR/bin/$_b" ]; then
+      preflight_error "no $SERIES_ZISK_DIR/bin/$_b (install ZisK $SERIES_ZISK_VERSION with ziskup)"
+    else
+      case $("$SERIES_ZISK_DIR/bin/$_b" --version 2>&1) in
+        *"$SERIES_ZISK_VERSION"*) ;;
+        *) preflight_error "$_b at $SERIES_ZISK_DIR is not the pinned $SERIES_ZISK_VERSION \
+($("$SERIES_ZISK_DIR/bin/$_b" --version 2>&1 | head -1))" ;;
+      esac
+    fi
+  done
+  runtime_stamp "$HERE/r10-index.tsv"
+  runtime_stamp "$HERE/r10-measure.tsv"
   if [ ! -x "$SERIES_TOOLCHAIN_DIR/bin/riscv64-unknown-elf-g++" ]; then
     preflight_error "no patched GCC 15.2.0 at $SERIES_TOOLCHAIN_DIR (set SERIES_TOOLCHAIN_DIR)"
   else
@@ -267,8 +301,13 @@ print((m.resolve_tip('profiling/series/r10-tip-index.tsv', 'MONAD_ZKVM_OFFICIAL_
 [ "$RESOLVED" = "$TIP" ] || { echo "TIP MISMATCH: driver says $TIP, compare.py resolves $RESOLVED"; exit 1; }
 echo "--- axis follows the index, resolved $RESOLVED"
 
+# A cache root per runtime, because compare.py keys its cache on (ELF content, block, name, input)
+# and NOT on the emulator: pointing --emu at another release against the shared root would serve the
+# previous release's numbers without a word. Same reason the tables carry a stamp.
 (cd "$BENCH/profiling" && \
-  python3 compare.py --axis r10tip-vs-ziskethone --axis r9-vs-ziskethone --axis r8-vs-ziskethone \
+  COMPARE_CACHE_ROOT="${COMPARE_CACHE_ROOT:-$BENCH/profiling/cache-zisk-$SERIES_ZISK_VERSION}" \
+  python3 compare.py --axis r10tip-vs-ziskethone \
+    --emu "$EMU" \
     --block-min 25815000 --block-max 25815199 --families 12 --html results/compare.html) \
   || { echo "COMPARE FAILED — historical builds not started"; exit 1; }
 

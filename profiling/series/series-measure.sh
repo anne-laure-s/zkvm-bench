@@ -18,7 +18,12 @@ if [ -n "${BLOCKS_FILE:-}" ]; then
 else
   OFF="${1:?offset is required when BLOCKS_FILE is not set}"
 fi
-JOBS="${2:-6}"; EMU=~/.zisk/bin/ziskemu
+JOBS="${2:-6}"
+# Overridable, and it must be: the ZisK release is both a BUILD input (the guest links its
+# libziskclib) and a MEASUREMENT input (its cost model). 1.2.0-alpha prices a keccak
+# permutation at 25x1538 where 1.1.0-alpha charged 25x3022, so the same ELF reports a COST
+# ~20 % lower under it. A hardcoded path here would silently mix two cost models in one table.
+EMU="${EMU:-$HOME/.zisk/bin/ziskemu}"
 # INDEX/OUT are overridable so a second lineage measured under a different
 # runtime writes its own table: 1.0 and 1.1 numbers must never share one.
 INDEX="${INDEX:-$HERE/index.tsv}"; OUT="${OUT:-$HERE/measure.tsv}"

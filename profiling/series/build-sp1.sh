@@ -34,8 +34,12 @@ cd "$MONAD/zkvm/sp1/script"
 # and copied it under the new name -- a stale binary recorded as this commit's, i.e. a run of
 # commits all reporting the same sha and read as "did not move the guest".
 ELF_GLOB="$MONAD/zkvm/sp1/target/release/build"
-before=$(find "$ELF_GLOB" -name 'monad-zkvm-guest-sp1.elf' -type f -exec stat -f%m {} + \
-         2>/dev/null | sort -rn | head -1); before=${before:-0}
+# `|| true` inside the substitution, and not just 2>/dev/null: on a tree that has never built SP1
+# the directory does not exist, find exits non-zero, `pipefail` carries that to the pipeline and
+# `set -e` kills the script HERE -- before cargo runs, with nothing printed. A cold worktree could
+# not be built at all, which is exactly the state every commit of a fresh lineage starts in.
+before=$( { find "$ELF_GLOB" -name 'monad-zkvm-guest-sp1.elf' -type f -exec stat -f%m {} + \
+            2>/dev/null || true; } | sort -rn | head -1 ); before=${before:-0}
 LOG=$(mktemp); trap 'rm -f "$LOG"' EXIT
 rc=0
 cargo build --release > "$LOG" 2>&1 || rc=$?

@@ -23,7 +23,9 @@ E="${1:?elf}"; OUT="${2:?out.tsv}"; JOBS="${3:-8}"
 [ -f "$E" ] || { echo "no such elf: $E" >&2; exit 2; }
 [ -d "$GEN" ] || { echo "no such corpus: $GEN" >&2; exit 2; }
 SHA=$(shasum -a 256 "$E" | cut -c1-16)
-export HERE E
+# Overridable: which RUNTIME verified a root is part of the verdict.
+EMU="${EMU:-$HOME/.zisk/bin/ziskemu}"
+export HERE E EMU
 RUN="$(mktemp -d)"; trap 'rm -rf "$RUN"' EXIT; export RUN
 
 HEX64='^[0-9a-f]{64}$'
@@ -38,7 +40,7 @@ one() {
   if [ ! -f "${w%.witness}.post_state_root" ]; then printf '%s\tNOREF\t\t\n' "$b"; return 0; fi
   python3 "$HERE/frame.py" "$w" "$d/i.bin" >/dev/null 2>&1
   if [ $? -ne 0 ]; then printf '%s\tFRAME_FAIL\t\t\n' "$b"; return 0; fi
-  ~/.zisk/bin/ziskemu -e "$E" -i "$d/i.bin" -o "$d/o.bin" >/dev/null 2>&1
+  "$EMU" -e "$E" -i "$d/i.bin" -o "$d/o.bin" >/dev/null 2>&1
   rc=$?
   if [ "$rc" -ne 0 ]; then printf '%s\tEXEC_FAIL(rc=%s)\t\t\n' "$b" "$rc"; return 0; fi
   got=$(xxd -p -l32 "$d/o.bin" 2>/dev/null | tr -d '\n')
