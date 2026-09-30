@@ -214,6 +214,7 @@ For r10, use the driver rather than the individual stages:
 ./series/run-r10.sh                  # full 200-block campaign
 ./series/run-r10.sh --nb-block 105   # deterministic nested sample for the series only
 ./series/run-r10.sh --skip-build     # reuse valid builds; build missing/new commits
+./series/run-r10.sh --last           # what the tip commit brings; --last 3 for the last three
 ```
 
 Fresh clone: follow [`series/RUN-R10.md`](series/RUN-R10.md) exactly. In particular, the driver needs
@@ -246,6 +247,40 @@ next `--skip-build` resumes from that checkpoint while the published index remai
 atomic.
 
 The run displays progress normally and appends the same output to `series/run-r10.log`.
+
+### Build speed
+
+The guest build runs through the cargo command `cargo-zisk build` wraps, with a linker script kept
+at a stable path. `cargo-zisk` writes that script to a fresh `mktemp` path on every call and the
+path is part of cargo's unit hash, so through it nothing is ever reused — an unchanged tree
+recompiles 112 crates. `--no-incremental` takes the wrapper back, for a ZisK release whose script
+has moved; the ELF is byte-identical either way.
+
+`--measure-jobs N` sets how many emulators run at once, 12 by default. Measured on this host, 24
+blocks of one ELF through the instrumented pass: 6 jobs 25 s, 12 jobs 16 s (1.56x), 16 jobs 14 s
+(1.79x), at ~0.4 GiB an emulator. Lower it while an SP1 campaign is running — an `sp1-runner` peaks
+near 7.4 GB and is the reason the cap exists at all.
+
+`--build-jobs N` walks the lineage in N worktrees at once. Commits are independent builds, and a
+worktree holds one commit at a time, so N worktrees is what N-way means. Each worker takes a
+contiguous slice, which is what keeps its builds incremental — a worker hopping between distant
+commits would rebuild the world at every step. Worker 1 is the series tree; workers 2..N are
+created beside it as `<series tree>-w2`, `-w3`, … the first time and kept, at ~8 GB each.
+`SERIES_WORKERS` moves them elsewhere.
+
+The official profile signs the guest's flags with the source root folded to a placeholder, so one
+commit built in two worktrees keeps one `MONAD_ZKVM_BUILD_SIGNATURE` and one identity. A lineage
+reaching back before that fold does not: its flags carry `-include <tree>/zkvm/guest/nodelete.hpp`
+literally, one commit gets two ELF SHAs across two worktrees, and every measurement is keyed by
+that SHA. The guests are identical either way — same steps, same COST, same public output — but on
+such a lineage the table cannot tell, so point `--build-jobs` at one about to be measured from
+scratch rather than at one already measured.
+
+An ELF is named by the program it holds, not by the bytes of its file: `series/elf-id.py` hashes
+the PT_LOAD segments and the entry point. Cargo's unit hash for a path package includes that
+package's path, so the same commit built in two worktrees differs in rustc's codegen-unit symbol
+names, which the emulator never loads. The map lives in `series/elf/.program-id.tsv`; where one
+program is on disk under several names, a name the lineage's own index already uses wins.
 
 ## Axes and block selection
 

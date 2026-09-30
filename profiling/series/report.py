@@ -8,7 +8,7 @@ Reads what the scripts beside it produce:
 
 Writes profiling/results/series-r4.html.
 """
-import argparse, math, os, statistics, sys
+import argparse, html, math, os, statistics, sys
 from collections import defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -41,9 +41,14 @@ def read_measure(d, name='measure.tsv', blocks=None):
         return per
     for line in open(p):
         q = line.rstrip('\n').split('\t')
-        if (len(q) == 4 and q[2] not in ('NA', '') and q[3] not in ('NA', '')
+        # COST may be absent: a `--quick` pass records steps and leaves `NA` for the instrumented
+        # metric, which costs about three times as much. Dropping those rows made a quick table read
+        # as an EMPTY one -- the measurement was there, the reader refused it. Steps are kept, cost
+        # is None, and every consumer below decides for itself whether it has enough.
+        if (len(q) == 4 and q[2] not in ('NA', '')
                 and (blocks is None or int(q[1]) in blocks)):
-            per[q[0]][int(q[1])] = (int(q[2]), int(q[3]))
+            cost = int(q[3]) if q[3] not in ('NA', '') else None
+            per[q[0]][int(q[1])] = (int(q[2]), cost)
     return per
 
 
@@ -52,11 +57,65 @@ def medians(per, base_sha):
     out, base = {}, per.get(base_sha, {})
     for sha, rows in per.items():
         common = sorted(set(rows) & set(base))
-        if common:
-            out[sha] = {'n': len(common),
-                        'steps': statistics.median(rows[b][0] / base[b][0] for b in common),
-                        'cost': statistics.median(rows[b][1] / base[b][1] for b in common)}
+        if not common:
+            continue
+        # Cost only over the blocks where BOTH sides carry it. A half-quick table then yields a
+        # complete steps curve and a cost curve over what was actually measured, instead of one
+        # ratio silently taken on a different set from its neighbour.
+        cb = [b for b in common if rows[b][1] is not None and base[b][1] is not None]
+        out[sha] = {'n': len(common),
+                    'steps': statistics.median(rows[b][0] / base[b][0] for b in common),
+                    'cost': statistics.median(rows[b][1] / base[b][1] for b in cb) if cb else None,
+                    'n_cost': len(cb)}
     return out
+
+
+def pairwise(per, a_sha, b_sha, field, biggest=()):
+    """This commit against the one before it, block by block.
+
+    Returns {med, pooled, big, n, n_big, lo, hi, better} -- three views of one set of ratios,
+    because a lever can separate them and the separation is the information.
+
+    PAIRED, because a ratio of two medians-to-base is not. Each side's median can sit on a
+    different block, so the ratio of the two moves by the gap between neighbours rather than by
+    what the commit did -- and the two disagree exactly when a commit's effect is concentrated,
+    which is the case worth seeing. r10's `state: index a FlatStorage row` is +0.027 % paired and
+    -0.268 % unpaired over one set of 100 blocks, opposite signs.
+
+    `pooled` is total over total on the same blocks: what a prover pays, where `med` is what a
+    typical block does. `big` is pooled over the LARGEST TENTH -- what a proving budget spends on
+    the blocks that dominate it.
+
+    `big` is POOLED and not a median over that tenth, which is the mistake this column was built
+    to avoid and reproduced one level down when it was. r10-zisk `state: index a FlatStorage row`
+    over its top 20 blocks: median +0.017 %, pooled -0.809 %. The win inside the tenth sits on a
+    few of its blocks, so a median across them sees nothing, exactly as the corpus median sees
+    nothing across the corpus.
+
+    The tenth is a DECILE and not a quartile because a quartile dilutes it: r10's three
+    `index ... once it is big enough` commits measure -0.026 % over the top 25 % and -1.314 % over
+    the top 10 %. On an effect that is uniform all three columns agree to the third decimal, which
+    is how to tell one shape from the other.
+    """
+    a, b = per.get(a_sha, {}), per.get(b_sha, {})
+    common = [x for x in set(a) & set(b)
+              if a[x][field] is not None and b[x][field] is not None and a[x][field]]
+    if not common:
+        return None
+    r = {x: b[x][field] / a[x][field] for x in common}
+    vals = sorted(r.values())
+    # `biggest` is ordered ONCE for the page, by the base build's step count, so every row's "big
+    # blocks" are the same blocks. Ordering per row by each commit's own steps would move the set
+    # under the reader and make two rows incomparable.
+    big = [x for x in biggest if x in r] or common
+    n_big = max(1, len(big) // 10)
+    top = big[-n_big:]
+    return {'med': statistics.median(vals),
+            'pooled': sum(b[x][field] for x in common) / sum(a[x][field] for x in common),
+            'big': sum(b[x][field] for x in top) / sum(a[x][field] for x in top),
+            'n': len(common), 'n_big': n_big,
+            'lo': vals[len(vals) // 10], 'hi': vals[-1 - len(vals) // 10],
+            'better': sum(1 for v in vals if v < 1)}
 
 
 def _num(v):
@@ -84,13 +143,22 @@ def svg_chart(points, w=1360, h=380, branch='al/zkvm-r4'):
     """
     if not points:
         return '<p class=note>no data yet</p>'
-    pad_l, pad_r, pad_t, pad_b = 58, 206, 18, 46
+    pad_l, pad_r, pad_t, pad_b = 58, 206, 18, 66
     # The viewBox is wider than the 920 these type sizes were chosen for, and CSS font-size inside an
     # SVG is in user units — the same class would render the labels a third smaller. Scale them.
     S = w / 920.0
     fs = lambda base: 'style="font-size:%.1fpx"' % (base * S)
     xs = [p[0] for p in points]
-    vals = [v for p in points for v in (p[2], p[3]) if v > 0]
+    # A series is drawn only when EVERY commit has it. A `--quick` pass measures steps and leaves
+    # COST for later, and a line broken across the commits that have it would read as a shape
+    # rather than as missing data. Steps alone is the honest picture of a quick table.
+    #
+    # Settled HERE, above the first read: the y-range below is taken over the series that will be
+    # drawn, so it has to know which those are, and a comprehension is a scope of its own -- naming
+    # SER from one before the assignment binds it raises rather than falling back to the module.
+    SER = tuple(x for x in ((3, 'c2', 'prover cost'), (2, 'c1', 'steps'))
+                if all(p[x[0]] is not None for p in points))
+    vals = [p[x[0]] for p in points for x in SER if p[x[0]] and p[x[0]] > 0]
     if not vals:
         return '<p class=note>no positive ratio to plot</p>'
     lo, hi = min(vals) / 1.04, max(vals) * 1.04
@@ -120,7 +188,6 @@ def svg_chart(points, w=1360, h=380, branch='al/zkvm-r4'):
 
     # Layers, not per-series blocks: drawing each series complete in turn puts the
     # second line over the first line's markers and takes a bite out of them.
-    SER = ((3, 'c2', 'prover cost'), (2, 'c1', 'work'))
     for series, colvar, _ in SER:
         d = ' '.join('%s%.1f,%.1f' % ('M' if k == 0 else 'L', X(p[0]), Y(p[series]))
                      for k, p in enumerate(points))
@@ -159,11 +226,11 @@ def svg_chart(points, w=1360, h=380, branch='al/zkvm-r4'):
     for p in points:
         if p[0] % tick_every == 0 or p[0] == last[0]:
             g.append('<text x="%.1f" y="%.1f" class="tick" %s text-anchor="middle">%d</text>'
-                     % (X(p[0]), h - pad_b + 18 * S, fs(11), p[0]))
+                     % (X(p[0]), h - pad_b + 20 * S, fs(11), p[0]))
     g.append('<text x="%d" y="%d" class="tick" %s text-anchor="middle">commit number on %s, '
              'oldest first — log scale, so equal percentages are equal heights</text>'
-             % ((pad_l + w - pad_r) / 2, h - 6 * S, fs(11), branch))
-    return ('<svg viewBox="0 0 %d %d" role="img" aria-label="work and prover cost across the '
+             % ((pad_l + w - pad_r) / 2, h - 8, fs(11), branch))
+    return ('<svg viewBox="0 0 %d %d" role="img" aria-label="steps and prover cost across the '
             'commit series, as a ratio to the base, on a log scale">' % (w, h)
             + ''.join(g) + '</svg>')
 
@@ -181,7 +248,7 @@ def svg_bars(points, w=1360, h=300, branch='al/zkvm-r4'):
     """
     if len(points) < 2:
         return '<p class=note>not enough commits yet</p>'
-    pad_l, pad_r, pad_t, pad_b = 58, 206, 18, 46
+    pad_l, pad_r, pad_t, pad_b = 58, 206, 18, 66
     S = w / 920.0
     fs = lambda base: 'style="font-size:%.1fpx"' % (base * S)
 
@@ -241,10 +308,10 @@ def svg_bars(points, w=1360, h=300, branch='al/zkvm-r4'):
     for p in points:
         if p[0] % tick_every == 0 or p[0] == points[-1][0]:
             g.append('<text x="%.1f" y="%.1f" class="tick" %s text-anchor="middle">%d</text>'
-                     % (X(p[0]), h - pad_b + 18 * S, fs(11), p[0]))
+                     % (X(p[0]), h - pad_b + 20 * S, fs(11), p[0]))
     g.append('<text x="%d" y="%d" class="tick" %s text-anchor="middle">commit number on %s — '
              'each bar is that commit against the one before it, so below the line is cheaper'
-             '</text>' % ((pad_l + w - pad_r) / 2, h - 6 * S, fs(11), branch))
+             '</text>' % ((pad_l + w - pad_r) / 2, h - 8, fs(11), branch))
     return ('<svg viewBox="0 0 %d %d" role="img" aria-label="what each commit changed, in percent '
             'against the previous commit">' % (w, h) + ''.join(g) + '</svg>')
 
@@ -275,11 +342,24 @@ svg{display:block;width:100%%;height:auto;min-width:980px}
 .line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
 .dot{stroke:var(--bg);stroke-width:2}
 .bar{stroke:none}
+/* The legend is the control, so it looks like one. Hiding a curve is the answer to two lines that
+   run close enough to read as one -- which they do wherever the two metrics track each other. */
+.lg{appearance:none;background:none;border:0;padding:2px 6px;font:inherit;color:var(--mut);
+cursor:pointer;border-radius:5px;display:inline-flex;align-items:center}
+.lg:hover{background:var(--card)}
+.lg:not(.on){opacity:.4;text-decoration:line-through}
+.hint2{font-size:11.5px;color:var(--mut);opacity:.8}
+.figure.off-c1 svg .c1,.figure.off-c2 svg .c2{display:none}
+.copied{color:var(--c1);font-weight:600}
+/* Only the failure tooltip takes the pointer. Left on permanently it sits under the moving
+   cursor and steals the mouseout that hides it, which reads as flicker. */
+#tip.grab{pointer-events:auto}
+.pick{user-select:all;-webkit-user-select:all;background:var(--card);padding:1px 4px;border-radius:4px}
 .bar.c1{fill:var(--c1)} .bar.c2{fill:var(--c2)}
 .dl{font-size:12px;font-weight:600}
 .c1{stroke:var(--c1)} .dl.c1{fill:var(--c1);stroke:none} circle.c1{fill:var(--c1)}
 .c2{stroke:var(--c2)} .dl.c2{fill:var(--c2);stroke:none} circle.c2{fill:var(--c2)}
-.hit{fill:transparent;cursor:pointer}
+.hit{fill:transparent;cursor:copy}
 .legend{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:var(--mut);padding:2px 8px 10px}
 .swatch{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:6px;vertical-align:-1px}
 table{width:100%%;border-collapse:collapse;font-size:13px;margin:10px 0}
@@ -304,7 +384,8 @@ TIP_JS = """<script>
   function show(e){
     var t=e.target; if(!t.classList||!t.classList.contains('hit')) return;
     tip.innerHTML='<b>'+t.dataset.c+'</b>'+(t.dataset.b?' · '+t.dataset.b:'')+'<br>'+t.dataset.s+
-      '<br>work '+t.dataset.w+' %  ·  cost '+t.dataset.k+' % vs the previous commit';
+      '<br>steps '+t.dataset.w+' %  ·  cost '+t.dataset.k+' % vs the previous commit';
+    tip.classList.remove('grab');
     tip.style.opacity=1; move(e);
   }
   function move(e){
@@ -313,6 +394,38 @@ TIP_JS = """<script>
     if(y+h>innerHeight-8) y=e.clientY-h-pad;
     tip.style.left=x+'px'; tip.style.top=y+'px';
   }
+  // Hide a curve: two ratios that track each other overlap, and no amount of colour separates
+  // them where they coincide. Scoped to the figure, so two charts on one page stay independent.
+  document.addEventListener('click',function(e){
+    var b=e.target.closest&&e.target.closest('.lg'); if(!b) return;
+    var fig=b.closest('.figure'); if(!fig) return;
+    var on=b.classList.toggle('on');
+    fig.classList.toggle('off-'+b.dataset.ser,!on);
+  });
+  // Click a point to copy its commit. The sha is what every follow-up needs -- a build, a diff, a
+  // bisect -- and reading nine characters off a tooltip to retype them is where they get corrupted.
+  document.addEventListener('click',function(e){
+    var t=e.target; if(!t.classList||!t.classList.contains('hit')) return;
+    var sha=t.dataset.c; if(!sha) return;
+    var done=function(ok){
+      // On failure the sha is still put where a person can take it: `user-select:all` makes one
+      // click select the whole thing. A browser may refuse the clipboard for reasons the page
+      // cannot fix (no secure context, no user activation), and "it did not work" is not a result.
+      tip.innerHTML=(ok?'<b>'+sha+'</b><br><span class=copied>copied to the clipboard</span>'
+        :'<code class=pick>'+sha+'</code><br>the clipboard refused — click the sha to select it');
+      tip.classList.toggle('grab',!ok);
+      tip.style.opacity=1; move(e);
+      if(ok) setTimeout(function(){tip.style.opacity=0;},1400);
+    };
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(sha).then(function(){done(true);},function(){done(false);});
+    } else {
+      // file:// without a secure context has no async clipboard; the textarea trick still works.
+      var a=document.createElement('textarea'); a.value=sha; document.body.appendChild(a); a.select();
+      var ok=false; try{ok=document.execCommand('copy');}catch(_){}
+      document.body.removeChild(a); done(ok);
+    }
+  });
   document.addEventListener('mouseover',show);
   document.addEventListener('mousemove',function(e){if(tip.style.opacity==1)move(e);});
   document.addEventListener('mouseout',function(e){
@@ -328,7 +441,8 @@ def backend_label(c, has_sp1, zisk_moved):
 
 
 def render(out, index_name='index.tsv', measure_name='measure.tsv', with_sp1=True,
-           branch='al/zkvm-r4', runtime=None, failed=(), base_ref=None, blocks_file=None):
+           branch='al/zkvm-r4', runtime=None, failed=(), base_ref=None, blocks_file=None,
+           print_deltas=False):
     # A lineage measured under another ZisK runtime keeps its own pair of tables:
     # its ELFs share elf/ (the key is the sha, which already separates them) but
     # its numbers are on a different cost model and must not be merged.
@@ -353,6 +467,9 @@ def render(out, index_name='index.tsv', measure_name='measure.tsv', with_sp1=Tru
         sys.exit('no built commits in index.tsv')
     base = ok[0]['sha']
     med = medians(per, base)
+    # One size ordering for the whole page, taken from the BASE build's step counts: the blocks
+    # called big must be the same blocks on every row, or two rows are not comparable.
+    biggest = sorted(per.get(base, {}), key=lambda b: per[base][b][0])
     measured = [c for c in ok if c['sha'] in med]
     if not measured:
         sys.exit('no measurements yet — run series-measure.sh')
@@ -371,16 +488,31 @@ def render(out, index_name='index.tsv', measure_name='measure.tsv', with_sp1=Tru
     # than shown: a delta that silently spans two commits is worse than no delta.
     unbuilt = {c['i'] for c in idx if c['status'] != 'OK'}
 
-    pts, rows, prev = [], [], None
+    pts, rows, prev, pooled_delta, big_delta, spread = [], [], None, {}, {}, {}
     for c in measured:
         m = med[c['sha']]
         moved = (prev is None) or (c['sha'] != prev['sha'])
         spans = bool(prev) and any(r in unbuilt for r in range(prev['i'] + 1, c['i']))
         c['spans'] = spans
-        dw = (m['steps'] / med[prev['sha']]['steps'] - 1) * 100 if prev else 0.0
-        dk = (m['cost'] / med[prev['sha']]['cost'] - 1) * 100 if prev else 0.0
+        if not prev:
+            dw = dk = 0.0
+            pooled_delta[c['commit']] = big_delta[c['commit']] = 0.0
+        else:
+            _s = pairwise(per, prev['sha'], c['sha'], 0, biggest)
+            _k = pairwise(per, prev['sha'], c['sha'], 1, biggest)
+            dw = (_s['med'] - 1) * 100 if _s else None
+            dk = (_k['med'] - 1) * 100 if _k else None
+            big_delta[c['commit']] = (_k['big'] - 1) * 100 if _k else None
+            if _k:
+                spread[c['commit']] = (
+                    f"{(_k['lo'] - 1) * 100:+.2f} % to {(_k['hi'] - 1) * 100:+.2f} % across the "
+                    f"middle eight tenths; {_k['better']} of {_k['n']} blocks cheaper")
+            # Keyed by commit rather than carried in the row tuple, which three other places
+            # unpack positionally.
+            pooled_delta[c['commit']] = (_k['pooled'] - 1) * 100 if _k else None
         if spans:
             dw = dk = None
+            pooled_delta[c['commit']] = big_delta[c['commit']] = None
         pts.append((c['i'], c['subject'].replace('"', '&quot;'), m['steps'], m['cost'], moved,
                     c['commit'],
                     'n/a' if dw is None else f'{dw:+.2f}',
@@ -414,6 +546,10 @@ def render(out, index_name='index.tsv', measure_name='measure.tsv', with_sp1=Tru
             f'the curve.')
          + '<br><b>Greyed commits did not change the ELF</b> — identical sha, so the commit cannot '
            'have moved that guest.'
+         + ' <b>A greyed row cost nothing</b> — either because the ELF is byte-identical, and then '
+           'its Δ is empty, or because a different binary measured the same, and then its Δ reads '
+           '0.00 %. The second is worth a look: it is what a lever whose build option never '
+           'reached the compiler looks like.'
          + (f'<br><b>Cost model</b> {runtime}. Numbers from another runtime are not '
             'comparable to these and are not mixed in.' if runtime else '')
          + (('<br><b>' + str(len(failed)) + ' commit(s) absent</b> — they do not compile, so no ELF '
@@ -422,12 +558,13 @@ def render(out, index_name='index.tsv', measure_name='measure.tsv', with_sp1=Tru
          + '</div>']
 
     h.append('<div class=figure><div class=legend>'
-             '<span><span class=swatch style="background:var(--c1)"></span>work (steps)</span>'
-             '<span><span class=swatch style="background:var(--c2)"></span>prover COST</span></div>')
+             '<button class="lg on" data-ser=c1><span class=swatch style="background:var(--c1)"></span>steps</button>'
+             '<button class="lg on" data-ser=c2><span class=swatch style="background:var(--c2)"></span>prover COST</button>'
+             '<span class=hint2>click a colour to isolate it · click a point to copy its sha</span></div>')
     h.append(svg_chart(pts, branch=branch))
     h.append('</div>')
     lastm = rows[-1][1]
-    h.append(f'<p>End to end: <b class=win>{lastm["steps"]:.4f}×</b> the work and '
+    h.append(f'<p>End to end: <b class=win>{lastm["steps"]:.4f}×</b> the steps and '
              f'<b class=win>{lastm["cost"]:.4f}×</b> the prover COST of the base — '
              f'−{(1-lastm["steps"])*100:.1f} % and −{(1-lastm["cost"])*100:.1f} %.</p>')
 
@@ -441,8 +578,9 @@ def render(out, index_name='index.tsv', measure_name='measure.tsv', with_sp1=Tru
              f'something</b>; a commit that moved nothing draws no bar. The scale is linear, so two '
              f'bars are comparable and a bar near nothing is a commit that did nearly nothing.</p>')
     h.append('<div class=figure><div class=legend>'
-             '<span><span class=swatch style="background:var(--c1)"></span>work (steps)</span>'
-             '<span><span class=swatch style="background:var(--c2)"></span>prover COST</span></div>')
+             '<button class="lg on" data-ser=c1><span class=swatch style="background:var(--c1)"></span>steps</button>'
+             '<button class="lg on" data-ser=c2><span class=swatch style="background:var(--c2)"></span>prover COST</button>'
+             '<span class=hint2>click a colour to isolate it · click a point to copy its sha</span></div>')
     h.append(svg_bars(pts, branch=branch))
     h.append('</div>')
 
@@ -468,8 +606,9 @@ def render(out, index_name='index.tsv', measure_name='measure.tsv', with_sp1=Tru
                  'the ZisK sample, because SP1 execution costs about twenty times as much per block. '
                  'The two charts do not share a sample; read each against itself.</p>')
         h.append('<div class=figure><div class=legend>'
-                 '<span><span class=swatch style="background:var(--c1)"></span>cycles</span>'
-                 '<span><span class=swatch style="background:var(--c2)"></span>PGU</span></div>')
+                 '<button class="lg on" data-ser=c1><span class=swatch style="background:var(--c1)"></span>cycles</button>'
+                 '<button class="lg on" data-ser=c2><span class=swatch style="background:var(--c2)"></span>PGU</button>'
+                 '<span class=hint2>click a colour to isolate it · click a point to copy its sha</span></div>')
         h.append(svg_chart(spts, branch=branch))
         h.append('</div>')
         h.append(f'<p>End to end on SP1: <b class=win>{spts[-1][2]:.4f}×</b> the cycles and '
@@ -528,11 +667,35 @@ def render(out, index_name='index.tsv', measure_name='measure.tsv', with_sp1=Tru
                 'two commits and belong to neither' if any_span else '') + '.</p>')
     h.append('<table><tr><th class=n>#</th><th>commit</th><th>subject</th>'
              '<th class=n title="blocks this ELF and the base share">n</th>'
-             '<th class=n>ZisK COST</th><th class=n>Δ</th>'
+             '<th class=n>ZisK COST</th>'
+             '<th class=n title="median of this commit\'s per-block ratios against the one '
+             'before it: what a typical block pays">Δ</th>'
+             '<th class=n title="total COST over the corpus against the commit before it: what a '
+             'prover pays. It parts from the median exactly when a commit pays on the blocks that '
+             'do the work it targets and not on the rest">Δ corpus</th>'
+             '<th class=n title="total COST over the largest tenth of the corpus by step count '
+             '-- the blocks a proving budget is actually spent on. Pooled like Δ corpus and not a '
+             'median, because within that tenth too the win sits on a few blocks. A median '
+             'regression is worth taking when this column pays for it; hover the Δ cell for the '
+             'spread">Δ top 10%</th>'
              + ('<th class=n>SP1 PGU</th><th class=n>Δ</th>' if with_sp1 else '') + '</tr>')
     for c, m, moved, dw, dk in rows:
         sp = sp1_by_commit.get(c['commit'])
-        flat = '' if (moved or (sp and sp[2])) else ' class=flat'
+        # Grey means "this commit cost nothing", and it has to mean that consistently: a row
+        # showing 0.00 % in full contrast beside a greyed one that shows nothing reads as an
+        # inconsistency, because from the reader's side both are the same news. The DISTINCTION
+        # survives in the Δ cell, which stays empty when the ELF is byte-identical and prints
+        # 0.00 % when a different binary measured the same -- two different facts, and the second
+        # is the one that catches a lever whose option never reached the compiler.
+        # Still means still on EVERY view. A commit flat on the median and on the corpus but
+        # -1.3 % over the big blocks is the one row that must not be greyed out.
+        _dp = pooled_delta.get(c['commit'])
+        _db = big_delta.get(c['commit'])
+        _still = ((dk is None or abs(dk) < 0.005) and (dw is None or abs(dw) < 0.005)
+                  and (_dp is None or abs(_dp) < 0.005) and (_db is None or abs(_db) < 0.005))
+        _s = spread.get(c['commit'])
+        _sp_title = f' title="{html.escape(_s, quote=True)}"' if _s and moved else ''
+        flat = '' if ((moved or (sp and sp[2])) and not _still) else ' class=flat'
         if sp:
             sp_ratio, sp_cell = f'{sp[0]:.4f}×', cell(sp[1], sp[2])
         else:
@@ -546,7 +709,10 @@ def render(out, index_name='index.tsv', measure_name='measure.tsv', with_sp1=Tru
                   f'ratio and the one above it do not rest on the same set">{m["n"]}</span>')
         h.append(f'<tr{flat}><td class=n>{c["i"]}</td><td><code>{c["commit"]}</code></td>'
                  f'<td>{c["subject"]}</td><td class=n>{n_cell}</td>'
-                 f'<td class=n>{zisk_cell}</td><td class=n>{cell(dk, moved)}</td>'
+                 f'<td class=n>{zisk_cell}</td>'
+                 f'<td class=n{_sp_title}>{cell(dk, moved)}</td>'
+                 f'<td class=n>{cell(pooled_delta.get(c["commit"]), moved)}</td>'
+                 f'<td class=n>{cell(big_delta.get(c["commit"]), moved)}</td>'
                  + (f'<td class=n>{sp_ratio}</td><td class=n>{sp_cell}</td>' if with_sp1 else '')
                  + '</tr>')
     h.append('</table>')
@@ -577,6 +743,18 @@ def render(out, index_name='index.tsv', measure_name='measure.tsv', with_sp1=Tru
              'view; every number in the prose comes from it.</footer></div>')
     open(out, 'w').write('\n'.join(h))
     print(f'wrote {out}  ({len(rows)} commits, {n} blocks)')
+    if print_deltas:
+        # The same four figures as the page's table, one line per commit, for a run that only
+        # wants to know what its last commits did. The first row is the reference: it has no step.
+        pct = lambda v: '      n/a' if v is None else f'{v:+8.3f}%'
+        print(f"\n{'':>5} {'commit':9}  {'steps':>9} {'COST':>9} {'pooled':>9} {'top 10%':>9}  (vs previous row)")
+        for j, (c, m, moved, dw, dk) in enumerate(rows):
+            if j == 0:
+                cells = f"{'ref':>9} {'ref':>9} {'ref':>9} {'ref':>9}"
+            else:
+                cells = (f"{pct(dw)} {pct(dk)} {pct(pooled_delta.get(c['commit']))} "
+                         f"{pct(big_delta.get(c['commit']))}")
+            print(f"{'#' + str(c['i']):>5} {c['commit'][:9]:9}  {cells}  {c['subject'][:64]}")
 
 
 if __name__ == '__main__':
@@ -594,7 +772,9 @@ if __name__ == '__main__':
                     help='the BASE series-build-lineage.sh walked from; omitted if not given')
     ap.add_argument('--blocks-file', metavar='PATH',
                     help='restrict the report to these witnesses/blocks without pruning the cache')
+    ap.add_argument('--print-deltas', action='store_true',
+                    help='also print each commit\'s step from the previous row to stdout')
     a = ap.parse_args()
     failed = tuple(c['commit'] for c in read_index(HERE, a.index) if c['status'] != 'OK')
     render(a.out, a.index, a.measure, not a.no_sp1, a.branch, a.runtime, failed, a.base,
-           a.blocks_file)
+           a.blocks_file, a.print_deltas)

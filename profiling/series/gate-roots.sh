@@ -18,17 +18,25 @@ E="${1:?elf}"; JOBS="${2:-6}"
 [ -d "$GEN" ] || { echo "no such corpus: $GEN" >&2; exit 2; }
 # Overridable: which RUNTIME verified a root is part of the verdict.
 EMU="${EMU:-$HOME/.zisk/bin/ziskemu}"
+. "$HERE/root-ref.sh"
 export HERE E EMU
+export -f root_match root_refs
 RUN="$(mktemp -d)"; trap 'rm -rf "$RUN"' EXIT; export RUN
 one() {
-  local w="$1" b d got want
+  local w="$1" b d got kind steps
   b=$(basename "$w" .witness); d="$RUN/$$"; mkdir -p "$d"
-  [ -f "${w%.witness}.post_state_root" ] || { echo "NOREF $b"; return; }
+  [ -n "$(root_refs "$w")" ] || { echo "NOREF $b"; return; }
   python3 "$HERE/frame.py" "$w" "$d/i.bin" || { echo "FRAME_FAIL $b"; return; }
-  "$EMU" -e "$E" -i "$d/i.bin" -o "$d/o.bin" >/dev/null 2>&1
+  steps=$("$EMU" -e "$E" -i "$d/i.bin" -o "$d/o.bin" -m 2>&1 | grep -oE 'steps=[0-9]+' | head -1 | cut -d= -f2)
   got=$(xxd -p -l32 "$d/o.bin" 2>/dev/null | tr -d '\n')
-  want=$(sed 's/^0x//' "${w%.witness}.post_state_root")
-  if [ "$got" = "$want" ]; then echo "OK $b"; else echo "DIFFER $b"; fi
+  # A guest that cannot read its input runs to completion, reports a few thousand steps and writes
+  # 256 zero bytes. Reported as DIFFER that is "the root is wrong", which sends you looking at the
+  # trie; it is not, the guest never ran. The two need different words.
+  if [ "${got:-}" = "0000000000000000000000000000000000000000000000000000000000000000" ] \
+     || { [ -n "${steps:-}" ] && [ "$steps" -lt 100000 ]; }; then
+    echo "NORUN $b steps=${steps:-?}"; return
+  fi
+  kind=$(root_match "$w" "$got") && echo "OK $b $kind" || echo "DIFFER $b"
 }
 export -f one
 # FAIL CLOSED, same reasoning as gate-roots-record.sh: an empty corpus used to print

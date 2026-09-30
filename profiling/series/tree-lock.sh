@@ -46,14 +46,20 @@ series_tree_claim() {
     fi
     rm -f "$f"
 
-    # The clobber guard. `git checkout -f` is coming; anything uncommitted here dies with it.
-    dirty=$(git -C "$d" status --porcelain 2>/dev/null | head -5)
+    # The clobber guard. `git checkout -f` is coming, and it destroys modifications to TRACKED
+    # files -- that is the work this refuses to take. It does not touch untracked files, so those
+    # are not at risk and must not block: walking a lineage whose submodule set changes leaves an
+    # initialised submodule directory behind as untracked on every run, and refusing that is
+    # refusing a safe build. Reported, since a stale one can still be read by a build.
+    dirty=$(git -C "$d" status --porcelain --untracked-files=no 2>/dev/null | head -5)
     if [ -n "$dirty" ]; then
-        echo "$d has uncommitted changes, and this script drives it with \`git checkout -f\`:" >&2
+        echo "$d has uncommitted changes to tracked files, and this script drives it with \`git checkout -f\`:" >&2
         echo "$dirty" | sed 's/^/    /' >&2
         echo "  commit, stash, or point MONAD at a worktree of your own (see RUNBOOK § series)" >&2
         exit 4
     fi
+    untracked=$(git -C "$d" status --porcelain 2>/dev/null | grep -c '^??' || true)
+    [ "$untracked" = 0 ] || echo "note: $d holds $untracked untracked path(s); a checkout leaves them" >&2
 
     # A branch by name when there is one, the exact commit when the tree is detached.
     SERIES_TREE_START=$(git -C "$d" symbolic-ref --quiet --short HEAD 2>/dev/null) \
@@ -69,5 +75,10 @@ series_tree_relinquish() {
     [ -n "${SERIES_TREE_DIR:-}" ] || return 0
     git -C "$SERIES_TREE_DIR" checkout -f -q "$SERIES_TREE_START" 2>/dev/null \
         || echo "WARNING: could not restore $SERIES_TREE_DIR to $SERIES_TREE_START" >&2
+    # Restore the submodules too. A checkout moves their pointers and not their worktrees, so
+    # returning the branch alone hands back a tree whose third_party belongs to the last commit
+    # the walk built -- and the next person's build fails somewhere they did not touch.
+    git -C "$SERIES_TREE_DIR" submodule update --init --recursive --quiet 2>/dev/null \
+        || echo "WARNING: submodules in $SERIES_TREE_DIR are not at $SERIES_TREE_START" >&2
     rm -f "$SERIES_TREE_LOCK"
 }

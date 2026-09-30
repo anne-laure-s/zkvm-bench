@@ -661,6 +661,17 @@ AXES = {
     # resolved value, kept so ./axis.py (which reads it directly) keeps working; it is overridden on
     # every run and is not what gets measured. Which build a report DID measure is stamped on the
     # section itself (`a_ident`), never inferred from this line.
+    # The branch stack rebased onto main, the one meant to be merged. Same shape as r10tip: the
+    # `tip` field resolves the last OK row of its own index at run time, so the axis follows the
+    # stack as branches are added on top and no sha is ever pinned by hand here.
+    'r10zisk-tip-vs-ziskethone': {'ephemeral': 'al/zkvm-r10-zisk-* stack via r10-zisk-buildenv.tsv (official profile)',
+             'backend': 'zisk', 'unit': 'steps',
+             'a': {'name': 'monad-r10-zisk-tip', 'tip': 'profiling/series/r10-zisk-tip-index.tsv',
+                   'requires_env': 'MONAD_ZKVM_OFFICIAL_PROFILE=ON',
+                   'elf': 'profiling/series/elf/429ee5c233520b73.elf',
+                   'src': 'monad'},
+             'b': {'name': 'ziskethone', 'elf': 'vendor/zisk-eth-client/bin/guests/stateless-validator-ziskethone/elf/zec-ziskethone.elf',
+                   'src': 'bin'}},
     'r10tip-vs-ziskethone': {'ephemeral': 'al/zkvm-r10 tip via r10-buildenv.tsv (official profile)',
              'backend': 'zisk', 'unit': 'steps',
              'a': {'name': 'monad-r10-tip-zisk', 'tip': 'profiling/series/r10-tip-index.tsv',
@@ -738,82 +749,100 @@ def frame_ziskos(src, dst):
     d = open(src, 'rb').read()
     open(dst, 'wb').write(struct.pack('<Q', len(d)) + d + b'\x00' * ((-(8 + len(d))) % 8))
 
-def run_zisk(emu, elf, inp, src_kind, with_cost=False):
-    """`-m` for steps + an honest duration. COST needs `-X --stats`, whose instrumentation
-    slows execution ~7× (0.08s → 0.57s here) — so it's a SECOND pass, and opt-in, rather than
-    silently wrecking the timing we report."""
-    tmp, inp0 = None, inp
+def _zisk_input(inp, src_kind):
+    """The file ziskemu reads: a Monad witness is framed first (see needs_framing). -> (path, tmp)"""
+    if src_kind == 'monad':
+        tmp = tempfile.NamedTemporaryFile(suffix='.zisk.bin', delete=False).name
+        frame_ziskos(inp, tmp)
+        return tmp, tmp
+    return inp, None
+
+def zisk_timed(emu, elf, inp, src_kind):
+    """`-m` for steps + an honest duration. collect() runs this pass on its own, with nothing
+    instrumented beside it, because the duration it reports is only honest on an unloaded core."""
+    path, tmp = _zisk_input(inp, src_kind)
     try:
-        if src_kind == 'monad':   # run_zisk IS the zisk path; see needs_framing
-            tmp = tempfile.NamedTemporaryFile(suffix='.zisk.bin', delete=False).name
-            frame_ziskos(inp, tmp); inp = tmp
         t0 = time.time()
-        p = subprocess.run([emu, '-e', elf, '-i', inp, '-m'], capture_output=True, text=True)
+        p = subprocess.run([emu, '-e', elf, '-i', path, '-m'], capture_output=True, text=True)
         wall = time.time() - t0
-        txt = p.stdout + p.stderr
-        cost, cats, kec, ops, opsn = None, None, None, None, None
-        if with_cost:
-            # --save-stats alongside --opcodes: the displayed per-opcode table is a TOP TEN,
-            # and that truncation reads as a difference in work. A precompile that clears the
-            # tenth place in one guest and not in the other shows as a cost on one side and a
-            # zero on the other -- measured identical on both: secp256k1_add is 305,605,440 in
-            # this guest and 305,605,440 in the base it is compared against, and the compare
-            # reported the base at 0 for 26 blocks. The snapshot is the full table, so
-            # precompiles are read from it rather than from what fits on screen.
-            snap = inp + '.stats'
-            q = subprocess.run([emu, '-e', elf, '-i', inp, '-X', '-S', '--sdk', '--opcodes',
-                                '--save-stats', snap], capture_output=True, text=True)
-            qt = q.stdout + q.stderr
-            pre, pren = {}, {}
-            try:
-                with open(snap) as fh:
-                    for line in fh:
-                        f = line.rstrip('\n').split(',')
-                        if len(f) >= 5 and f[0] == 'PRECOMPILES':
-                            pre[f[1]] = int(f[4]); pren[f[1]] = int(f[2])
-            except OSError:
-                pass
-            finally:
-                if os.path.exists(snap):
-                    os.remove(snap)
-            mc = re.search(r'COST\s+([\d,]+)', qt)
-            if mc: cost = int(mc.group(1).replace(',', ''))
-            # Same pass also prints a COST DISTRIBUTION SUMMARY (Base/Main/Opcodes/Precompiles/
-            # Memory) — free here, and it answers "is this block precompile-bound?".
-            cats = {m.group(1): int(m.group(2).replace(',', ''))
-                    for m in re.finditer(r'║\s+(Base|Main|Opcodes|Precompiles|Memory)\s+[█░]+\s+([\d,]+)', qt)}
-            cats = cats or None
-            # `--opcodes` adds a per-opcode cost table. ZisK gives no call COUNT for precompiles (the
-            # OPS column is blank for them), but cost/ZISK_KECCAK_COST recovers it EXACTLY: the costs
-            # divide by that constant with no remainder, and the same Monad guest run on both backends
-            # gives an identical count (5,783 derived here = 5,783 KECCAK_PERMUTE counted by SP1).
-            # Comparing zisk-reth against rsp instead shows a small real gap (5,205 vs 5,227) — two
-            # different guest programs with different trie code, not a measurement error.
-            mk = re.search(r'║\s+keccak\s+[█░]*\s+([\d,]+)', qt)
-            if mk: kec = int(mk.group(1).replace(',', ''))
-            # Whole per-opcode cost table while we are here (lower-case names only — the category
-            # rows are capitalised). Gives the ZisK-side counterpart of SP1's opcode counts:
-            # dma_memcpy for copying, add/or/and/xor/sll for plain arithmetic, etc.
-            ops = {m.group(1): int(m.group(2).replace(',', ''))
-                   for m in re.finditer(r'║\s+([a-z_][a-z_0-9]*)\s+[█░]+\s+([\d,]+)\s+[\d.]+%', qt)}
-            ops = {**(ops or {}), **pre} or None
-            # The same rows carry an "OPS + FROPS" column: the actual instruction COUNT. Keep it
-            # separately — cost is NOT proportional to it (measured cost/op from 0.23 on `sll` to
-            # 0.97 on `xor`, because the cheaper "frops" share differs per opcode), so a cost ratio
-            # is not an instruction-count ratio.
-            opsn = {m.group(1): int(m.group(2).replace(',', ''))
-                    for m in re.finditer(
-                        r'║\s+([a-z_][a-z_0-9]*)\s+[█░]+\s+[\d,]+\s+[\d.]+%\s+║\s+([\d,]+)\s+[\d,]+',
-                        qt)}
-            opsn = {**(opsn or {}), **pren} or None
     finally:
         if tmp and os.path.exists(tmp): os.remove(tmp)
+    txt = p.stdout + p.stderr
     grab = lambda pat, cast=int: (cast(re.search(pat, txt).group(1)) if re.search(pat, txt) else None)
     work = grab(r'steps=(\d+)')
     if p.returncode != 0 or work is None:
         return {'error': f'ziskemu rc={p.returncode}: {txt.strip()[-300:]}'}
     r = {'work': work, 'secs': grab(r'duration=([\d.]+)', float) or round(wall, 3),
          'gas': grab(r'Gas Consumed:\s*(\d+)'), 'txs': grab(r'Transaction Count:\s*(\d+)')}
+    if os.path.exists(inp): r['insz'] = os.path.getsize(inp)
+    return r
+
+def zisk_cost(emu, elf, inp, src_kind):
+    """COST needs `-X --stats`, whose instrumentation slows execution ~7x (0.08s -> 0.57s here), so
+    it is a SECOND pass, and opt-in, rather than silently wrecking the timing we report. It reports
+    no duration, so collect() runs it wide. -> the COST fields, merged into the timed record."""
+    path, tmp = _zisk_input(inp, src_kind)
+    cost, cats, kec, ops, opsn = None, None, None, None, None
+    snapdir = tempfile.mkdtemp(prefix='zisk-stats-')
+    snap = os.path.join(snapdir, 'run.stats')        # ziskemu creates it; a stale one is never read
+    try:
+        # --save-stats alongside --opcodes: the displayed per-opcode table is a TOP TEN,
+        # and that truncation reads as a difference in work. A precompile that clears the
+        # tenth place in one guest and not in the other shows as a cost on one side and a
+        # zero on the other -- measured identical on both: secp256k1_add is 305,605,440 in
+        # this guest and 305,605,440 in the base it is compared against, and the compare
+        # reported the base at 0 for 26 blocks. The snapshot is the full table, so
+        # precompiles are read from it rather than from what fits on screen.
+        q = subprocess.run([emu, '-e', elf, '-i', path, '-X', '-S', '--sdk', '--opcodes',
+                            '--save-stats', snap], capture_output=True, text=True)
+        qt = q.stdout + q.stderr
+        pre, pren = {}, {}
+        try:
+            with open(snap) as fh:
+                for line in fh:
+                    f = line.rstrip('\n').split(',')
+                    if len(f) >= 5 and f[0] == 'PRECOMPILES':
+                        pre[f[1]] = int(f[4]); pren[f[1]] = int(f[2])
+        except OSError:
+            pass
+        finally:
+            if os.path.exists(snap):
+                os.remove(snap)
+        mc = re.search(r'COST\s+([\d,]+)', qt)
+        if mc: cost = int(mc.group(1).replace(',', ''))
+        # Same pass also prints a COST DISTRIBUTION SUMMARY (Base/Main/Opcodes/Precompiles/
+        # Memory) — free here, and it answers "is this block precompile-bound?".
+        cats = {m.group(1): int(m.group(2).replace(',', ''))
+                for m in re.finditer(r'║\s+(Base|Main|Opcodes|Precompiles|Memory)\s+[█░]+\s+([\d,]+)', qt)}
+        cats = cats or None
+        # `--opcodes` adds a per-opcode cost table. ZisK gives no call COUNT for precompiles (the
+        # OPS column is blank for them), but cost/ZISK_KECCAK_COST recovers it EXACTLY: the costs
+        # divide by that constant with no remainder, and the same Monad guest run on both backends
+        # gives an identical count (5,783 derived here = 5,783 KECCAK_PERMUTE counted by SP1).
+        # Comparing zisk-reth against rsp instead shows a small real gap (5,205 vs 5,227) — two
+        # different guest programs with different trie code, not a measurement error.
+        mk = re.search(r'║\s+keccak\s+[█░]*\s+([\d,]+)', qt)
+        if mk: kec = int(mk.group(1).replace(',', ''))
+        # Whole per-opcode cost table while we are here (lower-case names only — the category
+        # rows are capitalised). Gives the ZisK-side counterpart of SP1's opcode counts:
+        # dma_memcpy for copying, add/or/and/xor/sll for plain arithmetic, etc.
+        ops = {m.group(1): int(m.group(2).replace(',', ''))
+               for m in re.finditer(r'║\s+([a-z_][a-z_0-9]*)\s+[█░]+\s+([\d,]+)\s+[\d.]+%', qt)}
+        ops = {**(ops or {}), **pre} or None
+        # The same rows carry an "OPS + FROPS" column: the actual instruction COUNT. Keep it
+        # separately — cost is NOT proportional to it (measured cost/op from 0.23 on `sll` to
+        # 0.97 on `xor`, because the cheaper "frops" share differs per opcode), so a cost ratio
+        # is not an instruction-count ratio.
+        opsn = {m.group(1): int(m.group(2).replace(',', ''))
+                for m in re.finditer(
+                    r'║\s+([a-z_][a-z_0-9]*)\s+[█░]+\s+[\d,]+\s+[\d.]+%\s+║\s+([\d,]+)\s+[\d,]+',
+                    qt)}
+        opsn = {**(opsn or {}), **pren} or None
+    finally:
+        if tmp and os.path.exists(tmp): os.remove(tmp)
+        if os.path.exists(snap): os.remove(snap)
+        os.rmdir(snapdir)
+    r = {}
     if cost is not None: r['cost'] = cost
     if cats: r['cats'] = cats
     if kec is not None:
@@ -821,7 +850,13 @@ def run_zisk(emu, elf, inp, src_kind, with_cost=False):
         r['kec'] = round(kec / ZISK_KECCAK_COST)      # comparable to SP1's KECCAK_PERMUTE count
     if ops: r['ops'] = ops
     if opsn: r['opsn'] = opsn   # instruction COUNTS (see above)
-    if os.path.exists(inp0): r['insz'] = os.path.getsize(inp0)
+    return r
+
+def run_zisk(emu, elf, inp, src_kind, with_cost=False):
+    """Both passes of one run, back to back."""
+    r = zisk_timed(emu, elf, inp, src_kind)
+    if with_cost and 'error' not in r:
+        r.update(zisk_cost(emu, elf, inp, src_kind))
     return r
 
 def run_sp1(runner, elf, inp, _src_kind):
@@ -1088,9 +1123,10 @@ def _throughput_by_identity(guest):
     return rate
 
 
-def collect(axis, blocks, tools, cache, jobs, force, with_cost=False):
+def collect(axis, blocks, tools, cache, jobs, force, with_cost=False, cost_jobs=None):
     """Run both sides over `blocks` (cached per block, per BUILD — see cache-format.md).
-    -> {block: {a:…, b:…}}"""
+    `jobs` runs the timed pass, `cost_jobs` ZisK's instrumented one. -> {block: {a:…, b:…}}"""
+    cost_jobs = cost_jobs or jobs
     ax = AXES[axis]; backend = ax['backend']
     tool = tools[backend]
     ax_side_by_name = {ax[k]['name']: ax[k] for k in ('a', 'b')}
@@ -1123,9 +1159,10 @@ def collect(axis, blocks, tools, cache, jobs, force, with_cost=False):
                 todo.append((key, side, elf, b))
     if todo:
         done = [0]
-        def note(label):
+        def note(label, total=None, phase=''):
             done[0] += 1
-            print(f"\r  [{axis}] {done[0]}/{len(todo)} runs… ({label})".ljust(70), end='', flush=True)
+            print(f"\r  [{axis}] {phase}{done[0]}/{total or len(todo)} runs… ({label})".ljust(70),
+                  end='', flush=True)
         if backend == 'sp1' and not sp1_has_batch(tool):
             print(f"  [{axis}] note: this sp1-runner predates --batch (rebuild it to pay the ~6s "
                   f"startup once per process instead of once per block) — running one at a time")
@@ -1142,22 +1179,46 @@ def collect(axis, blocks, tools, cache, jobs, force, with_cost=False):
                     note(f"batch of {len(res)}")
                     save_cache(cache)             # incremental: an interrupted sweep keeps its work
         else:
-            if with_cost and backend == 'zisk':
-                print(f"  [{axis}] collecting prover-work COST too — that needs a second, "
-                      f"instrumented pass (~10x slower). Skip it with --quick.")
-            def work(item):
+            two_pass = with_cost and backend == 'zisk'
+            if two_pass:
+                print(f"  [{axis}] collecting prover-work COST too — a second, instrumented pass "
+                      f"(~10x slower), run after the timed one: {jobs} timed at a time, then "
+                      f"{cost_jobs} instrumented. Skip it with --quick.")
+            def timed(item):
                 key, side, elf, b = item
                 inp = resolve_input(side, b)
-                r = (run_zisk(tool, elf, inp, side['src'], with_cost)
+                r = (zisk_timed(tool, elf, inp, side['src'])
                      if backend == 'zisk' else run_sp1(tool, elf, inp, side['src']))
                 return key, r, f"{side['name']} {b}"
+            # The timed pass runs alone. Its duration is the one the report prints, and a run that
+            # shares the machine with instrumented ones -- or lands on an efficiency core because
+            # too many run at once -- reports a slower machine, not a slower guest.
+            timed_r = {}
             with ThreadPoolExecutor(max(1, jobs)) as ex:
-                for i, (key, r, label) in enumerate(ex.map(work, todo)):
+                for i, (key, r, label) in enumerate(ex.map(timed, todo)):
                     e, blk, nm = key
-                    cache.put(e, blk, _cachemod.RUN, r, name=nm, backend=ax['backend'],
-                              inp=resolve_input(ax_side_by_name[nm], blk))
+                    if two_pass and 'error' not in r:
+                        timed_r[key] = r                  # completed by the COST pass below
+                    else:
+                        cache.put(e, blk, _cachemod.RUN, r, name=nm, backend=ax['backend'],
+                                  inp=resolve_input(ax_side_by_name[nm], blk))
+                        if i % 25 == 24: save_cache(cache)
                     note(label)
-                    if i % 25 == 24: save_cache(cache)
+            if timed_r:
+                print()
+                done[0] = 0
+                pending = [it for it in todo if it[0] in timed_r]
+                def costed(item):
+                    key, side, elf, b = item
+                    return (key, zisk_cost(tool, elf, resolve_input(side, b), side['src']),
+                            f"{side['name']} {b}")
+                with ThreadPoolExecutor(max(1, cost_jobs)) as ex:
+                    for i, (key, extra, label) in enumerate(ex.map(costed, pending)):
+                        e, blk, nm = key
+                        cache.put(e, blk, _cachemod.RUN, {**timed_r[key], **extra}, name=nm,
+                                  backend=ax['backend'], inp=resolve_input(ax_side_by_name[nm], blk))
+                        note(label, len(pending), 'COST ')
+                        if i % 25 == 24: save_cache(cache)
         print()
         save_cache(cache)
     # Unconditional: with nothing measured, `_dirty` is empty and this writes only builds.json — and
@@ -4251,9 +4312,14 @@ def main():
                                      'takes precedence over --block-min/--block-max')
     ap.add_argument('--limit', type=int, help='cap the number of blocks (after filtering)')
     ap.add_argument('--jobs', type=int, default=None,
-                    help='parallel runs (default 4 zisk / 3 sp1). SP1 pays a ~6s fixed startup per '
-                         'process regardless of workload, and running 3 at once measured 1.8x faster '
-                         'than serial; lower it if big blocks strain RAM')
+                    help='parallel runs of the timed pass, whose duration the report prints '
+                         '(default 4 zisk / 3 sp1): keep it within the performance cores. SP1 pays a '
+                         '~6s fixed startup per process regardless of workload, and running 3 at once '
+                         'measured 1.8x faster than serial; lower it if big blocks strain RAM')
+    ap.add_argument('--cost-jobs', type=int, default=None,
+                    help="parallel runs of ZisK's instrumented COST pass (default: the core count "
+                         'minus two, at most 16). It reports no duration, so unlike --jobs it can '
+                         'fill every core; measured on an M5 Max, 6 -> 1.00x, 12 -> 1.56x, 16 -> 1.79x')
     # One command collects everything by default — work-units, prover work (COST/PGU) and its
     # category split, precompile counts, gas/txs, and the honest --no-gas exec time. --quick drops
     # only the piece that is genuinely expensive.
@@ -4414,8 +4480,9 @@ def main():
             print(f"skip {axis}: no block has inputs for both {AXES[axis]['a']['name']} and "
                   f"{AXES[axis]['b']['name']}"); continue
         jobs = args.jobs if args.jobs else (4 if AXES[axis]['backend'] == 'zisk' else 3)
+        cost_jobs = args.cost_jobs or min(16, max(1, (os.cpu_count() or 4) - 2))
         print(f"[{axis}] {len(blocks)} common block(s), {blocks[0]}..{blocks[-1]}")
-        rows = collect(axis, blocks, tools, cache, jobs, args.force, not args.quick)
+        rows = collect(axis, blocks, tools, cache, jobs, args.force, not args.quick, cost_jobs)
         if not rows:
             print(f"skip {axis}: every run failed (see --force / tool paths)"); continue
         collected.append((axis, blocks, rows))
