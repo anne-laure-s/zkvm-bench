@@ -279,6 +279,9 @@ FAMILIES = [
                                # parameters are `evmc_vm*`/`evmc_host_interface*` — underscores, so
                                # the `evmc::` namespace anchor does not match.
                                r'|w_execute2'
+                               # On ZisK the handlers are named after their table slot
+                               # (monad_vm_slot_<row>_<n>), so nothing in the name says opcode.
+                               r'|monad_vm_slot_'
                                # Same enumeration-versus-anchor asymmetry as `state / trie` below:
                                # `runtime::(codecopy|calldatacopy|call|Context::from)` names four
                                # members, so `returndatacopy`, `log3`, `gas_price` and
