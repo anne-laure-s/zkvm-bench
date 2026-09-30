@@ -9,7 +9,8 @@
 # which already separates them.
 #
 # Full mode rebuilds every commit. REUSE_BUILDS=1 validates and reuses rows from
-# the previous complete index and from a private resume checkpoint. The published
+# the previous complete index and from every checkpoint and unmerged slice this
+# table has left, whichever walk -- serial or parallel -- wrote them. The published
 # index is still replaced only after the whole walk succeeds: an interruption
 # keeps the last complete index while preserving verified progress for the next
 # incremental run. The measurement table remains keyed by ELF sha and block.
@@ -56,6 +57,9 @@ BUILDFIX="${BUILDFIX:-}"
 BUILDENV="${BUILDENV:-$HERE/$(basename "$BRANCH" | sed 's/^zkvm-//')-buildenv.tsv}"
 REUSE_BUILDS="${REUSE_BUILDS:-0}"
 REUSE_INDEX="${REUSE_INDEX:-$INDEX}"
+# The table this walk writes. A slice of a parallel walk indexes into a file of its own, so the driver
+# names the table; a serial walk IS the table.
+REUSE_FAMILY="${REUSE_FAMILY:-$(basename "$INDEX")}"
 SEED_INDEX="${SEED_INDEX:-}"
 ONLY_TIP="${ONLY_TIP:-0}"
 SERIES_TOOLCHAIN_DIR="${SERIES_TOOLCHAIN_DIR:-${RISCV_TOOLCHAIN_DIR:-$HOME/.local/xPacks/zisk-dma-gcc-15.2.0}}"
@@ -66,6 +70,7 @@ mkdir -p "$HERE/elf" "$(dirname "$INDEX")"
 # not dirty the repository. Every row is revalidated before reuse.
 RESUME_INDEX="${RESUME_INDEX:-$HERE/elf/.$(basename "$INDEX").resume}"
 . "$HERE/tree-lock.sh"
+. "$HERE/subject-ref.sh"
 MONAD="${MONAD:-$(series_monad_default)}"
 export MONAD                        # build.sh / build-sp1.sh read it too
 series_tree_claim "$MONAD"          # refuses a busy or dirty tree; restores HEAD on exit
@@ -77,13 +82,34 @@ if [ "$ONLY_TIP" = 1 ]; then
 else
   COMMITS=$(git rev-list --reverse "$BASE".."$BRANCH") \
     || { echo "cannot walk $BASE..$BRANCH" >&2; exit 2; }
-  i=0
+  # Row numbers are the lineage's, not the walk's. series-build-parallel.sh hands each worker a
+  # contiguous SLICE of one lineage, and a slice that renumbered from 1 would produce four indexes
+  # all claiming row 1 -- merging them would then need a renumbering pass that could silently
+  # reorder the series. Numbering from where the slice starts makes the merge a concatenation.
+  i="${I_OFFSET:-0}"
 fi
 [ -n "$COMMITS" ] || { echo "$BASE..$BRANCH contains no commits" >&2; exit 2; }
+# Anchors resolve over a range that INCLUDES the base. The walk itself does not build the base --
+# `rev-list BASE..BRANCH` excludes it -- but a sidecar rule anchored on the base is the natural way
+# to say "every commit of this lineage", and searching the exclusive range made that rule the one
+# thing that could never resolve. A root commit has no parent, so fall back to the whole branch.
+# Overridable, and a parallel walk must override it: a worker builds a SLICE of the lineage, and
+# the sidecar anchors sit wherever the option was introduced -- usually near the lineage base, which
+# is outside every slice but the first. Resolved against the slice alone they would not resolve at
+# all, and an unresolvable anchor is a hard failure by design. The driver passes the whole lineage.
+if [ -z "${ANCHOR_RANGE:-}" ]; then
+  if git rev-parse --verify "$BASE^{commit}" >/dev/null 2>&1 && \
+     git rev-parse --verify "$BASE^^{commit}" >/dev/null 2>&1; then
+      ANCHOR_RANGE="$BASE^..$BRANCH"
+  else
+      ANCHOR_RANGE="$BRANCH"
+  fi
+fi
 NEW_INDEX="$INDEX.tmp.$$"
 cleanup_lineage() {
   [ -z "${NEW_INDEX:-}" ] || rm -f "$NEW_INDEX"
   [ -z "${RESUME_INDEX:-}" ] || rm -f "$RESUME_INDEX.tmp.$$"
+  [ -z "${REUSE_POOL:-}" ] || rm -f "$REUSE_POOL"
   series_tree_relinquish
 }
 # series_tree_claim installed the checkout-restoration trap. Extend it instead
@@ -91,6 +117,39 @@ cleanup_lineage() {
 trap cleanup_lineage EXIT
 : > "$NEW_INDEX"
 [ "$REUSE_BUILDS" = 1 ] || rm -f "$RESUME_INDEX"
+# Every build this table has recorded, whichever walk recorded it. A serial walk and each slice of a
+# parallel one checkpoint to files of their own -- several writers on one checkpoint would drop each
+# other's rows -- and a parallel walk whose merge never ran leaves its finished slices in .parallel/.
+# Each of them is read by every walk of the table, so a serial run resumes what a parallel one built
+# and the reverse. A row is used only after the checks below, so reading more of them never reuses a
+# build it should not.
+REUSE_POOL="$HERE/elf/.$(basename "$INDEX").pool.$$"
+: > "$REUSE_POOL"
+if [ "$REUSE_BUILDS" = 1 ]; then
+  for f in "$RESUME_INDEX" "$HERE/elf/.$REUSE_FAMILY".resume "$HERE/elf/.$REUSE_FAMILY".w*.resume \
+           "$HERE/elf/.parallel/$REUSE_FAMILY".w[0-9]* "$REUSE_INDEX"; do
+    case "$f" in *.log) continue ;; esac
+    [ -s "$f" ] && cat "$f" >> "$REUSE_POOL"
+  done
+fi
+# Gate one ELF against the corpus, keyed by its sha. Empty GATE_GEN disables it, which is what a
+# caller with no corpus (or one deliberately measuring an unverifiable arm) needs.
+gate_elf() {
+    local h="$1" s="$2" gate
+    [ -n "${GATE_GEN:-}" ] || { printf '%s' '-'; return 0; }
+    # Overridable because a parallel walk writes its rows to a per-worker index whose name would
+    # derive four different gate-record names for one lineage -- and the record is keyed by the ELF
+    # sha precisely so that every commit building the same bytes shares one verdict.
+    gate="${GATE_PREFIX:-$(dirname "$INDEX")/$(basename "$INDEX" -index.tsv)}-gate-$h.tsv"
+    if REUSE=1 GEN="$GATE_GEN" "$HERE/gate-roots-record.sh" "$HERE/elf/$h.elf" "$gate" \
+           "${GATE_JOBS:-6}" >/dev/null 2>&1; then
+        printf '%s' 'gate-ok'
+    else
+        echo "[$i] $s GATE_FAIL $h -- see $(basename "$gate")" >&2
+        printf '%s' 'GATE_FAIL'
+    fi
+}
+
 checkpoint_lineage() {
   [ "$REUSE_BUILDS" = 1 ] || return 0
   local tmp="$RESUME_INDEX.tmp.$$"
@@ -114,11 +173,29 @@ for c in $COMMITS; do
       if [ -n "$bline" ]; then
           IFS=$'\t' read -r -a bfields <<< "$bline"; benv=("${bfields[@]:1}")
       else
+          # Four anchor forms, one resolver. `@after` excludes its own commit, `@from` includes it
+          # -- a rule that starts AT the commit introducing an option is the common case and had
+          # to be written as "the parent of", which is one more sha to rebase away. The `:subject`
+          # variants name the commit by its subject, which a rebase preserves where it rewrites
+          # every sha; an anchor that no longer resolves is a hard failure, never a silent skip.
           while IFS=$'\t' read -r -a bfields; do
-              [ "${bfields[0]:-}" = '@after' ] || continue
+              case "${bfields[0]:-}" in
+                  @after|@from) _incl=0; [ "${bfields[0]}" = '@after' ] || _incl=1
+                                _aref="${bfields[1]:-}" ;;
+                  @after:subject|@from:subject)
+                                _incl=0; [ "${bfields[0]}" = '@after:subject' ] || _incl=1
+                                _aref="subject:${bfields[1]:-}" ;;
+                  *) continue ;;
+              esac
               [ -n "${bfields[1]:-}" ] || continue
-              [ "$c" != "$(git rev-parse "${bfields[1]}" 2>/dev/null)" ] || continue
-              git merge-base --is-ancestor "${bfields[1]}" "$c" 2>/dev/null || continue
+              _anchor=$(resolve_ref "$ANCHOR_RANGE" "$_aref") || {
+                  echo "BUILDENV anchor does not resolve in $BASE..$BRANCH: ${bfields[1]}" >&2
+                  exit 2; }
+              if [ "$c" = "$_anchor" ]; then
+                  [ "$_incl" = 1 ] || continue
+              else
+                  git merge-base --is-ancestor "$_anchor" "$c" 2>/dev/null || continue
+              fi
               benv=("${bfields[@]:2}")
           done < "$BUILDENV"
       fi
@@ -136,36 +213,44 @@ for c in $COMMITS; do
       benv=("RISCV_TOOLCHAIN_DIR=$SERIES_STOCK_TOOLCHAIN_DIR")
   fi
   expected_env="${benv[*]-}"
-  oldline=""
+  # Every recorded build of this commit, the seed's first. One counts only if its ELF is still the file
+  # it names and was built from the recipe this commit resolves to now; the first that does is used.
+  candidates=""
   if [ -n "$SEED_INDEX" ] && [ -s "$SEED_INDEX" ]; then
-      oldline=$(awk -F'\t' -v c="$s" '$2==c && $3=="OK"{print; exit}' "$SEED_INDEX")
+      candidates=$(awk -F'\t' -v c="$s" '$2==c && $3=="OK"' "$SEED_INDEX")
   fi
-  if [ -z "$oldline" ] && [ "$REUSE_BUILDS" = 1 ] && [ -s "$RESUME_INDEX" ]; then
-      oldline=$(awk -F'\t' -v c="$s" '$2==c && $3=="OK"{line=$0} END{if(line) print line}' "$RESUME_INDEX")
+  if [ "$REUSE_BUILDS" = 1 ] && [ -s "$REUSE_POOL" ]; then
+      candidates="$candidates${candidates:+$'\n'}$(awk -F'\t' -v c="$s" '$2==c && $3=="OK"' "$REUSE_POOL")"
   fi
-  if [ -z "$oldline" ] && [ "$REUSE_BUILDS" = 1 ] && [ -s "$REUSE_INDEX" ]; then
-      oldline=$(awk -F'\t' -v c="$s" '$2==c && $3=="OK"{print; exit}' "$REUSE_INDEX")
-  fi
-  if [ -n "$oldline" ]; then
+  h=""
+  while IFS= read -r oldline; do
+      [ -n "$oldline" ] || continue
       IFS=$'\t' read -r -a oldfields <<< "$oldline"
-      h="${oldfields[3]:-}"; oldenv="${oldfields[5]:-}"
-      if [ -n "$h" ] && [ -f "$HERE/elf/$h.elf" ] && [ "$oldenv" = "$expected_env" ]; then
-          actual_h=$(shasum -a256 "$HERE/elf/$h.elf" | cut -c1-16)
-      else
-          actual_h=""
-      fi
-      if [ "$actual_h" = "$h" ]; then
-          printf '%d\t%s\tOK\t%s\t%s%s\n' "$i" "$s" "$h" "$subj" \
-                 "${benv[*]+${benv[*]:+$'\t'${benv[*]}}}" >> "$NEW_INDEX"
-          echo "[$i] $s $h REUSED $subj"
-          reused=$((reused+1))
-          checkpoint_lineage || { echo "cannot checkpoint $RESUME_INDEX" >&2; exit 2; }
-          continue
-      fi
+      _h="${oldfields[3]:-}"
+      [ -n "$_h" ] && [ -f "$HERE/elf/$_h.elf" ] && [ "${oldfields[5]:-}" = "$expected_env" ] || continue
+      [ "$(shasum -a256 "$HERE/elf/$_h.elf" | cut -c1-16)" = "$_h" ] || continue
+      h="$_h"; break
+  done <<< "$candidates"
+  if [ -n "$h" ]; then
+      printf '%d\t%s\tOK\t%s\t%s%s\n' "$i" "$s" "$h" "$subj" \
+             "${benv[*]+${benv[*]:+$'\t'${benv[*]}}}" >> "$NEW_INDEX"
+      echo "[$i] $s $h REUSED $(gate_elf "$h" "$s") $subj"
+      reused=$((reused+1))
+      checkpoint_lineage || { echo "cannot checkpoint $RESUME_INDEX" >&2; exit 2; }
+      continue
   fi
 
   git checkout -f -q --detach "$c" || {
     echo "[$i] $s CHECKOUT_FAIL $subj" >&2
+    exit 2
+  }
+  # A checkout moves the submodule POINTERS and leaves the submodule worktrees where the previous
+  # commit left them, so walking a lineage compiles each commit's own sources against whatever
+  # third_party the last one happened to check out. That is not a build failure you can read: the
+  # error surfaces deep in a template instantiation, in a file the commit never touched.
+  git submodule update --init --recursive --quiet || {
+    echo "[$i] $s SUBMODULE_FAIL $subj" >&2
+    git reset --hard -q "$c" 2>/dev/null || true
     exit 2
   }
   if [ -n "$BUILDFIX" ]; then
@@ -178,6 +263,8 @@ for c in $COMMITS; do
         git reset --hard -q "$c" 2>/dev/null || true
         exit 2
       }
+      # The fix may carry a submodule bump of its own.
+      git submodule update --init --recursive --quiet || true
     fi
   fi
   # bash 3.2 (what macOS ships) treats "${arr[@]}" on an EMPTY array as unbound under `set -u`,
@@ -203,13 +290,32 @@ for c in $COMMITS; do
     echo "[$i] $s CLEANUP_FAIL after build" >&2
     exit 2
   }
-  h=$(shasum -a256 "$HERE/elf/tmp-$s.elf" | cut -c1-16)
-  mv "$HERE/elf/tmp-$s.elf" "$HERE/elf/$h.elf" 2>/dev/null || rm -f "$HERE/elf/tmp-$s.elf"
+  # Name the build by the PROGRAM, not by the bytes of the file. Cargo's unit hash for a path
+  # package includes that package's absolute path, so the same commit built in two worktrees --
+  # which is what a parallel walk is -- yields two files differing only in rustc's codegen-unit
+  # symbol names, none of it inside a PT_LOAD segment and none of it visible to the emulator.
+  # Keyed by the file sha, those would be two cache entries and two measurement campaigns for one
+  # program. --prefer keeps a name this lineage already uses when the cache knows the program under
+  # several. See elf-id.py.
+  _adopt=$("$HERE/elf-id.py" --dir "$HERE/elf" --adopt "$HERE/elf/tmp-$s.elf" \
+           --prefer "$([ -s "$REUSE_INDEX" ] && echo "$REUSE_INDEX" || echo "$INDEX")") || {
+      echo "[$i] $s ADOPT_FAIL $subj" >&2
+      rm -f "$HERE/elf/tmp-$s.elf"
+      exit 2
+  }
+  h=${_adopt%%	*}; _adopted=${_adopt##*	}
+  # Gate HERE, next to the build that produced it, and keyed by the ELF's own sha. Gating only the
+  # tip left every earlier commit unverified, so a lineage could be measured end to end with a
+  # guest that stopped reproducing the corpus somewhere in the middle -- and nothing to say where.
+  # The record is per-sha, so a commit that rebuilds an identical binary reuses the verdict and a
+  # re-walk of an unchanged lineage costs nothing.
+  _gv=$(gate_elf "$h" "$s")
   # $'\t' and not '\t': printf expands escapes in the FORMAT, never in a %s argument,
   # so the literal two characters would land in the subject column.
   printf '%d\t%s\tOK\t%s\t%s%s\n' "$i" "$s" "$h" "$subj" \
          "${benv[*]+${benv[*]:+$'\t'${benv[*]}}}" >> "$NEW_INDEX"
-  echo "[$i] $s $h $subj${benv[*]+${benv[*]:+  [env: ${benv[*]}]}}"
+  _tag=""; [ "${_adopted:-}" = reused ] && _tag=" reused-elf"
+  echo "[$i] $s $h$_tag${_gv:+ $_gv} $subj${benv[*]+${benv[*]:+  [env: ${benv[*]}]}}"
   rebuilt=$((rebuilt+1))
   checkpoint_lineage || { echo "cannot checkpoint $RESUME_INDEX" >&2; exit 2; }
 done
@@ -217,6 +323,9 @@ mv "$NEW_INDEX" "$INDEX" || { echo "cannot replace $INDEX" >&2; exit 2; }
 NEW_INDEX=""
 rm -f "$RESUME_INDEX"
 echo "done: $rebuilt rebuilt, $reused reused; index replaced"
+# A slice is not a lineage: it has no tip of its own, and "every row OK" is a statement about the
+# merged index. The driver makes it there, over all the slices at once.
+[ "${PARTIAL:-0}" = 0 ] || exit 0
 FAILED_ROWS=$(awk -F'\t' '$3!="OK"{n++} END{print n+0}' "$INDEX")
 [ "$FAILED_ROWS" = 0 ] || {
   echo "$FAILED_ROWS lineage commit(s) failed — refusing to measure a partial series" >&2
