@@ -158,18 +158,46 @@ done
 
 # Workers write to their own logs and this relays them, because W processes echoing into one pipe
 # tear each other's lines apart. Reading whole lines from separate files cannot.
+#
+# The relayed lines say what each worker has just done, not how far the walk has got, so a gauge
+# over every slice follows them each time one moves. It counts, among the lines it has relayed,
+# those that name an ELF, `[i] <commit> <elf>`, reused or built alike. A worker stops at its first
+# failure, which names no ELF: its slice is marked stopped and the gauge stays short of 100 %.
 relay() {
-    local k line n
+    local k n c d t alive final chunk done_all parts state last="" pct filled bar i
     while :; do
+        # Read before the pass, not after it: the pass that ends the loop then starts once every
+        # worker has exited, and relays their last lines.
+        final=0; [ -f "$WDIR/.done" ] && final=1
+        done_all=0; parts=""
         for k in $(seq 1 "$W"); do
+            # Alive is sampled before the log is read: a worker found dead has written all it ever
+            # will, so a slice still short after the read is one that stopped.
+            alive=0; kill -0 "${pids[$((k-1))]}" 2>/dev/null && alive=1
             n=$(wc -l < "${wlog[$((k-1))]}" 2>/dev/null | tr -d ' '); n=${n:-0}
-            eval "seen=\${seen_$k:-0}"
+            eval "seen=\${seen_$k:-0}; d=\${done_$k:-0}"
             if [ "$n" -gt "$seen" ]; then
-                sed -n "$((seen+1)),${n}p" "${wlog[$((k-1))]}" | sed "s/^/[w$k] /"
-                eval "seen_$k=$n"
+                chunk=$(sed -n "$((seen+1)),${n}p" "${wlog[$((k-1))]}")
+                printf '%s\n' "$chunk" | sed "s/^/[w$k] /"
+                c=$(printf '%s\n' "$chunk" | grep -cE '^\[[0-9]+\] [0-9a-f]{7,} [0-9a-f]{16}( |$)')
+                d=$((d + ${c:-0}))
+                eval "seen_$k=$n; done_$k=$d"
             fi
+            t=$(( ${wto[$((k-1))]} - ${wfrom[$((k-1))]} + 1 ))
+            state=""; [ "$alive" = 1 ] || [ "$d" -ge "$t" ] || state=" stopped"
+            done_all=$((done_all + d)); parts="$parts  w$k $d/$t$state"
         done
-        [ -f "$WDIR/.done" ] && break
+        if [ "$parts" != "$last" ]; then
+            pct=$((done_all * 100 / N)); filled=$((pct / 5)); bar=""; i=0
+            while [ "$i" -lt 20 ]; do
+                if [ "$i" -lt "$filled" ]; then bar="$bar#"; else bar="$bar-"; fi
+                i=$((i+1))
+            done
+            printf 'progress [%s] %3d%% (%d/%d, %d left)%s\n' \
+                   "$bar" "$pct" "$done_all" "$N" "$((N - done_all))" "$parts"
+            last=$parts
+        fi
+        [ "$final" = 1 ] && break
         sleep 2
     done
 }
