@@ -169,6 +169,10 @@ relay() {
         # Read before the pass, not after it: the pass that ends the loop then starts once every
         # worker has exited, and relays their last lines.
         final=0; [ -f "$WDIR/.done" ] && final=1
+        # A driver that dies never writes .done. The relay is a background job, which a
+        # non-interactive shell starts with SIGINT ignored, so a ^C that kills the driver leaves it
+        # polling forever, relaying the logs of every later run that reuses the same paths.
+        kill -0 "$DRIVER" 2>/dev/null || final=1
         done_all=0; parts=""
         for k in $(seq 1 "$W"); do
             # Alive is sampled before the log is read: a worker found dead has written all it ever
@@ -202,6 +206,7 @@ relay() {
     done
 }
 rm -f "$WDIR/.done"
+DRIVER=$$
 relay & relay_pid=$!
 
 rc=0; failed=""
