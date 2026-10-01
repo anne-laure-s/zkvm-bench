@@ -15,13 +15,14 @@ block's content barely matters. This measures it instead of extrapolating it.
 | presets | two blocks each of `wholesale` (21 tx), `wholesale-cbdc` (21), `worker-payouts` (130), `payouts` (500) | the design document's mixes, token contracts included |
 | arms | every L2 block twice: the encrypting guest, and the same chain built with the plaintext cipher suite | what the encryption costs in time, block for block |
 | JUMPDEST | every L2 block a third time, on the encrypting guest built with the JUMPDEST precompile (`MONAD_ZKVM_JUMPDEST_SOFTWARE=OFF`) | what the precompile's instance costs a proof: an L2 build analyses JUMPDESTs in software by default, one instance fewer for about 9,600 more steps |
+| Keccak-f | the L2 blocks of up to 250 transactions a fourth time, on the encrypting guest built with every Keccak-f in software (`MONAD_ZKVM_KECCAKF_SOFTWARE=ON`, the memo off) | whether a block that plans no Keccakf instance -- about a fifth of a small block's plan by area -- proves faster: at 4,138 steps a permutation, the plan's area against the default's is 0.79x on transfer blocks of up to 25 transactions, 0.85x at 50, 1.20x at 100 and 1.62x at 250, and larger blocks would only time the overflow |
 | mainnet | blocks 25815195, 25815036 and 25815092 of `r10zisk-rtp` (p10, p50, p90: 27-76 Msteps), on the mainnet guest | ties this box to zkvm-bench's mainnet fits |
 
 The L2 corpora come from `monad-zkvm-corpus-gen` (monad, `al/zkvm-l2`): the L2's own chain from
 genesis 0, 256 warm-up blocks, witnesses carrying only the ancestor headers their block reads. The
 ELFs are dev builds with the six levers the official profile forces, built with ZisK 1.3.1-alpha's
-own toolchain, the L2 ones with the L2's default of JUMPDESTs in software but for the third arm's;
-`inputs/provenance.txt` has their hashes.
+own toolchain, the L2 ones with the L2's default of JUMPDESTs in software but for the third arm's,
+and the fourth arm's with every Keccak-f in software; `inputs/provenance.txt` has their hashes.
 
 Each prove is timed on the client's wall clock around `cargo-zisk remote prove`, submission to
 proof on disk, against a warm worker: what a sequencer waiting on a proof would see. Setup runs
@@ -35,6 +36,7 @@ On the Mac, once (the corpora are already generated; see `prepare-inputs.py --he
 
 ```sh
 python3 prepare-inputs.py --elf-l2 <L2 ELF> --elf-control <control ELF> --elf-mainnet <mainnet ELF> \
+    [--elf-l2-precompile <L2 ELF, JUMPDEST precompile>] [--elf-l2-keccak-sw <L2 ELF, Keccak-f in software>] \
     --l2 <L2 corpora> --control <control corpora> \
     --mainnet <zkvm-bench>/guests/monad/gen/r10zisk-rtp-25815000-25815199-cb7b6b1ae/witnesses
 ZISK_PUBLICS_BIN=<zisk-publics built for glibc 2.35> bash make-bundle.sh
@@ -49,7 +51,7 @@ tar xzf l2-latency-bundle.tar.gz && bash zisk-infra/cluster/tests/l2-latency/run
 That is the one command. It detaches, prints the `tail -f` to follow it, installs ZisK
 1.3.1-alpha if the box does not have it (15-60 min, most of it the key's constant trees), and ends
 with `summary.md` printed and the run packed into `~/l2-latency-<stamp>.tar.gz`. A fresh 1-GPU box:
-about an hour of install, then roughly 30 min of proofs.
+about an hour of install, then roughly 40 min of proofs.
 
 Knobs: `PASSES=2`, `WARMUPS=1`, `GPU_SETS="1 all"` to time a one-GPU worker beside the all-GPU
 one, `ONLY=<regex on input ids>`.
@@ -58,7 +60,7 @@ one, `ONLY=<regex on input ids>`.
 
 | file | what |
 |---|---|
-| `summary.md` | the tables: seconds per block size on both arms, the fit `fixed + slope x Msteps` per arm, the presets, the mainnet blocks against zkvm-bench's 1.1 fit, the longest worker phases, and the sizing table at 50 TPS — for each block interval, the proof time, the provers it takes to keep up and the latency |
+| `summary.md` | the tables: seconds per block size on every arm, the fit `fixed + slope x Msteps` per arm, the presets, the mainnet blocks against zkvm-bench's 1.1 fit, the longest worker phases, and the sizing table at 50 TPS — for each block interval, the proof time, the provers it takes to keep up and the latency |
 | `stark-<set>/timings.csv` | every prove: pass, input, arm, seconds, return code |
 | `stark-<set>/phases.csv` | every `<<< PHASE (N ms)` span the worker logged during each prove |
 | `precheck.csv` | the ziskemu replay of every input before any proving |

@@ -94,44 +94,50 @@ for tdir in sorted(res.glob('stark-*')):
         return med.get(rid, math.nan)
 
     # the sweep, every arm side by side, one row per block size (medians over its blocks): the
-    # L2 as built by default (JUMPDEST in software), with the precompile if that arm was staged,
-    # and the plaintext control; ratios are block for block, then medians
+    # L2 as built by default (JUMPDEST in software), each optional arm that was staged -- the
+    # JUMPDEST precompile, Keccak-f in software -- and the plaintext control; ratios are block
+    # for block, then medians, each the lever's arm over the arm without it
     pairs = sorted({r['pair'] for r in INP.values() if r['set'] == 'sweep'})
     sizes = sorted({INP[f'l2-{q}']['label'] for q in pairs if f'l2-{q}' in INP})
-    pre = any(r['arm'] == 'l2-precompile' for r in INP.values())
+    staged = {r['arm'] for r in INP.values()}
+    # (arm, its seconds column, the ratio's numerator and denominator arms, the ratio's column)
+    extra = [e for e in (
+        ('l2-precompile', 'L2, precompile s', 'l2', 'l2-precompile', 'L2 / precompile'),
+        ('l2-keccak-sw', 'L2, Keccak-f sw s', 'l2-keccak-sw', 'l2', 'Keccak-f sw / L2'),
+    ) if e[0] in staged]
     md = lambda v: st.median(v) if v else math.nan
+    # an arm that did not prove a size (the Keccak-f arm stops at 250 tx) shows a dash
+    f2 = lambda x, spec='.2f': '–' if math.isnan(x) else format(x, spec)
 
     def ratio(qs, a, b):
         v = [sec(f'{a}-{q}') / sec(f'{b}-{q}') for q in qs]
         return md([x for x in v if not math.isnan(x)])
 
-    p('| tx / block | Msteps (L2) | L2 s |' + (' L2, precompile s |' if pre else '') +
-      ' control s |' + (' L2 / precompile |' if pre else '') + ' L2 / control |')
-    p('|---:|---:|---:|' + ('---:|' if pre else '') + '---:|' + ('---:|' if pre else '') + '---:|')
+    p('| tx / block | Msteps (L2) | L2 s |' + ''.join(f' {e[1]} |' for e in extra) +
+      ' control s |' + ''.join(f' {e[4]} |' for e in extra) + ' L2 / control |')
+    p('|---:|---:|---:|' + '---:|' * len(extra) + '---:|' + '---:|' * len(extra) + '---:|')
     for lab in sizes:
         qs = [q for q in pairs if f'l2-{q}' in INP and INP[f'l2-{q}']['label'] == lab]
         ms = st.median(int(INP[f'l2-{q}']['steps']) for q in qs) / 1e6
         col = lambda arm: md([s for s in (sec(f'{arm}-{q}') for q in qs) if not math.isnan(s)])
-        row = f"| {int(lab[1:])} | {ms:.2f} | {col('l2'):.2f} |"
-        if pre:
-            row += f" {col('l2-precompile'):.2f} |"
-        row += f" {col('control'):.2f} |"
-        if pre:
-            row += f" {ratio(qs, 'l2', 'l2-precompile'):.3f} |"
-        row += f" {ratio(qs, 'l2', 'control'):.3f} |"
+        row = f"| {int(lab[1:])} | {ms:.2f} | {f2(col('l2'))} |"
+        row += ''.join(f" {f2(col(e[0]))} |" for e in extra)
+        row += f" {f2(col('control'))} |"
+        row += ''.join(f" {f2(ratio(qs, e[2], e[3]), '.3f')} |" for e in extra)
+        row += f" {f2(ratio(qs, 'l2', 'control'), '.3f')} |"
         p(row)
     p('')
     pres = sorted({r['pair'] for r in INP.values() if r['set'] == 'preset'})
     if pres:
-        p('| preset block | tx | Msteps (L2) | L2 s |' + (' L2, precompile s |' if pre else '') +
+        p('| preset block | tx | Msteps (L2) | L2 s |' + ''.join(f' {e[1]} |' for e in extra) +
           ' control s |')
-        p('|---|---:|---:|---:|' + ('---:|' if pre else '') + '---:|')
+        p('|---|---:|---:|---:|' + '---:|' * len(extra) + '---:|')
         for q in pres:
             l2, ct = f'l2-{q}', f'control-{q}'
             if l2 in INP:
                 p(f"| {q[len('preset-'):]} | {INP[l2]['txs']} | {int(INP[l2]['steps'])/1e6:.2f} | "
-                  f"{sec(l2):.2f} |" + (f" {sec('l2-precompile-' + q):.2f} |" if pre else '') +
-                  f" {sec(ct):.2f} |")
+                  f"{f2(sec(l2))} |" + ''.join(f" {f2(sec(e[0] + '-' + q))} |" for e in extra) +
+                  f" {f2(sec(ct))} |")
         p('')
     mn = [r for r in INP.values() if r['arm'] == 'mainnet']
     if mn:
@@ -144,7 +150,7 @@ for tdir in sorted(res.glob('stark-*')):
 
     p('| arm | n | fixed s | s per Msteps | Msteps/s | R2 |')
     p('|---|---:|---:|---:|---:|---:|')
-    for arm in ('l2', 'l2-precompile', 'control', 'mainnet'):
+    for arm in ('l2', 'l2-precompile', 'l2-keccak-sw', 'control', 'mainnet'):
         xs, ys = [], []
         for rid, s in med.items():
             r = INP.get(rid)

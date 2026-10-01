@@ -3,12 +3,19 @@
 
     prepare-inputs.py --elf-l2 L2.elf --elf-control CONTROL.elf --elf-mainnet MAINNET.elf \\
         --l2 L2_CORPORA --control CONTROL_CORPORA --mainnet MAINNET_WITNESSES \\
-        [--elf-l2-precompile L2_PRECOMPILE.elf] \\
+        [--elf-l2-precompile L2_PRECOMPILE.elf] [--elf-l2-keccak-sw L2_KECCAK_SW.elf] \\
+        [--keccak-sw-max-tx 250] \\
         [--emu ~/.zisk/bin/ziskemu] [--presets 2] [--mainnet-blocks 25815195,25815036,25815092]
 
 --elf-l2-precompile adds a third arm: the L2's witnesses on an L2 guest built with
 MONAD_ZKVM_JUMPDEST_SOFTWARE=OFF, so that what the JUMPDEST precompile's instance costs a proof
 is measured block for block against the default, which analyses JUMPDESTs in software.
+
+--elf-l2-keccak-sw adds a fourth arm: the L2's witnesses of up to --keccak-sw-max-tx transactions
+on an L2 guest built with MONAD_ZKVM_KECCAKF_SOFTWARE=ON (and the memo off), which runs every
+Keccak-f in software so that the block plans no Keccakf instance. Its permutations land in Main
+and Binary instead, which a block of a hundred transactions already overflows: the larger blocks
+would only time that, so they are left out.
 
 L2_CORPORA and CONTROL_CORPORA are monad-zkvm-corpus-gen output directories from the same seeds,
 one per arm: a `sweep/` of block sizes and the preset corpora beside it, each with its
@@ -83,6 +90,9 @@ def main():
     ap.add_argument('--elf-control', required=True)
     ap.add_argument('--elf-mainnet', required=True)
     ap.add_argument('--elf-l2-precompile')
+    ap.add_argument('--elf-l2-keccak-sw')
+    ap.add_argument('--keccak-sw-max-tx', type=int, default=250,
+                    help='largest block the --elf-l2-keccak-sw arm proves')
     ap.add_argument('--source', default='', help='where the ELFs were built from, for provenance.txt')
     ap.add_argument('--l2', required=True)
     ap.add_argument('--control', required=True)
@@ -105,22 +115,29 @@ def main():
     given = [('l2', a.elf_l2), ('control', a.elf_control), ('mainnet', a.elf_mainnet)]
     if a.elf_l2_precompile:
         given.append(('l2-precompile', a.elf_l2_precompile))
+    if a.elf_l2_keccak_sw:
+        given.append(('l2-keccak-sw', a.elf_l2_keccak_sw))
     for arm, src in given:
         dst = inp / f'monad-{arm}.elf'
         shutil.copyfile(src, dst)
         elfs[arm] = dst
 
     rows = []
-    arms = [('l2', pathlib.Path(a.l2)), ('control', pathlib.Path(a.control))]
+    # (arm, corpora, largest block it proves)
+    arms = [('l2', pathlib.Path(a.l2), None), ('control', pathlib.Path(a.control), None)]
     if a.elf_l2_precompile:
-        arms.append(('l2-precompile', pathlib.Path(a.l2)))
-    for arm, root in arms:
+        arms.append(('l2-precompile', pathlib.Path(a.l2), None))
+    if a.elf_l2_keccak_sw:
+        arms.append(('l2-keccak-sw', pathlib.Path(a.l2), a.keccak_sw_max_tx))
+    for arm, root, max_tx in arms:
         for kind, label, m in manifests(root):
             picked = list(csv.DictReader(open(m)))
             picked.sort(key=lambda r: int(r['number']))
             if kind == 'preset':
                 picked = picked[:a.presets]
             for k, row in enumerate(picked, 1):
+                if max_tx is not None and int(row['txs']) > max_tx:
+                    continue
                 w = m.parent / f"{row['scenario']}-{int(row['number']):08d}.witness"
                 framed = frame(w.read_bytes())
                 expect = l2_expect(row)
