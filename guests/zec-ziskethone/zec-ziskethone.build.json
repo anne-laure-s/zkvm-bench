@@ -1,35 +1,32 @@
 {
   "commit": "f2616a77279abd3766db5f2e8513c3ea1e91aab0",
-  "distribution": {
-    "git_blob": "d993fb1ab66cb11712a48200cc834a2498f3d0ef",
-    "path": "bin/guests/stateless-validator-ziskethone/elf/zec-ziskethone.elf",
-    "repo": "https://github.com/0xPolygonHermez/zisk-eth-client",
-    "tags": [
-      "v0.13.0",
-      "v0.13.1"
-    ]
-  },
   "elf": "guests/zec-ziskethone/zec-ziskethone.elf",
-  "elf_sha256": "cf9f4e75152ada7c1cdd4965f16082eb777d876f7267c7255d7d8347a5713972",
+  "elf_sha256": "d223b73500292dd4bba817f69de2189d5e5a11752dfe1ed4c54a00ed21e4dcd6",
   "expect": {
-    "bytes": 1013104,
+    "bytes": 1016984,
     "dma_marker_sites_min": 100
   },
   "notes": [
-    "The ELF zisk-eth-client ships, not a local build: `git -C vendor/zisk-eth-client show <tag>:<distribution.path>` reproduces it byte for byte (distribution.git_blob) for both tags. v0.13.0 and v0.13.1 pin third_party/ziskethone at `commit` and ship the same bytes; they target zisk-sdk 1.3.0-alpha and 1.3.1-alpha, which are `runtimes`. run-r10.sh refuses a ZisK pin outside them.",
-    "Carries the DMA lowering: 7,660 `csrs 0x813` sites, against 7,784 in guests/ziskethone/ziskethone.elf and two in a stock-compiler fallback.",
-    "Reads the guests/ziskethone/fixtures/1-<block>.bin inputs unchanged: on the 200 blocks 25815000-25815199 its public output equals the corpus .blockhash reference every time under ziskemu 1.3.1-alpha. The compare axes keep the side name `ziskethone`, which is what locates those inputs."
+    "ziskethone `commit` built by zisk-eth-client's own driver at v0.13.0, the pin of that release's third_party/ziskethone: `git archive` of both, then the driver with ZISKETHONE_DIR, ZISK_TOOLCHAIN_PREFIX and ZISK_DMA_GCC_PREFIX set to the toolchain above. v0.13.1 has the same driver and the same pin; the two target zisk-sdk 1.3.0-alpha and 1.3.1-alpha, which are `runtimes`, and run-r10.sh refuses a ZisK pin outside them.",
+    "Byte-reproducible: the same procedure rebuilds guests/ziskethone/ziskethone.elf (39ad249e, ziskethone 2bb899a, driver c20fda3) byte for byte, and that ELF is also the one zisk-eth-client shipped at c20fda3.",
+    "NOT the ELF zisk-eth-client v0.13.0 and v0.13.1 ship (sha256 cf9f4e75152ada7c..., 1,013,104 B). That file is not a build of the commit both releases pin: it runs 0.55 % fewer steps over the 200 blocks 25815000-25815199 and is not reproduced by this procedure.",
+    "Reads the guests/ziskethone/fixtures/1-<block>.bin inputs unchanged: on the 200 blocks its public output equals the corpus .blockhash reference every time under ziskemu 1.3.1-alpha. Carries the DMA lowering (7,661 `csrs 0x813` sites) and Zba (815 `sh3add`). The compare axes keep the side name `ziskethone`, which locates those inputs."
   ],
-  "profile": "ziskethone-distributed",
+  "profile": "ziskethone-zec-driver",
   "runtimes": [
     "1.3.0-alpha",
     "1.3.1-alpha"
   ],
   "schema": 1,
   "source": {
+    "driver": "crates/clients/ziskethone/guest/build-elf.sh",
     "driver_commit": "74ba3134df4b417f1d332a0944360a9f88d0442a",
     "driver_repo": "vendor/zisk-eth-client",
     "driver_tag": "v0.13.0",
     "upstream_url": "https://github.com/0xPolygonHermez/ziskethone.git"
+  },
+  "toolchain": {
+    "dma_gcc": "zisk-dma-gcc-14.3.0",
+    "xpack": "xpack-riscv-none-elf-gcc-14.3.0-1"
   }
 }

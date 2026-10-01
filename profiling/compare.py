@@ -664,9 +664,9 @@ AXES = {
     # The branch stack rebased onto main, the one meant to be merged. Same shape as r10tip: the
     # `tip` field resolves the last OK row of its own index at run time, so the axis follows the
     # stack as branches are added on top and no sha is ever pinned by hand here.
-    # Both axes run-r10.sh drives compare against the ziskethone zisk-eth-client distributes for
-    # the ZisK release the series pins (guests/zec-ziskethone/zec-ziskethone.build.json); the side
-    # keeps the name `ziskethone`, which is what locates its inputs.
+    # Both axes run-r10.sh drives compare against ziskethone at the commit zisk-eth-client pins for
+    # the ZisK release the series pins, built by its driver (guests/zec-ziskethone/
+    # zec-ziskethone.build.json); the side keeps the name `ziskethone`, which locates its inputs.
     'r10zisk-tip-vs-ziskethone': {'ephemeral': 'al/zkvm-r10-zisk-* stack via r10-zisk-buildenv.tsv (official profile)',
              'backend': 'zisk', 'unit': 'steps',
              'a': {'name': 'monad-r10-zisk-tip', 'tip': 'profiling/series/r10-zisk-tip-index.tsv',

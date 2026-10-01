@@ -67,8 +67,8 @@ The required payload is currently about 2.7 GB: 200 Monad witnesses plus
 their post-state roots, and 200 ZisKethone inputs. `.expected_pv` files are
 optional and are not read by execution, profiling, the root gate or compare.
 The ZisKethone reference is tracked at `guests/zec-ziskethone/zec-ziskethone.elf`: ziskethone
-f2616a772 as zisk-eth-client v0.13.0 and v0.13.1 distribute it. Its build record lists the ZisK releases it
-is distributed for, and the preflight refuses a pin outside them.
+f2616a772, the commit zisk-eth-client v0.13.0 and v0.13.1 pin, built by their driver. Its build record
+lists the ZisK releases those versions target, and the preflight refuses a pin outside them.
 
 To make `--skip-build` fast on the first machine handoff, optionally copy
 `profiling/series/elf/`, `r10-index.tsv`, `r10-measure.tsv` and

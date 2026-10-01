@@ -211,8 +211,9 @@ SERIES_STOCK_TOOLCHAIN_DIR="${SERIES_STOCK_TOOLCHAIN_DIR:-$HOME/riscv_gcc_multil
 # indistinguishable from a source change. Override BOTH together to move the pin.
 SERIES_ZISK_DIR="${SERIES_ZISK_DIR:-$HOME/.zisk-1.3}"
 SERIES_ZISK_VERSION="${SERIES_ZISK_VERSION:-1.3.1-alpha}"
-# The ziskethone the compare measures against is built for a release too: zisk-eth-client distributes
-# it for named ZisK releases. Its record lists them, and the preflight refuses a pin outside them.
+# The ziskethone the compare measures against is built for a release too: the commit zisk-eth-client
+# pins for named ZisK releases, built by its driver. Its record lists them, and the preflight refuses
+# a pin outside them.
 ZEG_RECORD="$BENCH/guests/zec-ziskethone/zec-ziskethone.build.json"
 # One measurement cache per release, for every stage: profiling/cache.py keys on the ELF and not on the
 # emulator, so series-measure and compare.py must read and publish into the root of the pin -- the
@@ -303,7 +304,7 @@ if not os.path.isfile(elf):
 if hashlib.sha256(open(elf, "rb").read()).hexdigest() != rec.get("elf_sha256"):
     sys.exit(print(f"{rec.get('elf')} is not the ELF its record names (sha256 differs)"))
 if pin not in (rec.get("runtimes") or []):
-    print(f"the ziskethone reference is distributed for ZisK {', '.join(rec.get('runtimes') or ['?'])}, "
+    print(f"the ziskethone reference is built for ZisK {', '.join(rec.get('runtimes') or ['?'])}, "
           f"the pin is {pin}")
 PY
 )

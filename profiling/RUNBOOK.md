@@ -47,8 +47,8 @@ cargo build --release --no-default-features \
 cd ../../../profiling
 ```
 
-The ZisKethone reference ELF is tracked at `guests/zec-ziskethone/zec-ziskethone.elf`, as
-zisk-eth-client v0.13.0 and v0.13.1 distribute it. Monad ELFs and large
+The ZisKethone reference ELF is tracked at `guests/zec-ziskethone/zec-ziskethone.elf`: ziskethone
+f2616a772 built by zisk-eth-client v0.13.0's driver. Monad ELFs and large
 corpora are git-ignored. Copy them from the artifact host or generate them through
 [`infra/monad-witness/`](../infra/monad-witness/README.md).
 
