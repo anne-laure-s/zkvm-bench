@@ -14,12 +14,14 @@ block's content barely matters. This measures it instead of extrapolating it.
 | sweep | payouts' mix (transfers, a withdrawal in twenty) at 1, 10, 25, 50, 100, 250, 500, 1,000, 2,000 and 5,000 transactions, three blocks each | the shape of `secs(Msteps)`, from the fixed cost to the range zkvm-bench measured |
 | presets | two blocks each of `wholesale` (21 tx), `wholesale-cbdc` (21), `worker-payouts` (130), `payouts` (500) | the design document's mixes, token contracts included |
 | arms | every L2 block twice: the encrypting guest, and the same chain built with the plaintext cipher suite | what the encryption costs in time, block for block |
+| JUMPDEST | every L2 block a third time, on the encrypting guest built with the JUMPDEST precompile (`MONAD_ZKVM_JUMPDEST_SOFTWARE=OFF`) | what the precompile's instance costs a proof: an L2 build analyses JUMPDESTs in software by default, one instance fewer for about 9,600 more steps |
 | mainnet | blocks 25815195, 25815036 and 25815092 of `r10zisk-rtp` (p10, p50, p90: 27-76 Msteps), on the mainnet guest | ties this box to zkvm-bench's mainnet fits |
 
 The L2 corpora come from `monad-zkvm-corpus-gen` (monad, `al/zkvm-l2`): the L2's own chain from
 genesis 0, 256 warm-up blocks, witnesses carrying only the ancestor headers their block reads. The
 ELFs are dev builds with the six levers the official profile forces, built with ZisK 1.3.1-alpha's
-own toolchain; `inputs/provenance.txt` has their hashes.
+own toolchain, the L2 ones with the L2's default of JUMPDESTs in software but for the third arm's;
+`inputs/provenance.txt` has their hashes.
 
 Each prove is timed on the client's wall clock around `cargo-zisk remote prove`, submission to
 proof on disk, against a warm worker: what a sequencer waiting on a proof would see. Setup runs

@@ -93,30 +93,45 @@ for tdir in sorted(res.glob('stark-*')):
     def sec(rid):
         return med.get(rid, math.nan)
 
-    # the sweep, both arms side by side, one row per block size (medians over its blocks)
+    # the sweep, every arm side by side, one row per block size (medians over its blocks): the
+    # L2 as built by default (JUMPDEST in software), with the precompile if that arm was staged,
+    # and the plaintext control; ratios are block for block, then medians
     pairs = sorted({r['pair'] for r in INP.values() if r['set'] == 'sweep'})
     sizes = sorted({INP[f'l2-{q}']['label'] for q in pairs if f'l2-{q}' in INP})
-    p('| tx / block | Msteps (L2) | L2 s | control s | L2 / control |')
-    p('|---:|---:|---:|---:|---:|')
+    pre = any(r['arm'] == 'l2-precompile' for r in INP.values())
+    md = lambda v: st.median(v) if v else math.nan
+
+    def ratio(qs, a, b):
+        v = [sec(f'{a}-{q}') / sec(f'{b}-{q}') for q in qs]
+        return md([x for x in v if not math.isnan(x)])
+
+    p('| tx / block | Msteps (L2) | L2 s |' + (' L2, precompile s |' if pre else '') +
+      ' control s |' + (' L2 / precompile |' if pre else '') + ' L2 / control |')
+    p('|---:|---:|---:|' + ('---:|' if pre else '') + '---:|' + ('---:|' if pre else '') + '---:|')
     for lab in sizes:
         qs = [q for q in pairs if f'l2-{q}' in INP and INP[f'l2-{q}']['label'] == lab]
         ms = st.median(int(INP[f'l2-{q}']['steps']) for q in qs) / 1e6
-        l2s = [sec(f'l2-{q}') for q in qs if not math.isnan(sec(f'l2-{q}'))]
-        cts = [sec(f'control-{q}') for q in qs if not math.isnan(sec(f'control-{q}'))]
-        ratios = [sec(f'l2-{q}') / sec(f'control-{q}') for q in qs
-                  if not math.isnan(sec(f'l2-{q}') / sec(f'control-{q}'))]
-        md = lambda v: st.median(v) if v else math.nan
-        p(f"| {int(lab[1:])} | {ms:.2f} | {md(l2s):.2f} | {md(cts):.2f} | {md(ratios):.3f} |")
+        col = lambda arm: md([s for s in (sec(f'{arm}-{q}') for q in qs) if not math.isnan(s)])
+        row = f"| {int(lab[1:])} | {ms:.2f} | {col('l2'):.2f} |"
+        if pre:
+            row += f" {col('l2-precompile'):.2f} |"
+        row += f" {col('control'):.2f} |"
+        if pre:
+            row += f" {ratio(qs, 'l2', 'l2-precompile'):.3f} |"
+        row += f" {ratio(qs, 'l2', 'control'):.3f} |"
+        p(row)
     p('')
     pres = sorted({r['pair'] for r in INP.values() if r['set'] == 'preset'})
     if pres:
-        p('| preset block | tx | Msteps (L2) | L2 s | control s |')
-        p('|---|---:|---:|---:|---:|')
+        p('| preset block | tx | Msteps (L2) | L2 s |' + (' L2, precompile s |' if pre else '') +
+          ' control s |')
+        p('|---|---:|---:|---:|' + ('---:|' if pre else '') + '---:|')
         for q in pres:
             l2, ct = f'l2-{q}', f'control-{q}'
             if l2 in INP:
                 p(f"| {q[len('preset-'):]} | {INP[l2]['txs']} | {int(INP[l2]['steps'])/1e6:.2f} | "
-                  f"{sec(l2):.2f} | {sec(ct):.2f} |")
+                  f"{sec(l2):.2f} |" + (f" {sec('l2-precompile-' + q):.2f} |" if pre else '') +
+                  f" {sec(ct):.2f} |")
         p('')
     mn = [r for r in INP.values() if r['arm'] == 'mainnet']
     if mn:
@@ -129,7 +144,7 @@ for tdir in sorted(res.glob('stark-*')):
 
     p('| arm | n | fixed s | s per Msteps | Msteps/s | R2 |')
     p('|---|---:|---:|---:|---:|---:|')
-    for arm in ('l2', 'control', 'mainnet'):
+    for arm in ('l2', 'l2-precompile', 'control', 'mainnet'):
         xs, ys = [], []
         for rid, s in med.items():
             r = INP.get(rid)

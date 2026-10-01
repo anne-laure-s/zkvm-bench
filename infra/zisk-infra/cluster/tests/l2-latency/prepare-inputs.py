@@ -3,7 +3,12 @@
 
     prepare-inputs.py --elf-l2 L2.elf --elf-control CONTROL.elf --elf-mainnet MAINNET.elf \\
         --l2 L2_CORPORA --control CONTROL_CORPORA --mainnet MAINNET_WITNESSES \\
+        [--elf-l2-precompile L2_PRECOMPILE.elf] \\
         [--emu ~/.zisk/bin/ziskemu] [--presets 2] [--mainnet-blocks 25815195,25815036,25815092]
+
+--elf-l2-precompile adds a third arm: the L2's witnesses on an L2 guest built with
+MONAD_ZKVM_JUMPDEST_SOFTWARE=OFF, so that what the JUMPDEST precompile's instance costs a proof
+is measured block for block against the default, which analyses JUMPDESTs in software.
 
 L2_CORPORA and CONTROL_CORPORA are monad-zkvm-corpus-gen output directories from the same seeds,
 one per arm: a `sweep/` of block sizes and the preset corpora beside it, each with its
@@ -77,6 +82,8 @@ def main():
     ap.add_argument('--elf-l2', required=True)
     ap.add_argument('--elf-control', required=True)
     ap.add_argument('--elf-mainnet', required=True)
+    ap.add_argument('--elf-l2-precompile')
+    ap.add_argument('--source', default='', help='where the ELFs were built from, for provenance.txt')
     ap.add_argument('--l2', required=True)
     ap.add_argument('--control', required=True)
     ap.add_argument('--mainnet', required=True)
@@ -95,13 +102,19 @@ def main():
         shutil.rmtree(inp)
     (inp / 'bins').mkdir(parents=True)
     elfs = {}
-    for arm, src in (('l2', a.elf_l2), ('control', a.elf_control), ('mainnet', a.elf_mainnet)):
+    given = [('l2', a.elf_l2), ('control', a.elf_control), ('mainnet', a.elf_mainnet)]
+    if a.elf_l2_precompile:
+        given.append(('l2-precompile', a.elf_l2_precompile))
+    for arm, src in given:
         dst = inp / f'monad-{arm}.elf'
         shutil.copyfile(src, dst)
         elfs[arm] = dst
 
     rows = []
-    for arm, root in (('l2', pathlib.Path(a.l2)), ('control', pathlib.Path(a.control))):
+    arms = [('l2', pathlib.Path(a.l2)), ('control', pathlib.Path(a.control))]
+    if a.elf_l2_precompile:
+        arms.append(('l2-precompile', pathlib.Path(a.l2)))
+    for arm, root in arms:
         for kind, label, m in manifests(root):
             picked = list(csv.DictReader(open(m)))
             picked.sort(key=lambda r: int(r['number']))
@@ -141,6 +154,8 @@ def main():
         w.writerows(rows)
     with open(inp / 'provenance.txt', 'w') as f:
         f.write(f'ziskemu      {v.strip()}\n')
+        if a.source:
+            f.write(f'source       {a.source}\n')
         for arm, p in elfs.items():
             f.write(f'{p.name:22} sha256 {hashlib.sha256(p.read_bytes()).hexdigest()}\n')
         f.write(f'l2 corpora   {a.l2}\ncontrol      {a.control}\nmainnet      {a.mainnet}\n')
