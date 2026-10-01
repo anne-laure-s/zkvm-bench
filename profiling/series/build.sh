@@ -74,11 +74,22 @@ LOG=$(mktemp); trap 'rm -f "$LOG"' EXIT
 # `|| rc=$?` and not a bare call: under set -e a failing build would kill the
 # script before the diagnostic below could print, so the failure would be silent.
 rc=0
-# Overridable for the same reason MONAD and RISCV_TOOLCHAIN_DIR are: the guest LINKS this
-# install's libziskclib.a, so the ZisK release is a build input like the compiler. Two
-# installs live side by side here (~/.zisk = 1.1.0-alpha, ~/.zisk-1.2 = 1.2.0-alpha) and a
+# Overridable for the same reason MONAD and RISCV_TOOLCHAIN_DIR are: the ZisK release is a build
+# input like the compiler -- its Rust toolchain compiles the guest and its std, and its cargo-zisk
+# writes the linker script. Several installs live side by side here, one per release, and a
 # hardcoded path makes a runtime A/B indistinguishable from a source change in the ELF.
 ZISK_DIR="${ZISK_DIR:-$HOME/.zisk}"
+# Naming the binary does not select the install. ZisK's tools find their toolchain and libraries
+# through ZISK_HOME, which is ~/.zisk whatever directory cargo-zisk runs from, and `cargo +zisk` is
+# rustup's one global link. Both are pointed at ZISK_DIR here; otherwise a build under any other pin
+# compiles with whatever ~/.zisk holds.
+export ZISK_HOME="$ZISK_DIR"
+_tc=("$ZISK_DIR"/toolchains/*/)
+if [ "${#_tc[@]}" -ne 1 ] || [ ! -x "${_tc[0]}bin/rustc" ]; then
+    echo "error: no single Rust toolchain under $ZISK_DIR/toolchains" >&2
+    exit 2
+fi
+export RUSTUP_TOOLCHAIN="${_tc[0]%/}"
 
 # ── ZISK_INCREMENTAL: bypass cargo-zisk's random linker-script path ──────────────────────────────
 # `cargo-zisk build` writes its linker script to a fresh mktemp file on every invocation and passes
@@ -89,7 +100,9 @@ ZISK_DIR="${ZISK_DIR:-$HOME/.zisk}"
 # The script itself is deterministic -- 5468 bytes, byte-identical across runs -- so the fix is to
 # keep one copy at a stable path and run the cargo command cargo-zisk would have run:
 #
-#     cargo +zisk build --target-dir target/elf --release --target riscv64ima-zisk-zkvm-elf
+#     cargo build --target-dir target/elf --release --target riscv64ima-zisk-zkvm-elf
+#
+# with RUSTUP_TOOLCHAIN naming ZISK_DIR's toolchain, as above.
 #
 # Off by default: this reproduces by hand what their tool does, so it can drift from a future ZisK
 # release. The guard against that drift is the ELF itself -- the caller compares its sha to a
@@ -125,7 +138,7 @@ if [ "${ZISK_INCREMENTAL:-0}" = 1 ] && _ld=$(zisk_stable_ld); then
     # `--cfg` to its value with a space hands rustc one unrecognised option called `cfg zisk_guest`.
     export CARGO_ENCODED_RUSTFLAGS=$(printf '%s\037%s\037%s\037%s' \
         '--cfg' 'zisk_guest' '-C' "link-arg=-T$_ld")
-    cargo +zisk build --target-dir target/elf --release \
+    cargo build --target-dir target/elf --release \
         --target riscv64ima-zisk-zkvm-elf > "$LOG" 2>&1 || rc=$?
 else
     "$ZISK_DIR/bin/cargo-zisk" build --release > "$LOG" 2>&1 || rc=$?

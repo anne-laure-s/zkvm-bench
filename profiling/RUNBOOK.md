@@ -34,10 +34,10 @@ workflow before any expensive work.
 Install the runners from the repository root:
 
 ```bash
-# ZisK: the r10 campaign is pinned to 1.1.0-alpha
+# ZisK: the r10 campaign is pinned to 1.3.1-alpha, in a directory of its own
 curl https://raw.githubusercontent.com/0xPolygonHermez/zisk/main/ziskup/install.sh | bash
-~/.zisk/bin/ziskup --version 1.1.0-alpha --nokey -y
-~/.zisk/bin/ziskemu --version
+~/.zisk/bin/ziskup --prefix ~/.zisk-1.3 --version 1.3.1-alpha --nokey -y
+~/.zisk-1.3/bin/ziskemu --version
 
 # SP1: normal and profiling builds are distinct
 cd infra/sp1-infra/sp1-runner
@@ -47,7 +47,8 @@ cargo build --release --no-default-features \
 cd ../../../profiling
 ```
 
-The ZisKethone reference ELF is tracked at `guests/ziskethone/ziskethone.elf`. Monad ELFs and large
+The ZisKethone reference ELF is tracked at `guests/zec-ziskethone/zec-ziskethone.elf`, as
+zisk-eth-client v0.13.0 and v0.13.1 distribute it. Monad ELFs and large
 corpora are git-ignored. Copy them from the artifact host or generate them through
 [`infra/monad-witness/`](../infra/monad-witness/README.md).
 

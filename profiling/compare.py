@@ -664,13 +664,16 @@ AXES = {
     # The branch stack rebased onto main, the one meant to be merged. Same shape as r10tip: the
     # `tip` field resolves the last OK row of its own index at run time, so the axis follows the
     # stack as branches are added on top and no sha is ever pinned by hand here.
+    # Both axes run-r10.sh drives compare against the ziskethone zisk-eth-client distributes for
+    # the ZisK release the series pins (guests/zec-ziskethone/zec-ziskethone.build.json); the side
+    # keeps the name `ziskethone`, which is what locates its inputs.
     'r10zisk-tip-vs-ziskethone': {'ephemeral': 'al/zkvm-r10-zisk-* stack via r10-zisk-buildenv.tsv (official profile)',
              'backend': 'zisk', 'unit': 'steps',
              'a': {'name': 'monad-r10-zisk-tip', 'tip': 'profiling/series/r10-zisk-tip-index.tsv',
                    'requires_env': 'MONAD_ZKVM_OFFICIAL_PROFILE=ON',
                    'elf': 'profiling/series/elf/429ee5c233520b73.elf',
                    'src': 'monad'},
-             'b': {'name': 'ziskethone', 'elf': 'vendor/zisk-eth-client/bin/guests/stateless-validator-ziskethone/elf/zec-ziskethone.elf',
+             'b': {'name': 'ziskethone', 'elf': 'guests/zec-ziskethone/zec-ziskethone.elf',
                    'src': 'bin'}},
     'r10tip-vs-ziskethone': {'ephemeral': 'al/zkvm-r10 tip via r10-buildenv.tsv (official profile)',
              'backend': 'zisk', 'unit': 'steps',
@@ -678,7 +681,7 @@ AXES = {
                    'requires_env': 'MONAD_ZKVM_OFFICIAL_PROFILE=ON',
                    'elf': 'profiling/series/elf/148f53c42c04310a.elf',
                    'src': 'monad'},
-             'b': {'name': 'ziskethone', 'elf': 'guests/ziskethone/ziskethone.elf',
+             'b': {'name': 'ziskethone', 'elf': 'guests/zec-ziskethone/zec-ziskethone.elf',
                    'src': 'bin'}},
 }
 # The default run is the shipped guest only: adding the levers axes must not silently change what

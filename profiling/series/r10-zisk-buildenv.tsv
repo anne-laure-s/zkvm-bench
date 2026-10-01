@@ -1,2 +1,2 @@
 @after:subject	zkvm: precompile golden-vector test harness	RISCV_TOOLCHAIN_DIR={toolchain}
-@from:subject	zkvm: start an audited ZisK 1.2 build profile	RISCV_TOOLCHAIN_DIR={toolchain}	MONAD_ZKVM_OFFICIAL_PROFILE=ON	MONAD_ZKVM_GIT_COMMIT={commit}
+@from:subject	zkvm: start an audited ZisK	RISCV_TOOLCHAIN_DIR={toolchain}	MONAD_ZKVM_OFFICIAL_PROFILE=ON	MONAD_ZKVM_GIT_COMMIT={commit}

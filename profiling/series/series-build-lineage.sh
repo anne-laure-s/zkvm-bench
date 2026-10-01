@@ -64,6 +64,15 @@ SEED_INDEX="${SEED_INDEX:-}"
 ONLY_TIP="${ONLY_TIP:-0}"
 SERIES_TOOLCHAIN_DIR="${SERIES_TOOLCHAIN_DIR:-${RISCV_TOOLCHAIN_DIR:-$HOME/.local/xPacks/zisk-dma-gcc-15.2.0}}"
 SERIES_STOCK_TOOLCHAIN_DIR="${SERIES_STOCK_TOOLCHAIN_DIR:-$HOME/riscv_gcc_multilib}"
+# The ZisK release build.sh builds with (ZISK_DIR, as it resolves it), version and revision. It is a
+# build input no sidecar row names, so it joins every commit's recorded recipe below: a row built
+# under another release then fails the recipe comparison and is rebuilt, never reused.
+ZISK_RELEASE=$("${ZISK_DIR:-$HOME/.zisk}/bin/cargo-zisk" --version 2>/dev/null \
+               | awk '{gsub(/[()]/, "", $4); print $2 "@" $4}')
+case "$ZISK_RELEASE" in
+  [0-9]*@?*) ;;
+  *) echo "cannot read the ZisK release of ${ZISK_DIR:-$HOME/.zisk}/bin/cargo-zisk" >&2; exit 2 ;;
+esac
 mkdir -p "$HERE/elf" "$(dirname "$INDEX")"
 # A checkpoint is cache, not published provenance. Keep it beside the ignored
 # ELFs rather than next to the tracked/final index, so an interrupted run does
@@ -212,6 +221,7 @@ for c in $COMMITS; do
   if [ "${#benv[@]}" -eq 0 ]; then
       benv=("RISCV_TOOLCHAIN_DIR=$SERIES_STOCK_TOOLCHAIN_DIR")
   fi
+  benv+=("ZISK_RELEASE=$ZISK_RELEASE")
   expected_env="${benv[*]-}"
   # Every recorded build of this commit, the seed's first. One counts only if its ELF is still the file
   # it names and was built from the recipe this commit resolves to now; the first that does is used.

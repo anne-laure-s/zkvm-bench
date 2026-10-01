@@ -7,13 +7,15 @@ This is the shortest supported path to `profiling/results/compare.html` and
 
 ```bash
 curl https://raw.githubusercontent.com/0xPolygonHermez/zisk/main/ziskup/install.sh | bash
-~/.zisk/bin/ziskup --version 1.1.0-alpha --nokey -y
-~/.zisk/bin/ziskemu --version
-~/.zisk/bin/cargo-zisk --version
+~/.zisk/bin/ziskup --prefix ~/.zisk-1.3 --version 1.3.1-alpha --nokey -y
+~/.zisk-1.3/bin/ziskemu --version
+~/.zisk-1.3/bin/cargo-zisk --version
 ```
 
-The campaign is pinned to ZisK `1.1.0-alpha`; the preflight rejects a different
-emulator or builder rather than mixing runtime-dependent measurements.
+The campaign is pinned to ZisK `1.3.1-alpha` in `~/.zisk-1.3` (`SERIES_ZISK_DIR` and
+`SERIES_ZISK_VERSION` move it); the preflight rejects a different emulator or builder rather
+than mixing runtime-dependent measurements. The build takes its Rust toolchain from that
+directory, not from rustup's global `zisk` link.
 
 Monad's official profile needs the patched GCC 15.2.0 installed by
 `profiling/experiments/zisk-dma-gcc15/build-gcc15.sh`. Its default output is:
@@ -64,7 +66,9 @@ guests/monad/use-gen zkvm-r8-canonical-25815000-25815199-0df7094a1
 The required payload is currently about 2.7 GB: 200 Monad witnesses plus
 their post-state roots, and 200 ZisKethone inputs. `.expected_pv` files are
 optional and are not read by execution, profiling, the root gate or compare.
-The ZisKethone ELF is tracked at `guests/ziskethone/ziskethone.elf`.
+The ZisKethone reference is tracked at `guests/zec-ziskethone/zec-ziskethone.elf`: ziskethone
+f2616a772 as zisk-eth-client v0.13.0 and v0.13.1 distribute it. Its build record lists the ZisK releases it
+is distributed for, and the preflight refuses a pin outside them.
 
 To make `--skip-build` fast on the first machine handoff, optionally copy
 `profiling/series/elf/`, `r10-index.tsv`, `r10-measure.tsv` and

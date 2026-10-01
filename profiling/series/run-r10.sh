@@ -200,16 +200,24 @@ SERIES_STOCK_TOOLCHAIN_DIR="${SERIES_STOCK_TOOLCHAIN_DIR:-$HOME/riscv_gcc_multil
 
 # ── The ZisK release, pinned here and forced into every stage ────────────────────────────────────
 # It is TWO inputs at once, and both have to move together or the run is incoherent:
-#   BUILD       the guest links this install's libziskclib.a, so the release is a build input like
-#               the compiler. Measured at commit 08735d46e: the 1.2 SDK build runs +2.89 % steps
-#               and +1.66 % COST against the 1.1 SDK build of the same source.
+#   BUILD       its Rust toolchain compiles the guest and its std, and its cargo-zisk writes the
+#               linker script; build.sh takes both from ZISK_DIR. Measured at commit 08735d46e: the
+#               1.2 SDK build runs +2.89 % steps and +1.66 % COST against the 1.1 SDK build of the
+#               same source.
 #   MEASUREMENT ziskemu's cost model. 1.2.0-alpha prices a keccak permutation at 25x1538 where
 #               1.1.0-alpha charged 25x3022 -- every other category is unchanged to the byte -- so
 #               the same ELF reports ~20 % less COST under it.
 # Pinned rather than "whatever is on PATH" for the reason the compiler is: a runtime A/B must not be
 # indistinguishable from a source change. Override BOTH together to move the pin.
-SERIES_ZISK_DIR="${SERIES_ZISK_DIR:-$HOME/.zisk-1.2}"
-SERIES_ZISK_VERSION="${SERIES_ZISK_VERSION:-1.2.0-alpha}"
+SERIES_ZISK_DIR="${SERIES_ZISK_DIR:-$HOME/.zisk-1.3}"
+SERIES_ZISK_VERSION="${SERIES_ZISK_VERSION:-1.3.1-alpha}"
+# The ziskethone the compare measures against is built for a release too: zisk-eth-client distributes
+# it for named ZisK releases. Its record lists them, and the preflight refuses a pin outside them.
+ZEG_RECORD="$BENCH/guests/zec-ziskethone/zec-ziskethone.build.json"
+# One measurement cache per release, for every stage: profiling/cache.py keys on the ELF and not on the
+# emulator, so series-measure and compare.py must read and publish into the root of the pin -- the
+# shared default root holds rows priced by earlier releases.
+export COMPARE_CACHE_ROOT="${COMPARE_CACHE_ROOT:-$BENCH/profiling/cache-zisk-$SERIES_ZISK_VERSION}"
 # The names the stages read: build.sh takes ZISK_DIR, gate-roots*.sh and series-measure.sh take EMU.
 ZISK_DIR="$SERIES_ZISK_DIR"
 EMU="$SERIES_ZISK_DIR/bin/ziskemu"
@@ -280,8 +288,26 @@ preflight() {
       *) preflight_error "stock compiler at $SERIES_STOCK_TOOLCHAIN_DIR is not GCC 15.2.0" ;;
     esac
   fi
-  [ -f "$BENCH/guests/ziskethone/ziskethone.elf" ] || \
-    preflight_error "missing tracked reference ELF guests/ziskethone/ziskethone.elf"
+  # Pinned by content and by release: an ELF other than the recorded one, or one built for another
+  # ZisK, would compare the pinned guest against something else under the same label.
+  zeg_check=$(python3 - "$ZEG_RECORD" "$BENCH" "$SERIES_ZISK_VERSION" <<'PY'
+import hashlib, json, os, sys
+record, bench, pin = sys.argv[1:4]
+try:
+    rec = json.load(open(record))
+except (OSError, ValueError) as e:
+    sys.exit(print(f"cannot read the ziskethone record {record}: {e}"))
+elf = os.path.join(bench, rec.get("elf") or "")
+if not os.path.isfile(elf):
+    sys.exit(print(f"missing ziskethone reference ELF {rec.get('elf')}"))
+if hashlib.sha256(open(elf, "rb").read()).hexdigest() != rec.get("elf_sha256"):
+    sys.exit(print(f"{rec.get('elf')} is not the ELF its record names (sha256 differs)"))
+if pin not in (rec.get("runtimes") or []):
+    print(f"the ziskethone reference is distributed for ZisK {', '.join(rec.get('runtimes') or ['?'])}, "
+          f"the pin is {pin}")
+PY
+)
+  [ -z "$zeg_check" ] || preflight_error "$zeg_check"
 
   missing_zeg=0; first_missing_zeg=""; block=25815000
   while [ "$block" -le 25815199 ]; do
@@ -357,6 +383,15 @@ expected ${LINEAGE_GEN_DIGEST:0:16}…)"
       _rb=$( cd "$MONAD_TREE" && resolve_ref "${_fork:-$LINEAGE_BASE}..$TARGET_COMMIT" "$LINEAGE_BASE" 2>&1 ) \
         && LINEAGE_BASE="$_rb" \
         || preflight_error "lineage base does not resolve: $_rb"
+    fi
+    # The official profile signs the ZisK release its source declares into the ELF. A tip declaring
+    # another release than the pin still builds -- the toolchain is the pin's -- and would sign a
+    # runtime it was not built with.
+    if [ -n "${TARGET_COMMIT:-}" ]; then
+      _rt=$(git -C "$MONAD_TREE" show "$TARGET_COMMIT:zkvm/guest/CMakeLists.txt" 2>/dev/null \
+            | sed -n 's/.*set(_monad_zkvm_runtime_version "\([^"]*\)").*/\1/p' | head -1)
+      [ -z "$_rt" ] || [ "$_rt" = "$SERIES_ZISK_VERSION" ] || preflight_error \
+        "$LINEAGE_BRANCH declares ZisK $_rt in its official profile (zkvm/guest/CMakeLists.txt), the pin is $SERIES_ZISK_VERSION"
     fi
     git -C "$MONAD_TREE" cat-file -e "$LINEAGE_BASE^{commit}" 2>/dev/null || \
       preflight_error "lineage base $LINEAGE_BASE is absent from $MONAD_TREE"
@@ -626,11 +661,8 @@ print((m.resolve_tip('profiling/series/' + '$LINEAGE' + '-tip-index.tsv', 'MONAD
 [ "$RESOLVED" = "$TIP" ] || { echo "TIP MISMATCH: driver says $TIP, compare.py resolves $RESOLVED"; exit 1; }
 echo "--- axis follows the index, resolved $RESOLVED"
 
-# A cache root per runtime, because compare.py keys its cache on (ELF content, block, name, input)
-# and NOT on the emulator: pointing --emu at another release against the shared root would serve the
-# previous release's numbers without a word. Same reason the tables carry a stamp.
+# compare.py reads and publishes into COMPARE_CACHE_ROOT, the pin's root (set beside the pin).
 (cd "$BENCH/profiling" && \
-  COMPARE_CACHE_ROOT="${COMPARE_CACHE_ROOT:-$BENCH/profiling/cache-zisk-$SERIES_ZISK_VERSION}" \
   python3 compare.py --axis "$LINEAGE_AXIS" \
     --emu "$EMU" --cost-jobs "$MEASURE_JOBS" \
     --block-min 25815000 --block-max 25815199 --families 12 --html "$LINEAGE_COMPARE_OUT") \

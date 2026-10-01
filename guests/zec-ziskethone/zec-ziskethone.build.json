@@ -1,0 +1,35 @@
+{
+  "commit": "f2616a77279abd3766db5f2e8513c3ea1e91aab0",
+  "distribution": {
+    "git_blob": "d993fb1ab66cb11712a48200cc834a2498f3d0ef",
+    "path": "bin/guests/stateless-validator-ziskethone/elf/zec-ziskethone.elf",
+    "repo": "https://github.com/0xPolygonHermez/zisk-eth-client",
+    "tags": [
+      "v0.13.0",
+      "v0.13.1"
+    ]
+  },
+  "elf": "guests/zec-ziskethone/zec-ziskethone.elf",
+  "elf_sha256": "cf9f4e75152ada7c1cdd4965f16082eb777d876f7267c7255d7d8347a5713972",
+  "expect": {
+    "bytes": 1013104,
+    "dma_marker_sites_min": 100
+  },
+  "notes": [
+    "The ELF zisk-eth-client ships, not a local build: `git -C vendor/zisk-eth-client show <tag>:<distribution.path>` reproduces it byte for byte (distribution.git_blob) for both tags. v0.13.0 and v0.13.1 pin third_party/ziskethone at `commit` and ship the same bytes; they target zisk-sdk 1.3.0-alpha and 1.3.1-alpha, which are `runtimes`. run-r10.sh refuses a ZisK pin outside them.",
+    "Carries the DMA lowering: 7,660 `csrs 0x813` sites, against 7,784 in guests/ziskethone/ziskethone.elf and two in a stock-compiler fallback.",
+    "Reads the guests/ziskethone/fixtures/1-<block>.bin inputs unchanged: on the 200 blocks 25815000-25815199 its public output equals the corpus .blockhash reference every time under ziskemu 1.3.1-alpha. The compare axes keep the side name `ziskethone`, which is what locates those inputs."
+  ],
+  "profile": "ziskethone-distributed",
+  "runtimes": [
+    "1.3.0-alpha",
+    "1.3.1-alpha"
+  ],
+  "schema": 1,
+  "source": {
+    "driver_commit": "74ba3134df4b417f1d332a0944360a9f88d0442a",
+    "driver_repo": "vendor/zisk-eth-client",
+    "driver_tag": "v0.13.0",
+    "upstream_url": "https://github.com/0xPolygonHermez/ziskethone.git"
+  }
+}
