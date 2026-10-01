@@ -30,7 +30,8 @@
 #                              # and takes well under a second; it measures no d2h itself, it prints
 #                              # the one command that does.
 #
-# Env: MIN_KEY_GB=5 (absent-extraction floor only) · REG_TIMEOUT=600 · VRAM_FLOOR_MIB=15000 · API_PORT=7000
+# Env: ZISK_VER=1.3.1-alpha (the release to run; another one installed counts as missing)
+#      MIN_KEY_GB=5 (absent-extraction floor only) · REG_TIMEOUT=600 · VRAM_FLOOR_MIB=15000 · API_PORT=7000
 #      SKIP_TOPO=1 to skip the pre-install d2h gate · FORCE_INSTALL=1 to install past a bad verdict
 #      (the gate only runs when an install is needed, i.e. on a fresh box)
 set -uo pipefail
@@ -101,11 +102,17 @@ reg_count() { local n
 
 say "state"
 HAVE_ZISKUP=0; command -v cargo-zisk >/dev/null 2>&1 && HAVE_ZISKUP=1
+# The release, read back from the binary. Another one than ZISK_VER is not a cluster to reuse: a
+# proving key and a worker from 1.1 prove nothing a 1.3.1 guest asks for. Exported so the install
+# below fetches the one asked for.
+export ZISK_VER="${ZISK_VER:-1.3.1-alpha}"
+HAVE_VER=""; [ "$HAVE_ZISKUP" = 1 ] && HAVE_VER="$(cargo-zisk --version 2>/dev/null | awk '{print $2}')"
+VER_OK=1; [ "$HAVE_ZISKUP" = 1 ] && [ "$HAVE_VER" != "$ZISK_VER" ] && VER_OK=0
 KGB="$(key_gb)"; VRAM="$(vram_mib)"; REG="$(reg_count)"
 COORD_UP=0; port_held "$API_PORT" && COORD_UP=1
 PROCS=0; procs_up && PROCS=1
-printf '   ziskup:%s  key:%s GB  port %s:%s  daemons:%s  VRAM:%s MiB  registrations:%s\n' \
-  "$(yes_no "$HAVE_ZISKUP")" "$KGB" "$API_PORT" \
+printf '   ziskup:%s (%s, want %s)  key:%s GB  port %s:%s  daemons:%s  VRAM:%s MiB  registrations:%s\n' \
+  "$(yes_no "$HAVE_ZISKUP")" "${HAVE_VER:-none}" "$ZISK_VER" "$KGB" "$API_PORT" \
   "$(port_word "$COORD_UP")" "$(yes_no "$PROCS")" "$VRAM" "$REG"
 
 # Healthy means port, registration and card all agree. Any two out of three is a broken state, not a
@@ -115,7 +122,7 @@ printf '   ziskup:%s  key:%s GB  port %s:%s  daemons:%s  VRAM:%s MiB  registrati
 # The cost of being wrong (a genuinely-up cluster whose log was rotated by something else) is one
 # restart, ~2 min.
 HEALTHY=0
-[ "$COORD_UP" = 1 ] && [ "$REG" -ge 1 ] && [ "$VRAM" -ge "$VRAM_FLOOR_MIB" ] && HEALTHY=1
+[ "$COORD_UP" = 1 ] && [ "$REG" -ge 1 ] && [ "$VRAM" -ge "$VRAM_FLOOR_MIB" ] && [ "$VER_OK" = 1 ] && HEALTHY=1
 
 if [ "$HEALTHY" = 1 ] && [ "${FORCE_RESTART:-0}" != 1 ]; then
   say "cluster already healthy — nothing to do"
@@ -131,6 +138,7 @@ fi
 # let it run rather than dying with advice to run the very script this one exists to drive.
 NEED_INSTALL=0; WHY=""
 [ "$HAVE_ZISKUP" = 1 ] || { NEED_INSTALL=1; WHY="no cargo-zisk"; }
+[ "$VER_OK" = 1 ] || { NEED_INSTALL=1; WHY="cargo-zisk ${HAVE_VER:-?}, want $ZISK_VER"; }
 # Exclusive on purpose: an absent key also measures 0 GB, and reporting both reads as two faults.
 if [ ! -d "$KEY" ]; then
   NEED_INSTALL=1; WHY="${WHY:+$WHY, }no key at $KEY"

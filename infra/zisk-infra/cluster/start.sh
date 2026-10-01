@@ -19,7 +19,7 @@
 #     NO_MPI=1                      force single-process (redundant now; overrides USE_MPI)
 #     WORKER_BACKEND=asm|emulator   witness backend (default asm; reth needs asm)
 #     PROVING_KEY=<folder>          default ~/.zisk/provingKey
-#     COMPUTE_CAPACITY / MAX_STREAMS / API_PORT / CLUSTER_PORT / METRICS_PORT
+#     COMPUTE_CAPACITY / MAX_STREAMS / MAX_RECURSIVE_STREAMS / API_PORT / CLUSTER_PORT / METRICS_PORT
 set -uo pipefail
 cd "$(dirname "$0")"
 mkdir -p run logs
@@ -64,7 +64,11 @@ fi
 # one that registered fine after, against the same coordinator. That was a hand-started worker grafted onto a
 # 2-hour-old coordinator holding the previous worker's setup; `stop.sh` + `start.sh` as a pair, then the
 # per-ELF `remote setup`, is what fixed it. COORDINATOR_HOST overrides for a split deployment.
-wargs=(--coordinator-url "http://${COORDINATOR_HOST:-127.0.0.1}:$CLUSTER_PORT" --proving-key "$PROVING_KEY" --gpu)
+wargs=(--coordinator-url "http://${COORDINATOR_HOST:-127.0.0.1}:$CLUSTER_PORT" --proving-key "$PROVING_KEY")
+# --gpu exists only on the GPU build (1.3.1-alpha's has it). Captured, then tested: a --help that
+# exits non-zero would otherwise read as "no --gpu" and leave the worker proving on the CPU.
+WORKER_HELP="$("$WORKER_BIN" --help 2>&1 || true)"
+case "$WORKER_HELP" in *--gpu*) wargs+=(--gpu) ;; *) echo "WARN: $WORKER_BIN has no --gpu (CPU build?)" >&2 ;; esac
 if [[ "$WORKER_BACKEND" == asm ]]; then
   # asm is the DEFAULT backend (selected simply by NOT passing --emulator; see
   # worker cli/main.rs). `--asm <path>` is OPTIONAL and is NOT used to locate the ROM
@@ -89,6 +93,7 @@ else
   wargs+=(--emulator)
 fi
 [[ -n "${MAX_STREAMS:-}" ]]      && wargs+=(--max-streams "$MAX_STREAMS")
+[[ -n "${MAX_RECURSIVE_STREAMS:-}" ]] && wargs+=(--max-recursive-streams "$MAX_RECURSIVE_STREAMS")
 [[ -n "${COMPUTE_CAPACITY:-}" ]] && wargs+=(--compute-capacity "$COMPUTE_CAPACITY")
 
 # ── worker launch: single-process (ALL GPUs) by DEFAULT; MPI only if USE_MPI=1 ─

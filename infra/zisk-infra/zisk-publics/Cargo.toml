@@ -9,7 +9,9 @@ edition = "2021"
 # reads them back. Same version as the prover's toolchain — a proof is only readable by the release that
 # wrote it.
 [dependencies]
-zisk-sdk = "1.1.0-alpha"
+# cpu-only: loading and verifying a proof needs no GPU, and without the feature the build wants the
+# CUDA toolkit, which a box running ziskup's prebuilt worker does not need to have.
+zisk-sdk = { version = "1.3.1-alpha", features = ["cpu-only"] }
 
 [[bin]]
 name = "zisk-publics"

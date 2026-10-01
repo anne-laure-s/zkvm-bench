@@ -97,9 +97,11 @@ command -v rustup >/dev/null 2>&1 || { echo "ERROR: rustup install failed" >&2; 
 
 # The version is PINNED: ziskup defaults to "latest", which moves binaries, proving key
 # and const-trees under a plain re-run — and the version decides whether the worker needs
-# the count_and_plan patch (see below) and which key tarball is fetched. Override with
-# ZISK_VER=<x.y.z> to install another release (e.g. 1.0.0-alpha to reproduce results/).
-ZISK_VER="${ZISK_VER:-1.1.0-alpha}"
+# the count_and_plan patch (see below) and which key tarball is fetched. 1.3.1-alpha is what
+# the guests are built against (monad's zkvm/zisk/Cargo.lock pins it). Override with
+# ZISK_VER=<x.y.z> to install another release: 1.1.0-alpha reproduces tests/r8 and
+# tests/paired, 1.0.0-alpha results/.
+ZISK_VER="${ZISK_VER:-1.3.1-alpha}"
 
 # In RAM-key mode, ziskup installs binaries only (--nokey); we fetch the key to RAM below.
 ZK="${ZISK_KEY:-}"
@@ -119,7 +121,9 @@ case "$ver" in *'[gpu]'*) GPUFLAG=--gpu ;; *) echo "ERROR: cargo-zisk is NOT the
 
 # ── RAM-key mode: download+extract the proving key to RAM, symlink, gen const-trees ──
 if [[ -n "$RAM_KEY" ]]; then
-  v="$ZISK_INSTALLED"
+  # Keys are named after the release's setup version, which ziskup records when a release
+  # ships one (1.3.1-alpha: setup_version = 1.3.1-alpha); the binary version otherwise.
+  v="$(cat "$HOME/.zisk/setup_version" 2>/dev/null || echo "$ZISK_INSTALLED")"
   F="zisk-provingkey-${v}.tar.gz"; BUCKET="https://storage.googleapis.com/zisk-setup"
   echo "== fetching proving key $v into $RAM_KEY (RAM, 3.5 GB download for 1.1.0-alpha) =="
   ( cd "$RAM_KEY" \

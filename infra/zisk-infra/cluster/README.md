@@ -5,7 +5,7 @@ them over (same discipline as the SP1 infra). ZisK installs cleanly via `ziskup`
 extraction, no redis/postgres.
 
 **Multi-GPU here = single-process (`NO_MPI=1`), NOT MPI.** One worker process drives **all** GPUs
-(proofman assigns every GPU to the single rank) — what `start.sh` does by default. On the pinned
+(proofman assigns every GPU to the single rank) — what `start.sh` does by default. From
 1.1.0-alpha the **stock** worker does this: `count_and_plan` binds the owning GPU at every entry
 point. On a `ZISK_VER=1.0.0-alpha` box it takes the committed `zisk-worker.patched` instead (the
 config of the archived 16×5090 benchmark); the stock 1.0.0 worker crashes there on multi-GPU.
@@ -16,7 +16,8 @@ ZisK's *official* multi-GPU path is MPI — `start.sh` still builds the exact `m
 (NUMA membind fails on socket-1 ranks); if you must, drop NUMA: `MPI_MAPBY=slot MPI_BIND=none` with
 `-np = n_gpus` (1 rank/GPU). The `-g/--gpu` flag exists only on a **GPU build** (hidden on CPU builds).
 
-> ⚠️ **ZisK is v1.1.0-alpha & GPU flags are hidden on CPU builds.** On the box (GPU build) re-check
+> ⚠️ **ZisK is v1.3.1-alpha by default (`ZISK_VER=1.1.0-alpha` for `tests/r8` and `tests/paired`), and GPU
+> flags are hidden on CPU builds.** On the box (GPU build) re-check
 > `zisk-worker --help` / `cargo-zisk prove --help` for GPU options. The canonical bring-up is ZisK's
 > own installer (which `start.sh` mirrors):
 > ```sh
@@ -27,11 +28,11 @@ ZisK's *official* multi-GPU path is MPI — `start.sh` still builds the exact `m
 
 ## One-time, on the box (persists across stop/start)
 ```sh
-./00-install-once.sh                 # system deps + ziskup 1.1.0-alpha --provingkey (GPU) + provingKey
+./00-install-once.sh                 # system deps + ziskup 1.3.1-alpha --provingkey (GPU) + provingKey
 #   -> cargo-zisk --version MUST report [gpu]; check provingKey size it printed.
 ```
 
-## Proving — multi-GPU (verified against cargo-zisk v1.1.0-alpha)
+## Proving — multi-GPU (verified against cargo-zisk v1.1.0-alpha; the flags below are unchanged in v1.3.1-alpha)
 
 **Distributed multi-GPU (coordinator + worker).** Setup is done on the coordinator
 (`remote setup`), NOT locally. The worker takes no `--gpu` (auto on GPU build) — it needs a
