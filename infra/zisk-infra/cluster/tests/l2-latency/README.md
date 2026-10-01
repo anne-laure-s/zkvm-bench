@@ -18,6 +18,7 @@ block's content barely matters. This measures it instead of extrapolating it.
 | Keccak-f | the L2 blocks of up to 250 transactions a fourth time, on the encrypting guest built with every Keccak-f in software (`MONAD_ZKVM_KECCAKF_SOFTWARE=ON`, the memo off) | whether a block that plans no Keccakf instance -- about a fifth of a small block's plan by area -- proves faster: at 4,138 steps a permutation, the plan's area against the default's is 0.79x on transfer blocks of up to 25 transactions, 0.85x at 50, 1.20x at 100 and 1.62x at 250, and larger blocks would only time the overflow |
 | Poseidon2 trie | the same L2 blocks, generated from the same seeds by a host tree configured with `MONAD_ZKVM_L2_TRIE_HASH=poseidon2`, on the encrypting guest built the same way: every trie of the chain on ZisK's Poseidon2 precompile, and the keccak that is left -- signatures, the EVM, code and block hashes -- on the Keccak-f precompile | what moving the trie off keccak saves a proof: about 80 % of a block's permutations are trie work |
 | Poseidon2 trie + Keccak-f sw | those blocks once more, on a guest that also runs the remaining keccak in software (`MONAD_ZKVM_KECCAKF_SOFTWARE=ON`) | whether a block that has no keccak left worth an instance proves faster without the Keccakf instance |
+| Poseidon2 trie and signatures + Keccak-f sw | the same blocks of the chain whose signatures are on Poseidon2 as well (`MONAD_ZKVM_L2_SIGNATURE_HASH=poseidon2`, with the spoke address that chain derives), on a guest that runs the keccak left in software | the configuration whose plan is the smallest at every size of the sweep: 0.79x the keccak chain's up to 100 transactions, 0.88x at 500, 0.78x at 5,000 |
 | mainnet | blocks 25815195, 25815036 and 25815092 of `r10zisk-rtp` (p10, p50, p90: 27-76 Msteps), on the mainnet guest | ties this box to zkvm-bench's mainnet fits |
 
 The L2 corpora come from `monad-zkvm-corpus-gen` (monad, `al/zkvm-l2`): the L2's own chain from
@@ -41,6 +42,7 @@ python3 prepare-inputs.py --elf-l2 <L2 ELF> --elf-control <control ELF> --elf-ma
     [--elf-l2-precompile <L2 ELF, JUMPDEST precompile>] [--elf-l2-keccak-sw <L2 ELF, Keccak-f in software>] \
     [--l2-poseidon <Poseidon2-trie corpora> --elf-l2-poseidon <ELF> --elf-l2-poseidon-ksw <ELF> \
      --poseidon-ksw-max-tx 1000] \
+    [--l2-poseidon-sig <Poseidon2-signature corpora> --elf-l2-poseidon-sig-ksw <ELF>] \
     --l2 <L2 corpora> --control <control corpora> \
     --mainnet <zkvm-bench>/guests/monad/gen/r10zisk-rtp-25815000-25815199-cb7b6b1ae/witnesses
 ZISK_PUBLICS_BIN=<zisk-publics built for glibc 2.35> bash make-bundle.sh
@@ -55,7 +57,7 @@ tar xzf l2-latency-bundle.tar.gz && bash zisk-infra/cluster/tests/l2-latency/run
 That is the one command. It detaches, prints the `tail -f` to follow it, installs ZisK
 1.3.1-alpha if the box does not have it (15-60 min, most of it the key's constant trees), and ends
 with `summary.md` printed and the run packed into `~/l2-latency-<stamp>.tar.gz`. A fresh 1-GPU box:
-about an hour of install, then about 75 min of proofs (two passes over 211 inputs, by zkvm-bench's
+about an hour of install, then about 90 min of proofs (two passes over 249 inputs, by zkvm-bench's
 1.1 fit plus setup). `ONLY=<regex>` narrows a run to some arms or sizes.
 
 Knobs: `PASSES=2`, `WARMUPS=1`, `GPU_SETS="1 all"` to time a one-GPU worker beside the all-GPU

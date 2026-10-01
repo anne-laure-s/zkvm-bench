@@ -7,6 +7,8 @@
         [--keccak-sw-max-tx 250] \\
         [--l2-poseidon L2_POSEIDON_CORPORA --elf-l2-poseidon L2_POSEIDON.elf \\
          [--elf-l2-poseidon-ksw L2_POSEIDON_KECCAK_SW.elf] [--poseidon-ksw-max-tx N]] \\
+        [--l2-poseidon-sig CORPORA --elf-l2-poseidon-sig ELF \\
+         [--elf-l2-poseidon-sig-ksw ELF] [--poseidon-sig-ksw-max-tx N]] \\
         [--emu ~/.zisk/bin/ziskemu] [--presets 2] [--mainnet-blocks 25815195,25815036,25815092]
 
 --elf-l2-precompile adds a third arm: the L2's witnesses on an L2 guest built with
@@ -26,6 +28,11 @@ way, its remaining keccak (signatures, the EVM, code hashes, block hashes) on th
 precompile; --elf-l2-poseidon-ksw on one that also runs that remainder in software, on the blocks
 of up to --poseidon-ksw-max-tx transactions. A block keeps its pair across the trie hashes, so
 every ratio is the same transactions, proven two ways.
+
+--l2-poseidon-sig names corpora of the chain whose signatures are on Poseidon2 as well
+(MONAD_ZKVM_L2_SIGNATURE_HASH=poseidon2, with the spoke address that chain derives), and
+--elf-l2-poseidon-sig / --elf-l2-poseidon-sig-ksw prove them the two ways the Poseidon2-trie arms
+do: the keccak left on the precompile, or in software up to --poseidon-sig-ksw-max-tx.
 
 L2_CORPORA and CONTROL_CORPORA are monad-zkvm-corpus-gen output directories from the same seeds,
 one per arm: a `sweep/` of block sizes and the preset corpora beside it, each with its
@@ -108,6 +115,11 @@ def main():
     ap.add_argument('--elf-l2-poseidon-ksw')
     ap.add_argument('--poseidon-ksw-max-tx', type=int, default=None,
                     help='largest block the --elf-l2-poseidon-ksw arm proves (default: every one)')
+    ap.add_argument('--l2-poseidon-sig', help='corpora of the chain with Poseidon2 signatures too')
+    ap.add_argument('--elf-l2-poseidon-sig')
+    ap.add_argument('--elf-l2-poseidon-sig-ksw')
+    ap.add_argument('--poseidon-sig-ksw-max-tx', type=int, default=None,
+                    help='largest block the --elf-l2-poseidon-sig-ksw arm proves (default: every one)')
     ap.add_argument('--source', default='', help='where the ELFs were built from, for provenance.txt')
     ap.add_argument('--l2', required=True)
     ap.add_argument('--control', required=True)
@@ -118,6 +130,8 @@ def main():
     a = ap.parse_args()
     if (a.elf_l2_poseidon or a.elf_l2_poseidon_ksw) and not a.l2_poseidon:
         sys.exit('the Poseidon2-trie arms prove the Poseidon2-trie corpora: give --l2-poseidon')
+    if (a.elf_l2_poseidon_sig or a.elf_l2_poseidon_sig_ksw) and not a.l2_poseidon_sig:
+        sys.exit('the Poseidon2-signature arms prove that chain\'s corpora: give --l2-poseidon-sig')
 
     v = subprocess.run([a.emu, '--version'], capture_output=True, text=True).stdout
     if '1.3.1-alpha' not in v:
@@ -138,6 +152,10 @@ def main():
         given.append(('l2-poseidon', a.elf_l2_poseidon))
     if a.elf_l2_poseidon_ksw:
         given.append(('l2-poseidon-ksw', a.elf_l2_poseidon_ksw))
+    if a.elf_l2_poseidon_sig:
+        given.append(('l2-poseidon-sig', a.elf_l2_poseidon_sig))
+    if a.elf_l2_poseidon_sig_ksw:
+        given.append(('l2-poseidon-sig-ksw', a.elf_l2_poseidon_sig_ksw))
     for arm, src in given:
         dst = inp / f'monad-{arm}.elf'
         shutil.copyfile(src, dst)
@@ -154,6 +172,11 @@ def main():
         arms.append(('l2-poseidon', pathlib.Path(a.l2_poseidon), None))
     if a.elf_l2_poseidon_ksw:
         arms.append(('l2-poseidon-ksw', pathlib.Path(a.l2_poseidon), a.poseidon_ksw_max_tx))
+    if a.elf_l2_poseidon_sig:
+        arms.append(('l2-poseidon-sig', pathlib.Path(a.l2_poseidon_sig), None))
+    if a.elf_l2_poseidon_sig_ksw:
+        arms.append(('l2-poseidon-sig-ksw', pathlib.Path(a.l2_poseidon_sig),
+                     a.poseidon_sig_ksw_max_tx))
     for arm, root, max_tx in arms:
         for kind, label, m in manifests(root):
             picked = list(csv.DictReader(open(m)))
@@ -203,6 +226,8 @@ def main():
         f.write(f'l2 corpora   {a.l2}\ncontrol      {a.control}\nmainnet      {a.mainnet}\n')
         if a.l2_poseidon:
             f.write(f'l2 poseidon  {a.l2_poseidon}\n')
+        if a.l2_poseidon_sig:
+            f.write(f'l2 pos. sig. {a.l2_poseidon_sig}\n')
     print(f'{len(rows)} inputs -> {inp}')
 
 
