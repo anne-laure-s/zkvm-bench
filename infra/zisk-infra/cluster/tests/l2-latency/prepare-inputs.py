@@ -5,6 +5,8 @@
         --l2 L2_CORPORA --control CONTROL_CORPORA --mainnet MAINNET_WITNESSES \\
         [--elf-l2-precompile L2_PRECOMPILE.elf] [--elf-l2-keccak-sw L2_KECCAK_SW.elf] \\
         [--keccak-sw-max-tx 250] \\
+        [--l2-poseidon L2_POSEIDON_CORPORA --elf-l2-poseidon L2_POSEIDON.elf \\
+         [--elf-l2-poseidon-ksw L2_POSEIDON_KECCAK_SW.elf] [--poseidon-ksw-max-tx N]] \\
         [--emu ~/.zisk/bin/ziskemu] [--presets 2] [--mainnet-blocks 25815195,25815036,25815092]
 
 --elf-l2-precompile adds a third arm: the L2's witnesses on an L2 guest built with
@@ -16,6 +18,14 @@ on an L2 guest built with MONAD_ZKVM_KECCAKF_SOFTWARE=ON (and the memo off), whi
 Keccak-f in software so that the block plans no Keccakf instance. Its permutations land in Main
 and Binary instead, which a block of a hundred transactions already overflows: the larger blocks
 would only time that, so they are left out.
+
+--l2-poseidon names corpora generated from the same seeds by a host tree configured with
+MONAD_ZKVM_L2_TRIE_HASH=poseidon2: the same blocks, with every trie of the chain built on ZisK's
+Poseidon2 precompile instead of keccak. --elf-l2-poseidon proves them on a guest built the same
+way, its remaining keccak (signatures, the EVM, code hashes, block hashes) on the Keccak-f
+precompile; --elf-l2-poseidon-ksw on one that also runs that remainder in software, on the blocks
+of up to --poseidon-ksw-max-tx transactions. A block keeps its pair across the trie hashes, so
+every ratio is the same transactions, proven two ways.
 
 L2_CORPORA and CONTROL_CORPORA are monad-zkvm-corpus-gen output directories from the same seeds,
 one per arm: a `sweep/` of block sizes and the preset corpora beside it, each with its
@@ -93,6 +103,11 @@ def main():
     ap.add_argument('--elf-l2-keccak-sw')
     ap.add_argument('--keccak-sw-max-tx', type=int, default=250,
                     help='largest block the --elf-l2-keccak-sw arm proves')
+    ap.add_argument('--l2-poseidon', help='corpora of the Poseidon2-trie chain, same seeds')
+    ap.add_argument('--elf-l2-poseidon')
+    ap.add_argument('--elf-l2-poseidon-ksw')
+    ap.add_argument('--poseidon-ksw-max-tx', type=int, default=None,
+                    help='largest block the --elf-l2-poseidon-ksw arm proves (default: every one)')
     ap.add_argument('--source', default='', help='where the ELFs were built from, for provenance.txt')
     ap.add_argument('--l2', required=True)
     ap.add_argument('--control', required=True)
@@ -101,6 +116,8 @@ def main():
     ap.add_argument('--presets', type=int, default=2, help='blocks per preset corpus')
     ap.add_argument('--mainnet-blocks', default='25815195,25815036,25815092')
     a = ap.parse_args()
+    if (a.elf_l2_poseidon or a.elf_l2_poseidon_ksw) and not a.l2_poseidon:
+        sys.exit('the Poseidon2-trie arms prove the Poseidon2-trie corpora: give --l2-poseidon')
 
     v = subprocess.run([a.emu, '--version'], capture_output=True, text=True).stdout
     if '1.3.1-alpha' not in v:
@@ -117,6 +134,10 @@ def main():
         given.append(('l2-precompile', a.elf_l2_precompile))
     if a.elf_l2_keccak_sw:
         given.append(('l2-keccak-sw', a.elf_l2_keccak_sw))
+    if a.elf_l2_poseidon:
+        given.append(('l2-poseidon', a.elf_l2_poseidon))
+    if a.elf_l2_poseidon_ksw:
+        given.append(('l2-poseidon-ksw', a.elf_l2_poseidon_ksw))
     for arm, src in given:
         dst = inp / f'monad-{arm}.elf'
         shutil.copyfile(src, dst)
@@ -129,6 +150,10 @@ def main():
         arms.append(('l2-precompile', pathlib.Path(a.l2), None))
     if a.elf_l2_keccak_sw:
         arms.append(('l2-keccak-sw', pathlib.Path(a.l2), a.keccak_sw_max_tx))
+    if a.elf_l2_poseidon:
+        arms.append(('l2-poseidon', pathlib.Path(a.l2_poseidon), None))
+    if a.elf_l2_poseidon_ksw:
+        arms.append(('l2-poseidon-ksw', pathlib.Path(a.l2_poseidon), a.poseidon_ksw_max_tx))
     for arm, root, max_tx in arms:
         for kind, label, m in manifests(root):
             picked = list(csv.DictReader(open(m)))
@@ -176,6 +201,8 @@ def main():
         for arm, p in elfs.items():
             f.write(f'{p.name:22} sha256 {hashlib.sha256(p.read_bytes()).hexdigest()}\n')
         f.write(f'l2 corpora   {a.l2}\ncontrol      {a.control}\nmainnet      {a.mainnet}\n')
+        if a.l2_poseidon:
+            f.write(f'l2 poseidon  {a.l2_poseidon}\n')
     print(f'{len(rows)} inputs -> {inp}')
 
 

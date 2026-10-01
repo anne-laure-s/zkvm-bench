@@ -95,8 +95,9 @@ for tdir in sorted(res.glob('stark-*')):
 
     # the sweep, every arm side by side, one row per block size (medians over its blocks): the
     # L2 as built by default (JUMPDEST in software), each optional arm that was staged -- the
-    # JUMPDEST precompile, Keccak-f in software -- and the plaintext control; ratios are block
-    # for block, then medians, each the lever's arm over the arm without it
+    # JUMPDEST precompile, Keccak-f in software, the Poseidon2 trie with and without it -- and the
+    # plaintext control; ratios are block for block, then medians, each the lever's arm over the
+    # arm without it
     pairs = sorted({r['pair'] for r in INP.values() if r['set'] == 'sweep'})
     sizes = sorted({INP[f'l2-{q}']['label'] for q in pairs if f'l2-{q}' in INP})
     staged = {r['arm'] for r in INP.values()}
@@ -104,6 +105,9 @@ for tdir in sorted(res.glob('stark-*')):
     extra = [e for e in (
         ('l2-precompile', 'L2, precompile s', 'l2', 'l2-precompile', 'L2 / precompile'),
         ('l2-keccak-sw', 'L2, Keccak-f sw s', 'l2-keccak-sw', 'l2', 'Keccak-f sw / L2'),
+        ('l2-poseidon', 'L2, Poseidon2 trie s', 'l2-poseidon', 'l2', 'Poseidon2 trie / L2'),
+        ('l2-poseidon-ksw', 'L2, Poseidon2 trie + Keccak-f sw s', 'l2-poseidon-ksw', 'l2',
+         'Poseidon2 trie + Keccak-f sw / L2'),
     ) if e[0] in staged]
     md = lambda v: st.median(v) if v else math.nan
     # an arm that did not prove a size (the Keccak-f arm stops at 250 tx) shows a dash
@@ -150,7 +154,8 @@ for tdir in sorted(res.glob('stark-*')):
 
     p('| arm | n | fixed s | s per Msteps | Msteps/s | R2 |')
     p('|---|---:|---:|---:|---:|---:|')
-    for arm in ('l2', 'l2-precompile', 'l2-keccak-sw', 'control', 'mainnet'):
+    for arm in ('l2', 'l2-precompile', 'l2-keccak-sw', 'l2-poseidon', 'l2-poseidon-ksw', 'control',
+                'mainnet'):
         xs, ys = [], []
         for rid, s in med.items():
             r = INP.get(rid)
