@@ -174,6 +174,8 @@ for _v in LINEAGE_BRANCH LINEAGE_BASE LINEAGE_AXIS LINEAGE_SERIES_OUT LINEAGE_CO
   [ -n "${!_v:-}" ] || { echo "$LINEAGE_CONF does not set $_v" >&2; exit 2; }
 done
 LINEAGE_BUILDFIX="${LINEAGE_BUILDFIX:-}"          # empty is a valid answer: no fix needed
+# The lineage-wide statistics page sits beside the series page unless the conf names one.
+LINEAGE_META_OUT="${LINEAGE_META_OUT:-${LINEAGE_SERIES_OUT%.html}-meta.html}"
 IDX="$HERE/$LINEAGE-index.tsv"
 TIP_IDX="$HERE/$LINEAGE-tip-index.tsv"
 MEASURE="$HERE/$LINEAGE-measure.tsv"
@@ -769,4 +771,14 @@ echo "--- measurement cache: $MEASURE_AFTER total rows ($((MEASURE_AFTER - MEASU
     --branch "${LINEAGE_BRANCH#origin/}" --base "$LINEAGE_BASE" --blocks-file "$SAMPLE_DIR/selected" \
     --out "$LINEAGE_SERIES_OUT" --no-sp1 $([ "$LAST_N" -eq 0 ] || echo --print-deltas)) \
   || { echo "SERIES REPORT FAILED" >&2; exit 1; }
+# How the lineage's gain is spread across its commits. It needs the whole walk, so a --last window,
+# two commits, has none. A failure here leaves the series page above complete, so it does not fail
+# the run.
+if [ "$LAST_N" -eq 0 ]; then
+  (cd "$BENCH/profiling" && \
+    python3 series/meta-report.py --index "$(basename "$IDX")" --measure "$(basename "$MEASURE")" \
+      --monad "$MONAD_TREE" --lineage "$LINEAGE" --blocks-file "$SAMPLE_DIR/selected" \
+      --out "$LINEAGE_META_OUT") \
+    || echo "META REPORT FAILED — $LINEAGE_SERIES_OUT is complete; $LINEAGE_META_OUT was not written" >&2
+fi
 echo "=== done $(date)"
