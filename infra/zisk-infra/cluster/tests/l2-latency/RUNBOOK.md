@@ -26,7 +26,7 @@ The README next to this file describes the design. This file is the procedure.
 | Linux with glibc 2.35 or later (Ubuntu 22.04+) | the bundled `zisk-publics` binary; on older systems it is rebuilt after the timing |
 | **80 GB free disk** | the proving key needs at least 64 GB, plus results |
 | outbound internet | apt, `ziskup`, the 5 GB proving key |
-| **3 hours** | up to 60 min of install on a fresh box, about 90 min of proofs |
+| **3 hours** | up to 60 min of install on a fresh box, about 90 min of proofs (50 for the reduced run, §2) |
 
 The GPU count does not matter: one worker drives all the cards. Two boxes with the same card and
 driver have differed 3.2× in zkvm-bench, from device-to-host bandwidth that no listing shows. The
@@ -64,6 +64,20 @@ The second command must print the hash from §1. The last one returns at once wi
 `running in the background (pid N)` and the `tail -f` line to follow. The run is detached
 (`nohup setsid`), so a dropped ssh session does not stop it.
 
+**The reduced run** proves the sweep at 1, 10, 100, 250 and 1,000 transactions, with the four
+presets and the three mainnet blocks: 159 inputs, 318 proves, about 50 min of proofs instead of 90.
+Start it with `ONLY` in front of `bash` instead of the last command above:
+
+```sh
+ssh -p <PORT> root@<HOST> 'tar xzf l2-latency-bundle.tar.gz && ONLY="-d(0001|0010|0100|0250|1000)-|-preset-|^mainnet-" bash zisk-infra/cluster/tests/l2-latency/run.sh'
+```
+
+What it leaves out: 25 and 50 transactions, which plan the same instances as 10 and 100 and so lie
+between them; 500, where the Poseidon2-trie arms' blocks straddle a Poseidon instance; 2,000 and
+5,000, blocks every 40 to 100 s at 50 TPS, beyond a latency worth having. 250 stays: it is the 5 s
+block, between the floor and 1,000 transactions, where the plan grows, and it is where `l2-keccak-sw`
+is 1.62× the reference's area, the plainest test of area into time.
+
 ## 3. Follow it
 
 ```sh
@@ -73,9 +87,9 @@ ssh -p <PORT> root@<HOST> 'tail -f ~/l2-latency-*/run.log'
 | step in run.log | duration | a healthy run prints | if not |
 |---|---|---|---|
 | `1/5 cluster up` | 15-60 min fresh, about 1 min otherwise | the last lines of `up.sh`, ending on a registered worker; the rest is in `$OUT/up.log`: the d2h verdict on a fresh box, the install, `const trees written` or `key already complete` | §5 |
-| `2/5 ziskemu replay` | about 1 min | `ziskemu: 249/249 inputs publish their block and run the staged step count` | stop: the bundle or the release is not what was staged |
-| `3/5 STARK proofs` | about 90 min | 8 warm-ups (one per ELF), then one `p<pass> <input id> <secs>s rc=0` line per proof, ending `STARK done: 498 proves, 0 failed` | §5 |
-| `4/5 every kept proof` | a few min (more if `zisk-publics` has to be built) | `zisk-publics: 249/249 proofs verify and commit to their block` | §5 |
+| `2/5 ziskemu replay` | about 1 min | `ziskemu: 249/249 inputs publish their block and run the staged step count` (every staged input, whatever `ONLY` selects) | stop: the bundle or the release is not what was staged |
+| `3/5 STARK proofs` | about 90 min (50 reduced) | 8 warm-ups (one per ELF), then one `p<pass> <input id> <secs>s rc=0` line per proof, ending `STARK done: 498 proves, 0 failed` (318 reduced; the step's banner counts every staged input either way) | §5 |
+| `4/5 every kept proof` | a few min (more if `zisk-publics` has to be built) | `zisk-publics: 249/249 proofs verify and commit to their block` (159/159 reduced) | §5 |
 | `5/5 summary` | seconds | `summary.md` printed, then `done — ~/l2-latency-<stamp>.tar.gz` | `summarize.err` |
 
 During step 3, `nvidia-smi` should show every GPU busy. The worker's log is
@@ -124,6 +138,7 @@ Each option goes in front of the `bash .../run.sh` command:
 |---|---|
 | `GPU_SETS="1 all"` | on a multi-GPU box, also time a worker on one GPU (it restarts between sets; about double the proof time) |
 | `PASSES=1` | one timing per input instead of two; about half the proof time, noisier |
+| `ONLY="-d(0001|0010|0100|0250|1000)-|-preset-|^mainnet-"` | the reduced run (§2): 1, 10, 100, 250 and 1,000 transactions, the presets and mainnet; 159 inputs, about 50 min |
 | `ONLY='<regex>'` | only the input ids that match, e.g. `ONLY='^(l2|l2-poseidon-all-ksw)-sweep'` or `ONLY='d0(001|050|100)-'` |
 | `OUT=<dir>` | results directory (default `~/l2-latency-<stamp>`) |
 | `L2LAT_FG=1` | stay in the foreground |
