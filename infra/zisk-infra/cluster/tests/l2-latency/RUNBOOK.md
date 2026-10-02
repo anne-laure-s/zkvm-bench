@@ -147,8 +147,10 @@ Each option goes in front of the `bash .../run.sh` command:
 
 **What to compare the time ratios with.** These are proving-area ratios against `l2`, from the
 instance plans `cargo-zisk execute` prints. An area is 2^nBitsExt × columns plus the compressor,
-from the proving key's starkinfo. Each figure is the median of the two blocks the run proves at
-that size. If proof time follows area, the sweep table's ratios land near these:
+from the proving key's starkinfo. Each figure is the median over the blocks the run proves at that
+size: three for a sweep size, two for a preset. Those blocks plan alike, except at 500 transactions
+on the two Poseidon2-trie arms, whose blocks straddle a Poseidon instance (three or four). If proof
+time follows area, the sweep table's ratios land near these:
 
 | block | tx | `l2` area | precompile | control | keccak sw | Poseidon2 trie | trie + keccak sw | all Poseidon2 + keccak sw |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -158,7 +160,7 @@ that size. If proof time follows area, the sweep table's ratios land near these:
 | sweep | 50 | 9.55 G | 1.03 | 0.97 | 0.85 | 1.00 | 0.79 | 0.79 |
 | sweep | 100 | 9.55 G | 1.03 | 0.97 | 1.20 | 1.00 | 0.79 | 0.79 |
 | sweep | 250 | 9.74 G | 1.03 | 0.95 | 1.62 | 1.03 | 0.82 | 0.82 |
-| sweep | 500 | 10.07 G | 1.03 | 0.94 | – | 1.07 | 0.93 | 0.88 |
+| sweep | 500 | 10.07 G | 1.03 | 0.94 | – | 1.05 | 0.91 | 0.88 |
 | sweep | 1,000 | 15.93 G | 1.02 | 0.80 | – | 0.96 | 0.93 | 0.87 |
 | sweep | 2,000 | 25.04 G | 1.01 | 0.86 | – | 0.85 | – | 0.81 |
 | sweep | 5,000 | 48.29 G | 1.01 | 0.88 | – | 0.81 | – | 0.78 |
