@@ -4,7 +4,8 @@ else on a fetched copy.
 
     summarize.py <results dir> [--tps 50]
 
-Medians over passes, per input, of the proofs that succeeded. Then, per arm and worker config,
+Medians over passes, per input, of the proofs that succeeded (one pass by default). Then, per
+arm and worker config,
 the line `secs = fixed + slope x Msteps` -- the shape zkvm-bench's mainnet runs gave
 (5.33 + 0.159 x Msteps on one RTX 5090, ZisK 1.1, measured 18-289 Msteps). These blocks reach
 down to a single transaction, so the fixed part is measured here instead of extrapolated, and it
@@ -15,6 +16,10 @@ The sizing table puts that line against a transaction rate: blocks every `interv
 ceil(secs / interval) provers -- each with this run's GPUs -- working on successive blocks. The
 latency is a transaction's wait for its block to close (half an interval on average) plus the
 proof. The proofs are STARK (VADCOP final) proofs: there is no SNARK wrap to add.
+
+A run that proves every input of one ELF in a row (bench-l2.sh's ORDER=elf, the default) times
+the arms in different stretches of it; recheck.csv, the first ELF's first inputs proved again at
+the end, gives the end-over-start ratio that bounds how much of an arm-to-arm ratio is drift.
 """
 import csv
 import math
@@ -93,13 +98,22 @@ for tdir in sorted(res.glob('stark-*')):
     def sec(rid):
         return med.get(rid, math.nan)
 
+    rc = tdir / 'recheck.csv'
+    if rc.exists():
+        again = [r for r in csv.DictReader(open(rc)) if r['rc'] == '0']
+        rel = [fnum(r['secs']) / sec(r['id']) for r in again if not math.isnan(sec(r['id']))]
+        if rel:
+            p(f"Drift check: {len(rel)} proofs of `{again[0]['arm']}` taken again at the end of the "
+              f"run, end / start = {st.median(rel):.3f} (each: "
+              + ', '.join(f'{x:.3f}' for x in rel) + '). Arm-to-arm ratios within that much of 1 '
+              'are within the drift.\n')
+
     # the sweep, every arm side by side, one row per block size (medians over its blocks): the
-    # L2 as built by default (JUMPDEST in software), each optional arm that was staged -- the
-    # JUMPDEST precompile, Keccak-f in software, the Poseidon2 trie with and without it -- and the
-    # plaintext control; ratios are block for block, then medians, each the lever's arm over the
-    # arm without it
+    # keccak chain's L2 (JUMPDEST in software), each optional arm that was staged -- the JUMPDEST
+    # precompile, Keccak-f in software, the Poseidon2 trie with and without it, the chain with
+    # everything on Poseidon2 -- and the plaintext control; ratios are block for block, then
+    # medians, each the lever's arm over the arm without it
     pairs = sorted({r['pair'] for r in INP.values() if r['set'] == 'sweep'})
-    sizes = sorted({INP[f'l2-{q}']['label'] for q in pairs if f'l2-{q}' in INP})
     staged = {r['arm'] for r in INP.values()}
     # (arm, its seconds column, the ratio's numerator and denominator arms, the ratio's column)
     extra = [e for e in (
@@ -123,20 +137,39 @@ for tdir in sorted(res.glob('stark-*')):
         v = [sec(f'{a}-{q}') / sec(f'{b}-{q}') for q in qs]
         return md([x for x in v if not math.isnan(x)])
 
-    p('| tx / block | Msteps (L2) | L2 s |' + ''.join(f' {e[1]} |' for e in extra) +
-      ' control s |' + ''.join(f' {e[4]} |' for e in extra) + ' L2 / control |')
-    p('|---:|---:|---:|' + '---:|' * len(extra) + '---:|' + '---:|' * len(extra) + '---:|')
-    for lab in sizes:
-        qs = [q for q in pairs if f'l2-{q}' in INP and INP[f'l2-{q}']['label'] == lab]
-        ms = st.median(int(INP[f'l2-{q}']['steps']) for q in qs) / 1e6
-        col = lambda arm: md([s for s in (sec(f'{arm}-{q}') for q in qs) if not math.isnan(s)])
-        row = f"| {int(lab[1:])} | {ms:.2f} | {f2(col('l2'))} |"
-        row += ''.join(f" {f2(col(e[0]))} |" for e in extra)
-        row += f" {f2(col('control'))} |"
-        row += ''.join(f" {f2(ratio(qs, e[2], e[3]), '.3f')} |" for e in extra)
-        row += f" {f2(ratio(qs, 'l2', 'control'), '.3f')} |"
-        p(row)
-    p('')
+    def size_table(groups):
+        """One row per block size, every arm side by side; `groups` are the pairs of each size."""
+        p('| tx / block | Msteps (L2) | L2 s |' + ''.join(f' {e[1]} |' for e in extra) +
+          ' control s |' + ''.join(f' {e[4]} |' for e in extra) + ' L2 / control |')
+        p('|---:|---:|---:|' + '---:|' * len(extra) + '---:|' + '---:|' * len(extra) + '---:|')
+        for qs in sorted(groups, key=lambda qs: int(INP[f'l2-{qs[0]}']['txs'])):
+            ms = st.median(int(INP[f'l2-{q}']['steps']) for q in qs) / 1e6
+            col = lambda arm: md([s for s in (sec(f'{arm}-{q}') for q in qs) if not math.isnan(s)])
+            # a size the run left out (ONLY) has no row
+            if all(math.isnan(col(arm)) for arm in ['l2', 'control'] + [e[0] for e in extra]):
+                continue
+            row = f"| {INP[f'l2-{qs[0]}']['txs']} | {ms:.2f} | {f2(col('l2'))} |"
+            row += ''.join(f" {f2(col(e[0]))} |" for e in extra)
+            row += f" {f2(col('control'))} |"
+            row += ''.join(f" {f2(ratio(qs, e[2], e[3]), '.3f')} |" for e in extra)
+            row += f" {f2(ratio(qs, 'l2', 'control'), '.3f')} |"
+            p(row)
+        p('')
+
+    def by_label(set_name):
+        qs = sorted({r['pair'] for r in INP.values() if r['set'] == set_name and f"l2-{r['pair']}" in INP})
+        labs = sorted({INP[f'l2-{q}']['label'] for q in qs})
+        return [[q for q in qs if INP[f'l2-{q}']['label'] == lab] for lab in labs]
+
+    p('The sweep, payouts\' mix:\n')
+    size_table(by_label('sweep'))
+    # the wholesale preset at more sizes, with the preset's own blocks as its 21-transaction row
+    ws = by_label('wholesale')
+    if ws:
+        pw = sorted(q for q in {r['pair'] for r in INP.values()} if q.startswith('preset-wholesale-b')
+                    and f'l2-{q}' in INP)
+        p('Wholesale, by size:\n')
+        size_table(ws + ([pw] if pw else []))
     pres = sorted({r['pair'] for r in INP.values() if r['set'] == 'preset'})
     if pres:
         p('| preset block | tx | Msteps (L2) | L2 s |' + ''.join(f' {e[1]} |' for e in extra) +

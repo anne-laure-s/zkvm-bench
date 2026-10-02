@@ -13,6 +13,7 @@ block's content barely matters. This measures it instead of extrapolating it.
 |---|---|---|
 | sweep | payouts' mix (transfers, a withdrawal in twenty) at 1, 10, 25, 50, 100, 250, 500, 1,000, 2,000 and 5,000 transactions, three blocks each | the shape of `secs(Msteps)`, from the fixed cost to the range zkvm-bench measured |
 | presets | two blocks each of `wholesale` (21 tx), `wholesale-cbdc` (21), `worker-payouts` (130), `payouts` (500) | the design document's mixes, token contracts included |
+| wholesale sizes | the `wholesale` preset at 1, 10, 100 and 248 transactions too (transfers between disjoint pairs of its 500 institutions, plus the block's anchor; 248 is as many as 500 institutions allow), three blocks each | the cheap end of the design document as a curve, beside the sweep's: a 500-account state against a million, so smaller witnesses for the same transactions. `payouts` needs no sizes of its own: the sweep is its mix, and at 500 transactions its Zipf draw and the sweep's uniform one plan the same instances within 0.2 % of the steps |
 | arms | every L2 block twice: the encrypting guest, and the same chain built with the plaintext cipher suite | what the encryption costs in time, block for block |
 | JUMPDEST | every L2 block a third time, on the encrypting guest built with the JUMPDEST precompile (`MONAD_ZKVM_JUMPDEST_SOFTWARE=OFF`) | what the precompile's instance costs a proof: an L2 build analyses JUMPDESTs in software by default, one instance fewer for about 9,600 more steps |
 | Keccak-f | the L2 blocks of up to 250 transactions a fourth time, on the encrypting guest built with every Keccak-f in software (`MONAD_ZKVM_KECCAKF_SOFTWARE=ON`, the memo off) | whether a block that plans no Keccakf instance -- about a fifth of a small block's plan by area -- proves faster: at 4,138 steps a permutation, the plan's area against the default's is 0.79x on transfer blocks of up to 25 transactions, 0.85x at 50, 1.20x at 100 and 1.62x at 250, and larger blocks would only time the overflow |
@@ -30,7 +31,13 @@ and the fourth arm's with every Keccak-f in software; `inputs/provenance.txt` ha
 
 Each prove is timed on the client's wall clock around `cargo-zisk remote prove`, submission to
 proof on disk, against a warm worker: what a sequencer waiting on a proof would see. Setup runs
-before every prove, outside the clock, as in `tests/paired`. The proofs are STARK (VADCOP final)
+before every prove, outside the clock, as in `tests/paired`. Every input is proved once, one ELF
+after another -- each ELF's warm-up proof, discarded, then all its inputs -- as a prover on one
+chain proves one ELF, so no proof pays for the worker changing ELF. ZisK's times have been stable
+from one proof of a block to the next, and the three blocks of a size plan alike, which makes them
+the repeats. The arms then take their turns at different times, so the first ELF's first three
+inputs are proved again at the end: their times against the first ones bound the box's drift.
+`ORDER=pair` restores `tests/paired`'s order, every arm of one block in a row. The proofs are STARK (VADCOP final)
 proofs, timed and verified as they are: there is no SNARK wrap in this design, so none is timed and
 no PLONK key is installed.
 
@@ -62,11 +69,12 @@ tar xzf l2-latency-bundle.tar.gz && bash zisk-infra/cluster/tests/l2-latency/run
 That is the one command. It detaches, prints the `tail -f` to follow it, installs ZisK
 1.3.1-alpha if the box does not have it (15-60 min, most of it the key's constant trees), and ends
 with `summary.md` printed and the run packed into `~/l2-latency-<stamp>.tar.gz`. A fresh 1-GPU box:
-about an hour of install, then about 90 min of proofs (two passes over 249 inputs, by zkvm-bench's
-1.1 fit plus setup). `ONLY=<regex>` narrows a run to some arms or sizes.
+about an hour of install, then about 60 min of proofs (one pass over 333 inputs, by zkvm-bench's
+1.1 fit plus setup; 40 for the RUNBOOK's reduced run). `ONLY=<regex>` narrows a run to some arms or
+sizes.
 
-Knobs: `PASSES=2`, `WARMUPS=1`, `GPU_SETS="1 all"` to time a one-GPU worker beside the all-GPU
-one, `ONLY=<regex on input ids>`.
+Knobs: `PASSES=1`, `WARMUPS=1`, `ORDER=elf|pair`, `RECHECK=3`, `GPU_SETS="1 all"` to time a
+one-GPU worker beside the all-GPU one, `ONLY=<regex on input ids>`.
 
 ## What comes back
 

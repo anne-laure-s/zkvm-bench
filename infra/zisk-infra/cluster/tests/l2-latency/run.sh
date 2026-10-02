@@ -11,13 +11,15 @@
 #      coordinator and one worker on every GPU up, and waits for the worker to register;
 #   2. replays every input through this box's ziskemu, which must publish what its block's
 #      manifest records (check.py emu) -- a bad bundle stops here, not an hour later;
-#   3. times a STARK proof of every input, PASSES times, for each GPU_SETS entry (bench-l2.sh);
+#   3. times a STARK proof of every input, PASSES times, for each GPU_SETS entry (bench-l2.sh):
+#      by default every input of one ELF in a row, after that ELF's warm-up, then a few of the
+#      first ELF's again to bound the box's drift over the run;
 #   4. checks that every kept proof verifies and commits to its block (check.py publics);
 #   5. writes summary.md and packs the run into ~/l2-latency-<stamp>.tar.gz.
 #
 # The proofs are STARK (VADCOP final) proofs, timed and verified as they are: no SNARK wrap.
 #
-# Env: PASSES=2 · WARMUPS=1
+# Env: PASSES=1 · WARMUPS=1 · ORDER=elf|pair · RECHECK=3 (see bench-l2.sh)
 #      GPU_SETS="all" — or e.g. "1 all" to time a one-GPU worker too (restarts between sets)
 #      ONLY=<regex on input ids> · OUT=<results dir> · L2LAT_FG=1 (stay in the foreground)
 set -uo pipefail
@@ -38,7 +40,7 @@ fi
 
 export PATH="$HOME/.zisk/bin:$HOME/.cargo/bin:$PATH"
 export ZISK_VER=1.3.1-alpha
-PASSES="${PASSES:-2}"; WARMUPS="${WARMUPS:-1}"
+PASSES="${PASSES:-1}"; WARMUPS="${WARMUPS:-1}"; ORDER="${ORDER:-elf}"; RECHECK="${RECHECK:-3}"
 GPU_SETS="${GPU_SETS:-all}"
 say()  { printf '\n\033[1m== %s\033[0m  (%s)\n' "$*" "$(date -u +%H:%M:%S)"; }
 warn() { printf '\033[33m!! %s\033[0m\n' "$*" >&2; }
@@ -73,7 +75,12 @@ python3 "$HERE/check.py" emu "$IN" "$OUT/precheck.csv" \
   || die "the staged inputs do not reproduce on this box — read $OUT/precheck.csv"
 
 # ── 3. STARK proofs, per worker config ────────────────────────────────────────────────────────
-say "3/5 STARK proofs: ${PASSES} pass(es) over $(($(wc -l < "$IN/inputs.csv") - 1)) inputs, GPU sets: $GPU_SETS"
+NSEL=$(python3 - "$IN/inputs.csv" "${ONLY:-.}" <<'EOF'
+import csv, re, sys
+print(sum(1 for r in csv.DictReader(open(sys.argv[1])) if re.search(sys.argv[2], r['id'])))
+EOF
+)
+say "3/5 STARK proofs: ${PASSES} pass(es) over $NSEL of $(($(wc -l < "$IN/inputs.csv") - 1)) inputs, order $ORDER, GPU sets: $GPU_SETS"
 LAST_SET=all
 for set in $GPU_SETS; do
   if [ "$set" = all ]; then
@@ -87,7 +94,8 @@ for set in $GPU_SETS; do
       || { warn "could not restart on $set GPU(s) — skipping that set"; continue; }
   fi
   LAST_SET="$set"
-  OUT="$OUT/stark-$set" GPUS="$set" PASSES="$PASSES" WARMUPS="$WARMUPS" ONLY="${ONLY:-.}" \
+  OUT="$OUT/stark-$set" GPUS="$set" PASSES="$PASSES" WARMUPS="$WARMUPS" ORDER="$ORDER" \
+    RECHECK="$RECHECK" ONLY="${ONLY:-.}" \
     bash "$HERE/bench-l2.sh" || warn "bench-l2.sh exited non-zero for GPU set $set"
   cp "$CLUSTER/logs/worker.log" "$OUT/stark-$set/worker.log" 2>/dev/null
   cp "$CLUSTER/logs/coordinator.log" "$OUT/stark-$set/coordinator.log" 2>/dev/null

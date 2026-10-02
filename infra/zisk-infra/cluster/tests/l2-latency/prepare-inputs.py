@@ -42,7 +42,9 @@ hashes) in software, on every block.
 
 L2_CORPORA and CONTROL_CORPORA are monad-zkvm-corpus-gen output directories from the same seeds,
 one per arm: a `sweep/` of block sizes and the preset corpora beside it, each with its
-manifest.csv. MAINNET_WITNESSES is a zkvm-bench generation (<n>.witness beside <n>.blockhash).
+manifest.csv, and optionally a `wholesale-sweep/` -- the wholesale preset at more sizes, every
+block of which is staged like the sweep's (set `wholesale`, labelled by its distinct count).
+MAINNET_WITNESSES is a zkvm-bench generation (<n>.witness beside <n>.blockhash).
 
 Writes inputs/ next to this script: the three ELFs, every witness framed the way the prover reads
 it (LE64 length, the witness, zero padding to 8), and inputs.csv -- one row per input with its
@@ -95,7 +97,8 @@ def replay(emu, elf, framed, expect):
 
 
 def manifests(root):
-    """(set, label, manifest) for the sweep points and the presets under one arm's corpora."""
+    """(set, label, manifest) for the sweep points, the presets and the wholesale sweep's points
+    under one arm's corpora."""
     out = []
     for m in sorted((root / 'sweep').glob('*/manifest.csv')):
         d = re.search(r'-d(\d+)$', m.parent.name)
@@ -104,6 +107,9 @@ def manifests(root):
         m = root / p / 'manifest.csv'
         if m.exists():
             out.append(('preset', p, m))
+    for m in sorted((root / 'wholesale-sweep').glob('*/manifest.csv')):
+        d = re.search(r'-d(\d+)$', m.parent.name)
+        out.append(('wholesale', f'd{int(d.group(1)):04d}', m))
     return out
 
 
