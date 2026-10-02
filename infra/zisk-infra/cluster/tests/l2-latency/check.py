@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The two checks that bracket the timing. RUNS ON THE BOX.
 
-    check.py emu     <inputs dir> <out.csv>     before: ziskemu on every input
+    check.py emu     <inputs dir> <out.csv>     before: ziskemu on every input ONLY selects
     check.py publics <inputs dir> <results dir> after: every kept proof, verified and read back
 
 `emu` runs this box's ziskemu on every input and requires the public output its block's manifest
@@ -44,7 +44,7 @@ def emu(inputs, out_csv):
         ok = got[:len(want)] == want and steps == r['steps']
         return r['id'], ok, p.returncode, steps, r['steps']
 
-    rs = rows(inputs)
+    rs = [r for r in rows(inputs) if re.search(os.environ.get('ONLY', '.'), r['id'])]
     with ThreadPoolExecutor(max(1, (os.cpu_count() or 2) // 2)) as ex:
         res = list(ex.map(one, rs))
     with open(out_csv, 'w') as f:

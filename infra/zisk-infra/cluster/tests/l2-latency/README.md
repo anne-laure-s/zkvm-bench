@@ -73,7 +73,7 @@ about an hour of install, then about 60 min of proofs (one pass over 330 inputs,
 1.1 fit plus setup; 40 for the RUNBOOK's reduced run). `ONLY=<regex>` narrows a run to some arms or
 sizes.
 
-Knobs: `PASSES=1`, `WARMUPS=1`, `ORDER=elf|pair`, `RECHECK=3`, `GPU_SETS="1 all"` to time a
+Knobs: `PASSES=1`, `WARMUPS=1`, `ORDER=elf|pair`, `RECHECK=3`, `PRECHECK=0|1`, `GPU_SETS="1 all"` to time a
 one-GPU worker beside the all-GPU one, `ONLY=<regex on input ids>`.
 
 ## What comes back
@@ -83,7 +83,7 @@ one-GPU worker beside the all-GPU one, `ONLY=<regex on input ids>`.
 | `summary.md` | the tables: seconds per block size on every arm, the fit `fixed + slope x Msteps` per arm, the presets, the mainnet blocks (when staged) against zkvm-bench's 1.1 fit, the longest worker phases, and the sizing table at 50 TPS — for each block interval, the proof time, the provers it takes to keep up and the latency |
 | `stark-<set>/timings.csv` | every prove: pass, input, arm, seconds, return code |
 | `stark-<set>/phases.csv` | every `<<< PHASE (N ms)` span the worker logged during each prove |
-| `precheck.csv` | the ziskemu replay of every input before any proving |
+| `precheck.csv` | with `PRECHECK=1`, the ziskemu replay of the selected inputs before any proving |
 | `publics.csv` | every kept proof, verified by zisk-publics and checked to commit to its block |
 | `*/gpu.csv`, `*/metrics/` | nvidia-smi every 500 ms while proving; the coordinator's Prometheus metrics after each prove |
 

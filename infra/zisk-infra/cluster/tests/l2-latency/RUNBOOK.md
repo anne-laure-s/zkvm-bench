@@ -93,7 +93,7 @@ ssh -p <PORT> root@<HOST> 'tail -f ~/l2-latency-*/run.log'
 | step in run.log | duration | a healthy run prints | if not |
 |---|---|---|---|
 | `1/5 cluster up` | 15-60 min fresh, about 1 min otherwise | the last lines of `up.sh`, ending on a registered worker; the rest is in `$OUT/up.log`: the d2h verdict on a fresh box, the install, `const trees written` or `key already complete` | §5 |
-| `2/5 ziskemu replay` | about 1 min | `ziskemu: 330/330 inputs publish their block and run the staged step count` (every staged input, whatever `ONLY` selects) | stop: the bundle or the release is not what was staged |
+| `2/5 ziskemu replay skipped` | seconds | the line itself; with `PRECHECK=1`, `ziskemu: N/N inputs publish their block and run the staged step count` for the inputs `ONLY` selects | stop: the bundle or the release is not what was staged |
 | `3/5 STARK proofs` | about 60 min (40 reduced) | for each of the 7 ELFs in turn, a `== <elf>` line, one `warm` line, then one `p1 <input id> <secs>s rc=0` line per proof; at the end `== recheck` and three `r` lines; ending `STARK done: 330 proves, 0 failed` (240 reduced) | §5 |
 | `4/5 every kept proof` | a few min (more if `zisk-publics` has to be built) | `zisk-publics: 330/330 proofs verify and commit to their block` (240/240 reduced) | §5 |
 | `5/5 summary` | seconds | `summary.md` printed, then `done — ~/l2-latency-<stamp>.tar.gz` | `summarize.err` |
@@ -116,7 +116,7 @@ scp -P <PORT> root@<HOST>:'l2-latency-20*.tar.gz' ~/Documents/zkvms/l2-bench/res
 the proofs:
 - `summary.md` and the per-proof `timings.csv`, `phases.csv`, `gpu.csv`, and `recheck.csv`;
 - the Prometheus metrics;
-- `precheck.csv` and `publics.csv`;
+- `publics.csv`, and `precheck.csv` with `PRECHECK=1`;
 - the logs, `env.txt`, `inputs.csv` and `provenance.txt`.
 
 Then destroy the instance. To keep it for a rerun instead, stop the cluster first:
@@ -131,7 +131,7 @@ Then destroy the instance. To keep it for a rerun instead, stop the cluster firs
 | step 1: `cargo-zisk` reports `[cpu]`, or the install fails | `~/install.log` | CUDA was not visible to `ziskup`. Use another box or image with a working driver. |
 | step 1: `the key is unusable` | `~/check-setup.log` | Delete `~/.zisk/provingKey` and rerun: `up.sh` reinstalls what is missing. |
 | step 1: no worker registers within 600 s | `$OUT/up.log`, `~/zisk-infra/cluster/logs/worker.log` | Rerun with `FORCE_RESTART=1` in front of the command. A stale worker holding the card is the usual cause. |
-| step 2: `BAD <id>` lines | `$OUT/precheck.csv` | The bundle is corrupt or ZisK is not 1.3.1-alpha (`~/.zisk/bin/ziskemu --version`). Recopy and check the hash. Nothing has been timed yet. |
+| step 2 (with `PRECHECK=1`): `BAD <id>` lines | `$OUT/precheck.csv` | The bundle is corrupt or ZisK is not 1.3.1-alpha (`~/.zisk/bin/ziskemu --version`). Recopy and check the hash. Nothing has been timed yet. |
 | step 3: `SETUP FAILED for <elf>` | `$OUT/stark-all/logs/setup.*.log` | `all workers failed setup, no VK received` means an incomplete key: see the `the key is unusable` row. |
 | step 3: proves with `rc=` not 0 | `$OUT/stark-all/logs/<id>.p<n>.log`, `worker.log` | Out-of-memory or the 1,800 s `PROVE_TIMEOUT`. The summary takes only successful proves; rerun those ids (§6). |
 | step 4: a proof that does not verify or commit to its block | `$OUT/publics.csv` | That input's time is not a time of that block. Report it; do not use that row. |
@@ -145,6 +145,7 @@ Each option goes in front of the `bash .../run.sh` command:
 |---|---|
 | `GPU_SETS="1 all"` | on a multi-GPU box, also time a worker on one GPU (it restarts between sets; about double the proof time) |
 | `PASSES=2` | two timings per input instead of one; about double the proof time |
+| `PRECHECK=1` | replay the selected inputs through this box's ziskemu before proving. Off by default: a bundle already replayed on its release adds nothing, and step 4 checks every proof against its block either way |
 | `ORDER=pair` | every arm of one block in a row, alternating which goes first (tests/paired's order), instead of one ELF after another; the warm-ups then all come first |
 | `RECHECK=0` | no drift check at the end (`RECHECK=N` proves the first ELF's first N inputs again; 3 by default) |
 | `ONLY="-d(0001|0010|0100|0250|1000)-|-preset-|-wholesale-"` | the reduced run (§2): the sweep at 1, 10, 100, 250 and 1,000 transactions, wholesale at its five sizes and the other presets; 240 inputs, about 40 min |

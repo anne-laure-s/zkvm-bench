@@ -9,8 +9,10 @@
 #
 #   1. up.sh: installs ZisK 1.3.1-alpha and its proving key if they are missing, brings the
 #      coordinator and one worker on every GPU up, and waits for the worker to register;
-#   2. replays every input through this box's ziskemu, which must publish what its block's
-#      manifest records (check.py emu) -- a bad bundle stops here, not an hour later;
+#   2. with PRECHECK=1, replays the inputs ONLY selects through this box's ziskemu, which must
+#      publish what its block's manifest records (check.py emu) -- a bad bundle stops there, not
+#      an hour later. Off by default: a bundle already replayed on its release adds nothing, and
+#      step 4 checks every proof against its block whatever this step did;
 #   3. times a STARK proof of every input, PASSES times, for each GPU_SETS entry (bench-l2.sh):
 #      by default every input of one ELF in a row, after that ELF's warm-up, then a few of the
 #      first ELF's again to bound the box's drift over the run;
@@ -19,7 +21,7 @@
 #
 # The proofs are STARK (VADCOP final) proofs, timed and verified as they are: no SNARK wrap.
 #
-# Env: PASSES=1 · WARMUPS=1 · ORDER=elf|pair · RECHECK=3 (see bench-l2.sh)
+# Env: PASSES=1 · WARMUPS=1 · ORDER=elf|pair · RECHECK=3 (see bench-l2.sh) · PRECHECK=0|1
 #      GPU_SETS="all" — or e.g. "1 all" to time a one-GPU worker too (restarts between sets)
 #      ONLY=<regex on input ids> · OUT=<results dir> · L2LAT_FG=1 (stay in the foreground)
 set -uo pipefail
@@ -70,9 +72,13 @@ say "1/5 cluster up (installs ZisK $ZISK_VER on a fresh box: 15-60 min)"
 up "$OUT/up.log" || die "up.sh failed — read $OUT/up.log"
 
 # ── 2. the inputs, through this box's emulator ────────────────────────────────────────────────
-say "2/5 ziskemu replay of every input"
-python3 "$HERE/check.py" emu "$IN" "$OUT/precheck.csv" \
-  || die "the staged inputs do not reproduce on this box — read $OUT/precheck.csv"
+if [ "${PRECHECK:-0}" = 1 ]; then
+  say "2/5 ziskemu replay of the selected inputs"
+  ONLY="${ONLY:-.}" python3 "$HERE/check.py" emu "$IN" "$OUT/precheck.csv" \
+    || die "the staged inputs do not reproduce on this box — read $OUT/precheck.csv"
+else
+  say "2/5 ziskemu replay skipped (PRECHECK=1 to run it)"
+fi
 
 # ── 3. STARK proofs, per worker config ────────────────────────────────────────────────────────
 NSEL=$(python3 - "$IN/inputs.csv" "${ONLY:-.}" <<'EOF'
