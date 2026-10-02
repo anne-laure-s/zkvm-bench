@@ -35,6 +35,9 @@ no PLONK key is installed.
 
 ## Running it
 
+[RUNBOOK.md](RUNBOOK.md) is the step-by-step for one run on a rented box: what to rent, what each
+step prints, what to do when one fails, and the proving-area ratios to read the times against.
+
 On the Mac, once (the corpora are already generated; see `prepare-inputs.py --help`):
 
 ```sh
