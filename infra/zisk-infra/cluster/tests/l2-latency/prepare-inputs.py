@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Stage the L2 latency bench's inputs. RUNS ON THE MAC.
 
-    prepare-inputs.py --elf-l2 L2.elf --elf-control CONTROL.elf --elf-mainnet MAINNET.elf \\
-        --l2 L2_CORPORA --control CONTROL_CORPORA --mainnet MAINNET_WITNESSES \\
+    prepare-inputs.py --elf-l2 L2.elf --elf-control CONTROL.elf \\
+        --l2 L2_CORPORA --control CONTROL_CORPORA \\
+        [--elf-mainnet MAINNET.elf --mainnet MAINNET_WITNESSES] \\
         [--elf-l2-precompile L2_PRECOMPILE.elf] [--elf-l2-keccak-sw L2_KECCAK_SW.elf] \\
         [--keccak-sw-max-tx 250] \\
         [--l2-poseidon L2_POSEIDON_CORPORA --elf-l2-poseidon L2_POSEIDON.elf \\
@@ -40,13 +41,17 @@ MONAD_ZKVM_L2_HASH=poseidon2, the default: tries, signatures, block hash, state 
 and --elf-l2-poseidon-all-ksw proves them with the keccak left (the EVM's, the anchor's, code
 hashes) in software, on every block.
 
+--elf-mainnet with --mainnet adds the mainnet guest on --mainnet-blocks, which ties a box to
+zkvm-bench's mainnet fits. The staged bundle leaves it out: on a 62 GB box the mainnet ELF's ASM
+microservices pushed the worker out of memory, and the L2 arms answer the questions without it.
+
 L2_CORPORA and CONTROL_CORPORA are monad-zkvm-corpus-gen output directories from the same seeds,
 one per arm: a `sweep/` of block sizes and the preset corpora beside it, each with its
 manifest.csv, and optionally a `wholesale-sweep/` -- the wholesale preset at more sizes, every
 block of which is staged like the sweep's (set `wholesale`, labelled by its distinct count).
 MAINNET_WITNESSES is a zkvm-bench generation (<n>.witness beside <n>.blockhash).
 
-Writes inputs/ next to this script: the three ELFs, every witness framed the way the prover reads
+Writes inputs/ next to this script: the ELFs, every witness framed the way the prover reads
 it (LE64 length, the witness, zero padding to 8), and inputs.csv -- one row per input with its
 arm, its pair (the same block on the other arm), its size and the public output it must prove.
 
@@ -117,7 +122,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--elf-l2', required=True)
     ap.add_argument('--elf-control', required=True)
-    ap.add_argument('--elf-mainnet', required=True)
+    ap.add_argument('--elf-mainnet')
     ap.add_argument('--elf-l2-precompile')
     ap.add_argument('--elf-l2-keccak-sw')
     ap.add_argument('--keccak-sw-max-tx', type=int, default=250,
@@ -137,7 +142,7 @@ def main():
     ap.add_argument('--source', default='', help='where the ELFs were built from, for provenance.txt')
     ap.add_argument('--l2', required=True)
     ap.add_argument('--control', required=True)
-    ap.add_argument('--mainnet', required=True)
+    ap.add_argument('--mainnet')
     ap.add_argument('--emu', default=str(pathlib.Path.home() / '.zisk/bin/ziskemu'))
     ap.add_argument('--presets', type=int, default=2, help='blocks per preset corpus')
     ap.add_argument('--mainnet-blocks', default='25815195,25815036,25815092')
@@ -146,6 +151,8 @@ def main():
         sys.exit('the Poseidon2-trie arms prove the Poseidon2-trie corpora: give --l2-poseidon')
     if (a.elf_l2_poseidon_sig or a.elf_l2_poseidon_sig_ksw) and not a.l2_poseidon_sig:
         sys.exit('the Poseidon2-signature arms prove that chain\'s corpora: give --l2-poseidon-sig')
+    if bool(a.elf_mainnet) != bool(a.mainnet):
+        sys.exit('the mainnet arm takes both --elf-mainnet and --mainnet, or neither')
     if a.elf_l2_poseidon_all_ksw and not a.l2_poseidon_all:
         sys.exit('the all-Poseidon2 arm proves that chain\'s corpora: give --l2-poseidon-all')
 
@@ -159,7 +166,9 @@ def main():
         shutil.rmtree(inp)
     (inp / 'bins').mkdir(parents=True)
     elfs = {}
-    given = [('l2', a.elf_l2), ('control', a.elf_control), ('mainnet', a.elf_mainnet)]
+    given = [('l2', a.elf_l2), ('control', a.elf_control)]
+    if a.elf_mainnet:
+        given.append(('mainnet', a.elf_mainnet))
     if a.elf_l2_precompile:
         given.append(('l2-precompile', a.elf_l2_precompile))
     if a.elf_l2_keccak_sw:
@@ -219,8 +228,8 @@ def main():
                                  elf=elfs[arm].name, bin=f'bins/{rid}.bin', expect=expect.hex()))
                 print(f'{rid:36} {int(row["txs"]):>5} tx {steps:>11,} steps', flush=True)
 
-    mroot = pathlib.Path(a.mainnet)
-    for n in a.mainnet_blocks.split(','):
+    mroot = pathlib.Path(a.mainnet) if a.mainnet else None
+    for n in (a.mainnet_blocks.split(',') if mroot else []):
         w = mroot / f'{n}.witness'
         h = (mroot / f'{n}.blockhash').read_text().strip()
         framed = frame(w.read_bytes())
@@ -243,7 +252,9 @@ def main():
             f.write(f'source       {a.source}\n')
         for arm, p in elfs.items():
             f.write(f'{p.name:22} sha256 {hashlib.sha256(p.read_bytes()).hexdigest()}\n')
-        f.write(f'l2 corpora   {a.l2}\ncontrol      {a.control}\nmainnet      {a.mainnet}\n')
+        f.write(f'l2 corpora   {a.l2}\ncontrol      {a.control}\n')
+        if a.mainnet:
+            f.write(f'mainnet      {a.mainnet}\n')
         if a.l2_poseidon:
             f.write(f'l2 poseidon  {a.l2_poseidon}\n')
         if a.l2_poseidon_sig:

@@ -1,7 +1,7 @@
 # l2-latency — runbook for one run on a rented GPU box
 
 One command times a STARK proof (VADCOP final, no SNARK wrap) of every staged L2 block on seven guest
-configurations, plus three mainnet blocks. It answers three questions:
+configurations. It answers three questions:
 
 1. **The floor.** How long does a proof of a small L2 block take? That is the latency floor at 50 TPS.
 2. **Area into time.** `cargo-zisk execute` puts some configurations at 0.79× the proving area of the
@@ -13,7 +13,7 @@ The README next to this file describes the design. This file is the procedure.
 ## 0. What you need
 
 **The bundle.** `l2-latency-bundle.tar.gz` from `~/Documents/zkvms/l2-bench/bundle/` on the Mac.
-- It holds 333 inputs and 8 ELFs, built from monad `al/zkvm-l2` dfe4497ec with ZisK 1.3.1-alpha.
+- It holds 330 inputs and 7 ELFs, built from monad `al/zkvm-l2` dfe4497ec with ZisK 1.3.1-alpha.
 - `inputs/provenance.txt` inside it has every ELF's sha256.
 - Take its sha256 before copying (§1), so you can check it on the box.
 
@@ -70,12 +70,12 @@ first three inputs are proved again after a warm-up of their own: their times ag
 ones bound how much the box drifted while the arms took their turns (§7).
 
 **The reduced run** proves the sweep at 1, 10, 100, 250 and 1,000 transactions, the wholesale
-preset at its five sizes (1, 10, 21, 100 and 248 transactions), the three other presets and the three
-mainnet blocks: 243 inputs, about 40 min of proofs instead of 60. Start it with `ONLY` in front of
-`bash` instead of the last command above:
+preset at its five sizes (1, 10, 21, 100 and 248 transactions) and the three other presets: 240
+inputs, about 40 min of proofs instead of 60. Start it with `ONLY` in front of `bash` instead of the
+last command above:
 
 ```sh
-ssh -p <PORT> root@<HOST> 'tar xzf l2-latency-bundle.tar.gz && ONLY="-d(0001|0010|0100|0250|1000)-|-preset-|-wholesale-|^mainnet-" bash zisk-infra/cluster/tests/l2-latency/run.sh'
+ssh -p <PORT> root@<HOST> 'tar xzf l2-latency-bundle.tar.gz && ONLY="-d(0001|0010|0100|0250|1000)-|-preset-|-wholesale-" bash zisk-infra/cluster/tests/l2-latency/run.sh'
 ```
 
 What it leaves out: 25 and 50 transactions, which plan the same instances as 10 and 100 and so lie
@@ -93,9 +93,9 @@ ssh -p <PORT> root@<HOST> 'tail -f ~/l2-latency-*/run.log'
 | step in run.log | duration | a healthy run prints | if not |
 |---|---|---|---|
 | `1/5 cluster up` | 15-60 min fresh, about 1 min otherwise | the last lines of `up.sh`, ending on a registered worker; the rest is in `$OUT/up.log`: the d2h verdict on a fresh box, the install, `const trees written` or `key already complete` | §5 |
-| `2/5 ziskemu replay` | about 1 min | `ziskemu: 333/333 inputs publish their block and run the staged step count` (every staged input, whatever `ONLY` selects) | stop: the bundle or the release is not what was staged |
-| `3/5 STARK proofs` | about 60 min (40 reduced) | for each of the 8 ELFs in turn, a `== <elf>` line, one `warm` line, then one `p1 <input id> <secs>s rc=0` line per proof; at the end `== recheck` and three `r` lines; ending `STARK done: 333 proves, 0 failed` (243 reduced) | §5 |
-| `4/5 every kept proof` | a few min (more if `zisk-publics` has to be built) | `zisk-publics: 333/333 proofs verify and commit to their block` (243/243 reduced) | §5 |
+| `2/5 ziskemu replay` | about 1 min | `ziskemu: 330/330 inputs publish their block and run the staged step count` (every staged input, whatever `ONLY` selects) | stop: the bundle or the release is not what was staged |
+| `3/5 STARK proofs` | about 60 min (40 reduced) | for each of the 7 ELFs in turn, a `== <elf>` line, one `warm` line, then one `p1 <input id> <secs>s rc=0` line per proof; at the end `== recheck` and three `r` lines; ending `STARK done: 330 proves, 0 failed` (240 reduced) | §5 |
+| `4/5 every kept proof` | a few min (more if `zisk-publics` has to be built) | `zisk-publics: 330/330 proofs verify and commit to their block` (240/240 reduced) | §5 |
 | `5/5 summary` | seconds | `summary.md` printed, then `done — ~/l2-latency-<stamp>.tar.gz` | `summarize.err` |
 
 During step 3, `nvidia-smi` should show every GPU busy. The worker's log is
@@ -104,8 +104,7 @@ During step 3, `nvidia-smi` should show every GPU busy. The worker's log is
 
 Input ids are `<arm>-<set>-<label>-b<n>`, for example `l2-poseidon-all-ksw-sweep-d0050-b2`,
 `control-preset-wholesale-b1` or `l2-wholesale-d0198-b3` (the wholesale sizes are labelled by the
-institutions a block touches: 1, 18, 198 and 494 for 1, 10, 100 and 248 transactions), plus
-`mainnet-<block>`.
+institutions a block touches: 1, 18, 198 and 494 for 1, 10, 100 and 248 transactions).
 
 ## 4. Bring the results back, then stop paying
 
@@ -148,7 +147,7 @@ Each option goes in front of the `bash .../run.sh` command:
 | `PASSES=2` | two timings per input instead of one; about double the proof time |
 | `ORDER=pair` | every arm of one block in a row, alternating which goes first (tests/paired's order), instead of one ELF after another; the warm-ups then all come first |
 | `RECHECK=0` | no drift check at the end (`RECHECK=N` proves the first ELF's first N inputs again; 3 by default) |
-| `ONLY="-d(0001|0010|0100|0250|1000)-|-preset-|-wholesale-|^mainnet-"` | the reduced run (§2): the sweep at 1, 10, 100, 250 and 1,000 transactions, wholesale at its five sizes, the other presets and mainnet; 243 inputs, about 40 min |
+| `ONLY="-d(0001|0010|0100|0250|1000)-|-preset-|-wholesale-"` | the reduced run (§2): the sweep at 1, 10, 100, 250 and 1,000 transactions, wholesale at its five sizes and the other presets; 240 inputs, about 40 min |
 | `ONLY='<regex>'` | only the input ids that match, e.g. `ONLY='^(l2|l2-poseidon-all-ksw)-sweep'` or `ONLY='d0(001|050|100)-'` |
 | `OUT=<dir>` | results directory (default `~/l2-latency-<stamp>`) |
 | `L2LAT_FG=1` | stay in the foreground |
@@ -168,7 +167,10 @@ Each option goes in front of the `bash .../run.sh` command:
 | `l2-poseidon` | tries on Poseidon2, the remaining keccak on the precompile | 50 |
 | `l2-poseidon-ksw` | tries on Poseidon2, the remaining keccak in software | 44 (up to 1,000 tx) |
 | `l2-poseidon-all-ksw` | the chain as monad builds it by default: everything it defines on Poseidon2 (tries, signatures, block hash, state blinder, bloom), the remaining keccak in software | 50 |
-| `mainnet` | the mainnet guest on three `r10zisk-rtp` blocks | 3 |
+
+The mainnet guest is not staged: on a 62 GB box its ASM microservices pushed the worker out of
+memory (the cgroup's `oom_kill`), and the L2 arms answer the questions without it.
+`prepare-inputs.py --elf-mainnet --mainnet` still stages it, for a box with more memory.
 
 **What to compare the time ratios with.** These are proving-area ratios against `l2`, from the
 instance plans `cargo-zisk execute` prints. An area is 2^nBitsExt × columns plus the compressor,

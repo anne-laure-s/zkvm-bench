@@ -100,8 +100,12 @@ for tdir in sorted(res.glob('stark-*')):
 
     rc = tdir / 'recheck.csv'
     if rc.exists():
-        again = [r for r in csv.DictReader(open(rc)) if r['rc'] == '0']
+        tried = list(csv.DictReader(open(rc)))
+        again = [r for r in tried if r['rc'] == '0']
         rel = [fnum(r['secs']) / sec(r['id']) for r in again if not math.isnan(sec(r['id']))]
+        if tried and not rel:
+            p(f'Drift check: none of the {len(tried)} proofs taken again at the end succeeded, so '
+              'this run has no bound on its drift (recheck.csv, logs/*.recheck.log).\n')
         if rel:
             p(f"Drift check: {len(rel)} proofs of `{again[0]['arm']}` taken again at the end of the "
               f"run, end / start = {st.median(rel):.3f} (each: "
@@ -182,7 +186,7 @@ for tdir in sorted(res.glob('stark-*')):
                   f"{f2(sec(l2))} |" + ''.join(f" {f2(sec(e[0] + '-' + q))} |" for e in extra) +
                   f" {f2(sec(ct))} |")
         p('')
-    mn = [r for r in INP.values() if r['arm'] == 'mainnet']
+    mn = [r for r in INP.values() if r['arm'] == 'mainnet' and not math.isnan(sec(r['id']))]
     if mn:
         p('| mainnet block | Msteps | s | zkvm-bench 1.1 fit, 5.33 + 0.159 x Msteps |')
         p('|---|---:|---:|---:|')
@@ -215,10 +219,14 @@ for tdir in sorted(res.glob('stark-*')):
             spans.setdefault((r['id'], r['phase']), {}).setdefault(r['pass'], 0)
             spans[(r['id'], r['phase'])][r['pass']] = max(spans[(r['id'], r['phase'])][r['pass']],
                                                          fnum(r['ms']))
-        shown = [f'l2-{q}' for q in pairs if f'l2-{q}' in INP and q.endswith('-b1')]
+        # the sweep sizes this run proved (ONLY can leave some out): all of them up to six, else
+        # four spread across the range
+        shown = [f'l2-{q}' for q in pairs if f'l2-{q}' in INP and q.endswith('-b1')
+                 and not math.isnan(sec(f'l2-{q}'))]
         shown.sort(key=lambda i: int(INP[i]['txs']))
-        shown = [shown[i] for i in sorted({0, len(shown) // 3, 2 * len(shown) // 3, len(shown) - 1})
-                 if 0 <= i < len(shown)]
+        if len(shown) > 6:
+            shown = [shown[i] for i in sorted({0, len(shown) // 3, 2 * len(shown) // 3,
+                                               len(shown) - 1})]
         names = {}
         for (rid, name), v in spans.items():
             if rid in shown:
