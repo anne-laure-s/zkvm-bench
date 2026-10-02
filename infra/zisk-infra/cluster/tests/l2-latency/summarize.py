@@ -112,6 +112,8 @@ for tdir in sorted(res.glob('stark-*')):
          'Poseidon2 trie and signatures / L2'),
         ('l2-poseidon-sig-ksw', 'L2, Poseidon2 trie and signatures + Keccak-f sw s',
          'l2-poseidon-sig-ksw', 'l2', 'Poseidon2 trie and signatures + Keccak-f sw / L2'),
+        ('l2-poseidon-all-ksw', 'L2, all Poseidon2 + Keccak-f sw s', 'l2-poseidon-all-ksw', 'l2',
+         'all Poseidon2 + Keccak-f sw / L2'),
     ) if e[0] in staged]
     md = lambda v: st.median(v) if v else math.nan
     # an arm that did not prove a size (the Keccak-f arm stops at 250 tx) shows a dash
@@ -159,7 +161,8 @@ for tdir in sorted(res.glob('stark-*')):
     p('| arm | n | fixed s | s per Msteps | Msteps/s | R2 |')
     p('|---|---:|---:|---:|---:|---:|')
     for arm in ('l2', 'l2-precompile', 'l2-keccak-sw', 'l2-poseidon', 'l2-poseidon-ksw',
-                'l2-poseidon-sig', 'l2-poseidon-sig-ksw', 'control', 'mainnet'):
+                'l2-poseidon-sig', 'l2-poseidon-sig-ksw', 'l2-poseidon-all-ksw', 'control',
+                'mainnet'):
         xs, ys = [], []
         for rid, s in med.items():
             r = INP.get(rid)

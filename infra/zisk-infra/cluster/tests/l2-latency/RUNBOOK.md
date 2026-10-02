@@ -5,7 +5,7 @@ configurations, plus three mainnet blocks. It answers three questions:
 
 1. **The floor.** How long does a proof of a small L2 block take? That is the latency floor at 50 TPS.
 2. **Area into time.** `cargo-zisk execute` puts some configurations at 0.79× the proving area of the
-   default. Does the proof get shorter by that much?
+   keccak chain. Does the proof get shorter by that much?
 3. **Sizing.** For each block interval, how long is a proof, and how many provers keep up with 50 TPS?
 
 The README next to this file describes the design. This file is the procedure.
@@ -13,7 +13,7 @@ The README next to this file describes the design. This file is the procedure.
 ## 0. What you need
 
 **The bundle.** `l2-latency-bundle.tar.gz` from `~/Documents/zkvms/l2-bench/bundle/` on the Mac.
-- It holds 249 inputs and 8 ELFs, built from monad `al/zkvm-l2` 59915cb3e with ZisK 1.3.1-alpha.
+- It holds 249 inputs and 8 ELFs, built from monad `al/zkvm-l2` dfe4497ec with ZisK 1.3.1-alpha.
 - `inputs/provenance.txt` inside it has every ELF's sha256.
 - Take its sha256 before copying (§1), so you can check it on the box.
 
@@ -82,7 +82,7 @@ During step 3, `nvidia-smi` should show every GPU busy. The worker's log is
 `~/zisk-infra/cluster/logs/worker.log`. Timings accumulate in
 `~/l2-latency-<stamp>/stark-all/timings.csv` as they are taken.
 
-Input ids are `<arm>-<set>-<label>-b<n>`, for example `l2-poseidon-sig-ksw-sweep-d0050-b2` or
+Input ids are `<arm>-<set>-<label>-b<n>`, for example `l2-poseidon-all-ksw-sweep-d0050-b2` or
 `control-preset-wholesale-b1`, plus `mainnet-<block>`.
 
 ## 4. Bring the results back, then stop paying
@@ -124,7 +124,7 @@ Each option goes in front of the `bash .../run.sh` command:
 |---|---|
 | `GPU_SETS="1 all"` | on a multi-GPU box, also time a worker on one GPU (it restarts between sets; about double the proof time) |
 | `PASSES=1` | one timing per input instead of two; about half the proof time, noisier |
-| `ONLY='<regex>'` | only the input ids that match, e.g. `ONLY='^(l2|l2-poseidon-sig-ksw)-sweep'` or `ONLY='d0(001|050|100)-'` |
+| `ONLY='<regex>'` | only the input ids that match, e.g. `ONLY='^(l2|l2-poseidon-all-ksw)-sweep'` or `ONLY='d0(001|050|100)-'` |
 | `OUT=<dir>` | results directory (default `~/l2-latency-<stamp>`) |
 | `L2LAT_FG=1` | stay in the foreground |
 | `FORCE_INSTALL=1`, `FORCE_RESTART=1` | see §5 |
@@ -136,13 +136,13 @@ Each option goes in front of the `bash .../run.sh` command:
 
 | arm | guest | blocks |
 |---|---|---|
-| `l2` | the L2 as built by default: keccak tries and signatures, Keccak-f precompile, JUMPDESTs in software | 38 |
+| `l2` | the keccak chain (`MONAD_ZKVM_L2_HASH=keccak`): keccak tries, signatures and block hash, Keccak-f precompile, JUMPDESTs in software | 38 |
 | `l2-precompile` | `l2` with the JUMPDEST precompile | 38 |
 | `control` | `l2` with the plaintext cipher suite: no encryption | 38 |
 | `l2-keccak-sw` | `l2` with every Keccak-f in software | 24 (up to 250 tx) |
 | `l2-poseidon` | tries on Poseidon2, the remaining keccak on the precompile | 38 |
 | `l2-poseidon-ksw` | tries on Poseidon2, the remaining keccak in software | 32 (up to 1,000 tx) |
-| `l2-poseidon-sig-ksw` | tries and signatures on Poseidon2, the remaining keccak in software | 38 |
+| `l2-poseidon-all-ksw` | the chain as monad builds it by default: everything it defines on Poseidon2 (tries, signatures, block hash, state blinder, bloom), the remaining keccak in software | 38 |
 | `mainnet` | the mainnet guest on three `r10zisk-rtp` blocks | 3 |
 
 **What to compare the time ratios with.** These are proving-area ratios against `l2`, from the
@@ -150,7 +150,7 @@ instance plans `cargo-zisk execute` prints. An area is 2^nBitsExt × columns plu
 from the proving key's starkinfo. Each figure is the median of the two blocks the run proves at
 that size. If proof time follows area, the sweep table's ratios land near these:
 
-| block | tx | `l2` area | precompile | control | keccak sw | Poseidon2 trie | trie + keccak sw | trie + signatures + keccak sw |
+| block | tx | `l2` area | precompile | control | keccak sw | Poseidon2 trie | trie + keccak sw | all Poseidon2 + keccak sw |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | sweep | 1 | 9.55 G | 1.03 | 0.97 | 0.79 | 1.00 | 0.79 | 0.79 |
 | sweep | 10 | 9.55 G | 1.03 | 0.97 | 0.79 | 1.00 | 0.79 | 0.79 |
@@ -164,7 +164,7 @@ that size. If proof time follows area, the sweep table's ratios land near these:
 | sweep | 5,000 | 48.29 G | 1.01 | 0.88 | – | 0.81 | – | 0.78 |
 | wholesale | 21 | 9.55 G | 1.03 | 0.97 | 0.79 | 1.00 | 0.79 | 0.79 |
 | wholesale-cbdc | 21 | 9.55 G | 1.03 | 0.97 | 0.85 | 1.00 | 0.79 | 0.79 |
-| worker-payouts | 130 | 11.57 G | 1.02 | 0.98 | 2.41 | 0.87 | 1.03 | 1.03 |
+| worker-payouts | 130 | 11.57 G | 1.02 | 0.98 | 2.41 | 0.87 | 1.03 | 0.98 |
 | payouts | 500 | 10.07 G | 1.03 | 0.94 | – | 1.05 | 0.91 | 0.88 |
 
 A dash is a size the arm does not prove.

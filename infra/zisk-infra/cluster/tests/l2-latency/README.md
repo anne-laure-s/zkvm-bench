@@ -19,6 +19,7 @@ block's content barely matters. This measures it instead of extrapolating it.
 | Poseidon2 trie | the same L2 blocks, generated from the same seeds by a host tree configured with `MONAD_ZKVM_L2_TRIE_HASH=poseidon2`, on the encrypting guest built the same way: every trie of the chain on ZisK's Poseidon2 precompile, and the keccak that is left -- signatures, the EVM, code and block hashes -- on the Keccak-f precompile | what moving the trie off keccak saves a proof: about 80 % of a block's permutations are trie work |
 | Poseidon2 trie + Keccak-f sw | those blocks once more, on a guest that also runs the remaining keccak in software (`MONAD_ZKVM_KECCAKF_SOFTWARE=ON`) | whether a block that has no keccak left worth an instance proves faster without the Keccakf instance |
 | Poseidon2 trie and signatures + Keccak-f sw | the same blocks of the chain whose signatures are on Poseidon2 as well (`MONAD_ZKVM_L2_SIGNATURE_HASH=poseidon2`, with the spoke address that chain derives), on a guest that runs the keccak left in software | the configuration whose plan is the smallest at every size of the sweep: 0.79x the keccak chain's up to 100 transactions, 0.88x at 500, 0.78x at 5,000 |
+| all Poseidon2 + Keccak-f sw | the same blocks of the chain a monad tree builds when it names no hash (`MONAD_ZKVM_L2_HASH=poseidon2`: tries, signatures, block hash, state blinder and bloom on Poseidon2, with the spoke address and salt commitment that chain derives), on a guest that runs the keccak left in software | the chain as monad builds it by default: the plan of the previous row at every size of the sweep for 4 to 25 % fewer steps, and 0.98x the keccak chain's area on worker-payouts, whose token transfers fill blooms |
 | mainnet | blocks 25815195, 25815036 and 25815092 of `r10zisk-rtp` (p10, p50, p90: 27-76 Msteps), on the mainnet guest | ties this box to zkvm-bench's mainnet fits |
 
 The L2 corpora come from `monad-zkvm-corpus-gen` (monad, `al/zkvm-l2`): the L2's own chain from
@@ -46,6 +47,7 @@ python3 prepare-inputs.py --elf-l2 <L2 ELF> --elf-control <control ELF> --elf-ma
     [--l2-poseidon <Poseidon2-trie corpora> --elf-l2-poseidon <ELF> --elf-l2-poseidon-ksw <ELF> \
      --poseidon-ksw-max-tx 1000] \
     [--l2-poseidon-sig <Poseidon2-signature corpora> --elf-l2-poseidon-sig-ksw <ELF>] \
+    [--l2-poseidon-all <all-Poseidon2 corpora> --elf-l2-poseidon-all-ksw <ELF>] \
     --l2 <L2 corpora> --control <control corpora> \
     --mainnet <zkvm-bench>/guests/monad/gen/r10zisk-rtp-25815000-25815199-cb7b6b1ae/witnesses
 ZISK_PUBLICS_BIN=<zisk-publics built for glibc 2.35> bash make-bundle.sh
