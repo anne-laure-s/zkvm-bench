@@ -144,6 +144,11 @@ for k in $(seq 1 "$W"); do
     # different slices or not -- cost one gate. Two workers reaching the same sha at the same
     # moment can interleave that file; gate-roots-record.sh validates a cached record before
     # trusting it, so the outcome is a re-gate, never a pass that was not earned.
+    # A worker is a background job, which a non-interactive shell starts with SIGINT and SIGQUIT
+    # ignored -- a disposition everything it starts inherits and no shell can restore. A ^C would
+    # end this driver and leave the workers building, holding their trees' locks, so the next run
+    # is refused. perl puts both back to their default before the worker starts: a ^C ends the
+    # workers and their builds as it ends a build in the foreground.
     env MONAD="$(worker_tree "$k")" \
         BRANCH="$slice_tip" BASE="$slice_base" \
         INDEX="$idx" I_OFFSET="$((OFFSET0 + from - 1))" REUSE_FAMILY="$BN" \
@@ -151,6 +156,7 @@ for k in $(seq 1 "$W"); do
         GATE_PREFIX="$(dirname "$INDEX")/$(basename "$INDEX" -index.tsv)" \
         GATE_JOBS="${GATE_JOBS:-$(( 6 / W < 1 ? 1 : 6 / W ))}" \
         PARTIAL=1 \
+        perl -e '$SIG{INT} = $SIG{QUIT} = "DEFAULT"; exec @ARGV or die "exec $ARGV[0]: $!\n"' \
         "$HERE/series-build-lineage.sh" > "$log" 2>&1 &
     pids+=($!)
     echo "  worker $k: commits $from..$to in $(worker_tree "$k")"
