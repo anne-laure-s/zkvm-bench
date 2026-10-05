@@ -82,7 +82,8 @@ pub = res / 'publics.csv'
 if pub.exists():
     rs = list(csv.DictReader(open(pub)))
     p(f'Proofs verified and read back after the timing: '
-      f'{sum(r["ok"] == "True" for r in rs)}/{len(rs)} commit to their block.\n')
+      f'{sum(r["ok"] == "True" for r in rs)}/{len(rs)} commit to their block'
+      + (f', verified under the timed install\'s own setup key' if rs and all(r.get('pinned') == 'True' for r in rs) else '') + '.\n')
 
 fits = {}
 for tdir in sorted(res.glob('stark-*')):

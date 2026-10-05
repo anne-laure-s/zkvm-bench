@@ -60,6 +60,16 @@ def emu(inputs, out_csv):
 
 def publics(inputs, results):
     tool = os.environ.get('ZISK_PUBLICS', 'zisk-publics')
+    # zisk-publics verifies a proof against the setup key the proof itself carries, which a proof
+    # made with any other setup would satisfy just as well. Each proof is therefore verified a
+    # second time pinned to the final circuit's key of the install being timed (ZISK_HOME), so
+    # that "verifies" means "verifies under the key this run timed".
+    home = pathlib.Path(os.environ.get('ZISK_HOME', pathlib.Path.home() / '.zisk'))
+    found = sorted(home.glob('provingKey/zisk/vadcop_final/vadcop_final.verkey.json')) \
+        + sorted(home.glob('verifyKey/**/vadcop_final.verkey.json'))
+    vk = found[0] if found else None
+    if vk is None:
+        print(f'  !! no vadcop_final.verkey.json under {home}: proofs are checked unpinned')
     by_id = {r['id']: r for r in rows(inputs)}
     proofs = sorted(p for p in results.rglob('proofs/*.proof') if not p.name.startswith('warm'))
     out = []
@@ -72,16 +82,23 @@ def publics(inputs, results):
         want = bytes.fromhex(r['expect'])
         q = subprocess.run([tool, str(p), str(len(want))], capture_output=True)
         ok = q.returncode == 0 and q.stdout[:len(want)] == want
-        out.append((p.relative_to(results), rid, kind, ok, q.returncode))
+        if vk is None:
+            pinned = 'no-key'
+        else:
+            v = subprocess.run(['cargo-zisk', 'verify', '-p', str(p), '--setup-vk', str(vk)], capture_output=True)
+            pinned = v.returncode == 0
+        out.append((p.relative_to(results), rid, kind, ok and pinned is not False, q.returncode, pinned))
         if not ok:
             print(f'  BAD {p.relative_to(results)} rc={q.returncode} '
                   f'{q.stderr.decode(errors="replace").strip()[-200:]}')
+        elif pinned is False:
+            print(f'  BAD {p.relative_to(results)} does not verify under {vk}')
     with open(results / 'publics.csv', 'w') as f:
-        f.write('proof,id,kind,ok,rc\n')
+        f.write('proof,id,kind,ok,rc,pinned\n')
         for o in out:
             f.write(','.join(map(str, o)) + '\n')
     good = sum(1 for o in out if o[3])
-    print(f'zisk-publics: {good}/{len(out)} proofs verify and commit to their block')
+    print(f'zisk-publics: {good}/{len(out)} proofs verify{f" under {vk}" if vk else ""} and commit to their block')
     return 0 if out and good == len(out) else 1
 
 
