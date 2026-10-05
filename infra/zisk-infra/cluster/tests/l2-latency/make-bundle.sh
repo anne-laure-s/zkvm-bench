@@ -26,7 +26,7 @@ for f in 00-install-once.sh up.sh start.sh stop.sh watch.sh nolock.c mlocktest.c
 done
 cp "$CLUSTER/tests/lib.sh" "$CLUSTER/tests/t3-topo.sh" "$STAGE/cluster/tests/"
 cp -R "$HERE/README.md" "$HERE/RUNBOOK.md" "$HERE/run.sh" "$HERE/bench-l2.sh" "$HERE/check.py" "$HERE/summarize.py" \
-      "$HERE/inputs" "$STAGE/cluster/tests/l2-latency/"
+      "$HERE/poc-install.sh" "$HERE/inputs" "$STAGE/cluster/tests/l2-latency/"
 cp -R "$ZI/zisk-publics/Cargo.toml" "$ZI/zisk-publics/Cargo.lock" "$ZI/zisk-publics/src" \
       "$STAGE/zisk-publics/"
 if [ -n "${ZISK_PUBLICS_BIN:-}" ]; then
