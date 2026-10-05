@@ -241,7 +241,22 @@ smallest floor. The second (branch `al/poc-min-padding-50tx`) raises Main to 2^1
 2^16, Keccakf and the ArithEq family's large variants to 2^18, so that a 50-tx block opens each
 air once (18 leaves of the recursion tree on the default chain, 19 on the keccak chain, against
 21 and 23). The arm `l2-poseidon-all-addsw` is the default chain with EVM ADD/SUB in software:
-no Add256 instance, one leaf fewer, for +0.1-0.3 % steps.
+no Add256 instance, one leaf fewer, for +0.1-0.3 % steps. The arm `l2-poseidon-all-nodma` is that
+guest without any DMA operation either (ziskos built without its DMA memcpy & co., ZisK branch
+`al/ziskos-no-dma-mem`; the guest's own word-wise ones, monad `al/exp-nodma-all`): none of the four
+DMA instances, for 16-36 % more steps. Under the 50-tx key it opens 13 leaves from 1 to 50 tx
+where `l2-poseidon-all-addsw` opens 17 (`poc/dma-areas.py`; area with compressors and recursion):
+
+| tx | `-addsw`: leaves | area | `-nodma`: leaves | area | steps `-addsw` -> `-nodma` |
+|---:|---:|---:|---:|---:|---|
+| 1 | 17 | 5.48 G | 13 | 4.74 G | 0.17 -> 0.20 M |
+| 25 | 17 | 5.51 G | 13 | 4.81 G | 0.69 -> 0.91 M |
+| 50 | 17 | 5.58 G | 13 | 4.84 G | 1.22 -> 1.62 M |
+| 100 | 21 | 7.33 G | 18 | 6.60 G | 2.24 -> 3.01 M |
+
+No key changes for it: the DMA airs stay in every key, unused. Its blocks still compile a few DMA
+operations the sweep never runs (the toolchain's prebuilt Rust std on Vec growth and panics; the
+C++ SDIV/SMOD, MODEXP gas and blob base fee): a block that runs one plans the DMA instances again.
 
 On the Mac, `poc/poc-pack.sh` writes `poc/dist/zisk-poc-src.tar.gz` (16 MB; with `--with-key`
 also the Mac's key, ~10 GB, which spares the box its setup), and `ZTREE=zisk50 poc/poc-pack.sh`
@@ -260,7 +275,7 @@ two PoC trees built and set up side by side in `~/.zisk-poc` and `~/.zisk-poc50`
 
 ```
 L=~/zisk-infra/cluster/tests/l2-latency
-SEL='^(l2|l2-poseidon-all-ksw|l2-poseidon-all-addsw)-sweep-d(0001-b[123]|0010-b1|0025-b1|0050-b1|0100-b1|0250-b1|1000-b1)$'
+SEL='^(l2|l2-poseidon-all-ksw|l2-poseidon-all-addsw|l2-poseidon-all-nodma)-sweep-d(0001-b[123]|0010-b1|0025-b1|0050-b1|0100-b1|0250-b1|1000-b1)$'
 nohup bash -c "bash ~/zisk-infra/cluster/up.sh \
   && { bash $L/poc-install.sh ~/poc-dist > ~/poc-install.log 2>&1 & \
        POC_HOME=~/.zisk-poc50 POC_TREE=~/zisk-poc50 bash $L/poc-install.sh ~/poc50-dist > ~/poc50-install.log 2>&1 & \

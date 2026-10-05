@@ -10,7 +10,8 @@
          [--elf-l2-poseidon-ksw L2_POSEIDON_KECCAK_SW.elf] [--poseidon-ksw-max-tx N]] \\
         [--l2-poseidon-sig CORPORA --elf-l2-poseidon-sig ELF \\
          [--elf-l2-poseidon-sig-ksw ELF] [--poseidon-sig-ksw-max-tx N]] \\
-        [--l2-poseidon-all CORPORA --elf-l2-poseidon-all-ksw ELF [--elf-l2-poseidon-all-addsw ELF]] \\
+        [--l2-poseidon-all CORPORA --elf-l2-poseidon-all-ksw ELF [--elf-l2-poseidon-all-addsw ELF] \\
+         [--elf-l2-poseidon-all-nodma ELF]] \\
         [--emu ~/.zisk/bin/ziskemu] [--presets 2] [--mainnet-blocks 25815195,25815036,25815092]
 
 --elf-l2-precompile adds a third arm: the L2's witnesses on an L2 guest built with
@@ -41,7 +42,10 @@ MONAD_ZKVM_L2_HASH=poseidon2, the default: tries, signatures, block hash, state 
 and --elf-l2-poseidon-all-ksw proves them with the keccak left (the EVM's, the anchor's, code
 hashes) in software, on every block. --elf-l2-poseidon-all-addsw proves the same blocks on that
 guest built with MONAD_ZKVM_ADD256_SOFTWARE (EVM ADD/SUB without the add256 precompile), which
-plans no Add256 instance: one leaf fewer in the proof's recursion tree.
+plans no Add256 instance: one leaf fewer in the proof's recursion tree. --elf-l2-poseidon-all-nodma
+proves them on that guest without any DMA operation either (ziskos built without its DMA
+memcpy & co., the guest's own word-wise ones instead): none of the four DMA instances, four
+leaves fewer again, for 16-36 % more steps.
 
 --elf-mainnet with --mainnet adds the mainnet guest on --mainnet-blocks, which ties a box to
 zkvm-bench's mainnet fits. The staged bundle leaves it out: on a 62 GB box the mainnet ELF's ASM
@@ -142,6 +146,7 @@ def main():
     ap.add_argument('--l2-poseidon-all', help='corpora of the chain with everything on Poseidon2')
     ap.add_argument('--elf-l2-poseidon-all-ksw')
     ap.add_argument('--elf-l2-poseidon-all-addsw')
+    ap.add_argument('--elf-l2-poseidon-all-nodma')
     ap.add_argument('--source', default='', help='where the ELFs were built from, for provenance.txt')
     ap.add_argument('--l2', required=True)
     ap.add_argument('--control', required=True)
@@ -156,7 +161,8 @@ def main():
         sys.exit('the Poseidon2-signature arms prove that chain\'s corpora: give --l2-poseidon-sig')
     if bool(a.elf_mainnet) != bool(a.mainnet):
         sys.exit('the mainnet arm takes both --elf-mainnet and --mainnet, or neither')
-    if (a.elf_l2_poseidon_all_ksw or a.elf_l2_poseidon_all_addsw) and not a.l2_poseidon_all:
+    if (a.elf_l2_poseidon_all_ksw or a.elf_l2_poseidon_all_addsw or a.elf_l2_poseidon_all_nodma) \
+            and not a.l2_poseidon_all:
         sys.exit('the all-Poseidon2 arm proves that chain\'s corpora: give --l2-poseidon-all')
 
     v = subprocess.run([a.emu, '--version'], capture_output=True, text=True).stdout
@@ -188,6 +194,8 @@ def main():
         given.append(('l2-poseidon-all-ksw', a.elf_l2_poseidon_all_ksw))
     if a.elf_l2_poseidon_all_addsw:
         given.append(('l2-poseidon-all-addsw', a.elf_l2_poseidon_all_addsw))
+    if a.elf_l2_poseidon_all_nodma:
+        given.append(('l2-poseidon-all-nodma', a.elf_l2_poseidon_all_nodma))
     for arm, src in given:
         dst = inp / f'monad-{arm}.elf'
         shutil.copyfile(src, dst)
@@ -213,6 +221,8 @@ def main():
         arms.append(('l2-poseidon-all-ksw', pathlib.Path(a.l2_poseidon_all), None))
     if a.elf_l2_poseidon_all_addsw:
         arms.append(('l2-poseidon-all-addsw', pathlib.Path(a.l2_poseidon_all), None))
+    if a.elf_l2_poseidon_all_nodma:
+        arms.append(('l2-poseidon-all-nodma', pathlib.Path(a.l2_poseidon_all), None))
     for arm, root, max_tx in arms:
         for kind, label, m in manifests(root):
             picked = list(csv.DictReader(open(m)))
