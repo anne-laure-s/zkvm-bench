@@ -41,8 +41,9 @@ export PATH="$HOME/.cargo/bin:$PATH"
 say "build dependencies"
 # What ZisK's book lists for a Linux build. Idempotent.
 if command -v apt-get >/dev/null 2>&1; then
-  apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang libclang-dev pkg-config \
+  # The lock timeout lets this wait for an install up.sh may be running at the same time.
+  apt-get -o DPkg::Lock::Timeout=1800 update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=1800 install -y -qq build-essential clang libclang-dev pkg-config \
     jq curl git xz-utils libgmp-dev libsodium-dev libomp-dev nlohmann-json3-dev protobuf-compiler \
     uuid-dev libssl-dev libopenmpi-dev openmpi-bin nasm libgrpc++-dev libsecp256k1-dev libpqxx-dev >/dev/null
 fi

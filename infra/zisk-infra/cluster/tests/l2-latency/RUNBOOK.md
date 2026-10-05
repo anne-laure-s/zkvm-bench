@@ -223,3 +223,55 @@ A dash is a size the arm does not prove.
 `gpu.csv` utilisation. A "marginal" verdict or low utilisation makes absolute times specific to this
 box. The ratios between arms are the robust result: every arm ran on the same box, and the drift
 check bounds what the box could have changed between the first ELF's turn and the last's.
+
+## 8. The minimal-padding PoC: the same blocks on ZisK with shorter instances
+
+The floor of a small block is padding: a 1-tx block of the default chain runs 171 K steps in a
+Main instance of 16.8 M, and every other instance it opens is as empty. The PoC is ZisK
+1.3.1-alpha with every air such a block uses 16 times shorter (Rom and Poseidon 4 times): branch
+`al/poc-min-padding` of the local ZisK clone, three files changed (`pil/zisk.pil`, the
+`traces.rs` generated from it, `setup/starkstructs.poseidon.json`); the planners read the heights
+from `traces.rs`, so no Rust changes. Its key was set up and tested on the Mac
+(`~/Documents/zkvms/l2-bench/poc`): a program proven end to end through the recursion and the
+VADCOP final proof, and that proof accepted by the release's `cargo-zisk verify`. The run below
+times it against the release on the same box.
+
+On the Mac, `poc/poc-pack.sh` writes `poc/dist/zisk-poc-src.tar.gz` (16 MB; with `--with-key`
+also the Mac's key, ~10 GB, which spares the box its setup):
+
+```
+scp -P <PORT> ~/Documents/zkvms/l2-bench/bundle/l2-latency-bundle-poc.tar.gz \
+    ~/Documents/zkvms/l2-bench/poc/dist/zisk-poc-src.tar.gz root@<HOST>:~/
+ssh -p <PORT> root@<HOST> 'tar xzf l2-latency-bundle-poc.tar.gz && mkdir -p poc-dist && mv zisk-poc-src.tar.gz poc-dist/'
+```
+
+On the box, one chain: the release installed and up, the PoC built and set up in `~/.zisk-poc`
+(`poc-install.sh`, ~45 min), then the same selection timed on the release and on the PoC:
+
+```
+L=~/zisk-infra/cluster/tests/l2-latency
+SEL='^(l2|l2-poseidon-all-ksw)-sweep-d(0001-b[123]|0010-b1|0100-b1|0250-b1|1000-b1)$'
+nohup bash -c "bash ~/zisk-infra/cluster/up.sh && bash $L/poc-install.sh ~/poc-dist \
+  && L2LAT_FG=1 GPU_SETS='1 2 4' RECHECK=0 ONLY='$SEL' bash $L/run.sh \
+  ; L2LAT_FG=1 ZISK_HOME=~/.zisk-poc FORCE_RESTART=1 GPU_SETS='1 2 4' RECHECK=0 ONLY='$SEL' bash $L/run.sh" \
+  > ~/poc-compare.log 2>&1 < /dev/null &
+```
+
+`GPU_SETS` as the box allows (`'1 2'` on two cards). The two runs land in two
+`~/l2-latency-<stamp>` directories; bring both back as in §4. The proving areas the plans predict
+(`poc/plans.py`, compressors included, without the two virtual tables both keys share):
+
+| arm | tx | release: instances | area | PoC: instances | area |
+|---|---:|---:|---:|---:|---:|
+| default chain | 1 | 16 | 7.53 G | 16 | 0.99 G |
+| default chain | 10 | 16 | 7.53 G | 16 | 0.99 G |
+| default chain | 100 | 16 | 7.53 G | 24 | 2.71 G |
+| default chain | 250 | 17 | 7.99 G | 40 | 5.61 G |
+| default chain | 1,000 | 24 | 13.86 G | 120 | 19.00 G |
+| `l2` | 1 | 17 | 9.55 G | 17 | 1.75 G |
+| `l2` | 100 | 17 | 9.55 G | 25 | 4.98 G |
+| `l2` | 1,000 | 21 | 15.93 G | 128 | 37.08 G |
+
+Shorter instances leave the compressors (Main, Poseidon, the ArithEq family, Keccakf) about as
+big as they were, and a big block takes many more instances, so the PoC is a small-block key:
+the 1,000-tx rows are expected to lose, which is the trade-off this run measures.
