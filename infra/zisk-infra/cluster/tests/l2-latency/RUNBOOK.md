@@ -250,7 +250,7 @@ On the box, one chain: the release installed and up, the PoC built and set up in
 
 ```
 L=~/zisk-infra/cluster/tests/l2-latency
-SEL='^(l2|l2-poseidon-all-ksw)-sweep-d(0001-b[123]|0010-b1|0100-b1|0250-b1|1000-b1)$'
+SEL='^(l2|l2-poseidon-all-ksw)-sweep-d(0001-b[123]|0010-b1|0025-b1|0050-b1|0100-b1|0250-b1|1000-b1)$'
 nohup bash -c "bash ~/zisk-infra/cluster/up.sh && bash $L/poc-install.sh ~/poc-dist \
   && L2LAT_FG=1 GPU_SETS='1 2 4' RECHECK=0 ONLY='$SEL' bash $L/run.sh \
   ; L2LAT_FG=1 ZISK_HOME=~/.zisk-poc FORCE_RESTART=1 GPU_SETS='1 2 4' RECHECK=0 ONLY='$SEL' bash $L/run.sh" \
@@ -265,6 +265,8 @@ nohup bash -c "bash ~/zisk-infra/cluster/up.sh && bash $L/poc-install.sh ~/poc-d
 |---|---:|---:|---:|---:|---:|
 | default chain | 1 | 16 | 7.53 G | 16 | 0.99 G |
 | default chain | 10 | 16 | 7.53 G | 16 | 0.99 G |
+| default chain | 25 | 16 | 7.53 G | 16 | 1.01 G |
+| default chain | 50 | 16 | 7.53 G | 19 | 1.75 G |
 | default chain | 100 | 16 | 7.53 G | 24 | 2.71 G |
 | default chain | 250 | 17 | 7.99 G | 40 | 5.61 G |
 | default chain | 1,000 | 24 | 13.86 G | 120 | 19.00 G |
