@@ -236,29 +236,45 @@ from `traces.rs`, so no Rust changes. Its key was set up and tested on the Mac
 VADCOP final proof, and that proof accepted by the release's `cargo-zisk verify`. The run below
 times it against the release on the same box.
 
+There are two PoC keys. The first divides every height by 16 (Rom and Poseidon by 4): the
+smallest floor. The second (branch `al/poc-min-padding-50tx`) raises Main to 2^19, Poseidon to
+2^16, Keccakf and the ArithEq family's large variants to 2^18, so that a 50-tx block opens each
+air once (18 leaves of the recursion tree on the default chain, 19 on the keccak chain, against
+21 and 23). The arm `l2-poseidon-all-addsw` is the default chain with EVM ADD/SUB in software:
+no Add256 instance, one leaf fewer, for +0.1-0.3 % steps.
+
 On the Mac, `poc/poc-pack.sh` writes `poc/dist/zisk-poc-src.tar.gz` (16 MB; with `--with-key`
-also the Mac's key, ~10 GB, which spares the box its setup):
+also the Mac's key, ~10 GB, which spares the box its setup), and `ZTREE=zisk50 poc/poc-pack.sh`
+the 50-tx tree into `poc/dist50/`:
 
 ```
-scp -P <PORT> ~/Documents/zkvms/l2-bench/bundle/l2-latency-bundle-poc.tar.gz \
-    ~/Documents/zkvms/l2-bench/poc/dist/zisk-poc-src.tar.gz root@<HOST>:~/
-ssh -p <PORT> root@<HOST> 'tar xzf l2-latency-bundle-poc.tar.gz && mkdir -p poc-dist && mv zisk-poc-src.tar.gz poc-dist/'
+scp -P <PORT> ~/Documents/zkvms/l2-bench/bundle/l2-latency-bundle-poc.tar.gz root@<HOST>:~/
+ssh -p <PORT> root@<HOST> 'tar xzf l2-latency-bundle-poc.tar.gz && mkdir -p poc-dist poc50-dist'
+scp -P <PORT> ~/Documents/zkvms/l2-bench/poc/dist/zisk-poc-src.tar.gz root@<HOST>:~/poc-dist/
+scp -P <PORT> ~/Documents/zkvms/l2-bench/poc/dist50/zisk-poc-src.tar.gz root@<HOST>:~/poc50-dist/
 ```
 
-On the box, one chain: the release installed and up, the PoC built and set up in `~/.zisk-poc`
-(`poc-install.sh`, ~45 min), then the same selection timed on the release and on the PoC:
+On the box, one chain: the release installed and up (up.sh also installs the build tools), the
+two PoC trees built and set up side by side in `~/.zisk-poc` and `~/.zisk-poc50`
+(`poc-install.sh`, ~45 min), then the same selection timed on the release and on each PoC:
 
 ```
 L=~/zisk-infra/cluster/tests/l2-latency
-SEL='^(l2|l2-poseidon-all-ksw)-sweep-d(0001-b[123]|0010-b1|0025-b1|0050-b1|0100-b1|0250-b1|1000-b1)$'
-nohup bash -c "bash ~/zisk-infra/cluster/up.sh && bash $L/poc-install.sh ~/poc-dist \
-  && L2LAT_FG=1 GPU_SETS='1 2 4' RECHECK=0 ONLY='$SEL' bash $L/run.sh \
-  ; L2LAT_FG=1 ZISK_HOME=~/.zisk-poc FORCE_RESTART=1 GPU_SETS='1 2 4' RECHECK=0 ONLY='$SEL' bash $L/run.sh" \
+SEL='^(l2|l2-poseidon-all-ksw|l2-poseidon-all-addsw)-sweep-d(0001-b[123]|0010-b1|0025-b1|0050-b1|0100-b1|0250-b1|1000-b1)$'
+nohup bash -c "bash ~/zisk-infra/cluster/up.sh \
+  && { bash $L/poc-install.sh ~/poc-dist > ~/poc-install.log 2>&1 & \
+       POC_HOME=~/.zisk-poc50 POC_TREE=~/zisk-poc50 bash $L/poc-install.sh ~/poc50-dist > ~/poc50-install.log 2>&1 & \
+       wait; } \
+  && test -d ~/.zisk-poc/provingKey && test -d ~/.zisk-poc50/provingKey \
+  && L2LAT_FG=1 GPU_SETS='1 2 4' PASSES=3 ONLY='$SEL' bash $L/run.sh \
+  ; L2LAT_FG=1 ZISK_HOME=~/.zisk-poc FORCE_RESTART=1 GPU_SETS='1 2 4' PASSES=3 ONLY='$SEL' bash $L/run.sh \
+  ; L2LAT_FG=1 ZISK_HOME=~/.zisk-poc50 FORCE_RESTART=1 GPU_SETS='1 2 4' PASSES=3 ONLY='$SEL' bash $L/run.sh" \
   > ~/poc-compare.log 2>&1 < /dev/null &
 ```
 
-`GPU_SETS` as the box allows (`'1 2'` on two cards). The two runs land in two
-`~/l2-latency-<stamp>` directories; bring both back as in §4. The proving areas the plans predict
+`GPU_SETS` as the box allows (`'1 2'` on two cards). Three passes per input, since a floor near a
+second is more sensitive to noise. The three runs land in three `~/l2-latency-<stamp>`
+directories; bring them back as in §4. The proving areas the plans predict
 (`poc/plans.py`, compressors included, without the two virtual tables both keys share):
 
 | arm | tx | release: instances | area | PoC: instances | area |
