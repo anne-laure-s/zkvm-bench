@@ -22,7 +22,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-ZISK = pathlib.Path.home() / '.zisk' / 'bin'
+ZISK = pathlib.Path(os.environ.get('ZISK_HOME', pathlib.Path.home() / '.zisk')) / 'bin'
 
 
 def rows(inputs):

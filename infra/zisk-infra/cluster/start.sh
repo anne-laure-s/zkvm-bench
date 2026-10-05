@@ -18,12 +18,14 @@
 #     USE_MPI=1                     opt into the MPI multi-rank path (ZISK_SRC needed; segfaults on vast.ai)
 #     NO_MPI=1                      force single-process (redundant now; overrides USE_MPI)
 #     WORKER_BACKEND=asm|emulator   witness backend (default asm; reth needs asm)
-#     PROVING_KEY=<folder>          default ~/.zisk/provingKey
+#     PROVING_KEY=<folder>          default $ZISK_HOME/provingKey
+#     ZISK_HOME=<folder>            the ZisK install, default ~/.zisk; the daemons inherit it
 #     COMPUTE_CAPACITY / MAX_STREAMS / MAX_RECURSIVE_STREAMS / API_PORT / CLUSTER_PORT / METRICS_PORT
 set -uo pipefail
 cd "$(dirname "$0")"
 mkdir -p run logs
-export PATH="$HOME/.zisk/bin:$PATH"
+export ZISK_HOME="${ZISK_HOME:-$HOME/.zisk}"
+export PATH="$ZISK_HOME/bin:$PATH"
 
 API_PORT="${API_PORT:-7000}"            # client-facing (ProverClient::remote / submit.sh)
 CLUSTER_PORT="${CLUSTER_PORT:-50051}"   # worker-facing (ZisK default)
@@ -31,7 +33,7 @@ METRICS_PORT="${METRICS_PORT:-9090}"
 COORD_BIN="${COORD_BIN:-zisk-coordinator}"
 WORKER_BIN="${WORKER_BIN:-zisk-worker}"
 ZISK_SRC="${ZISK_SRC:-$HOME/zisk}"
-PROVING_KEY="${PROVING_KEY:-$HOME/.zisk/provingKey}"
+PROVING_KEY="${PROVING_KEY:-$ZISK_HOME/provingKey}"
 # Default backend is ASM, not emulator: the only guest here is reth, and --emulator
 # returns "register_hints_stream not supported" for it (hints REQUIRE asm). emulator
 # is fine only for hint-less guests — override with WORKER_BACKEND=emulator if so.

@@ -26,7 +26,8 @@
 # and its `<<< PHASE (N ms)` spans written to phases.csv, whatever the phases are called in this
 # release.
 set -u
-export PATH="$HOME/.zisk/bin:$PATH"
+export ZISK_HOME="${ZISK_HOME:-$HOME/.zisk}"
+export PATH="$ZISK_HOME/bin:$PATH"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLUSTER="$(cd "$HERE/../.." && pwd)"
 IN="$HERE/inputs"

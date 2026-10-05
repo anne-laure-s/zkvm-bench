@@ -40,7 +40,11 @@ if [ "${L2LAT_FG:-0}" != 1 ]; then
   exit 0
 fi
 
-export PATH="$HOME/.zisk/bin:$HOME/.cargo/bin:$PATH"
+# ZISK_HOME picks the ZisK install, ~/.zisk unless set: binaries, proving key, ELF cache. A build
+# kept beside the release (the minimal-padding PoC in ~/.zisk-poc) runs through the very same
+# steps; every ZisK binary reads ZISK_HOME as well.
+export ZISK_HOME="${ZISK_HOME:-$HOME/.zisk}"
+export PATH="$ZISK_HOME/bin:$HOME/.cargo/bin:$PATH"
 export ZISK_VER=1.3.1-alpha
 PASSES="${PASSES:-1}"; WARMUPS="${WARMUPS:-1}"; ORDER="${ORDER:-elf}"; RECHECK="${RECHECK:-3}"
 GPU_SETS="${GPU_SETS:-all}"

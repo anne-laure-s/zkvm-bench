@@ -36,7 +36,10 @@
 #      (the gate only runs when an install is needed, i.e. on a fresh box)
 set -uo pipefail
 cd "$(dirname "$0")"
-export PATH="$HOME/.zisk/bin:$PATH"
+# ZISK_HOME: the install to bring up, ~/.zisk unless set. Only ~/.zisk is ever installed into; a
+# non-default home (a PoC build beside the release) must arrive complete, see step 2.
+export ZISK_HOME="${ZISK_HOME:-$HOME/.zisk}"
+export PATH="$ZISK_HOME/bin:$PATH"
 
 # A floor for "the extraction never happened", not for "the const-trees are missing" —
 # no real key of any version falls under this. Completeness is check-setup's job, below.
@@ -46,7 +49,7 @@ VRAM_FLOOR_MIB="${VRAM_FLOOR_MIB:-15000}"
 # Exported, not merely assigned: start.sh defaults to 7000 independently, so without this a changed
 # port here would leave this script watching one port while the coordinator binds another.
 export API_PORT="${API_PORT:-7000}"
-KEY="$HOME/.zisk/provingKey"
+KEY="$ZISK_HOME/provingKey"
 COORD_LOG="logs/coordinator.log"
 WORKER_LOG="logs/worker.log"
 
@@ -146,6 +149,10 @@ elif [ "$KGB" -lt "$MIN_KEY_GB" ]; then
   NEED_INSTALL=1; WHY="${WHY:+$WHY, }key only ${KGB} GB"
 fi
 if [ "$NEED_INSTALL" = 1 ]; then
+  # 00-install-once.sh installs the release into ~/.zisk and nowhere else; a home of another
+  # build (the PoC's) is put together by its own script, so an incomplete one is a stop here.
+  [ "$ZISK_HOME" = "$HOME/.zisk" ] || die "$WHY — and $ZISK_HOME is not ~/.zisk: up.sh installs \
+only the release there. Complete that install with the script that made it."
   # The one branch that changes the machine, so it refuses to run anywhere but a box:
   # 00-install-once.sh carries no platform guard of its own — it apt-installs, curls rustup and
   # writes ~/.zisk — and this script is also run on the Mac, read-only, to look at a cluster.
