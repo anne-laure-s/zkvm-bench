@@ -226,6 +226,9 @@ check bounds what the box could have changed between the first ELF's turn and th
 
 ## 8. The minimal-padding PoC: the same blocks on ZisK with shorter instances
 
+To time only the PoC, on 1, 2 and 4 GPUs of one box, with three commands on the Mac:
+[RUNBOOK-POC.md](RUNBOOK-POC.md). This section times the release and every PoC key in one chain.
+
 The floor of a small block is padding: a 1-tx block of the default chain runs 171 K steps in a
 Main instance of 16.8 M, and every other instance it opens is as empty. The PoC is ZisK
 1.3.1-alpha with every air such a block uses 16 times shorter (Rom and Poseidon 4 times): branch
