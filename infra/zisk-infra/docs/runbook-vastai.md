@@ -1,5 +1,10 @@
 # vast.ai runbook — measuring and closing the gap with ZisK's own cluster
 
+**Not the entry point.** To prove one block, follow [`../README.md`](../README.md) § *Experiment —
+prove one block*. This document is what to run on a **rented** box to settle a question, and it
+assumes that one works: its phases 0–2 are the same ship and bring-up, with the rental criteria and
+the per-track timings added.
+
 Three tracks, by GPU count. They do not answer the same question:
 
 | box | what it decides | box time | deliverable |
@@ -95,12 +100,19 @@ and 70 GB; finding out at boot costs cents.
 
 ```bash
 ssh -p $PORT $REMOTE
-cd ~/zisk-infra/cluster && ./00-install-once.sh
+cd ~/zisk-infra/cluster && bash up.sh      # installs what is missing, starts what is down, and
+                                           #   returns only once a worker is REGISTERED
 ```
 
+`up.sh`, not `00-install-once.sh` then `start.sh` by hand. It drives both, and it is the same command
+the zisk-infra README's step 3 gives — one bring-up procedure for the whole repo. What it adds is the
+part this phase used to leave to the reader: it refuses to read an incompletely extracted proving key
+as a success, kills a coordinator or worker that `stop.sh` missed and that still holds port 7000 or
+the card, and never accepts a registration line from an unrotated previous session as this run's.
+
 30–60 min, and **~15 min measured on a 1-GPU box** (48 threads, NVMe at 9.7 GB/s): the const-tree
-generation is CPU-bound and the 70 GB extraction disk-bound, so the span tracks the box, not the GPU
-count. It fails fast when the disk is too small. Check its output for:
+generation is CPU-bound and the extraction disk-bound, so the span tracks the box, not the GPU count.
+It fails fast when the disk is too small. Check the install output for:
 
 - `cargo-zisk: … [gpu]` — otherwise ziskup did not see CUDA; reinstall with the driver present.
 - `cargo-zisk: … 1.3.1-alpha …` matching the pinned `ZISK_VER`, and `stock worker kept (bind_device fix
@@ -108,13 +120,10 @@ count. It fails fast when the disk is too small. Check its output for:
   worker under the stock name — reinstall it as the message says.
 - `patched map_locked_flag -> 0 … (pristine copy kept at …globals.c.orig)` and `built ~/nolock.so` —
   the pristine copy is what t4's `locked` arm needs in order to revert the patch.
-- `provingKey: …` (**~70 GB** extracted).
+- `provingKey: …` (**21 GB** extracted on 1.3.1-alpha; 54 on 1.1.0-alpha, 70 on 1.0.0-alpha).
 
-Then:
-
-```bash
-./start.sh && tail -f logs/worker.log     # wait for registration: 1-2 min (1 GPU), 4-6 (8), 8-12 (16)
-```
+Registration takes 1–2 min on 1 GPU, 4–6 on 8, 8–12 on 16, and `up.sh` waits for it rather than
+returning for you to tail a log. Then, once per ELF:
 
 ```bash
 cargo-zisk remote setup -e ~/zisk-reth.elf --hints --coordinator http://127.0.0.1:7000
