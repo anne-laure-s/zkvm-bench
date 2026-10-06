@@ -32,15 +32,17 @@ and recursion; `results/anchor-cmp/SUMMARY.md` on the Mac):
 
 | tx | `kanchor-ksw` | `kanchor-kpre` | `p2anchor-ksw` | `p2anchor-kpre` | `p2anchor-addsw` | `p2anchor-nodma` |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 17, 5.14 G | 18, 6.28 G | 17, 5.14 G | 18, 6.28 G | 16, 5.00 G | 13, 4.40 G |
-| 50 | 17, 5.30 G | 18, 6.39 G | 17, 5.25 G | 18, 6.39 G | 16, 5.10 G | 13, 4.51 G |
-| 100 | 22, 7.28 G | 22, 8.27 G | 21, 7.00 G | 22, 8.27 G | 20, 6.85 G | 18, 6.27 G |
-| 250 | 33, 11.68 G | 30, 11.41 G | 30, 10.62 G | 31, 11.89 G | 29, 10.48 G | 29, 10.89 G |
-| 1,000 | 95, 34.86 G | 80, 29.47 G | 81, 29.38 G | 81, 29.82 G | 80, 28.79 G | 82, 31.47 G |
+| 1 | 17, 5.33 G | 18, 6.47 G | 17, 5.33 G | 18, 6.47 G | 16, 5.18 G | 13, 4.58 G |
+| 50 | 17, 5.49 G | 18, 6.57 G | 17, 5.43 G | 18, 6.57 G | 16, 5.28 G | 13, 4.69 G |
+| 100 | 22, 7.46 G | 22, 8.45 G | 21, 7.18 G | 22, 8.45 G | 20, 7.03 G | 18, 6.45 G |
+| 250 | 33, 11.86 G | 30, 11.59 G | 30, 10.80 G | 31, 12.08 G | 29, 10.66 G | 29, 11.07 G |
+| 1,000 | 95, 35.04 G | 80, 29.65 G | 81, 29.56 G | 81, 30.00 G | 80, 28.97 G | 82, 31.65 G |
 
 The table at the end of the run gives each arm over `kanchor-ksw`, block for block. The key's
 FROPS were tuned on the previous base's ELFs; on these they may cover less, which costs area and
-never soundness.
+never soundness. Its ROM is 1.3.1's own height, 2^22 (the PoC tree 8fa8a2af7): the guest's new
+interpreter transpiles to 2.4 M ROM instructions, which the PoC's earlier 2^20 refused before
+proving a row. That costs 0.18 G in every proof, counted in the table.
 
 ## 1. The box
 
