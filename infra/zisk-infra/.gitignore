@@ -13,9 +13,11 @@ cluster/run/
 cluster/logs/
 cluster/runs/
 
-# Prebuilt patched CUDA worker (76 MB) is COMMITTED on purpose — it's load-bearing:
-# the stock ziskup worker crashes in count_and_plan.cu on multi-GPU, so all-GPU proving
-# (MPI *and* NO_MPI single-process) needs this drop-in. Rebuild recipe: docs/zisk-bringup-report.md.
+# The box-check corpora: ~155 MB across three directories, rebuilt on the box by each test's own
+# prepare-inputs.sh, and dropped from the wire by cluster/ship.sh. Their scripts, READMEs and
+# steps-*.csv ARE tracked — the measurement is the result, the witnesses are not.
+cluster/tests/*/inputs/
+cluster/tests/*/inputs-*/
 
 # Python / OS
 __pycache__/

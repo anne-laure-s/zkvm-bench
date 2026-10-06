@@ -1,0 +1,17 @@
+tag,steps
+# ZisK steps (`ziskemu -e <elf> -i <input> -m`) for the committed zisk-eth-client sample blocks.
+# Source: infra/zisk-infra/docs/zisk-benchmark.md (measured 2026-07-03, zisk-reth guest).
+# Steps are the denominator of every Msteps/s in results.csv, so they are pinned here rather than
+# re-derived per run. lib.sh appends any block it has to measure itself.
+# NOTE: valid for the ELF pinned by guests/zisk-reth/zisk-reth.build.json — a guest rebuild changes them.
+1-24647140,74123669
+1-24628607,77032188
+1-25229957,78779780
+1-24628608,104704880
+1-24626900,134583289
+1-24697073,143056130
+1-24697070,153259439
+1-24628590,409510987
+1-25229951,413614075
+1-24628595,448359946
+1-24628611,478728818

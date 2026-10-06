@@ -69,16 +69,19 @@ needs a node exposing the debug namespace:
 ./run gen-input GUEST=zisk-reth ZISK_ETH_DIR=../../vendor/zisk-eth-client BLOCK=<n> RPC_URL=http://<node>:8545
 ```
 
-## ZisK is v1.0.0-alpha — CLI facts the harness relies on
+## ZisK is v1.3.1-alpha — CLI facts the harness relies on
 
-All `cargo-zisk`/`ziskemu`/`zisk-coordinator`/`zisk-worker` invocations were checked against the
-installed v1.0.0-alpha `--help`. Baked-in facts: local `prove --hints` **requires `--asm`** (so
-`setup --asm --hints`); `remote prove` sends hints inline (no `--asm`) via `--coordinator` (default
-`:7000`); `-o` is the **proof file**; coordinator binds `7000` (client) / `50051` (worker) / `9090`
-(metrics). **Multi-GPU default = single-process, all GPUs** (`NO_MPI`): the patched worker lets one
-process drive every GPU (proofman assigns all GPUs to the single rank), which is what `cluster/start.sh`
-runs by default. MPI (`mpirun` → `MPI_NP` ranks, ~2 GPUs/rank via `mpi_params.sh`) is the official
-alternative path — opt in with `USE_MPI=1`.
+All `cargo-zisk`/`ziskemu`/`zisk-coordinator`/`zisk-worker` invocations are checked against the
+installed v1.3.1-alpha `--help`. Baked-in facts: local `prove --hints` **requires `--asm`** (so
+`setup --asm --hints`) — the flag's own help now says so; `remote prove` sends hints inline (no
+`--asm`) via `--coordinator`, which also reads `ZISK_COORDINATOR_URL` (default `:7000`); `-o` is the
+**proof file**; coordinator binds `7000` (client) / `50051` (worker) / `9090` (metrics).
+**`check-setup` is a `cargo-zisk-dev` subcommand** — plain `cargo-zisk` answers "unrecognized
+subcommand", which reads like a removed feature rather than a wrong binary. **Multi-GPU default =
+single-process, all GPUs** (`NO_MPI`): one process drives every GPU (proofman assigns all GPUs to
+the single rank), which is what `cluster/start.sh` runs by default. The stock worker does that from
+1.1.0-alpha on, so no worker binary is patched or shipped here. MPI (`mpirun` → `MPI_NP`
+ranks, ~2 GPUs/rank via `mpi_params.sh`) is the official alternative path — opt in with `USE_MPI=1`.
 
 ⚠️ **GPU-only flags are hidden on a CPU build's `--help`** (e.g. the Mac). The worker's `-g/--gpu`
 exists only on a GPU build; likewise re-check `cargo-zisk prove --help` on the box for a GPU flag (add

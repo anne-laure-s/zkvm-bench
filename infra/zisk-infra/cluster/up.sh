@@ -108,6 +108,20 @@ printf '   ziskup:%s  key:%s GB  port %s:%s  daemons:%s  VRAM:%s MiB  registrati
   "$(yes_no "$HAVE_ZISKUP")" "$KGB" "$API_PORT" \
   "$(port_word "$COORD_UP")" "$(yes_no "$PROCS")" "$VRAM" "$REG"
 
+# The enforced power limit, from tests/t6-duty.sh rather than a second copy of the query here: that
+# one has three parsing traps in it (driver 580 prints no "Enforced Power Limit" line, the Module
+# Power Readings block repeats every label with N/A, and Average Power Draw reads N/A on 580 + 5090),
+# and a second definition is how the two would drift. t6 returns early when sourced, so this takes
+# the function without its sampling. A host can cap below the vendor default with nothing in the
+# listing saying so, and this is the only place a run records it.
+T6="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tests/t6-duty.sh"
+if [ -r "$T6" ]; then
+  # shellcheck source=/dev/null
+  . "$T6" && power_block
+else
+  echo "   power    not captured — tests/t6-duty.sh not shipped beside up.sh"
+fi
+
 # Healthy means port, registration and card all agree. Any two out of three is a broken state, not a
 # starting one — the case that matters being VRAM held with no registration, which is a zombie. The
 # daemon probe is deliberately NOT a fourth leg: if those three hold, the processes are alive by

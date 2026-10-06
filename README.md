@@ -23,7 +23,7 @@ STARK) — not that the raw work-units are interchangeable. The shared report co
 
 | Dir | What |
 |-----|------|
-| **`guests/<name>/`** | Per-guest artifacts (shared, prover-agnostic): compiled `<name>.elf` + `inputs/`. Guests: `rsp`, `fibonacci` (SP1 example), `zisk-reth`, `openvm-reth` (+ the special `monad`, below). |
+| **`guests/<name>/`** | Per-guest artifacts (shared, prover-agnostic): compiled `<name>.elf` + `inputs/`. Guests: `rsp`, `fibonacci` (SP1 example), `zisk-reth`, `ziskethone` (upstream's C++ ZisK reference — the only guest whose ELF is committed), `openvm-reth`, `monad-r10-zisk` (+ the special `monad`, below). |
 | **`infra/<stack>-infra/`** | Tooling per zkVM (`sp1-infra` · `zisk-infra` · `openvm-infra`): the `./run` dispatcher, `scripts/`, `cluster/` (on-box multi-GPU proving), the runner, `docs/`, and each guest's **recipe** (`<stack>-infra/guests/<name>/guest.sh`). Artifacts resolve from `../../guests/`. |
 | **`guests/monad/`** | The special **Monad** guest — block-replay ELFs (SP1 + ZisK) + `ev.sh` (execute-and-verify) + witnesses, for the cross-zkVM **execution**-time comparison. See `guests/monad/README.md`. |
 | **`infra/monad-witness/`** | The **producer** side, on a Monad node: drives the node's replay of Ethereum mainnet to dump Monad-guest witnesses at the tip, then queues the cadence blocks, prunes the rest, and records the timestamps the latency report joins on (`witness-follow` · `witness-tap`). The witness seam for the Monad guest — there is no other source for these witnesses. See [`infra/monad-witness/README.md`](infra/monad-witness/README.md). |
@@ -52,7 +52,7 @@ for the **stack(s) you actually use**, not all three:
 - **Prove** (the actual benchmark) — additionally a **GPU box**: a Vast.ai multi-GPU instance (RTX 5090);
   SP1's cluster also needs **CUDA ≥ 13** (driver ≥ 580).
 
-Versions are pinned per stack (SP1 6.2.4 · ZisK v1.0.0-alpha · OpenVM main/v1.4.0). The SP1 / cluster /
+Versions are pinned per stack (SP1 6.2.4 · ZisK 1.3.1-alpha · OpenVM main/v1.4.0). The SP1 / cluster /
 RSP pins are detailed in [`versions.md`](infra/sp1-infra/docs/versions.md); the ZisK and OpenVM versions
 live in their own docs (`infra/zisk-infra/docs/`, `infra/openvm-infra/docs/openvm-multigpu.md`). The exact
 clone commands + box setup are in each `infra/<stack>-infra/README.md`.

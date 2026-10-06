@@ -76,8 +76,11 @@ install openvm-eth          https://github.com/axiom-crypto/openvm-eth          
 # its Cargo.toml). Without these the proxy build fails: "failed to read .vendor/openvm/.../Cargo.toml".
 install openvm-eth/.vendor/openvm        https://github.com/openvm-org/openvm.git        v1.7.0  openvm.patch
 install openvm-eth/.vendor/stark-backend https://github.com/openvm-org/stark-backend.git v1.4.0  stark-backend.patch
-install zisk-eth-client     https://github.com/0xPolygonHermez/zisk-eth-client  v0.10.0      # clean checkout, no patch
-install zisk-ethproofs      https://github.com/0xPolygonHermez/zisk-ethproofs   19e3637      # ZisK ethproofs client (input-gen-server + ethproofs-client); clean checkout. Its `input` dep IS zisk-eth-client v0.10.0.
+# c20fda3 is the commit BOTH build records name (guests/zisk-reth/zisk-reth.build.json and
+# guests/ziskethone/ziskethone.build.json carry it as `commit` / `source.driver_commit`), so this
+# checkout is the one their build.sh accepts without FORCE=1.
+install zisk-eth-client     https://github.com/0xPolygonHermez/zisk-eth-client  c20fda3      # clean checkout, no patch
+install zisk-ethproofs      https://github.com/0xPolygonHermez/zisk-ethproofs   19e3637      # ZisK ethproofs client (input-gen-server + ethproofs-client); clean checkout. Its `input` dep is zisk-eth-client.
 
 echo
 echo "Vendors ready in $VENDOR/ (rsp, openvm-eth, zisk-eth-client)."

@@ -6,17 +6,23 @@
 # Hard-fails if cargo-zisk isn't [gpu] or the proving key is missing.
 #
 # ── DISK vs RAM ──────────────────────────────────────────────────────────────
-# The proving key extracts to ~30 GB+ (const-trees for all precompiles+recursion).
-#   * Default: everything on disk under ~/.zisk → needs a >=64 GB disk.
+# The proving key extracts to const-trees over all precompiles and recursion, and the size moves
+# sharply with the version: 70 GB on 1.0.0-alpha, 54 GB on 1.1.0-alpha, and **21 GB on 1.3.1-alpha**
+# (measured 2026-10-02 on a vast.ai 5090 — the figure the sanity check at the end prints). The ROM
+# assembly cache is separate and accumulates per ELF: 17 GB on that box, but across the ~10 ELFs it
+# set up over its life, so a campaign with two or three guests spends a few GB there, not 17.
+# Budget, 1.3.1-alpha: 21 key + a few per ELF + ~1.6 binaries/toolchain + inputs and proofs.
+#   * Default: everything on disk under ~/.zisk → needs a >=64 GB disk, which is what
+#     tests/t0-gonogo.sh demands before you transfer anything.
 #   * High-RAM / tiny-disk box (e.g. 1 TB RAM + 32 GB disk): put the KEY in RAM:
 #         ZISK_KEY_DIR=/dev/shm/zisk ./00-install-once.sh
 #     Binaries + toolchain + the ROM-asm cache stay on DISK (they must be
 #     executable; /dev/shm is usually mounted noexec). Only the proving key
-#     (read-only DATA, ~30 GB) is symlinked into RAM. RAM-backed = NOT persistent
+#     (read-only DATA) is symlinked into RAM. RAM-backed = NOT persistent
 #     across an instance STOP → just re-run this script after each start.
 set -uo pipefail
 
-# Resolve where the repo-committed helpers (nolock.c, zisk-worker.patched) live, so they
+# Resolve where the repo-committed helpers (nolock.c) live, so they
 # are found whether shipped inside cluster/ or at the zisk-infra repo root, falling back
 # to $HOME. `find_asset <name>` echoes the first existing path.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -55,13 +61,13 @@ if [[ -n "$RAM_KEY" ]]; then
   rm -f "$_t"
   ka="$(disk_avail_gb "$RAM_KEY")"
   [[ -n "$da" && "$da" -ge 12 ]] || { echo "ERROR: need >=12 GB free on disk (~/.zisk) for binaries+asm-cache; have ${da:-?} GB." >&2; exit 1; }
-  [[ -n "$ka" && "$ka" -ge 40 ]] || { echo "ERROR: need >=40 GB in $RAM_KEY for the proving key; have ${ka:-?} GB." >&2; exit 1; }
+  [[ -n "$ka" && "$ka" -ge "${MIN_KEY_GB:-32}" ]] || { echo "ERROR: need >=${MIN_KEY_GB:-32} GB in $RAM_KEY for the proving key; have ${ka:-?} GB." >&2; exit 1; }
   echo "RAM-key mode: binaries on disk (${da} GB free), proving key -> $RAM_KEY (${ka} GB free, RAM)"
 else
   MIN_DISK_GB="${MIN_DISK_GB:-64}"
   [[ -n "$da" && "$da" -ge "$MIN_DISK_GB" ]] || {
-    echo "ERROR: only ${da} GB free on ~/.zisk — ZisK's key needs ~30 GB+." >&2
-    echo "       Use a bigger disk (>=64 GB), OR put the key in RAM: ZISK_KEY_DIR=/dev/shm/zisk ./00-install-once.sh" >&2
+    echo "ERROR: only ${da} GB free on ~/.zisk — the key is 21 GB on 1.3.1-alpha, plus a per-ELF cache." >&2
+    echo "       Use a bigger disk (>=${MIN_DISK_GB} GB), OR put the key in RAM: ZISK_KEY_DIR=/dev/shm/zisk ./00-install-once.sh" >&2
     echo "       (override with MIN_DISK_GB=<n>.)" >&2
     exit 1
   }
@@ -98,8 +104,8 @@ command -v rustup >/dev/null 2>&1 || { echo "ERROR: rustup install failed" >&2; 
 # The version is PINNED: ziskup defaults to "latest", which moves binaries, proving key
 # and const-trees under a plain re-run — and the version decides whether the worker needs
 # the count_and_plan patch (see below) and which key tarball is fetched. Override with
-# ZISK_VER=<x.y.z> to install another release (e.g. 1.0.0-alpha to reproduce results/).
-ZISK_VER="${ZISK_VER:-1.1.0-alpha}"
+# ZISK_VER=<x.y.z> to install another release.
+ZISK_VER="${ZISK_VER:-1.3.1-alpha}"
 
 # In RAM-key mode, ziskup installs binaries only (--nokey); we fetch the key to RAM below.
 ZK="${ZISK_KEY:-}"
@@ -112,7 +118,7 @@ command -v cargo-zisk >/dev/null 2>&1 || { echo "ERROR: cargo-zisk not installed
 ver="$(cargo-zisk --version 2>/dev/null)"; echo "cargo-zisk: $ver"
 # Installed version drives the key tarball name AND the worker decision below, so read it
 # back from the binary rather than trusting the request.
-ZISK_INSTALLED="$(printf '%s' "$ver" | awk '{print $2}')"   # e.g. 1.1.0-alpha
+ZISK_INSTALLED="$(printf '%s' "$ver" | awk '{print $2}')"   # e.g. 1.3.1-alpha
 [ "$ZISK_INSTALLED" = "$ZISK_VER" ] \
   || echo "WARN: requested $ZISK_VER but cargo-zisk reports ${ZISK_INSTALLED:-?}" >&2
 case "$ver" in *'[gpu]'*) GPUFLAG=--gpu ;; *) echo "ERROR: cargo-zisk is NOT the GPU build ([gpu] expected) — is the NVIDIA driver present?" >&2; exit 1 ;; esac
@@ -121,7 +127,7 @@ case "$ver" in *'[gpu]'*) GPUFLAG=--gpu ;; *) echo "ERROR: cargo-zisk is NOT the
 if [[ -n "$RAM_KEY" ]]; then
   v="$ZISK_INSTALLED"
   F="zisk-provingkey-${v}.tar.gz"; BUCKET="https://storage.googleapis.com/zisk-setup"
-  echo "== fetching proving key $v into $RAM_KEY (RAM, 3.5 GB download for 1.1.0-alpha) =="
+  echo "== fetching proving key $v into $RAM_KEY (RAM; the tarball is 3.7 GB on 1.1.0-alpha, 5.1 on 1.3.1-alpha) =="
   ( cd "$RAM_KEY" \
       && curl -fL -O "$BUCKET/$F" && curl -fL -O "$BUCKET/$F.md5" \
       && md5sum -c "$F.md5" \
@@ -141,7 +147,8 @@ echo "== patch memlock (unprivileged Docker / vast.ai: memlock hard-capped ~64 K
 # STARTING_ASM_MICROSERVICES with "mmap(rom) errno=11 / Shmem creation for mo failed"
 # — killing BOTH `cargo-zisk setup --asm` and `prove --asm`. The `-u/--unlock-mapped-memory`
 # flag that would fix it does NOT propagate through the SDK to the spawned microservice
-# (verified on v1.0.0-alpha; globals.c still defaults to MAP_LOCKED in v1.1.0-alpha), so we patch
+# (verified on v1.0.0-alpha; emulator-asm/src/globals.c:35 still reads `map_locked_flag = MAP_LOCKED`
+# at v1.3.1-alpha, so the patch is still required), so we patch
 # the C default map_locked_flag = 0. Pages are never actually swapped on a big-RAM box → zero
 # perf cost. Idempotent. See
 # fix-memlock-patch.sh for the standalone version (+ cache purge when re-patching).
@@ -170,48 +177,20 @@ else
 fi
 
 echo "== zisk-worker multi-GPU (count_and_plan) =="
-# One worker process driving ALL GPUs needs every CountAndPlan entry point to bind the GPU
-# that owns its buffers. From 1.1.0-alpha upstream does that (a bind_device() call at each
-# entry point, reset() included), so the STOCK worker is the correct binary and the
-# committed zisk-worker.patched — a 1.0.0-alpha build — MUST NOT be dropped in: it would
-# pair a 1.0.0 worker with a 1.1.0 coordinator and proving key.
-case "$ZISK_INSTALLED" in
-  1.0.0-alpha)
-    # Reproducing results/zisk-reth-16gpu-clean. There reset() issues its cudaMemset with
-    # no cudaSetDevice, so the stock worker dies at count_and_plan.cu:1586 on multi-GPU;
-    # the committed binary (off-box sm_120 rebuild, --version identical to stock, so it is
-    # identified by BuildID) is what makes single-process multi-GPU work. Rebuild recipe in
-    # docs/zisk-bringup-report.md §4.6.
-    WORKER_PATCHED="$(find_asset zisk-worker.patched || true)"
-    if [ -n "$WORKER_PATCHED" ]; then
-      cp "$HOME/.zisk/bin/zisk-worker" "$HOME/.zisk/bin/zisk-worker.stock" 2>/dev/null || true
-      cp "$WORKER_PATCHED" "$HOME/.zisk/bin/zisk-worker"
-      chmod +x "$HOME/.zisk/bin/zisk-worker"
-      bid=$(readelf -n "$HOME/.zisk/bin/zisk-worker" 2>/dev/null | awk '/Build ID/{print $NF}')
-      echo "  installed patched worker from $WORKER_PATCHED — BuildID $bid"
-      echo "  (expected: 4da61fa8135d1d9ad46d76d6ce260b073a0c45f0)"
-      if [ "$bid" != "4da61fa8135d1d9ad46d76d6ce260b073a0c45f0" ]; then
-        echo "  !!! WARNING: zisk-worker BuildID mismatch (got ${bid:-?}, expected 4da61fa8135d1d9ad46d76d6ce260b073a0c45f0) — wrong/corrupt binary?" >&2
-      fi
-    else
-      echo "  !!! zisk-worker.patched NOT FOUND (looked in cluster/, repo root, \$HOME) !!!" >&2
-      echo "  !!! On 1.0.0-alpha the STOCK worker WILL crash in count_and_plan on multi-GPU." >&2
-      echo "  !!! Ship the binary (it is committed in the repo) or rebuild per docs/zisk-bringup-report.md." >&2
-    fi
-    ;;
-  *)
-    echo "  stock worker kept (bind_device fix is upstream in $ZISK_INSTALLED)"
-    # A leftover patched worker from an earlier 1.0.0-alpha install on this box would
-    # survive the ziskup upgrade only if ziskup skipped the binary — it does not, but the
-    # BuildID is cheap to assert and the failure mode (silent version mismatch) is not.
-    bid=$(readelf -n "$HOME/.zisk/bin/zisk-worker" 2>/dev/null | awk '/Build ID/{print $NF}')
-    if [ "$bid" = "4da61fa8135d1d9ad46d76d6ce260b073a0c45f0" ]; then
-      echo "  ERROR: ~/.zisk/bin/zisk-worker is the 1.0.0-alpha PATCHED binary, not the $ZISK_INSTALLED stock one." >&2
-      echo "         Reinstall the worker: ziskup --version $ZISK_INSTALLED --nokey -y" >&2
-      exit 1
-    fi
-    ;;
-esac
+# One worker process driving ALL GPUs needs every CountAndPlan entry point to bind the GPU that owns
+# its buffers. Upstream does that from 1.1.0-alpha on (a bind_device() call at each entry point,
+# reset() included), so the STOCK worker is the correct binary on every version this script installs
+# and nothing is dropped in over it.
+echo "  stock worker kept (bind_device fix is upstream in $ZISK_INSTALLED)"
+# A box that was set up long ago may still carry a hand-patched 1.0.0-alpha worker under the stock
+# name: --version reports the same string, so the BuildID is the only thing that separates them, and
+# pairing that binary with this coordinator and proving key fails in the contributions phase.
+bid=$(readelf -n "$HOME/.zisk/bin/zisk-worker" 2>/dev/null | awk '/Build ID/{print $NF}')
+if [ "$bid" = "4da61fa8135d1d9ad46d76d6ce260b073a0c45f0" ]; then
+  echo "  ERROR: ~/.zisk/bin/zisk-worker is a patched 1.0.0-alpha binary, not the $ZISK_INSTALLED stock one." >&2
+  echo "         Reinstall the worker: ziskup --version $ZISK_INSTALLED --nokey -y" >&2
+  exit 1
+fi
 
 echo "== zisk repo @ v$ZISK_INSTALLED (mpi_params.sh / official deploy scripts) =="
 # Pinned to the INSTALLED release, not main: mpi_params.sh sizes ranks/streams against the worker
@@ -231,6 +210,10 @@ echo "== sanity check =="
 command -v mpirun >/dev/null 2>&1 && mpirun --version | head -1 || echo "WARN: mpirun missing (openmpi-bin)"
 nvidia-smi -L 2>/dev/null | head -1 || echo "(no nvidia-smi)"
 if [ -e "$HOME/.zisk/provingKey" ]; then
+  # The one measurement of the key this repo ever gets, and the floors at the top are derived from
+  # it: 21 GB on 1.3.1-alpha. It moved by a factor of three between releases (70, then 54, then 21),
+  # so a new version wants this line read again rather than trusted — and `du ~/.zisk/cache` beside
+  # it, which is the per-ELF half the floors also have to carry.
   du -shL "$HOME/.zisk/provingKey" 2>/dev/null | sed 's/^/provingKey: /'
 else
   echo "ERROR: provingKey missing at ~/.zisk/provingKey after install." >&2
