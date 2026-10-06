@@ -37,13 +37,20 @@ Without them the failure is silent and expensive:
 4. execution diverges — reverts, `INVALID` opcodes, ~30 % low `gas_used` — and the only symptom is a
    wrong block hash at the very end of the run
 
-Two guards now catch this, so you should never see the silent version again:
+Two guards catch it, and **neither is upstream yet** — they live in
+[`cli/vendor-patches/ziskethone.patch`](../../../cli/vendor-patches/ziskethone.patch), against
+`ziskethone.git`. Nothing applies that patch for you: `guests/ziskethone/build.sh` checks the
+upstream out at the commit its build record pins, and that commit has neither guard. Apply it to
+your `vendor/ziskethone` checkout before generating anything, or carry the check yourself.
 
 - the **encoder** (`rust-input-gen/src/state_root.rs`) refuses to write a container when it walked
   storage leaves, indexed none of them, and `witness.keys` holds no 32-byte entry at all — it fails in
-  seconds at generation time, exit 1, and prints the preimage counts
+  seconds at generation time, exit 1, and prints the preimage counts. Patching it changes no guest
+  binary, so this half costs nothing to adopt.
 - the **guest** (`cpp-guest/src/state_root.cpp`) fatals before executing a container whose
-  `numberOfStorages == 0` while the walk crossed keyless storage leaves — exit 134
+  `numberOfStorages == 0` while the walk crossed keyless storage leaves — exit 134. This half changes
+  the ELF, so a build carrying it will not meet the `elf_sha256` equality in
+  `guests/ziskethone/ziskethone.build.json`, and the shipped `ziskethone.elf` does **not** carry it.
 
 Known producers:
 
