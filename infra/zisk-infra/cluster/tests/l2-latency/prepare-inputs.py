@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Stage the L2 latency bench's inputs. RUNS ON THE MAC.
 
+    prepare-inputs.py --arm NAME=ELF:CORPORA [--arm ...]    any arms, by name
+
     prepare-inputs.py --elf-l2 L2.elf --elf-control CONTROL.elf \\
         --l2 L2_CORPORA --control CONTROL_CORPORA \\
         [--elf-mainnet MAINNET.elf --mainnet MAINNET_WITNESSES] \\
@@ -47,6 +49,11 @@ proves them on that guest without any DMA operation either (ziskos built without
 memcpy & co., the guest's own word-wise ones instead): none of the four DMA instances, four
 leaves fewer again, for 16-36 % more steps.
 
+--arm NAME=ELF:CORPORA stages an arm by name, as many as given, each proving its own corpora
+with its own ELF; with --arm the flags above are optional, and arms named either way can be mixed.
+Two arms on the same blocks (the same witnesses from two trees) share their pairs, so their
+ratios are block for block.
+
 --elf-mainnet with --mainnet adds the mainnet guest on --mainnet-blocks, which ties a box to
 zkvm-bench's mainnet fits. The staged bundle leaves it out: on a 62 GB box the mainnet ELF's ASM
 microservices pushed the worker out of memory, and the L2 arms answer the questions without it.
@@ -88,7 +95,16 @@ def hx(s):
     return bytes.fromhex(s[2:] if s.startswith('0x') else s)
 
 
-def l2_expect(row):
+def l2_expect(row, chain_id=1):
+    """What the guest publishes for this block, from its manifest row. From al/zkvm-l2 4c0f7e30f
+    on the domain chain id, the number, both state commitments, the message anchor and the
+    sequencing anchor -- 144 of the 209 bytes; the viewing key and the salt commitment after them
+    are the ELF's and not the block's. Before it, the parent hash, the block hash, the anchor and
+    the number."""
+    if row.get('pre_commitment') and row.get('seq_anchor'):
+        return (struct.pack('>Q', chain_id) + struct.pack('>Q', int(row['number']))
+                + hx(row['pre_commitment']) + hx(row['commitment']) + hx(row['anchor'])
+                + hx(row['seq_anchor']))
     return (hx(row['parent_hash']) + hx(row['block_hash']) + hx(row['anchor'])
             + struct.pack('>Q', int(row['number'])))
 
@@ -126,8 +142,11 @@ def manifests(root):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--elf-l2', required=True)
-    ap.add_argument('--elf-control', required=True)
+    ap.add_argument('--arm', action='append', default=[], metavar='NAME=ELF:CORPORA',
+                    help='an arm by name: its ELF and the corpora it proves (repeatable)')
+    ap.add_argument('--chain-id', type=int, default=1, help='MONAD_ZKVM_L2_CHAIN_ID of the ELFs')
+    ap.add_argument('--elf-l2')
+    ap.add_argument('--elf-control')
     ap.add_argument('--elf-mainnet')
     ap.add_argument('--elf-l2-precompile')
     ap.add_argument('--elf-l2-keccak-sw')
@@ -148,13 +167,24 @@ def main():
     ap.add_argument('--elf-l2-poseidon-all-addsw')
     ap.add_argument('--elf-l2-poseidon-all-nodma')
     ap.add_argument('--source', default='', help='where the ELFs were built from, for provenance.txt')
-    ap.add_argument('--l2', required=True)
-    ap.add_argument('--control', required=True)
+    ap.add_argument('--l2')
+    ap.add_argument('--control')
     ap.add_argument('--mainnet')
     ap.add_argument('--emu', default=str(pathlib.Path.home() / '.zisk/bin/ziskemu'))
     ap.add_argument('--presets', type=int, default=2, help='blocks per preset corpus')
     ap.add_argument('--mainnet-blocks', default='25815195,25815036,25815092')
     a = ap.parse_args()
+    named = []
+    for spec in a.arm:
+        name, _, rest = spec.partition('=')
+        elf, _, corpora = rest.partition(':')
+        if not (name and elf and corpora):
+            sys.exit(f'--arm {spec}: expected NAME=ELF:CORPORA')
+        named.append((name, elf, pathlib.Path(corpora)))
+    if not named and not (a.elf_l2 and a.elf_control and a.l2 and a.control):
+        sys.exit('give --arm, or --elf-l2, --elf-control, --l2 and --control')
+    if bool(a.elf_l2) != bool(a.l2) or bool(a.elf_control) != bool(a.control):
+        sys.exit('--elf-l2 goes with --l2, --elf-control with --control')
     if (a.elf_l2_poseidon or a.elf_l2_poseidon_ksw) and not a.l2_poseidon:
         sys.exit('the Poseidon2-trie arms prove the Poseidon2-trie corpora: give --l2-poseidon')
     if (a.elf_l2_poseidon_sig or a.elf_l2_poseidon_sig_ksw) and not a.l2_poseidon_sig:
@@ -175,7 +205,11 @@ def main():
         shutil.rmtree(inp)
     (inp / 'bins').mkdir(parents=True)
     elfs = {}
-    given = [('l2', a.elf_l2), ('control', a.elf_control)]
+    given = [(n, e) for n, e, _ in named]
+    if a.elf_l2:
+        given.append(('l2', a.elf_l2))
+    if a.elf_control:
+        given.append(('control', a.elf_control))
     if a.elf_mainnet:
         given.append(('mainnet', a.elf_mainnet))
     if a.elf_l2_precompile:
@@ -203,7 +237,11 @@ def main():
 
     rows = []
     # (arm, corpora, largest block it proves)
-    arms = [('l2', pathlib.Path(a.l2), None), ('control', pathlib.Path(a.control), None)]
+    arms = [(n, c, None) for n, _, c in named]
+    if a.l2:
+        arms.append(('l2', pathlib.Path(a.l2), None))
+    if a.control:
+        arms.append(('control', pathlib.Path(a.control), None))
     if a.elf_l2_precompile:
         arms.append(('l2-precompile', pathlib.Path(a.l2), None))
     if a.elf_l2_keccak_sw:
@@ -234,7 +272,7 @@ def main():
                     continue
                 w = m.parent / f"{row['scenario']}-{int(row['number']):08d}.witness"
                 framed = frame(w.read_bytes())
-                expect = l2_expect(row)
+                expect = l2_expect(row, a.chain_id)
                 pair = f'{kind}-{label}-b{k}'
                 rid = f'{arm}-{pair}'
                 (inp / 'bins' / f'{rid}.bin').write_bytes(framed)
@@ -269,7 +307,12 @@ def main():
             f.write(f'source       {a.source}\n')
         for arm, p in elfs.items():
             f.write(f'{p.name:22} sha256 {hashlib.sha256(p.read_bytes()).hexdigest()}\n')
-        f.write(f'l2 corpora   {a.l2}\ncontrol      {a.control}\n')
+        for n, _, c in named:
+            f.write(f'{n:22} corpora {c}\n')
+        if a.l2:
+            f.write(f'l2 corpora   {a.l2}\n')
+        if a.control:
+            f.write(f'control      {a.control}\n')
         if a.mainnet:
             f.write(f'mainnet      {a.mainnet}\n')
         if a.l2_poseidon:

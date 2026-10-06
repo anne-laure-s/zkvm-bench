@@ -21,7 +21,7 @@
 # It detaches itself (nohup setsid) unless POC_FG=1; the log is ~/poc-run-<stamp>.log.
 #
 # Env: POC_KEYS="poc50f" (each one installed in ~/.zisk-<key>; "poc50f poc50" times both)
-#      GPU_SETS="1 2 4" · PASSES=3 · ONLY=<regex on input ids>, default the four arms of the PoC
+#      GPU_SETS="1 2 4" · PASSES=3 · ONLY=<regex on input ids>, default every staged arm's sweep
 #      selection at 1 to 1,000 transactions · MIN_FREE_GB=70 per key to install
 #      SKIP_TOPO=1 · FORCE_INSTALL=1 (install past a bad d2h verdict) · DRY_RUN=1 (print the plan)
 #      VRAM_FLOOR_MIB (up.sh's; it reaches up.sh through run.sh)
@@ -33,7 +33,7 @@ LOG="$HOME/poc-run-$STAMP.log"
 POC_KEYS="${POC_KEYS:-poc50f}"
 GPU_SETS="${GPU_SETS:-1 2 4}"
 PASSES="${PASSES:-3}"
-ONLY="${ONLY:-^(l2|l2-poseidon-all-ksw|l2-poseidon-all-addsw|l2-poseidon-all-nodma)-sweep-d(0001-b[123]|0010-b1|0025-b1|0050-b1|0100-b1|0250-b1|1000-b1)$}"
+ONLY="${ONLY:--sweep-d(0001-b[123]|0010-b1|0025-b1|0050-b1|0100-b1|0250-b1|1000-b1)$}"
 MIN_FREE_GB="${MIN_FREE_GB:-70}"
 DRY="${DRY_RUN:-0}"
 say()  { printf '\n\033[1m== %s\033[0m  (%s)\n' "$*" "$(date -u +%H:%M:%S)"; }

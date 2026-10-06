@@ -138,6 +138,56 @@ for tdir in sorted(res.glob('stark-*')):
     # an arm that did not prove a size (the Keccak-f arm stops at 250 tx) shows a dash
     f2 = lambda x, spec='.2f': '–' if math.isnan(x) else format(x, spec)
 
+    if 'l2' not in staged:
+        # Arms staged by name (prepare-inputs.py --arm), none of them the keccak chain's L2 the
+        # tables below are built around: every arm per block size, medians over the size's blocks,
+        # and each arm over the first one staged, block for block.
+        names = list(dict.fromkeys(r['arm'] for r in INP.values()))
+        ref = names[0]
+        p(f"The sweep, payouts' mix: median s per block size, and each arm over `{ref}`, block "
+          'for block.\n')
+        p('| tx | ' + ' | '.join(f'{n} s' for n in names) + ' |'
+          + ''.join(f' {n} / {ref} |' for n in names[1:]))
+        p('|---:|' + '---:|' * (2 * len(names) - 1))
+        for n_tx in sorted({int(r['txs']) for r in INP.values() if r['set'] == 'sweep'}):
+            qs = sorted({r['pair'] for r in INP.values()
+                         if r['set'] == 'sweep' and int(r['txs']) == n_tx})
+            col = lambda arm: md([x for x in (sec(f'{arm}-{q}') for q in qs) if not math.isnan(x)])
+            rat = lambda arm: md([x for x in (sec(f'{arm}-{q}') / sec(f'{ref}-{q}') for q in qs)
+                                  if not math.isnan(x)])
+            if all(math.isnan(col(n)) for n in names):
+                continue
+            p(f'| {n_tx:,} | ' + ' | '.join(f2(col(n)) for n in names) + ' |'
+              + ''.join(f' {f2(rat(n), ".3f")} |' for n in names[1:]))
+        p('')
+        presets = sorted({r['pair'] for r in INP.values() if r['set'] == 'preset'})
+        if any(not math.isnan(sec(f'{n}-{q}')) for n in names for q in presets):
+            p('| preset block | ' + ' | '.join(f'{n} s' for n in names) + ' |')
+            p('|---|' + '---:|' * len(names))
+            for q in presets:
+                p(f"| {q[len('preset-'):]} | " + ' | '.join(f2(sec(f'{n}-{q}')) for n in names) + ' |')
+            p('')
+        p('| arm | n | fixed s | s per Msteps | Msteps/s | R2 |')
+        p('|---|---:|---:|---:|---:|---:|')
+        for arm in names:
+            xs = [int(INP[rid]['steps']) / 1e6 for rid, x in med.items()
+                  if rid in INP and INP[rid]['arm'] == arm and not math.isnan(x)]
+            ys = [x for rid, x in med.items()
+                  if rid in INP and INP[rid]['arm'] == arm and not math.isnan(x)]
+            a_, b_, r2 = ols(xs, ys)
+            if xs:
+                p(f'| {arm} | {len(xs)} | {a_:.2f} | {b_:.4f} | {1 / b_ if b_ else math.nan:.1f} '
+                  f'| {r2:.4f} |')
+        p('')
+        gpu = tdir / 'gpu.csv'
+        if gpu.exists():
+            util = [fnum(l.split(',')[1]) for l in open(gpu) if l.count(',') >= 2]
+            util = [u for u in util if not math.isnan(u)]
+            if util:
+                p(f'GPU utilisation while proving: mean {st.mean(util):.0f} %, median '
+                  f'{st.median(util):.0f} %.\n')
+        continue
+
     def ratio(qs, a, b):
         v = [sec(f'{a}-{q}') / sec(f'{b}-{q}') for q in qs]
         return md([x for x in v if not math.isnan(x)])
