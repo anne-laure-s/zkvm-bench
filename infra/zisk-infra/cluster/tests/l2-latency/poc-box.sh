@@ -28,11 +28,14 @@ SSH=(ssh -p "$PORT" "$DEST")
 say() { printf '\033[1m== %s\033[0m\n' "$*"; }
 die() { printf '\033[31mXX %s\033[0m\n' "$*" >&2; exit 1; }
 sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
+# The box's sha256 of a file, the hash alone: a box that prints a banner on every ssh command would
+# otherwise make every comparison fail.
+rsha() { "${SSH[@]}" "sha256sum '$1' 2>/dev/null" | grep -oE '^[0-9a-f]{64}' | tail -1 || true; }
 
 # The env poc-run.sh reads, forwarded only when set here.
 forward() {
   local e="POC_KEYS='$POC_KEYS'" v
-  for v in GPU_SETS PASSES ONLY SKIP_TOPO FORCE_INSTALL MIN_FREE_GB DRY_RUN; do
+  for v in GPU_SETS PASSES ONLY SKIP_TOPO FORCE_INSTALL MIN_FREE_GB DRY_RUN VRAM_FLOOR_MIB; do
     [ -n "${!v:-}" ] && e="$e $v='${!v}'"
   done
   echo "$e"
@@ -47,7 +50,7 @@ case "$CMD" in
       echo "memlock: $(ulimit -l)"
       echo "cpu:    $(nproc) threads, $(awk "/MemTotal/{printf \"%.0f GB\", \$2/1048576}" /proc/meminfo) RAM"'
     echo
-    echo "Want: 4 GPUs with 32 GB or more each, an nvcc line (a CUDA -devel image), Ubuntu 22.04+"
+    echo "Want: 4 GPUs with 32 GB or more each, nvcc 12.8 or later (a CUDA -devel image), Ubuntu 22.04+"
     echo "(glibc 2.35+), about 80 GB free per PoC key ($POC_KEYS). memlock 64 is the usual vast.ai cap:"
     echo "the PoC install patches around it."
     ;;
@@ -69,13 +72,13 @@ case "$CMD" in
         *) key="poc${f#"$L2BENCH/poc/dist"}"; key="${key%%/*}"; rel="$key-dist/$(basename "$f")" ;;
       esac
       want="$(sha "$f")"
-      have="$("${SSH[@]}" "sha256sum '$rel' 2>/dev/null | cut -d' ' -f1" || true)"
+      have="$(rsha "$rel")"
       if [ "$have" = "$want" ]; then
         echo "   $rel: already there"
       else
         echo "   $rel ($(du -h "$f" | cut -f1))"
         scp -q -P "$PORT" "$f" "$DEST:$rel"
-        have="$("${SSH[@]}" "sha256sum '$rel' | cut -d' ' -f1")"
+        have="$(rsha "$rel")"
         [ "$have" = "$want" ] || die "$rel arrived with another sha256 ($have, want $want)"
       fi
     done

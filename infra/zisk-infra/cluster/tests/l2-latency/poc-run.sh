@@ -24,6 +24,7 @@
 #      GPU_SETS="1 2 4" · PASSES=3 · ONLY=<regex on input ids>, default the four arms of the PoC
 #      selection at 1 to 1,000 transactions · MIN_FREE_GB=70 per key to install
 #      SKIP_TOPO=1 · FORCE_INSTALL=1 (install past a bad d2h verdict) · DRY_RUN=1 (print the plan)
+#      VRAM_FLOOR_MIB (up.sh's; it reaches up.sh through run.sh)
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLUSTER="$(cd "$HERE/../.." && pwd)"
@@ -68,16 +69,19 @@ EOF
 [ "${NSEL:-0}" -gt 0 ] || die "ONLY selects no input of $HERE/inputs/inputs.csv"
 echo "   $NSEL inputs selected (ONLY=$ONLY)"
 
-# Which keys still need their install. A complete one has its binaries and its final circuit's
-# verification key; poc-install.sh starts from scratch, so it runs only for the others.
+# Which keys still need their install. poc-install.sh writes ~/.zisk-<key>/.installed last of
+# all, with the sha256 of the tree it installed: a key counts as installed when that is the tree in
+# ~/<key>-dist now. It starts from scratch, so it runs only for the others.
 TODO=()
 for key in $POC_KEYS; do
   home="$HOME/.zisk-$key"
-  if [ -x "$home/bin/cargo-zisk" ] && [ -f "$home/provingKey/zisk/vadcop_final/vadcop_final.verkey.json" ]; then
+  src="$HOME/$key-dist/zisk-poc-src.tar.gz"
+  have="$(cut -d' ' -f1 "$home/.installed" 2>/dev/null || true)"
+  if [ -n "$have" ] && { [ ! -f "$src" ] || [ "$have" = "$(sha256sum "$src" | cut -d' ' -f1)" ]; }; then
     echo "   $key: installed in $home"
   else
-    [ -f "$HOME/$key-dist/zisk-poc-src.tar.gz" ] || die "$key: no ~/$key-dist/zisk-poc-src.tar.gz — copy it from the Mac's poc/dist${key#poc}/ (poc-box.sh start does)"
-    echo "   $key: to install from ~/$key-dist ($(ls "$HOME/$key-dist" | tr '\n' ' '))"
+    [ -f "$src" ] || die "$key: no $src — copy it from the Mac's poc/dist${key#poc}/ (poc-box.sh start does)"
+    echo "   $key: to install from ~/$key-dist ($(ls "$HOME/$key-dist" | tr '\n' ' '))${have:+, replacing an install of another tree}"
     TODO+=("$key")
   fi
 done
@@ -86,6 +90,12 @@ if [ "${#TODO[@]}" -gt 0 ]; then
   export PATH="/usr/local/cuda/bin:$PATH"
   command -v nvcc >/dev/null 2>&1 || [ "$DRY" = 1 ] \
     || die "no nvcc: the PoC is built from source and needs the CUDA toolkit. Rent an image with it (a -devel CUDA image)."
+  # poc-install.sh builds for ZisK's "major" archs, sm_80 to sm_120 (RTX 50xx): nvcc 12.8 or later,
+  # or the build stops on compute_120 a quarter of an hour in.
+  NVCC_REL="$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')"
+  echo "   nvcc ${NVCC_REL:-none}"
+  [ "$DRY" = 1 ] || awk -v v="${NVCC_REL:-0}" 'BEGIN { split(v, a, "."); exit !(a[1] > 12 || (a[1] == 12 && a[2] >= 8)) }' \
+    || die "nvcc ${NVCC_REL:-?} is too old to build for sm_120 (RTX 50xx): rent an image with CUDA 12.8 or later"
   FREE_GB="$(df -Pk "$HOME" | awk 'NR==2{print int($4/1048576)}')"
   NEED_GB=$(( MIN_FREE_GB * ${#TODO[@]} ))
   echo "   disk: ${FREE_GB} GB free, ~${NEED_GB} GB needed (tree, key and its GPU constant trees: ${MIN_FREE_GB} GB a key)"

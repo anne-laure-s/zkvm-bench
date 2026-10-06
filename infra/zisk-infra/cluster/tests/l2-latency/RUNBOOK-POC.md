@@ -33,7 +33,7 @@ compressors and recursion):
 | need | why |
 |---|---|
 | **4 GPUs**, 32 GB VRAM or more each (RTX 5090), power limit at the default (575-600 W) | the 1-, 2- and 4-GPU sets; the first box was capped at 450 W and was about 10 % slower for it |
-| a **CUDA `-devel` image**: `nvcc` present | the PoC is built from source with the GPU prover |
+| a **CUDA `-devel` image, 12.8 or later**: `nvcc` present | the PoC is built from source with the GPU prover, for ZisK's major archs up to sm_120 (RTX 50xx), which older nvcc cannot target |
 | Ubuntu 22.04 or later | glibc 2.35 for the bundled `zisk-publics` |
 | **120 GB free disk** (200 GB with `POC_KEYS="poc50f poc50"`) | the tree, its key and the key's GPU constant trees: about 70 GB a key |
 | 64 GB RAM or more | the worker keeps every ELF's ASM services resident: four ELFs here |
@@ -59,8 +59,8 @@ $P start <host> <port>
 $P log <host> <port>
 ```
 
-- `check` takes ten seconds and copies nothing. It wants four GPUs, an `nvcc` line and the disk
-  above.
+- `check` takes ten seconds and copies nothing. It wants four GPUs, nvcc 12.8 or later and the
+  disk above.
 - `start` copies the bundle (245 MB) and the tree (16 MB), checks their sha256 on the box, and
   starts `poc-run.sh`, detached. A second `start` copies only what changed: a box kept from a
   previous run skips its install too.
@@ -108,11 +108,13 @@ with that in mind. The `d2h` line of the log is the figure to compare.
 | symptom | where to read | what to do |
 |---|---|---|
 | `no nvcc` | — | The image has the driver but not the toolkit. Rent a CUDA `-devel` image. |
+| `nvcc 12.x is too old` | — | The same, with CUDA 12.8 or later. |
 | `too little disk` | — | A bigger disk. `MIN_FREE_GB` lowers the bar, on your own judgement. |
 | `THIS IS THE STARVED CASE` | `~/topo.log` | Rent another box (2 minutes lost). `FORCE_INSTALL=1` goes on, but keep the d2h figure with the results. |
 | `<key> did not install` | `~/<key>-install.log`, then `~/zisk-<key>-build.log` or `~/zisk-<key>-key.log` | The build (CUDA, missing package) or the key's setup (network: it fetches pil2-proofman). Fix, then `start` again: it reinstalls only what is missing. |
 | `1/5 cluster up` fails | `~/l2-latency-<stamp>-<key>/up.log`, `~/check-setup.log` | `the key is unusable`: delete `~/.zisk-<key>` and `start` again. |
 | proofs with `rc=` not 0, `mmap(rom) errno=11` in `worker.log` | `~/zisk-infra/cluster/logs/worker.log` | The memlock cap: the install patched it and built `~/nolock.so`; check both exist (`grep map_locked_flag ~/.zisk-<key>/zisk/emulator-asm/src/globals.c`). |
+| `1/5 cluster up` waits 600 s and gives up although `worker.log` shows the worker registered | `up.log` | up.sh calls a worker healthy from 15,000 MiB of VRAM held on the box, the release worker's size. A PoC worker on one GPU should hold more (its streams are floored at the largest compressor, ~6 GB each), but if it does not, `VRAM_FLOOR_MIB=4000` in front of `start`. |
 | the 2- or 4-GPU worker dies at startup | `worker.log` | The stack: `poc-run.sh` already sets `RUST_MIN_STACK=67108864 OMP_STACKSIZE=64M`; rerun with larger values in front of `start`. |
 | a proof that does not verify | `publics.csv` | That row is not a time of that block: report it, do not use it. |
 | the session or the box dropped | — | `start` again: copies and installs are skipped when already done, and a new results directory is made. |
@@ -129,3 +131,4 @@ All are given in front of `$P start`:
 | `ONLY` | the 36 inputs above | a regex on input ids, e.g. `'^l2-poseidon-all-nodma-sweep-'` for one arm |
 | `DRY_RUN` | — | `1` prints the plan on the box and runs nothing |
 | `SKIP_TOPO` | — | `1` skips the d2h measurement |
+| `VRAM_FLOOR_MIB` | `15000` | up.sh's VRAM sign of a live worker, see §6 |

@@ -105,12 +105,19 @@ else
 fi
 
 say "installing into $POC_HOME"
-mkdir -p "$POC_HOME/bin" "$POC_HOME/zisk/emulator-asm" "$POC_HOME/cache"
-for b in cargo-zisk cargo-zisk-dev ziskemu zisk-coordinator zisk-worker zisk-transpiler-riscv; do
+# What ZisK's tools/test-env/build_zisk.sh installs on Linux. The two static libraries are not
+# optional: the worker builds every ELF's ASM emulator with emulator-asm/Makefile, run in
+# $POC_HOME/zisk/emulator-asm, which links -lziskc -lziskclib from ../../bin, $POC_HOME/bin.
+rm -f "$POC_HOME/.installed"
+mkdir -p "$POC_HOME/bin" "$POC_HOME/zisk/emulator-asm"
+for b in cargo-zisk cargo-zisk-dev ziskemu zisk-coordinator zisk-worker zisk-transpiler-riscv libziskclib.a; do
   cp "$R/$b" "$POC_HOME/bin/"
 done
-cp "$R/libziskclib.a" "$POC_HOME/bin/" 2>/dev/null || true
-rm -rf "$POC_HOME/zisk/emulator-asm/src" "$POC_HOME/zisk/lib-c" "$POC_HOME/provingKey"
+cp "$POC_TREE/target/zisk-libs/libziskc.a" "$POC_HOME/bin/"
+# A cache left by an earlier install holds ASM emulators built from its sources and setups made
+# with its key: the first remote setup of each ELF rebuilds them.
+rm -rf "$POC_HOME/zisk/emulator-asm/src" "$POC_HOME/zisk/lib-c" "$POC_HOME/provingKey" "$POC_HOME/cache"
+mkdir -p "$POC_HOME/cache"
 cp -r "$POC_TREE/emulator-asm/src" "$POC_TREE/emulator-asm/Makefile" "$POC_HOME/zisk/emulator-asm/"
 cp -r "$POC_TREE/lib-c" "$POC_HOME/zisk/"
 mv "$POC_TREE/build/provingKey" "$POC_HOME/provingKey"
@@ -129,6 +136,10 @@ NOLOCK_C="$(cd "$(dirname "$0")/../.." && pwd)/nolock.c"
 if [ ! -f "$HOME/nolock.so" ] && [ -f "$NOLOCK_C" ]; then
   gcc -shared -fPIC -O2 -o "$HOME/nolock.so" "$NOLOCK_C" -ldl || echo "   WARN: nolock.so did not build"
 fi
+
+# The mark poc-run.sh reads: the tree this install was made from, written last, so that an install
+# that stopped part way, or one of another tree, reads as missing.
+sha256sum "$SRC/zisk-poc-src.tar.gz" > "$POC_HOME/.installed"
 
 say "done — $(du -sh "$POC_HOME/provingKey" | cut -f1) of key; time it with:"
 echo "   ZISK_HOME=$POC_HOME FORCE_RESTART=1 bash $(cd "$(dirname "$0")" && pwd)/run.sh"
