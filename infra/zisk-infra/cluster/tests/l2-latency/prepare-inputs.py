@@ -67,6 +67,9 @@ MAINNET_WITNESSES is a zkvm-bench generation (<n>.witness beside <n>.blockhash).
 Writes inputs/ next to this script: the ELFs, every witness framed the way the prover reads
 it (LE64 length, the witness, zero padding to 8), and inputs.csv -- one row per input with its
 arm, its pair (the same block on the other arm), its size and the public output it must prove.
+A framed witness is stored once, under its content's name (bins/<sha256 prefix>.bin): arms that
+prove the same blocks share their files, and the bundle carries each block once rather than once
+per arm (gzip does not find a repeat that far back).
 
 Every input is replayed through ziskemu first, and a run that does not reproduce what its manifest
 recorded stops here: a latency measured on the wrong block is a number about nothing. The steps it
@@ -93,6 +96,14 @@ def frame(witness: bytes) -> bytes:
 
 def hx(s):
     return bytes.fromhex(s[2:] if s.startswith('0x') else s)
+
+
+def store(inp, framed):
+    """bins/<content>.bin, written once whichever arms prove it; its path inside inputs/."""
+    rel = f'bins/{hashlib.sha256(framed).hexdigest()[:16]}.bin'
+    if not (inp / rel).exists():
+        (inp / rel).write_bytes(framed)
+    return rel
 
 
 def l2_expect(row, chain_id=1):
@@ -275,12 +286,12 @@ def main():
                 expect = l2_expect(row, a.chain_id)
                 pair = f'{kind}-{label}-b{k}'
                 rid = f'{arm}-{pair}'
-                (inp / 'bins' / f'{rid}.bin').write_bytes(framed)
+                rel = store(inp, framed)
                 steps = replay(a.emu, elfs[arm], framed, expect)
                 rows.append(dict(id=rid, arm=arm, pair=pair, set=kind, label=label,
                                  number=row['number'], txs=row['txs'], gas=row['gas_used'],
                                  witness_bytes=row['witness_bytes'], steps=steps,
-                                 elf=elfs[arm].name, bin=f'bins/{rid}.bin', expect=expect.hex()))
+                                 elf=elfs[arm].name, bin=rel, expect=expect.hex()))
                 print(f'{rid:36} {int(row["txs"]):>5} tx {steps:>11,} steps', flush=True)
 
     mroot = pathlib.Path(a.mainnet) if a.mainnet else None
@@ -290,11 +301,11 @@ def main():
         framed = frame(w.read_bytes())
         expect = hx(h)
         rid = f'mainnet-{n}'
-        (inp / 'bins' / f'{rid}.bin').write_bytes(framed)
+        rel = store(inp, framed)
         steps = replay(a.emu, elfs['mainnet'], framed, expect)
         rows.append(dict(id=rid, arm='mainnet', pair=rid, set='mainnet', label=n, number=n,
                          txs='', gas='', witness_bytes=w.stat().st_size, steps=steps,
-                         elf=elfs['mainnet'].name, bin=f'bins/{rid}.bin', expect=expect.hex()))
+                         elf=elfs['mainnet'].name, bin=rel, expect=expect.hex()))
         print(f'{rid:36} {"":>5}    {steps:>11,} steps', flush=True)
 
     with open(inp / 'inputs.csv', 'w', newline='') as f:

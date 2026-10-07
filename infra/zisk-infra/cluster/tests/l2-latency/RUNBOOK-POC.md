@@ -78,7 +78,7 @@ $P log <host> <port>
 
 - `check` takes ten seconds and copies nothing. It wants four GPUs, nvcc 12.8 or later and the
   disk above.
-- `start` copies the bundle (208 MB) and the tree (16 MB), checks their sha256 on the box, and
+- `start` copies the bundle (49 MB) and the tree (16 MB), checks their sha256 on the box, and
   starts `poc-run.sh`, detached. A second `start` copies only what changed: a box kept from a
   previous run skips its install too.
 - `log` follows the run. Ctrl-C stops following, not the run.
