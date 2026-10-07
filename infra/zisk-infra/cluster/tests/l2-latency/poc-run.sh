@@ -99,7 +99,8 @@ if [ "${#TODO[@]}" -gt 0 ]; then
   export PATH="/usr/local/cuda/bin:$PATH"
   command -v nvcc >/dev/null 2>&1 || [ "$DRY" = 1 ] \
     || die "no nvcc: the PoC is built from source and needs the CUDA toolkit. Rent an image with it (a -devel CUDA image)."
-  # poc-install.sh builds for ZisK's "major" archs, sm_80 to sm_120 (RTX 50xx): nvcc 12.8 or later,
+  # poc-install.sh builds for the box's GPUs, sm_120 on an RTX 50xx (ZisK's "major" archs, sm_80 to
+  # sm_120, when it cannot tell): nvcc 12.8 or later,
   # or the build stops on compute_120 a quarter of an hour in.
   NVCC_REL="$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')"
   echo "   nvcc ${NVCC_REL:-none}"

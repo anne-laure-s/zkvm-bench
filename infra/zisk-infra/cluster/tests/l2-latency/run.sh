@@ -74,6 +74,11 @@ up() { # up <log> [env…] — up.sh with this run's env, never leaving a failur
 # ── 1. the cluster ────────────────────────────────────────────────────────────────────────────
 say "1/5 cluster up (installs ZisK $ZISK_VER on a fresh box: 15-60 min)"
 up "$OUT/up.log" || die "up.sh failed — read $OUT/up.log"
+# Each ELF's one-time ROM setup (its Merkle root and its three ASM emulators), several ELFs at a
+# time, rather than one by one at each ELF's first setup while the box waits (asm-prebuild.sh).
+say "1/5 the ELFs' ROM setups, ahead of the first proof"
+ONLY="${ONLY:-.}" bash "$HERE/asm-prebuild.sh" "$IN" "$OUT/asm-prebuild" \
+  || warn "asm-prebuild.sh failed — the worker sets up each ELF at its first setup"
 
 # ── 2. the inputs, through this box's emulator ────────────────────────────────────────────────
 if [ "${PRECHECK:-0}" = 1 ]; then

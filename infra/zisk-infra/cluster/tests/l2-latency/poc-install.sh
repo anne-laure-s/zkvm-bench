@@ -9,7 +9,7 @@
 # The PoC is ZisK 1.3.1-alpha with shorter instances (branch al/poc-min-padding: pil/zisk.pil,
 # the traces.rs generated from it, setup/starkstructs.poseidon.json). This script:
 #
-#   1. builds the tree with the GPU prover (CUDA_ARCHS=major, as ZisK's build_zisk.sh does);
+#   1. builds the tree with the GPU prover, for this box's GPU architecture (ARCHS below);
 #   2. makes the key: with provingKey.tar, unpacks it and redoes what depends on the box (the
 #      recursion witness libraries for Linux, the per-air GPU expression kernels); without it,
 #      runs ZisK's own setup pipeline here (tools/test-env/setup_build.sh, Poseidon1 like the
@@ -66,8 +66,15 @@ rm -rf "$POC_TREE"; mkdir -p "$POC_TREE"
 tar -xzf "$SRC/zisk-poc-src.tar.gz" -C "$POC_TREE"
 grep -q 'Minimal-padding PoC' "$POC_TREE/pil/zisk.pil" || die "the tarball is not the PoC tree"
 
-say "building it with the GPU prover (CUDA_ARCHS=major) — ~/${LOGS##*/}-build.log"
-( cd "$POC_TREE" && CUDA_ARCHS=major cargo build --release ) > "$LOGS-build.log" 2>&1 \
+# The prover and the setup's expression kernels are compiled for this box's GPUs only (12.0 on an RTX
+# 5090: "120"). ZisK's build_zisk.sh compiles "major" -- 80 86 89 90 100 120 -- for a build carried
+# between GPUs; here that is five architectures of nvcc time, in the build and again in gen-exps,
+# for GPUs the box does not have. "major" stays the fallback when nvidia-smi cannot tell.
+ARCHS="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d ' .' | sort -u | paste -sd, - || true)"
+[[ "$ARCHS" =~ ^[0-9]+(,[0-9]+)*$ ]] || ARCHS=major
+
+say "building it with the GPU prover (CUDA_ARCHS=$ARCHS) — ~/${LOGS##*/}-build.log"
+( cd "$POC_TREE" && CUDA_ARCHS="$ARCHS" cargo build --release ) > "$LOGS-build.log" 2>&1 \
   || { tail -30 "$LOGS-build.log" >&2; die "the build failed — ~/${LOGS##*/}-build.log"; }
 R="$POC_TREE/target/release"
 "$R/cargo-zisk" --version | grep -q '\[gpu\]' || die "cargo-zisk is not a [gpu] build: $("$R/cargo-zisk" --version)"
@@ -83,7 +90,7 @@ if [ -f "$SRC/provingKey.tar" ]; then
   ( cd "$POC_TREE" && export ZISK_REPO_DIR="$POC_TREE" ROOT_DIR="$POC_TREE" \
       && . tools/test-env/setup_common.sh \
       && "$R/cargo-zisk-dev" proofman-setup rebuild-witness-libs --proving-key build/provingKey \
-      && "$R/cargo-zisk-dev" proofman-setup gen-exps --proving-key build/provingKey --arch major \
+      && "$R/cargo-zisk-dev" proofman-setup gen-exps --proving-key build/provingKey --arch "$ARCHS" \
            --stark-src "$PROOFMAN_DIR/pil2-stark" ) > "$LOGS-key.log" 2>&1 \
     || { tail -30 "$LOGS-key.log" >&2; die "finishing the key failed — ~/${LOGS##*/}-key.log"; }
 else
@@ -95,9 +102,9 @@ else
   SS="$POC_TREE/setup/starkstructs.poseidon.json"; cp "$SS" "$SS.shipped"
   # CUDA_ARCHS as for the build above: the pipeline cargo-runs the tree's binaries, and another
   # value would rebuild the prover's CUDA library first.
-  ( cd "$POC_TREE" && CUDA_ARCHS=major ZISK_REPO_DIR="$POC_TREE" HASH_MODE=Poseidon1 \
+  ( cd "$POC_TREE" && CUDA_ARCHS="$ARCHS" ZISK_REPO_DIR="$POC_TREE" HASH_MODE=Poseidon1 \
       SETUP_JOBS="${SETUP_JOBS:-8}" RECURSIVE_JOBS="${RECURSIVE_JOBS:-8}" \
-      ./tools/test-env/setup_build.sh --build-dir build --gen-exps --exps-arch major ) \
+      ./tools/test-env/setup_build.sh --build-dir build --gen-exps --exps-arch "$ARCHS" ) \
     > "$LOGS-key.log" 2>&1 || { tail -30 "$LOGS-key.log" >&2; die "the setup failed — ~/${LOGS##*/}-key.log"; }
   # The setup writes back every compressor it had to add. The shipped file already holds the ones
   # the Mac's setup chose, so a change means this key is not the one tested there.

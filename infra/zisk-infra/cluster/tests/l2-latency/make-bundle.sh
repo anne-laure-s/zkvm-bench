@@ -27,6 +27,7 @@ done
 cp "$CLUSTER/tests/lib.sh" "$CLUSTER/tests/t3-topo.sh" "$STAGE/cluster/tests/"
 cp -R "$HERE/README.md" "$HERE/RUNBOOK.md" "$HERE/run.sh" "$HERE/bench-l2.sh" "$HERE/check.py" "$HERE/summarize.py" \
       "$HERE/poc-install.sh" "$HERE/poc-run.sh" "$HERE/poc-box.sh" "$HERE/poc-summary.py" "$HERE/RUNBOOK-POC.md" \
+      "$HERE/asm-prebuild.sh" \
       "$HERE/inputs" "$STAGE/cluster/tests/l2-latency/"
 cp -R "$ZI/zisk-publics/Cargo.toml" "$ZI/zisk-publics/Cargo.lock" "$ZI/zisk-publics/src" \
       "$STAGE/zisk-publics/"
