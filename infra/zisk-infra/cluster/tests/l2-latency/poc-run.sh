@@ -22,7 +22,8 @@
 #
 # Env: POC_KEYS="poc50f" (each one installed in ~/.zisk-<key>; "poc50f poc50" times both)
 #      GPU_SETS="1 2 4" · PASSES=3 · ONLY=<regex on input ids>, default every staged arm's sweep
-#      selection at 1 to 1,000 transactions · MIN_FREE_GB=70 per key to install
+#      selection at 1 to 1,000 transactions · MIN_FREE_GB=95 per key to install
+#      MIN_SHM_GB=16 (/dev/shm the worker's ASM services need)
 #      SKIP_TOPO=1 · FORCE_INSTALL=1 (install past a bad d2h verdict) · DRY_RUN=1 (print the plan)
 #      VRAM_FLOOR_MIB (up.sh's; it reaches up.sh through run.sh)
 set -uo pipefail
@@ -34,7 +35,7 @@ POC_KEYS="${POC_KEYS:-poc50f}"
 GPU_SETS="${GPU_SETS:-1 2 4}"
 PASSES="${PASSES:-3}"
 ONLY="${ONLY:--sweep-d(0001-b[123]|0010-b1|0025-b1|0050-b1|0100-b1|0250-b1|1000-b1)$}"
-MIN_FREE_GB="${MIN_FREE_GB:-70}"
+MIN_FREE_GB="${MIN_FREE_GB:-95}"
 DRY="${DRY_RUN:-0}"
 say()  { printf '\n\033[1m== %s\033[0m  (%s)\n' "$*" "$(date -u +%H:%M:%S)"; }
 warn() { printf '\033[33m!! %s\033[0m\n' "$*" >&2; }
@@ -68,6 +69,14 @@ EOF
 )
 [ "${NSEL:-0}" -gt 0 ] || die "ONLY selects no input of $HERE/inputs/inputs.csv"
 echo "   $NSEL inputs selected (ONLY=$ONLY)"
+# The worker runs three ASM services per ELF (minimal traces, ROM histogram, memory ops), each
+# with 0.5 GB of /dev/shm from the start (measured on these ELFs), 9 GB for the six here, more
+# while one proves; ZisK's own containers get 48 GB. Docker's default is 64 MB, and a service out
+# of it dies on a bus error at the first proof -- after the 45 min of install, so it is checked now.
+SHM_GB="$(df -Pk /dev/shm 2>/dev/null | awk 'NR==2{print int($2/1048576)}')"
+echo "   /dev/shm: ${SHM_GB:-?} GB (want ${MIN_SHM_GB:-16} or more)"
+[ "${SHM_GB:-0}" -ge "${MIN_SHM_GB:-16}" ] || [ "$DRY" = 1 ] \
+  || die "/dev/shm is ${SHM_GB:-?} GB: the worker's ASM services need ~10 GB of it for these six ELFs. Rent an image/template with a bigger --shm-size (MIN_SHM_GB lowers the bar, on your own judgement)."
 
 # Which keys still need their install. poc-install.sh writes ~/.zisk-<key>/.installed last of
 # all, with the sha256 of the tree it installed: a key counts as installed when that is the tree in
@@ -98,7 +107,7 @@ if [ "${#TODO[@]}" -gt 0 ]; then
     || die "nvcc ${NVCC_REL:-?} is too old to build for sm_120 (RTX 50xx): rent an image with CUDA 12.8 or later"
   FREE_GB="$(df -Pk "$HOME" | awk 'NR==2{print int($4/1048576)}')"
   NEED_GB=$(( MIN_FREE_GB * ${#TODO[@]} ))
-  echo "   disk: ${FREE_GB} GB free, ~${NEED_GB} GB needed (tree, key and its GPU constant trees: ${MIN_FREE_GB} GB a key)"
+  echo "   disk: ${FREE_GB} GB free, ~${NEED_GB} GB needed (tree, key, its GPU constant trees and the ELFs' ASM emulators: ${MIN_FREE_GB} GB a key)"
   [ "$FREE_GB" -ge "$NEED_GB" ] || [ "$DRY" = 1 ] \
     || die "too little disk for ${#TODO[@]} key(s). Rent a bigger disk, or set MIN_FREE_GB lower on your own judgement."
 fi

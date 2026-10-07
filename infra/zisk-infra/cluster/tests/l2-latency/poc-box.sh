@@ -35,7 +35,7 @@ rsha() { "${SSH[@]}" "sha256sum '$1' 2>/dev/null" | grep -oE '^[0-9a-f]{64}' | t
 # The env poc-run.sh reads, forwarded only when set here.
 forward() {
   local e="POC_KEYS='$POC_KEYS'" v
-  for v in GPU_SETS PASSES ONLY SKIP_TOPO FORCE_INSTALL MIN_FREE_GB DRY_RUN VRAM_FLOOR_MIB; do
+  for v in GPU_SETS PASSES ONLY SKIP_TOPO FORCE_INSTALL MIN_FREE_GB MIN_SHM_GB DRY_RUN VRAM_FLOOR_MIB; do
     [ -n "${!v:-}" ] && e="$e $v='${!v}'"
   done
   echo "$e"
@@ -48,10 +48,11 @@ case "$CMD" in
       echo "os:     $(. /etc/os-release; echo "$PRETTY_NAME"), $(ldd --version | head -1)"
       echo "nvcc:   $( (PATH=/usr/local/cuda/bin:$PATH; nvcc --version 2>/dev/null | tail -1) || true)"
       echo "memlock: $(ulimit -l)"
+      echo "shm:    $(df -h /dev/shm | awk "NR==2{print \$4\" free of \"\$2}")"
       echo "cpu:    $(nproc) threads, $(awk "/MemTotal/{printf \"%.0f GB\", \$2/1048576}" /proc/meminfo) RAM"'
     echo
     echo "Want: 4 GPUs with 32 GB or more each, nvcc 12.8 or later (a CUDA -devel image), Ubuntu 22.04+"
-    echo "(glibc 2.35+), about 80 GB free per PoC key ($POC_KEYS). memlock 64 is the usual vast.ai cap:"
+    echo "(glibc 2.35+), /dev/shm of 16 GB or more, about 95 GB free per PoC key ($POC_KEYS). memlock 64 is the usual vast.ai cap:"
     echo "the PoC install patches around it."
     ;;
 

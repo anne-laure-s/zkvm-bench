@@ -51,9 +51,10 @@ proving a row. That costs 0.18 G in every proof, counted in the table.
 | **4 GPUs**, 32 GB VRAM or more each (RTX 5090), power limit at the default (575-600 W) | the 1-, 2- and 4-GPU sets; the first box was capped at 450 W and was about 10 % slower for it |
 | a **CUDA `-devel` image, 12.8 or later**: `nvcc` present | the PoC is built from source with the GPU prover, for ZisK's major archs up to sm_120 (RTX 50xx), which older nvcc cannot target |
 | Ubuntu 22.04 or later | glibc 2.35 for the bundled `zisk-publics` |
-| **120 GB free disk** (200 GB with `POC_KEYS="poc50f poc50"`) | the tree, its key and the key's GPU constant trees: about 70 GB a key |
+| **120 GB free disk** (200 GB with `POC_KEYS="poc50f poc50"`) | the tree, its key and the key's GPU constant trees, about 70 GB, and the ASM emulators the worker builds for the six ELFs, about 23 GB: some 95 GB a key |
 | 64 GB RAM or more | the worker keeps every ELF's ASM services resident: six ELFs here |
-| about **2 hours** | ~45 min of build and setup, a few minutes of constant trees, about an hour of proofs |
+| **/dev/shm of 16 GB or more** (Docker `--shm-size`) | those services live in it, 0.5 GB each from the start, three per ELF: ~10 GB here, more while proving. Docker's default is 64 MB; `poc-run.sh` stops at once below 16 GB (`MIN_SHM_GB`) |
+| about **2.5 hours** | ~45 min of build and setup, a few minutes of constant trees, ~25 min of ASM emulator builds, about an hour of proofs |
 
 ## 2. On the Mac, once
 
@@ -91,7 +92,7 @@ To see the plan on the box first without running anything, put `DRY_RUN=1` in fr
 | `PoC run: keys [poc50f] …` | seconds | four GPUs listed, `54 inputs selected`, `poc50f: to install`, the disk line | §6 |
 | `1/3 d2h on the idle box` | ~2 min | `good <mode> d2h … ratio …` | `bad`: rent another box |
 | `2/3 building and setting up poc50f` | ~45 min | `poc50f: done — … of key` (details in `~/poc50f-install.log`) | §6 |
-| `3/3 STARK proofs`, then run.sh's `1/5` to `5/5` for the key | ~45 min | `1/5 cluster up` with const trees written once; per GPU set a worker restart, then per ELF a `warm` line and `p1`…`p3` lines with `rc=0`; `zisk-publics: N/N proofs verify under …/provingKey/…` | §6 |
+| `3/3 STARK proofs`, then run.sh's `1/5` to `5/5` for the key | ~1 h 30 | `1/5 cluster up` with const trees written once; per GPU set a worker restart, then per ELF a `warm` line and `p1`…`p3` lines with `rc=0` -- on the first set each ELF's `warm` comes ~4 min late: the worker builds that ELF's ASM emulator (2.4 M ROM instructions: three binaries, ~4 GB of cache, up to 11 GB of RAM while it assembles), once for the run; `zisk-publics: N/N proofs verify under …/provingKey/…` | §6 |
 | the 1/2/4-GPU table | — | one table per arm (§5) | `poc-summary.py` on the archive, on the Mac |
 
 ## 5. Bring it back
