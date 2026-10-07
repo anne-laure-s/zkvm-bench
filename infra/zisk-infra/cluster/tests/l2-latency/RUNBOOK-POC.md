@@ -23,7 +23,9 @@ hash), and the Keccak-f path under each:
 - **Seven sizes.** Payouts blocks of 1 (three blocks), 10, 25, 50, 100, 250 and 1,000
   transactions on a 1,000,000-account state: 54 inputs. The bundle also holds 2,000 and 5,000,
   and two blocks of each preset (`ONLY` to add them, §7).
-- **Three passes** per input on each GPU set, after a warm-up per ELF. Every proof is a STARK
+- **One pass** per input on each GPU set, after a warm-up per ELF (ZisK's times are steady from one
+  proof of a block to the next; the 1-tx size has three blocks, and the drift check proves the first
+  ELF's first inputs again at the end of each set; `PASSES=3` for more). Every proof is a STARK
   (VADCOP final, no wrap), verified after the timing pinned to the PoC key, and must publish its
   block's chain id, number, both state commitments and both anchors.
 
@@ -54,7 +56,7 @@ proving a row. That costs 0.18 G in every proof, counted in the table.
 | **120 GB free disk** (200 GB with `POC_KEYS="poc50f poc50"`) | the tree, its key and the key's GPU constant trees, about 70 GB, and the six ELFs' ASM emulators, about 10 GB (23 GB with their sources, when the worker builds one itself): 80 to 95 GB a key |
 | 64 GB RAM or more | the worker keeps every ELF's ASM services resident: six ELFs here |
 | **/dev/shm of 16 GB or more** (Docker `--shm-size`) | those services live in it, 0.5 GB each from the start, three per ELF: ~10 GB here, more while proving. Docker's default is 64 MB; `poc-run.sh` stops at once below 16 GB (`MIN_SHM_GB`) |
-| about **2 hours** | up to ~45 min of build and setup (for the box's own GPU architecture only), a few minutes of constant trees, ~10 min of ROM setups (the ELFs' ASM emulators, several at a time), ~30 min of proofs and ~15 min of worker restarts and ASM service starts |
+| about **1 h 30** | up to ~45 min of build and setup (for the box's own GPU architecture only), a few minutes of constant trees, ~10 min of ROM setups (the ELFs' ASM emulators, several at a time), ~10 min of proofs and ~15 min of worker restarts and ASM service starts |
 
 ## 2. On the Mac, once
 
@@ -92,7 +94,7 @@ To see the plan on the box first without running anything, put `DRY_RUN=1` in fr
 | `PoC run: keys [poc50f] …` | seconds | four GPUs listed, `54 inputs selected`, `poc50f: to install`, the disk line | §6 |
 | `1/3 d2h on the idle box` | ~2 min | `good <mode> d2h … ratio …` | `bad`: rent another box |
 | `2/3 building and setting up poc50f` | ~45 min | `poc50f: done — … of key` (details in `~/poc50f-install.log`) | §6 |
-| `3/3 STARK proofs`, then run.sh's `1/5` to `5/5` for the key | ~1 h | `1/5 cluster up` with const trees written once; `1/5 the ELFs' ROM setups`: `6 ELF(s) to set up, P at a time`, then a `set up in … s` line per ELF (~4 min each, P at once as the RAM allows; one `not set up` is no failure: the worker builds it at that ELF's first warm-up, ~4 min late); per GPU set a worker restart, then per ELF a `warm` line and `p1`…`p3` lines with `rc=0`; `zisk-publics: N/N proofs verify under …/provingKey/…` | §6 |
+| `3/3 STARK proofs`, then run.sh's `1/5` to `5/5` for the key | ~40 min | `1/5 cluster up` with const trees written once; `1/5 the ELFs' ROM setups`: `6 ELF(s) to set up, P at a time`, then a `set up in … s` line per ELF (~4 min each, P at once as the RAM allows; one `not set up` is no failure: the worker builds it at that ELF's first warm-up, ~4 min late); per GPU set a worker restart, then per ELF a `warm` line and its `p1` lines with `rc=0`; `zisk-publics: N/N proofs verify under …/provingKey/…` | §6 |
 | the 1/2/4-GPU table | — | one table per arm (§5) | `poc-summary.py` on the archive, on the Mac |
 
 ## 5. Bring it back
@@ -142,9 +144,9 @@ All are given in front of `$P start`:
 
 | env | default | effect |
 |---|---|---|
-| `POC_KEYS` | `poc50f` | `"poc50f poc50"` also times the 50-tx key with the release's FROPS (the FROPS effect, one leaf); both install at once, ~40 min more of proofs |
+| `POC_KEYS` | `poc50f` | `"poc50f poc50"` also times the 50-tx key with the release's FROPS (the FROPS effect, one leaf); both install at once, ~25 min more of proofs |
 | `GPU_SETS` | `1 2 4` | e.g. `"4"` for four GPUs only, `"1 2"` on a 2-GPU box |
-| `PASSES` | `3` | passes per input and GPU set |
+| `PASSES` | `1` | passes per input and GPU set |
 | `ONLY` | the 54 inputs above | a regex on input ids, e.g. `'^p2anchor-nodma-'` for one arm, `'-sweep-|-preset-'` for everything staged |
 | `DRY_RUN` | — | `1` prints the plan on the box and runs nothing |
 | `SKIP_TOPO` | — | `1` skips the d2h measurement |
@@ -158,7 +160,7 @@ inputs is the other half of the comparison. After `fetch`, on the same box (`run
 ZisK 1.3.1 and its key itself: about 80 GB more disk and up to an hour):
 
 ```sh
-ssh -p <port> root@<host> 'ONLY="-sweep-d(0001-b[123]|0010-b1|0025-b1|0050-b1|0100-b1|0250-b1|1000-b1)$" GPU_SETS="1 2 4" PASSES=3 bash zisk-infra/cluster/tests/l2-latency/run.sh'
+ssh -p <port> root@<host> 'ONLY="-sweep-d(0001-b[123]|0010-b1|0025-b1|0050-b1|0100-b1|0250-b1|1000-b1)$" GPU_SETS="1 2 4" PASSES=1 bash zisk-infra/cluster/tests/l2-latency/run.sh'
 ```
 
 It detaches and leaves `~/l2-latency-<stamp>.tar.gz`, which `$P fetch` brings back with the rest.

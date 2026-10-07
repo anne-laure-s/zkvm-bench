@@ -14,7 +14,7 @@
 #
 # <host> as vast.ai prints it (ssh5.vast.ai, or an IP); the user is root unless BOX_USER says so.
 #
-# Env: POC_KEYS="poc50f" · GPU_SETS="1 2 4" · PASSES=3 · ONLY · DRY_RUN=1 (passed to poc-run.sh)
+# Env: POC_KEYS="poc50f" · GPU_SETS="1 2 4" · PASSES=1 · ONLY · DRY_RUN=1 (passed to poc-run.sh)
 #      L2BENCH=~/Documents/zkvms/l2-bench (the bundle in bundle/, the trees in poc/dist<suffix>/)
 set -euo pipefail
 L2BENCH="${L2BENCH:-$HOME/Documents/zkvms/l2-bench}"

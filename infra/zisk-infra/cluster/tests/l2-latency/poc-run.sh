@@ -21,7 +21,7 @@
 # It detaches itself (nohup setsid) unless POC_FG=1; the log is ~/poc-run-<stamp>.log.
 #
 # Env: POC_KEYS="poc50f" (each one installed in ~/.zisk-<key>; "poc50f poc50" times both)
-#      GPU_SETS="1 2 4" · PASSES=3 · ONLY=<regex on input ids>, default every staged arm's sweep
+#      GPU_SETS="1 2 4" · PASSES=1 · ONLY=<regex on input ids>, default every staged arm's sweep
 #      selection at 1 to 1,000 transactions · MIN_FREE_GB=95 per key to install
 #      MIN_SHM_GB=16 (/dev/shm the worker's ASM services need)
 #      SKIP_TOPO=1 · FORCE_INSTALL=1 (install past a bad d2h verdict) · DRY_RUN=1 (print the plan)
@@ -33,7 +33,7 @@ STAMP="${STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 LOG="$HOME/poc-run-$STAMP.log"
 POC_KEYS="${POC_KEYS:-poc50f}"
 GPU_SETS="${GPU_SETS:-1 2 4}"
-PASSES="${PASSES:-3}"
+PASSES="${PASSES:-1}"
 ONLY="${ONLY:--sweep-d(0001-b[123]|0010-b1|0025-b1|0050-b1|0100-b1|0250-b1|1000-b1)$}"
 MIN_FREE_GB="${MIN_FREE_GB:-95}"
 DRY="${DRY_RUN:-0}"
