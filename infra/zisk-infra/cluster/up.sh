@@ -63,7 +63,16 @@ die()  { printf '\033[31mXX\033[0m %s\n' "$*" >&2; exit 1; }
 # the pgrep/pkill running it. This is the third leg of the teardown decision: a worker that is alive
 # but has not yet allocated leaves the port free AND the VRAM low, and starting a second one on top of
 # it is the exact failure that grafting a hand-started worker onto a live coordinator produced.
-procs_up() { pgrep -f '[z]isk-(coordinator|worker)' >/dev/null 2>&1; }
+procs_up() { [ -n "$(live_daemons '[z]isk-(coordinator|worker)')" ]; }
+# The pids pgrep -f finds for $1, less the zombies: a daemon that exited on a box whose PID 1 never
+# reaps orphans (a container whose entrypoint is `sleep infinity`) stays in the table with an empty
+# command line, and pgrep -f then matches its name. Dead, it holds no port and no VRAM, and taken for
+# a live one it would refuse every restart -- run.sh's 2- and 4-GPU sets among them.
+live_daemons() { local p st
+  for p in $(pgrep -f "$1" 2>/dev/null); do
+    st="$(sed 's/.*) //' "/proc/$p/stat" 2>/dev/null | cut -d' ' -f1)"
+    [ -n "$st" ] && [ "$st" != Z ] && echo "$p"
+  done; }
 vram_mib() { nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
              | awk '{s+=$1} END{print s+0}'; }
 key_gb()   { local m; m="$(du -sm "$KEY" 2>/dev/null | cut -f1)"; echo $(( ${m:-0} / 1024 )); }
@@ -338,7 +347,7 @@ VRAM:${VRAM} MiB forced:${FORCE_RESTART:-0})"
   VRAM="$(vram_mib)"; port_held "$API_PORT" && COORD_UP=1 || COORD_UP=0
   [ "$VRAM" -lt "$VRAM_FLOOR_MIB" ] || warn "VRAM still ${VRAM} MiB after teardown — another tenant?"
   [ "$COORD_UP" = 0 ] || die "port $API_PORT still held after teardown — a process outside this tree owns it"
-  SURVIVORS="$(pgrep -f '[z]isk-(coordinator|worker)' 2>/dev/null | tr '\n' ' ' || true)"
+  SURVIVORS="$(live_daemons '[z]isk-(coordinator|worker)' | tr '\n' ' ' || true)"
   SURVIVORS="${SURVIVORS% }"
   [ -z "$SURVIVORS" ] || die "a zisk daemon survived pkill (pid $SURVIVORS) — starting a second one \
 on top of it is what this refuses to do"
@@ -403,7 +412,7 @@ tree took it in between. Pick another with API_PORT=<n>."
   # The check that needs no wording: once start.sh has returned, the worker HAS been launched, so a
   # missing process means it died — whatever it printed on the way out, and including every failure
   # the two greps above do not know about. This is the one that must not be removed.
-  if [ -n "$START_RC" ] && ! pgrep -f '[z]isk-worker' >/dev/null 2>&1; then
+  if [ -n "$START_RC" ] && [ -z "$(live_daemons '[z]isk-worker')" ]; then
     warn "no zisk-worker process is alive and start.sh has already returned. Worker log tail:"
     tail -20 "$WORKER_LOG" 2>/dev/null | sed 's/^/     /' >&2
     die "the worker died during startup — the tail above is the whole story"
